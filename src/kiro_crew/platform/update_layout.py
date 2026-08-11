@@ -12,15 +12,24 @@ from typing import NamedTuple
 
 from kiro_crew.beacon import distribution
 from kiro_crew.config.paths import data_home
+from kiro_crew.platform.update_capability import (
+    EXTERNALLY_MANAGED_MESSAGES,
+    MANAGED_BY_GIT,
+    UNAVAILABLE_MANAGED_BY_APP,
+    UNAVAILABLE_MANAGED_BY_IMAGE,
+    derive_capability,
+)
 
 #: Release channels the installer publishes.
 RELEASE_CHANNELS = ("stable", "insider", "nightly")
 
-#: Distributions managed by an external updater (desktop app, container).
+#: Distributions managed by an external updater (desktop app, container), mapped
+#: to the copy shown for them. Built from the capability module's table so the
+#: CLI and the dashboard cannot show different words for the same state.
 EXTERNALLY_MANAGED = {
-    "dmg": "Update via the desktop app's built-in updater (About → Check for updates).",
-    "appimage": "Update via the desktop app's built-in updater (About → Check for updates).",
-    "docker": "Update by pulling a newer image (docker pull).",
+    "dmg": EXTERNALLY_MANAGED_MESSAGES[UNAVAILABLE_MANAGED_BY_APP],
+    "appimage": EXTERNALLY_MANAGED_MESSAGES[UNAVAILABLE_MANAGED_BY_APP],
+    "docker": EXTERNALLY_MANAGED_MESSAGES[UNAVAILABLE_MANAGED_BY_IMAGE],
 }
 
 
@@ -37,12 +46,19 @@ class InstallLayout(NamedTuple):
 def detect_install_layout() -> InstallLayout:
     """Detect the current install layout using the same logic as the dashboard.
 
-    Returns an InstallLayout describing how to update this instance.
+    Derived from :func:`derive_capability` rather than from a second reading of
+    the same signals. Order matters and it is the reason this delegates: asking
+    ``is_git_worktree`` FIRST classified a container whose ``KIROCREW_PROJECT_DIR``
+    points at a checkout as a git install, so the channel endpoint refused the
+    switch with "a git checkout follows its git remote" instead of the guidance
+    naming the surface that actually updates it. An externally managed stamp wins
+    over a mounted checkout, and the capability contract is where that precedence
+    is decided once.
     """
     proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
-    is_git = bool(proj) and os.path.exists(os.path.join(proj, ".git"))
+    capability = derive_capability(install_root=proj)
 
-    if is_git:
+    if capability.managed_by == MANAGED_BY_GIT:
         return InstallLayout(
             kind="git",
             proj=proj,
