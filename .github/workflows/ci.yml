@@ -687,10 +687,24 @@ jobs:
     # on ordinary noise. Raise a floor only after main has held the higher
     # number for a while, and never above the LOWEST recent main measurement.
     #
-    #   Backend  measured ~81.9% on main (2026-08-07) -> floor 80%
-    #   Frontend measured 60.46-61.74% on main (2026-08-07) -> floor 60%
-    #     (frontend sits ~0.5pp above its floor: it cannot be ratcheted until
-    #      website/src gains real test coverage)
+    #   Backend  measured 89.57% on main -> floor 85%  (~4.6pp headroom)
+    #   Frontend measured 88.29% on main -> floor 85%  (~3.3pp headroom)
+    #
+    # Those two figures are what main holds after #3118 and #3132 landed, and
+    # they are union measurements (run the new tests alone, union their covered
+    # lines against main's published coverage artifact) rather than a figure read
+    # off a green Coverage Gate -- main was being pushed to faster than a run
+    # could finish when this was written. The method has matched CI within 0.1pp
+    # every time it was checked against a completed run, but treat CI's own
+    # number as authoritative the moment one lands.
+    #
+    # Before those two merges the frontend margin was ~1.1pp, which is thin
+    # enough that a single feature merge could spend it; at ~3.3pp that is no
+    # longer the near-term risk it was. The asymmetry is still worth watching,
+    # because frontend converts at roughly half backend's rate per targeted
+    # statement, so the two lanes do not recover a spent margin equally fast.
+    # If frontend coverage starts hovering near 85%, lower this floor rather
+    # than leaving a required check to fail main -- that is the cheaper failure.
     #
     # How backend got here, so the next person can judge the headroom:
     #   78.69%  starting point
@@ -698,14 +712,31 @@ jobs:
     #           BACKEND_DESELECTS set) -- an accounting fix, not new tests
     #   81.50%  #2103 added unit coverage for 7 pure-logic-ish modules
     #   81.94%  #2115 added 11 dashboard/Slack/app-platform modules
-    # 80% therefore leaves ~1.9pp of headroom, wider than the ~1.4pp the 77%
-    # floor had. Deliberately conservative: the last wave converted at a third
-    # the rate of the one before it (1,883 tests for +0.44pp vs 1,040 for
-    # +1.35pp), because the remaining uncovered lines sit behind I/O a unit test
-    # cannot reach. Do not assume the next raise is as cheap.
+    #   86.93%  #2947 12 files / 1,668 tests, ranked by uncovered-statement mass
+    #   88.84%  #3005 12 files / 1,615 tests, mostly the auto_improvement spine
+    #           (low there because its own tests are in BACKEND_DESELECTS, so
+    #           the new tests inject fakes instead of needing the capabilities)
+    #   89.57%  #3118 12 files / 1,342 tests -- note the falling return: this
+    #           wave converted 58% of the statements it targeted where #3005
+    #           converted more than it targeted, because what is left sits
+    #           behind I/O, subprocess and network boundaries
+    #
+    # And frontend, which moved much later and more slowly:
+    #   60.46%  2026-08-07, before any dedicated coverage work
+    #   83.38%  the zero-coverage sweep (files that had no test file at all)
+    #   84.46%  #2948 12 files / 348 tests
+    #   86.14%  #3014 12 files / 359 tests
+    #   88.29%  #3132 12 files / 554 tests -- three surfaces starting at or near
+    #           0% produced 739 of its 1,470 statements, while ChatPage.tsx, the
+    #           single largest target at 481 uncovered, produced nothing
+    #           measurable
+    # Frontend converts at roughly half the rate of backend per targeted
+    # statement, so do not size the next frontend raise off a backend wave. And
+    # rank candidates by how UNCOVERED they are, not merely by uncovered count:
+    # a file near 0% converts far better than a large page already at 80%.
     env:
-      BACKEND_MIN: 80
-      FRONTEND_MIN: 60
+      BACKEND_MIN: 85
+      FRONTEND_MIN: 85
     # Always run so the required check emits a real verdict. Without
     # `if: always()`, a failing OR skipped dependency would SKIP this job, and
     # GitHub treats a skipped required check as SATISFIED -- silently defeating
