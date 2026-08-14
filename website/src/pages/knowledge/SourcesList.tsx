@@ -4,7 +4,7 @@ import { Upload, FolderSync, FolderOpen, X, RefreshCw, AlertCircle, CheckCircle,
 import { Badge, EmptyState, ContentSkeleton } from '../../components/ui'
 import Clickable from '../../components/Clickable'
 import { knowledgeApi } from './api'
-import { formatRelativeDate, SUPPORTED_FORMATS_KEY } from './helpers'
+import { formatRelativeDate, FALLBACK_SUPPORTED_FORMATS } from './helpers'
 import { parseSourceProps, shouldShowWordCount } from './knowledgeUtils'
 import { fmtCompact, fmtNumber } from '../../i18n/format'
 import type { Source, SourceSpend, NamespaceInfo, IngestionJob, SourceFilesResponse } from './types'
@@ -104,7 +104,7 @@ function NamespacePicker({ value, onChange, namespaces }: { value: string; onCha
   )
 }
 
-function DropZone({ onFiles, accept }: { onFiles: (files: File[]) => void; accept?: string }) {
+function DropZone({ onFiles, accept, caption }: { onFiles: (files: File[]) => void; accept?: string; caption: string }) {
   const [over, setOver] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
   return (
@@ -117,7 +117,7 @@ function DropZone({ onFiles, accept }: { onFiles: (files: File[]) => void; accep
     >
       <Upload size={28} className="mx-auto mb-2 text-muted" />
       <div className="text-sm text-muted">{i18nT('pages.knowledge.sourcesList.drop_files_here_or_click_to_upload')}</div>
-      <div className="text-[11px] text-muted/50 mt-1">{i18nT(SUPPORTED_FORMATS_KEY)}</div>
+      <div className="text-[11px] text-muted/50 mt-1">{caption}</div>
       <input ref={inputRef} type="file" multiple accept={accept} aria-label={i18nT('pages.knowledge.sourcesList.upload_files')} className="hidden" onChange={e => e.target.files && onFiles(Array.from(e.target.files))} />
     </Clickable>
   )
@@ -266,9 +266,12 @@ function FolderProgress({ sourceId }: { sourceId: string }) {
   )
 }
 
-export default function SourcesList({ onIngest, uploadNamespace, setUploadNamespace, namespaces, ingestionJobs, uploadAccept, acceptsNoExtension }: {
+export default function SourcesList({ onIngest, uploadNamespace, setUploadNamespace, namespaces, ingestionJobs, uploadAccept, supportedFormatsDisplay, acceptsNoExtension }: {
   onIngest: (files: File[]) => void; uploadNamespace: string; setUploadNamespace: (v: string) => void
   namespaces: NamespaceInfo[]; ingestionJobs: IngestionJob[]
+  // Derived once in index.tsx next to `uploadAccept` (same source list, so the
+  // accept filter and the advertised copy cannot desync).
+  supportedFormatsDisplay: string
   uploadAccept?: string; acceptsNoExtension?: boolean
 }) {
   const queryClient = useQueryClient()
@@ -443,10 +446,11 @@ export default function SourcesList({ onIngest, uploadNamespace, setUploadNamesp
           <NamespacePicker value={uploadNamespace} onChange={setUploadNamespace} namespaces={namespaces} />
           {addType === 'local_file' ? (
             <>
-              <DropZone onFiles={(files) => { onIngest(files); setShowAdd(false) }} accept={uploadAccept ?? ".md,.txt,.org,.py,.java,.ts,.js,.rs,.go,.html,.htm,.csv,.log,.json,.yaml,.yml,.sh,.rb,.c,.cpp,.h,.docx,.pdf"} />
+              <DropZone onFiles={(files) => { onIngest(files); setShowAdd(false) }} accept={uploadAccept ?? FALLBACK_SUPPORTED_FORMATS.join(',')} caption={i18nT('pages.knowledge.helpers.supported_formats', { formats: supportedFormatsDisplay })} />
               <IngestionProgress jobs={ingestionJobs} />
               <div className="text-[11px] text-muted bg-bg rounded border border-border p-2">
-                {i18nT('pages.knowledge.sourcesList.supports_markdown_plain_text_code_files_html_jso')}
+                {i18nT('pages.knowledge.sourcesList.supports_formats', { formats: supportedFormatsDisplay })}
+                {' ' + i18nT('pages.knowledge.sourcesList.max_file_size')}
                 {acceptsNoExtension && ' ' + i18nT('pages.knowledge.sourcesList.files_with_no_extension_e_g_readme_are_ingested')}
               </div>
             </>

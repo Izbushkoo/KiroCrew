@@ -5896,7 +5896,6 @@
         "skip": "Skip",
         "source_name": "Source name",
         "source_name_optional": "Source name (optional)",
-        "supports_markdown_plain_text_code_files_html_jso": "Supports: Markdown, plain text, code files, HTML, JSON, YAML, CSV, DOCX, Org Mode, PDF. Max 50 MB per file.",
         "sync": "Sync",
         "sync_source": "Sync source",
         "type_new_to_create": "Type new to create",
