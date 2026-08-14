@@ -1809,6 +1809,11 @@ Examples:
     # fail-closed governance gate and all accessibility work live.
     sub.add_parser("mcp-computer", help=argparse.SUPPRESS)
 
+    # mcp-dashboard (MCP server — spawned by the agent backend, not user-facing).
+    # Mounted only for an agent whose spec grants it, so an unassigned set costs
+    # a session nothing: kiro-cli loads a server only when `tools` names it.
+    sub.add_parser("mcp-dashboard", help=argparse.SUPPRESS)
+
     # Builtin app MCP servers (spawned by the agent backend, not user-facing)
     for _bname in _BUILTIN_NAMES:
         sub.add_parser(f"mcp-{_bname}", help=argparse.SUPPRESS)
@@ -2283,6 +2288,11 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         from kiro_crew.mcp_computer import run_mcp_server as run_mcp_computer_server
 
         run_mcp_computer_server()
+    elif args.command == "mcp-dashboard":
+        # Loaded through importlib in the branch, like the builtin-app servers
+        # below: `kirocrew gateway` boots through this module, and a default-off
+        # optional subsystem must not be imported to start it.
+        importlib.import_module("kiro_crew.mcp_dashboard").run_mcp_server()
     elif args.command.startswith("mcp-") and args.command[4:] in _BUILTIN_NAMES:
         _mod = importlib.import_module(f"kiro_crew.apps.builtins.{args.command[4:]}.mcp_server")
         _mod.run_mcp_server()

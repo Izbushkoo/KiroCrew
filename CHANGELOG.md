@@ -171,6 +171,22 @@ All notable changes to KiroCrew are documented in this file.
   bypass the PreToolUse gate. The two in-process checks are kept as defence in
   depth for a mid-session disable. (#3482)
 
+- **Folder-write audit lines now name the internal component that made the
+  write, instead of inferring the caller's identity from the internal secret's
+  presence.** Every MCP stdio server now declares its component name on
+  loopback gateway requests (`X-Internal-Caller`, attached centrally by the
+  shared request helpers), and the folder endpoints validate it against a
+  known-caller set before trusting it into the security event log's `caller`
+  field — `source` stays in SEL's interface vocabulary (`mcp`), so operator
+  queries over `source == "mcp"` keep matching folder writes. The old
+  inference was correct only while exactly one internal caller existed — a
+  second internal caller would have silently inherited the same label. An
+  authenticated internal write with a missing or unrecognized caller name is
+  audited as `caller="unknown-internal"` with a warning, so a new caller shows
+  up loudly until it is added to the known set alongside its own test. Browser
+  writes still audit as `dashboard`; the caller header alone grants nothing.
+  (#3503)
+
 - **Side-panel oversize-question refusal now reports an accurate character
   target for every script, not just emoji.** The refusal derived its
   character count from a fixed worst-case floor (4 bytes/char, the emoji

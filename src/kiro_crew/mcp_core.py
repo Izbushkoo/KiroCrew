@@ -53,6 +53,7 @@ from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.mcp_caller import current_caller
 from kiro_crew.mcp_shared import (
     call_tool_with_logging,
+    internal_caller,
     run_mcp_stdio_loop,
 )
 from kiro_crew.mcp_tools import build_tool_list, dispatch
@@ -832,9 +833,30 @@ def _session_key_header_error(sk: str) -> str | None:
         )
 
 
+def _caller_header() -> dict[str, str]:
+    """``X-Internal-Caller`` for this process, when it has declared one.
+
+    MCP stdio servers declare their component name via
+    ``mcp_shared.set_internal_caller`` (done centrally in
+    ``run_mcp_stdio_loop``), and every loopback request from these helpers
+    carries it so the gateway's audit log can attribute an internal write to
+    the actual component instead of inferring "some internal caller" from the
+    secret's mere presence (#3503). Attribution only — the gateway
+    authenticates on ``X-Internal-Secret`` and validates this name against a
+    known set before trusting it into an audit line. Processes that never
+    declared an identity (CLI, tests) send no header rather than a guess.
+    """
+    name = internal_caller()
+    return {"X-Internal-Caller": name} if name else {}
+
+
 def _post(path: str, body: dict | None = None, *, timeout: float = 30) -> dict:
     data = json.dumps(body or {}).encode()
-    headers = {"Content-Type": "application/json", "X-Internal-Secret": _internal_secret()}
+    headers = {
+        "Content-Type": "application/json",
+        "X-Internal-Secret": _internal_secret(),
+        **_caller_header(),
+    }
     sk = _resolve_session_key()
     _sk_err = _session_key_header_error(sk)
     if _sk_err:
@@ -924,7 +946,7 @@ def _get(path: str, session_key: str | None = None) -> dict:
     session. Passing the verified key makes the value that was checked the value
     that is used. It is still validated by ``_session_key_header_error``.
     """
-    headers = {"X-Internal-Secret": _internal_secret()}
+    headers = {"X-Internal-Secret": _internal_secret(), **_caller_header()}
     sk = _resolve_session_key() if session_key is None else session_key
     _sk_err = _session_key_header_error(sk)
     if _sk_err:
@@ -944,10 +966,21 @@ def _get(path: str, session_key: str | None = None) -> dict:
         return {"error": str(e)}
 
 
-def _patch(path: str, body: dict | None = None) -> dict:
+def _patch(path: str, body: dict | None = None, *, session_key: str | None = None) -> dict:
+    """PATCH a loopback gateway path with the internal-secret handshake.
+
+    ``session_key``: as in :func:`_put`. A caller gated on
+    :func:`_resolve_session_key_strict` must send the key it verified —
+    re-resolving through the lenient walk here would let the request carry a
+    different session's authority than the one the gate approved.
+    """
     data = json.dumps(body or {}).encode()
-    headers = {"Content-Type": "application/json", "X-Internal-Secret": _internal_secret()}
-    sk = _resolve_session_key()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Internal-Secret": _internal_secret(),
+        **_caller_header(),
+    }
+    sk = _resolve_session_key() if session_key is None else session_key
     _sk_err = _session_key_header_error(sk)
     if _sk_err:
         return {"error": _sk_err}
@@ -984,7 +1017,11 @@ def _put(path: str, body: dict | None = None, session_key: str | None = None) ->
     this path means writing another crew's work item and public ledger.
     """
     data = json.dumps(body or {}).encode()
-    headers = {"Content-Type": "application/json", "X-Internal-Secret": _internal_secret()}
+    headers = {
+        "Content-Type": "application/json",
+        "X-Internal-Secret": _internal_secret(),
+        **_caller_header(),
+    }
     sk = _resolve_session_key() if session_key is None else session_key
     _sk_err = _session_key_header_error(sk)
     if _sk_err:
@@ -1010,7 +1047,7 @@ def _put(path: str, body: dict | None = None, session_key: str | None = None) ->
 
 def _delete(path: str, body: dict | None = None) -> dict:
     data = json.dumps(body or {}).encode() if body else None
-    headers = {"X-Internal-Secret": _internal_secret()}
+    headers = {"X-Internal-Secret": _internal_secret(), **_caller_header()}
     sk = _resolve_session_key()
     _sk_err = _session_key_header_error(sk)
     if _sk_err:
