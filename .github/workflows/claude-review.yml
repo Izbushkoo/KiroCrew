@@ -206,7 +206,7 @@ jobs:
       - name: Opus 4.8 discovery
         id: discover
         if: github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
-        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        uses: anthropics/claude-code-action@239e3a730883eeb5c53db12b0fc9573b3024b126 # v1
         with:
           use_bedrock: "true"
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -286,7 +286,7 @@ jobs:
       - name: Opus 4.8 validation
         id: review
         if: github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
-        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        uses: anthropics/claude-code-action@239e3a730883eeb5c53db12b0fc9573b3024b126 # v1
         with:
           use_bedrock: "true"
           github_token: ${{ secrets.GITHUB_TOKEN }}
