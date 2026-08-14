@@ -4,6 +4,16 @@ All notable changes to KiroCrew are documented in this file.
 
 ## [Unreleased]
 
+- **The instance token-mint timeout is now user-configurable.** The remote
+  `kirocrew token` mint ran with a hardcoded 30s budget, so a user behind a
+  slow ProxyCommand/jump host timed out in the mint step even when the ssh
+  forward itself came up (the connect flow spawns two proxy-bound ssh
+  children, and the mint is the second one). A new
+  `instances.mint_timeout_secs` (unset by default: SSH 30s, SSM 90s; clamped
+  to [10, 120]) now threads through the tunnel manager to both the SSH and
+  SSM mint paths; an explicit value applies to both transports, including a
+  value equal to either transport's default. (#3566)
+
 - **A Teams answer no longer gets silently truncated by a rate-limited
   chunk.** The Bot Framework Connector API enforces per-bot rate limits and
   can return HTTP 429, but the Teams outbound send raised immediately with
