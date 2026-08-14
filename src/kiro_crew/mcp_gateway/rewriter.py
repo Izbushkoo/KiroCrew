@@ -35,6 +35,7 @@ from typing import Any
 from kiro_crew import __version__, platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
+from kiro_crew.env import augmented_path
 from kiro_crew.mcp_gateway.hashing import hash_command, is_secret_env_key
 from kiro_crew.mcp_utils import mcp_server_alias
 
@@ -54,7 +55,7 @@ _FINGERPRINT_NAME = ".rewrite-fingerprint"
 # of serving overlays produced by older logic. The package version is also in
 # the fingerprint, so a release bump invalidates regardless; this constant is
 # the explicit knob for in-development changes.
-_FINGERPRINT_SCHEMA = 2
+_FINGERPRINT_SCHEMA = 3
 
 
 @dataclass
@@ -115,28 +116,87 @@ _TARGET_ARGS_SEP = "|"
 _STUB_MODULE = "kiro_crew.mcp_gateway.stub"
 
 
+def _resolve_target_command(
+    target_command: str,
+    env_pairs: dict[str, Any],
+    notes: _RewritePassNotes | None,
+) -> str:
+    """Resolve an MCP target command to an absolute path, or ``""``.
+
+    gatewayd spawns backends from the systemd ``--user`` environment, whose
+    ``PATH`` lacks the toolbox / user-local bin dirs a login shell has — so a
+    bare command that resolves fine for the SESSION's own exec ENOENTs on
+    every pooled spawn (issue #3495: 79% of all fallbacks). Search the spec's
+    own ``env.PATH`` first, then :func:`kiro_crew.env.augmented_path` over the
+    host ``PATH`` — the same augmentation the MCP probe and agent-config build
+    use (see ``agent.py::_resolve_command``), so a server that probes healthy
+    on the dashboard can never ENOENT in gatewayd.
+
+    An already-absolute command passes through unchanged (gatewayd errors on a
+    dead absolute path are terminal by design, not fallback-eligible). A bare
+    name that resolves nowhere returns ``""`` — the caller must NOT emit a
+    stub for it: kiro-cli's own spawn environment may still resolve it, so the
+    entry is left for the session to launch directly instead of degrading
+    through a guaranteed-ENOENT pooled spawn on every session.
+
+    Every ``shutil.which`` probe is recorded in ``notes.which_results`` so the
+    fingerprint cache-hit path re-runs and compares it (binary removed /
+    added / shadowed invalidates the cache in both directions).
+    """
+    if not target_command:
+        return ""
+    if os.path.isabs(target_command):
+        return target_command
+    env_path = env_pairs.get("PATH", "") if isinstance(env_pairs, dict) else ""
+    # The spec's own env.PATH is the operator's explicit intent, so it is
+    # probed FIRST; the augmentation applies only to the host PATH behind it —
+    # augmenting the joined string would let a well-known dir shadow a
+    # same-named binary the spec deliberately points elsewhere.
+    search_path = os.pathsep.join(
+        filter(None, [env_path, augmented_path(os.environ.get("PATH", ""))])
+    )
+    resolved = shutil.which(target_command, path=search_path)
+    if notes is not None:
+        notes.which_results[
+            f"{target_command}{_WHICH_KEY_SEP}{search_path}"
+        ] = resolved or ""
+    return resolved or ""
+
+
+def _normalized_env(entry: dict[str, Any]) -> dict[str, Any]:
+    """Return the entry's declared ``env`` as a dict (``{}`` for malformed)."""
+    declared = entry.get("env", {}) or {}
+    return declared if isinstance(declared, dict) else {}
+
+
 def _build_stub_entry(
     *,
     stubs_dir: Path,
     server_name: str,
     agent_name: str,
     original: dict[str, Any],
+    target_command: str,
     socket_path: Path,
     work_dir: Path,
     sandbox_mode: str,
     approval_mode: str,
     sidecars_written: set[str] | None = None,
     poolable: bool = False,
+    forward_env: bool = False,
     notes: _RewritePassNotes | None = None,
 ) -> dict[str, Any]:
     """Return the rewritten ``mcpServers[name]`` entry.
+
+    ``target_command`` is the ALREADY-RESOLVED absolute backend command —
+    callers run :func:`_resolve_target_command` first and skip the stub
+    entirely when it returns ``""``, so this function never emits a stub whose
+    pooled spawn is a guaranteed ENOENT (issue #3495 cause A).
 
     Preserves ``autoApprove`` on the wrapped entry so kiro-cli still honours
     it at the UI layer. ``env`` is cleared on the wrapper — the stub passes
     env separately through its flags so the gateway can hash the
     post-substitution env into the PoolKey.
     """
-    target_command = original.get("command", "")
     target_args: list[str] = [str(a) for a in original.get("args", []) or []]
     # ``~/.kiro/agents/*.json`` is hand-editable, so ``env`` can legally parse as
     # a non-dict (e.g. ``"env": [{}]``). Normalize to {} rather than trusting the
@@ -153,38 +213,6 @@ def _build_stub_entry(
             server_name, agent_name, type(_declared_env).__name__,
         )
     auto_approve: list[str] = list(original.get("autoApprove", []) or [])
-
-    # Resolve bare command names to absolute paths. gatewayd spawns the backend
-    # outside kiro-cli's PATH, so a
-    # bare command like "slack-mcp" fails with ENOENT on ``Command::spawn``.
-    # Search the spec env PATH then the host PATH. Leave unresolved bare
-    # names as-is (gatewayd will error and the stub falls back) so we
-    # don't silently upgrade broken specs.
-    if target_command and not os.path.isabs(target_command):
-        env_path = env_pairs.get("PATH", "") if isinstance(env_pairs, dict) else ""
-        search_path = os.pathsep.join(
-            filter(None, [env_path, os.environ.get("PATH", "")])
-        )
-        resolved = shutil.which(target_command, path=search_path)
-        # Record the probe RESULT, not just the attempt: which() reads
-        # filesystem state (directory contents, PATHEXT matches, shadowing
-        # order) that a stat-based fingerprint cannot see. The cache-hit path
-        # re-runs exactly these probes and compares, so a binary that was
-        # removed, reinstalled at another PATH prefix, or newly shadowed
-        # invalidates the cache — in BOTH directions (failed→resolves and
-        # resolved→different/none).
-        if notes is not None:
-            notes.which_results[
-                f"{target_command}{_WHICH_KEY_SEP}{search_path}"
-            ] = resolved or ""
-        if resolved:
-            target_command = resolved
-        else:
-            logger.warning(
-                "rewriter: could not resolve MCP command %r for server %r; "
-                "leaving as bare name (gatewayd will likely ENOENT)",
-                target_command, server_name,
-            )
 
     stub_args: list[str] = [
         "--server", server_name,
@@ -211,7 +239,7 @@ def _build_stub_entry(
             # than noise, since the pooled advice ("stop sharing this server")
             # names a state this server is already in.
             pass
-        elif forward_declared_env_enabled():
+        elif forward_env:
             # Forwarding is ON: the non-secret keys ARE applied to the pooled
             # backend (gatewayd merges them at spawn). Only the rotating-secret
             # keys remain unappliable, because they are excluded from
@@ -392,6 +420,7 @@ def _rewrite_single_spec(
     approval_mode: str,
     stub_servers: frozenset[str],
     pooling_enabled: bool = True,
+    forward_env: bool = False,
     inject_servers: dict[str, Any] | None = None,
     target_env: dict[str, str] | None = None,
     sidecars_written: set[str] | None = None,
@@ -474,11 +503,51 @@ def _rewrite_single_spec(
         if name not in stub_servers:
             new_servers[name] = {k: v for k, v in entry.items() if k != "poolable"}
             continue
+        entry_env = _normalized_env(entry)
+        resolved_cmd = _resolve_target_command(
+            str(entry.get("command", "")), entry_env, notes
+        )
+        if not resolved_cmd:
+            # Fix for issue #3495 cause A: an unresolvable bare command means
+            # gatewayd's spawn is a guaranteed ENOENT (it runs under the
+            # systemd --user PATH). Emitting a stub anyway degraded EVERY
+            # session through a spawn-fail → fallback-exec cycle. Leave the
+            # entry unwrapped instead: kiro-cli's own spawn environment may
+            # still resolve the name, and if it cannot, the failure surfaces
+            # in the session where the operator can see it.
+            logger.warning(
+                "rewriter: cannot resolve MCP command %r for opted-in server "
+                "%r (agent %r) on the gateway search path; leaving it "
+                "unwrapped so the session launches it directly. Use an "
+                "absolute path in the spec to pool it.",
+                entry.get("command", ""), name, agent_name,
+            )
+            new_servers[name] = {k: v for k, v in entry.items() if k != "poolable"}
+            continue
+        if pooling_enabled and entry_env and not forward_env:
+            # Fix for issue #3495 cause B: with declared-env forwarding OFF, a
+            # pooled backend is spawned WITHOUT the env this spec declares. A
+            # server that needs it dies at prime on every session — breaker
+            # trips, stub falls back, and the crash loop re-discovers the same
+            # policy fact forever. Pre-classify instead: leave the entry
+            # unwrapped (the session applies the declared env itself), and say
+            # exactly which knob re-enables pooling.
+            logger.warning(
+                "rewriter: opted-in server %r (agent %r) declares a non-empty "
+                "env (%d keys) that would be withheld from a shared backend "
+                "(mcp_gateway.forward_declared_env is off); leaving it "
+                "unwrapped so the session launches it with its declared env. "
+                "Enable mcp_gateway.forward_declared_env to pool it.",
+                name, agent_name, len(entry_env),
+            )
+            new_servers[name] = {k: v for k, v in entry.items() if k != "poolable"}
+            continue
         new_servers[name] = _build_stub_entry(
             stubs_dir=stubs_dir,
             server_name=name,
             agent_name=agent_name,
             original=entry,
+            target_command=resolved_cmd,
             socket_path=socket_path,
             work_dir=work_dir,
             sandbox_mode=sandbox_mode,
@@ -487,6 +556,7 @@ def _rewrite_single_spec(
             # Sharing is global over the stub set: being stubbed is the only
             # per-server decision, so there is nothing further to consult here.
             poolable=pooling_enabled,
+            forward_env=forward_env,
             notes=notes,
         )
         wrapped += 1
@@ -553,17 +623,39 @@ def _rewrite_single_spec(
                         alias, agent_name, inject_cmd, existing_cmd,
                     )
                     continue
+        entry_env = _normalized_env(entry)
+        resolved_cmd = _resolve_target_command(
+            str(entry.get("command", "")), entry_env, notes
+        )
+        if not resolved_cmd:
+            # Membership in ``inject`` was vetted by
+            # _injectable_settings_servers (same resolver, same pass), so this
+            # only fires on a filesystem race between the two probes. The
+            # entry was already DROPPED from the settings overlay on the
+            # strength of that vetting — injecting it RAW (unwrapped) keeps
+            # the server's tools alive for the session; skipping would make
+            # it vanish entirely.
+            logger.warning(
+                "rewriter: settings server %r became unresolvable between "
+                "vetting and injection; injecting it unwrapped into agent %r",
+                alias, agent_name,
+            )
+            new_servers[alias] = {k: v for k, v in entry.items() if k != "poolable"}
+            seen_targets.add(inject_sig)
+            continue
         new_servers[alias] = _build_stub_entry(
             stubs_dir=stubs_dir,
             server_name=alias,
             agent_name=agent_name,
             original=entry,
+            target_command=resolved_cmd,
             socket_path=socket_path,
             work_dir=work_dir,
             sandbox_mode=sandbox_mode,
             approval_mode=approval_mode,
             sidecars_written=sidecars_written,
             poolable=pooling_enabled,
+            forward_env=forward_env,
             notes=notes,
         )
         wrapped += 1
@@ -577,6 +669,10 @@ def _rewrite_single_spec(
 def _injectable_settings_servers(
     settings_spec: dict[str, Any],
     stub_servers: frozenset[str],
+    *,
+    pooling_enabled: bool = True,
+    forward_env: bool = False,
+    notes: _RewritePassNotes | None = None,
 ) -> dict[str, Any]:
     """Return ``{raw_name: raw_entry}`` of stdio servers in the global
     ``settings/mcp.json`` that must be RELOCATED out of the settings overlay
@@ -627,6 +723,32 @@ def _injectable_settings_servers(
             # launches it directly. Relocating it here would delete it from the
             # only overlay that still lists it.
             continue
+        entry_env = _normalized_env(entry)
+        if not _resolve_target_command(str(entry.get("command", "")), entry_env, notes):
+            # Issue #3495 cause A, settings edition: an unresolvable bare
+            # command must not be relocated into a stub whose pooled spawn is
+            # a guaranteed ENOENT. Leaving it raw in the settings overlay
+            # preserves the pre-pooling behaviour (kiro-cli merges and
+            # launches it with its own environment).
+            logger.warning(
+                "rewriter: cannot resolve MCP command %r for opted-in "
+                "settings server %r on the gateway search path; leaving it "
+                "raw in the settings overlay. Use an absolute path to pool it.",
+                entry.get("command", ""), name,
+            )
+            continue
+        if pooling_enabled and entry_env and not forward_env:
+            # Issue #3495 cause B, settings edition: pooling would withhold
+            # this server's declared env and crash-loop it. Leave it raw.
+            logger.warning(
+                "rewriter: opted-in settings server %r declares a non-empty "
+                "env (%d keys) that would be withheld from a shared backend "
+                "(mcp_gateway.forward_declared_env is off); leaving it raw in "
+                "the settings overlay. Enable mcp_gateway.forward_declared_env "
+                "to pool it.",
+                name, len(entry_env),
+            )
+            continue
         out[name] = entry
     return out
 
@@ -659,6 +781,7 @@ def _rewrite_inputs_fingerprint(
     approval_mode: str,
     stub_set: frozenset[str],
     pooling_enabled: bool,
+    forward_env: bool,
 ) -> dict[str, Any]:
     """Return a JSON-serializable snapshot of every input that can change
     :func:`rewrite_agents`'s output.
@@ -671,16 +794,18 @@ def _rewrite_inputs_fingerprint(
       ``pooling_enabled`` — decide stub flags and which entries are shareable.
     * ``python`` — ``sys.executable`` is baked into every overlay ``command``,
       so a moved/upgraded interpreter must regenerate the overlays.
-    * ``path_env`` / ``pathext`` — feed the ``shutil.which`` resolution of bare
-      command names. The other half of which()'s input — the CONTENTS of the
-      searched directories — is not stat-able here; it is covered by the
-      stored per-probe results, which the cache-hit path re-runs and compares
-      (see :class:`_RewritePassNotes`).
+    * ``path_env`` / ``pathext`` / ``path_augment`` — feed the
+      ``shutil.which`` resolution of bare command names (``path_augment`` is
+      the :func:`kiro_crew.env.augmented_path` prefix, which depends on
+      ambient state like ``MISE_DATA_DIR`` that ``path_env`` cannot see). The
+      other half of which()'s input — the CONTENTS of the searched
+      directories — is not stat-able here; it is covered by the stored
+      per-probe results, which the cache-hit path re-runs and compares (see
+      :class:`_RewritePassNotes`).
+    * ``forward_declared_env`` — decides whether an env-declaring server is
+      pooled at all (issue #3495 cause B pre-classification), so flipping the
+      config flag must regenerate the overlays.
     * ``schema`` / ``package`` — invalidate on rewriter logic changes.
-
-    ``mcp_gateway.forward_declared_env`` is deliberately NOT here: it selects
-    warning text only; the written overlays and sidecars are identical either
-    way (gatewayd reads that flag at spawn time, not from the overlay).
     """
     sources: dict[str, list[Any] | None] = {
         p.name: _stat_sig(p) for p in sorted(source_dir.glob("*.json"))
@@ -691,6 +816,8 @@ def _rewrite_inputs_fingerprint(
         "python": sys.executable,
         "path_env": os.environ.get("PATH", ""),
         "pathext": os.environ.get("PATHEXT", ""),
+        "path_augment": augmented_path(""),
+        "forward_declared_env": bool(forward_env),
         "source_dir": str(source_dir),
         "overlay_dir": str(overlay_dir),
         "socket_path": str(socket_path),
@@ -1054,6 +1181,11 @@ def rewrite_agents(
     # falls through to the full rewrite — unreadable never means "match".
     kiro_settings_json = source_dir.parent / "settings" / "mcp.json"
     fingerprint_path = overlay_dir / _FINGERPRINT_NAME
+    # Read the forwarding flag ONCE per pass: it now decides whether an
+    # env-declaring server is pooled at all (not just warning text), so every
+    # consumer in this pass must see the same value, and the fingerprint must
+    # record it (a flip regenerates the overlays).
+    forward_env = forward_declared_env_enabled()
     current_inputs = _rewrite_inputs_fingerprint(
         source_dir=source_dir,
         settings_path=kiro_settings_json,
@@ -1064,6 +1196,7 @@ def rewrite_agents(
         approval_mode=approval_mode,
         stub_set=stub_set,
         pooling_enabled=pooling_enabled,
+        forward_env=forward_env,
     )
     stored = _load_fingerprint(fingerprint_path)
     if stored is not None and stored.get("inputs") == current_inputs:
@@ -1102,7 +1235,12 @@ def rewrite_agents(
             loaded = json.loads(kiro_settings_json.read_text())
             if isinstance(loaded, dict):
                 settings_src_spec = loaded
-                settings_poolable = _injectable_settings_servers(loaded, stub_set)
+                settings_poolable = _injectable_settings_servers(
+                    loaded, stub_set,
+                    pooling_enabled=pooling_enabled,
+                    forward_env=forward_env,
+                    notes=notes,
+                )
         except OSError as exc:
             # Transient read failure: same reasoning as the per-agent site —
             # do not cache a pass that treated an existing settings file as
@@ -1151,6 +1289,7 @@ def rewrite_agents(
             approval_mode=approval_mode,
             stub_servers=stub_set,
             pooling_enabled=pooling_enabled,
+            forward_env=forward_env,
             inject_servers=settings_poolable,
             target_env=target_env,
             sidecars_written=written_sidecars,

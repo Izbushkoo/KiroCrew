@@ -73,6 +73,8 @@ from kiro_crew.mcp_gateway.rewriter import (
 )
 from kiro_crew.mcp_gateway.shutdown_budget import DRAIN_SECS, POOL_SHUTDOWN_SECS
 from kiro_crew.mcp_gateway.spill import cleanup_old_spill_files
+from kiro_crew.mcp_gateway.stub import _fallback_log_path as stub_fallback_log_path
+from kiro_crew.mcp_gateway.stub import fallback_counts as stub_fallback_counts
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.peer_resolve import resolve_peer_identity
 from kiro_crew.platform_compat import IS_WINDOWS
@@ -211,6 +213,46 @@ TargetResolver = Callable[
 
 
 # --- Public API -------------------------------------------------------------
+
+
+# (size, mtime_ns, time-bucket) of the live fallback log at the last
+# aggregation, plus the aggregated payload. The log is append-only between
+# rotations, so an unchanged stat means identical file CONTENT — but the
+# counts are a sliding 24 h window over that content, so the bucket bounds
+# how long expired records can linger in the advertised count when nothing
+# appends (at most one bucket width). Stats polls (dashboard cadence)
+# otherwise skip re-parsing up to ~2 MiB of JSONL per poll.
+_FALLBACK_CACHE_BUCKET_SECS = 300
+_fallback_stats_cache: tuple[tuple[int, int, int], dict[str, Any]] | None = None
+
+
+def _fallback_counts_cached() -> dict[str, Any]:
+    """Per-server stub-fallback counts for the stats reply (issue #3495).
+
+    Delegates to :func:`kiro_crew.mcp_gateway.stub.fallback_counts` — the
+    module that owns the log's path and format — and caches on the live
+    file's (size, mtime) plus a coarse time bucket: the aggregation is a pure
+    function of file content and the window's cutoff instant, and the bucket
+    caps the staleness of the cutoff between appends. Runs synchronous file
+    I/O; callers on the event loop wrap it in ``asyncio.to_thread``. Never
+    raises.
+    """
+    global _fallback_stats_cache
+    bucket = int(time.time() // _FALLBACK_CACHE_BUCKET_SECS)
+    try:
+        st = stub_fallback_log_path().stat()
+        sig = (st.st_size, st.st_mtime_ns, bucket)
+    except OSError:
+        sig = (0, 0, bucket)  # no log yet — cacheable as "empty"
+    if _fallback_stats_cache is not None and _fallback_stats_cache[0] == sig:
+        return _fallback_stats_cache[1]
+    try:
+        counts = stub_fallback_counts()
+    except Exception:  # pragma: no cover — reader is best-effort by contract
+        logger.debug("stub-fallback aggregation failed", exc_info=True)
+        return {"window_secs": 0, "total": 0, "by_server": {}, "by_reason": {}}
+    _fallback_stats_cache = (sig, counts)
+    return counts
 
 
 def _default_cli_socket_path() -> Path:
@@ -1947,6 +1989,9 @@ async def _handle_connection(
         snapshot = await pool.metrics_snapshot_async()
         if hot_keys is not None:
             snapshot.update(hot_keys.hit_stats())
+        # Parses up to ~2 MiB of JSONL on a cache miss — off the event loop,
+        # or every concurrent gateway task stalls behind a stats poll.
+        snapshot["stub_fallbacks"] = await asyncio.to_thread(_fallback_counts_cached)
         await _write_json_line(writer, {"type": "stats", **snapshot})
         return
 

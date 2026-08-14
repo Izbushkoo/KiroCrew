@@ -4,6 +4,20 @@ All notable changes to KiroCrew are documented in this file.
 
 ## [Unreleased]
 
+- **Opted-in MCP servers no longer silently fall back to unpooled backends.**
+  On one live host, 988 degradations accrued in 15 hours with no signal: 79%
+  were guaranteed-ENOENT pooled spawns of bare commands the gateway daemon's
+  systemd PATH cannot resolve, and 20% were crash-loops of servers whose
+  declared `env` the shared backend deliberately withholds
+  (`mcp_gateway.forward_declared_env` off). The rewriter now resolves bare
+  commands through the same augmented search path the MCP probe uses and
+  refuses to emit a stub it can prove will degrade — such servers are left
+  for the session to launch directly, with a warning naming the fix (absolute
+  path / the forwarding knob). The fallback audit log gains the reader it
+  never had: gatewayd's `stats` reply now carries per-server fallback counts
+  for the last 24 h, and the log rotates at 1 MiB instead of growing without
+  bound. (#3495)
+
 - **A lesson from a previous embedding-model generation could no longer get
   silently deleted or offered as a false contradiction.** `write_lesson`'s
   semantic dedup and `find_contradiction_candidates` compared raw embeddings

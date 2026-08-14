@@ -10,6 +10,7 @@ guard in ``_injectable_settings_servers``).
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -119,6 +120,7 @@ def _rewrite(
     *,
     stub_servers: frozenset[str] = frozenset(),
     pooling_enabled: bool = True,
+    forward_env: bool = False,
 ) -> tuple[dict, int]:
     return _rewrite_single_spec(
         spec,
@@ -129,6 +131,7 @@ def _rewrite(
         approval_mode="interactive",
         stub_servers=stub_servers,
         pooling_enabled=pooling_enabled,
+        forward_env=forward_env,
     )
 
 
@@ -157,7 +160,7 @@ def test_enabled_listed_server_is_still_wrapped(tmp_path: Path) -> None:
     spec = {
         "name": "agent-a",
         "mcpServers": {
-            "live": {"command": "some-mcp"},
+            "live": {"command": sys.executable},
         },
     }
     new_spec, wrapped = _rewrite(spec, tmp_path, stub_servers=frozenset({"live"}))
@@ -198,7 +201,7 @@ def test_allowlisted_server_gets_the_poolable_flag(tmp_path: Path) -> None:
     spec = {
         "name": "agent-a",
         "mcpServers": {
-            "shareable": {"command": "some-mcp"},
+            "shareable": {"command": sys.executable},
         },
     }
     new_spec, _ = _rewrite(
@@ -226,7 +229,7 @@ def test_private_server_with_declared_env_is_not_warned_about(
         "name": "agent-a",
         "mcpServers": {
             "needs-env": {
-                "command": "some-mcp",
+                "command": sys.executable,
                 "env": {"API_TOKEN": "x", "REGION": "us-west-2"},
             },
         },
@@ -258,7 +261,7 @@ def test_shared_server_with_declared_env_is_still_warned_about(
     spec = {
         "name": "agent-a",
         "mcpServers": {
-            "needs-env": {"command": "some-mcp", "env": {"REGION": "us-west-2"}},
+            "needs-env": {"command": sys.executable, "env": {"REGION": "us-west-2"}},
         },
     }
     with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.rewriter"):
@@ -268,7 +271,142 @@ def test_shared_server_with_declared_env_is_still_warned_about(
 
     msgs = [r.getMessage() for r in caplog.records if "declares" in r.getMessage()]
     assert len(msgs) == 1, msgs
-    assert "shared" in msgs[0]
+
+
+def test_unresolvable_bare_command_is_not_stubbed(tmp_path: Path, caplog) -> None:
+    """Issue #3495 cause A: a bare command that resolves nowhere on the gateway
+    search path must NOT get a stub — gatewayd's spawn would ENOENT on every
+    session and degrade it through a fallback exec. The entry is left for the
+    session to launch directly (its own environment may still resolve it)."""
+    import logging
+
+    spec = {
+        "name": "agent-a",
+        "mcpServers": {
+            "ghost": {
+                "command": "kirocrew-test-definitely-missing-cmd",
+                "args": ["--serve"],
+                "poolable": True,
+            },
+        },
+    }
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.rewriter"):
+        new_spec, wrapped = _rewrite(
+            spec, tmp_path, stub_servers=frozenset({"ghost"})
+        )
+
+    entry = new_spec["mcpServers"]["ghost"]
+    assert wrapped == 0
+    assert _WRAPPER_MARKER not in entry
+    assert entry.get("command") == "kirocrew-test-definitely-missing-cmd"
+    assert "poolable" not in entry  # internal hint never reaches kiro-cli
+    assert any("cannot resolve" in r.getMessage() for r in caplog.records)
+
+
+def test_resolvable_bare_command_lands_absolute_in_the_stub(tmp_path: Path) -> None:
+    """Issue #3495 cause A, positive half: a bare command that DOES resolve is
+    baked into the stub as an absolute path, so gatewayd (running under the
+    systemd --user PATH) can spawn it."""
+    exe_dir, exe_name = str(Path(sys.executable).parent), Path(sys.executable).name
+    spec = {
+        "name": "agent-a",
+        "mcpServers": {
+            "bare": {"command": exe_name, "env": {"PATH": exe_dir}},
+        },
+    }
+    new_spec, wrapped = _rewrite(
+        spec, tmp_path, stub_servers=frozenset({"bare"}), forward_env=True
+    )
+
+    assert wrapped == 1
+    args = new_spec["mcpServers"]["bare"]["args"]
+    resolved = args[args.index("--target-command") + 1]
+    assert Path(resolved).is_absolute(), resolved
+    assert Path(resolved).name == exe_name
+
+
+def test_env_declaring_server_is_declassified_when_forwarding_is_off(
+    tmp_path: Path, caplog
+) -> None:
+    """Issue #3495 cause B: with declared-env forwarding OFF, pooling a server
+    that declares env spawns it WITHOUT that env — it dies at prime on every
+    session, trips the breaker, and falls back anyway. Pre-classify: leave it
+    unwrapped so the session applies the declared env itself."""
+    import logging
+
+    spec = {
+        "name": "agent-a",
+        "mcpServers": {
+            "needs-env": {
+                "command": sys.executable,
+                "env": {"API_TOKEN": "x"},
+            },
+        },
+    }
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.rewriter"):
+        off_spec, off_wrapped = _rewrite(
+            spec, tmp_path, stub_servers=frozenset({"needs-env"}), forward_env=False
+        )
+
+    entry = off_spec["mcpServers"]["needs-env"]
+    assert off_wrapped == 0
+    assert _WRAPPER_MARKER not in entry
+    assert entry.get("env") == {"API_TOKEN": "x"}  # session still gets the env
+    assert any(
+        "forward_declared_env" in r.getMessage() for r in caplog.records
+    ), "the warning must name the knob that re-enables pooling"
+
+    # ... and IS eligible when forwarding is on.
+    on_spec, on_wrapped = _rewrite(
+        spec, tmp_path, stub_servers=frozenset({"needs-env"}), forward_env=True
+    )
+    assert on_wrapped == 1
+    assert on_spec["mcpServers"]["needs-env"].get(_WRAPPER_MARKER) is True
+
+
+def test_spec_env_path_wins_over_augmented_host_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The spec's declared env.PATH is the operator's explicit intent: it is
+    probed before the augmented host PATH, and the augmentation is applied to
+    the HOST path only — a well-known dir must not shadow a same-named binary
+    the spec deliberately points elsewhere.
+
+    ``shutil.which`` is faked (first matching dir in path order wins) so the
+    ordering assertion is platform-independent — the real which() on Windows
+    resolves only PATHEXT-suffixed files, which is not what this test is
+    about.
+    """
+    import os as _os
+
+    from kiro_crew.mcp_gateway import rewriter as _rw
+
+    spec_dir = tmp_path / "spec-bin"
+    host_dir = tmp_path / "host-bin"
+
+    def _fake_which(cmd: str, path: str = "") -> str | None:
+        for d in (path or "").split(_os.pathsep):
+            if d in (str(spec_dir), str(host_dir)):
+                return str(Path(d) / cmd)
+        return None
+
+    seen: list[str] = []
+
+    def _spy_augmented(base: str) -> str:
+        seen.append(base)
+        return base  # identity: augmentation dirs are irrelevant to the assert
+
+    monkeypatch.setattr(_rw.shutil, "which", _fake_which)
+    monkeypatch.setattr(_rw, "augmented_path", _spy_augmented)
+    monkeypatch.setenv("PATH", str(host_dir))
+
+    resolved = _rw._resolve_target_command(
+        "dupe-mcp", {"PATH": str(spec_dir)}, None
+    )
+
+    assert resolved == str(spec_dir / "dupe-mcp"), resolved
+    # augmented_path saw ONLY the host PATH — never the spec's env.PATH.
+    assert seen and all(str(spec_dir) not in s for s in seen), seen
 
 
 def test_pooling_disabled_still_wraps_but_shares_nothing(tmp_path: Path) -> None:
@@ -283,8 +421,8 @@ def test_pooling_disabled_still_wraps_but_shares_nothing(tmp_path: Path) -> None
     spec = {
         "name": "agent-a",
         "mcpServers": {
-            "declared": {"command": "some-mcp", "poolable": True},
-            "listed": {"command": "other-mcp"},
+            "declared": {"command": sys.executable, "poolable": True},
+            "listed": {"command": sys.executable},
         },
     }
     new_spec, wrapped = _rewrite(
@@ -359,6 +497,11 @@ def test_rewriter_calls_restrict_to_owner_on_windows(
     # Simulate Windows: IS_POSIX=False, IS_WINDOWS=True.
     monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_POSIX", False)
     monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_WINDOWS", True)
+    # Forwarding ON or the env-declaring fixture is declassified (issue #3495
+    # cause B) and no sidecar write happens at all.
+    monkeypatch.setattr(
+        "kiro_crew.mcp_gateway.rewriter.forward_declared_env_enabled", lambda: True
+    )
     with patch(
         "kiro_crew.mcp_gateway.rewriter.platform_compat.restrict_to_owner",
         side_effect=_mock_restrict,
@@ -482,6 +625,13 @@ def test_env_sidecar_directory_goes_through_make_owner_only_dir(
 
     from kiro_crew.mcp_gateway.rewriter import rewrite_agents
 
+    # Sidecar machinery is under test, not pooling classification: forwarding
+    # must be ON or the env-declaring fixture is declassified (issue #3495
+    # cause B) and no sidecar is ever written.
+    monkeypatch.setattr(
+        "kiro_crew.mcp_gateway.rewriter.forward_declared_env_enabled", lambda: True
+    )
+
     source_dir = tmp_path / "agents"
     _spec_with_env(source_dir)
     made: list[Path] = []
@@ -525,6 +675,13 @@ def test_failed_sidecar_protection_leaves_no_readable_credentials(
     from unittest.mock import patch
 
     from kiro_crew.mcp_gateway.rewriter import rewrite_agents
+
+    # Sidecar machinery is under test, not pooling classification: forwarding
+    # must be ON or the env-declaring fixture is declassified (issue #3495
+    # cause B) and no sidecar is ever written.
+    monkeypatch.setattr(
+        "kiro_crew.mcp_gateway.rewriter.forward_declared_env_enabled", lambda: True
+    )
 
     source_dir = tmp_path / "agents"
     _spec_with_env(source_dir)

@@ -30,7 +30,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from kiro_crew import platform_compat
 from kiro_crew.executors import subprocess_executor
@@ -915,6 +915,14 @@ def _fallback_log_path() -> Path:
     return _crew_home() / "logs" / "stub_fallback.jsonl"
 
 
+# Rotate the fallback log once it exceeds this size, keeping ONE previous
+# generation (``.jsonl.1``). The log grew unbounded before (467 KB in 15 h on
+# one degraded host, issue #3495); a 1 MiB cap bounds total disk use at ~2 MiB
+# while keeping enough history for the gateway's per-server fallback-rate
+# aggregation (see ``gatewayd`` stats).
+_FALLBACK_LOG_MAX_BYTES = 1024 * 1024
+
+
 def log_fallback(
     reason: str, stub_uuid: str, pool_label: str, args: argparse.Namespace
 ) -> None:
@@ -936,10 +944,77 @@ def log_fallback(
             "channel_id": args.channel_id or "",
             "target_command": args.target_command,
         }
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+        # Size-check, rotation, and append are one critical section under a
+        # sibling lock file: two stubs hitting the cap together would otherwise
+        # both rotate, the second replacing ``.1`` with the first's fresh live
+        # file — silently discarding a full generation of audit history.
+        # ``file_lock`` fails CLOSED (raises OSError, swallowed below): losing
+        # one record beats an unserialized rotation losing a megabyte of them.
+        lock_fd = os.open(
+            log_path.with_suffix(".jsonl.lock"), os.O_CREAT | os.O_RDWR, 0o600
+        )
+        try:
+            with platform_compat.file_lock(lock_fd):
+                try:
+                    if log_path.stat().st_size >= _FALLBACK_LOG_MAX_BYTES:
+                        # One-generation rotation; atomic under the lock.
+                        os.replace(log_path, log_path.with_suffix(".jsonl.1"))
+                except FileNotFoundError:
+                    pass  # fresh boot — nothing to rotate
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, separators=(",", ":")) + "\n")
+        finally:
+            os.close(lock_fd)
     except OSError:
         pass
+
+
+def fallback_counts(window_secs: float = 24 * 3600.0) -> dict[str, Any]:
+    """Aggregate the fallback audit log into per-server counts.
+
+    Reads the live log plus the one rotated generation (see
+    ``_FALLBACK_LOG_MAX_BYTES``) and counts records whose ``ts`` falls within
+    the last ``window_secs``. This is the reader the log never had (issue
+    #3495): 988 degradations accrued with no signal anywhere. gatewayd folds
+    the result into its ``stats`` reply so the dashboard's gateway health
+    surface shows a per-server fallback count instead of the operator having
+    to read a process tree.
+
+    Returns ``{"window_secs": ..., "total": n, "by_server": {name: n},
+    "by_reason": {reason: n}}``. Never raises — an unreadable or torn log
+    yields the counts of whatever parsed.
+    """
+    cutoff = time.time() - window_secs
+    total = 0
+    by_server: dict[str, int] = {}
+    by_reason: dict[str, int] = {}
+    live = _fallback_log_path()
+    for path in (live.with_suffix(".jsonl.1"), live):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue  # torn tail line from a racing writer
+                    if not isinstance(rec, dict):
+                        continue
+                    ts = rec.get("ts")
+                    if not isinstance(ts, (int, float)) or ts < cutoff:
+                        continue
+                    total += 1
+                    server = str(rec.get("server") or rec.get("pool_label") or "?")
+                    by_server[server] = by_server.get(server, 0) + 1
+                    reason = str(rec.get("reason") or "?")
+                    by_reason[reason] = by_reason.get(reason, 0) + 1
+        except OSError:
+            continue
+    return {
+        "window_secs": window_secs,
+        "total": total,
+        "by_server": by_server,
+        "by_reason": by_reason,
+    }
 
 
 def fallback_exec(args: argparse.Namespace) -> None:

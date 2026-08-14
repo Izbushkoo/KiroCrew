@@ -488,6 +488,7 @@ class TestMalformedDeclaredEnv:
             server_name="demo-mcp",
             agent_name="test-agent",
             original={"command": "/bin/true", "args": [], "env": env_value},
+            target_command="/bin/true",
             socket_path=tmp_path / "gateway.sock",
             work_dir=tmp_path,
             sandbox_mode="none",
