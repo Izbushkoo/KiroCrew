@@ -68,6 +68,7 @@ import ArtifactDeployPage from './pages/ArtifactDeployPage'
 import SettingsPage from './pages/SettingsPage'
 import EmbedSettingsPage from './pages/EmbedSettingsPage'
 import KiroCrewNavBridge from './components/KiroCrewNavBridge'
+import { calculateTopbarSearchLayout, TOPBAR_SEARCH_ASSUMED_ACTIONS } from './lib/topbarLayout'
 import InstanceTabBar from './components/InstanceTabBar'
 import InstancesViewport from './components/InstancesViewport'
 import EmbeddedHostBridge from './components/EmbeddedHostBridge'
@@ -171,36 +172,11 @@ export function metricColor(pct: number): string {
 }
 export const memColorClass = metricColor
 
-// Geometry for the centered top-bar search overlay. It is absolutely
-// positioned and centered on the VIEWPORT (left: 50vw), not flowed between the
-// brand and actions clusters, so it cannot be squeezed by its siblings — this
-// function has to keep it inside the gutter instead.
-//
-// Both inputs are the space a cluster CONSUMES from its side of the viewport
-// (`brand.right`, and `viewportWidth - actions.left`), not the cluster's bare
-// width: the header has its own horizontal padding, so measuring width alone
-// under-counts the occupied space and ate the whole TOPBAR_SEARCH_GAP.
-//   - `gutter` is the reserved space on EACH side (the larger of the two
-//     clusters plus the gap, mirrored because the overlay is center-anchored).
-//   - `width` is the resolved px width: a third of the viewport, but never
-//     wider than the space the clusters leave. It used to be a fixed
-//     `33.3333vw - 40px` in CSS, which sat UNDER a wide actions cluster
-//     (metrics capsule + usage pill) on narrower windows.
-//   - `visible` is only the floor: below TOPBAR_SEARCH_MIN_WIDTH the overlay is
-//     dropped rather than shrunk further, so `width` is never below the floor
-//     while the overlay is on screen.
-const TOPBAR_SEARCH_GAP = 12
-const TOPBAR_SEARCH_MIN_WIDTH = 240
-// Actions-cluster reach assumed for the first paint, before the clusters have
-// been measured. Chosen to reproduce the long-standing 360px initial gutter.
-const TOPBAR_SEARCH_ASSUMED_ACTIONS = 348
-
-export function calculateTopbarSearchLayout(brandEdge: number, actionsEdge: number, viewportWidth: number) {
-  const gutter = Math.ceil(Math.max(brandEdge, actionsEdge)) + TOPBAR_SEARCH_GAP
-  const available = viewportWidth - (gutter * 2)
-  const width = Math.max(TOPBAR_SEARCH_MIN_WIDTH, Math.min(Math.round(viewportWidth / 3) - 40, available))
-  return { gutter, width, visible: available >= TOPBAR_SEARCH_MIN_WIDTH }
-}
+// Top-bar search geometry lives in ./lib/topbarLayout so InstanceTabBar can cap
+// the crew switcher against the SAME constants; it cannot import this module
+// (which imports it) without a cycle. Re-exported through this path because
+// App.test.tsx pins the function here.
+export { calculateTopbarSearchLayout } from './lib/topbarLayout'
 
 // Apps-nav fetch resilience (see refreshAppNav). The dashboard loads
 // `/api/apps` once on mount; right after a `kirocrew update` the gateway is
