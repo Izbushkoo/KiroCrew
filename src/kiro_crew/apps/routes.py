@@ -1959,8 +1959,12 @@ _SAFE_SCP_URL_RE = re.compile(r"^[A-Za-z0-9._\-]+@[A-Za-z0-9.\-]+:[A-Za-z0-9._/\
 _SAFE_SSH_URL_RE = re.compile(
     r"^ssh://(?:[A-Za-z0-9._\-]+@)?[A-Za-z0-9.\-]+(?::[0-9]+)?/[A-Za-z0-9._/\-]+$"
 )
-_SAFE_REF_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
-_SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+# `\Z`, not `$`: Python's `$` also matches immediately BEFORE a trailing newline, so with
+# the `.match` calls in the blob handler a value like "main\n" passes -- and both of these
+# feed git argv and a filesystem join. Same defect class as the catalog-side coordinate
+# patterns; these were its remaining siblings on the request path.
+_SAFE_REF_RE = re.compile(r"^[A-Za-z0-9._/-]+\Z")
+_SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_./-]+\Z")
 _BLOB_ALLOWED_EXT = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico"})
 
 

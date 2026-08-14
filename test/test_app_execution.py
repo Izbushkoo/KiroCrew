@@ -784,6 +784,18 @@ class TestRegistryAndProvenanceBoundary:
             return item
 
         monkeypatch.setattr(registry, "_load_external_registries", _no_external_registries)
+        # The official catalog is a THIRD inventory source, so this test has to
+        # isolate it exactly as it already isolates the seed and the external
+        # registries. Left unpatched it reaches the live document over the
+        # network, and the assertion below would then depend on what the store
+        # currently ships.
+        monkeypatch.setattr(registry.official_catalog, "fetch_inventory_entries", lambda: [])
+        # Inventory now comes from a fresh fetch, so that source needs isolating
+        # too -- patching only the cache-fed loader would let the live document
+        # decide this assertion.
+        monkeypatch.setattr(
+            registry.official_catalog, "fetch_inventory_entries", lambda: []
+        )
         monkeypatch.setattr(registry, "list_installed_apps", lambda: [])
         monkeypatch.setattr(registry, "_resolve_manifest", _identity_manifest)
         monkeypatch.setattr(execution, "third_party_execution_allowed", lambda: False)
