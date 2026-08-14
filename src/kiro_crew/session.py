@@ -4399,6 +4399,13 @@ class SessionManager:
         """Clear every session mirroring to an exact location; return cleared keys."""
         return self._session_map.clear_mirror_links_at(link)
 
+    def flush(self) -> None:
+        """Force the map's pending write to disk: the caller's durability point."""
+        self._session_map.flush()
+
+    async def aflush(self) -> None:
+        await self._session_map.aflush()
+
     def set_mirror_paused(self, key: str, paused: bool, *, origin: bool = False) -> bool:
         """Set whether turns reach one non-Slack delivery; return the prior state.
 
