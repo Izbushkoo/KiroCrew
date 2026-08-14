@@ -74,7 +74,7 @@ from kiro_crew.security import (
 )
 from kiro_crew.sel import sel
 from kiro_crew.validation import _AGENT_NAME_RE, CHANNEL_ID_RE, CHANNEL_MAX_LEN, WORKSPACE_NAME_RE
-from kiro_crew.vector_memory import VectorMemoryStore
+from kiro_crew.vector_memory import VectorMemoryStore, _lesson_display_text
 
 # Workspace dirs are confined to the data home: a workspace is agent-writable
 # working state, so letting --dir escape would let it be pointed at ~/.ssh or the
@@ -1429,7 +1429,17 @@ def _learn(args: argparse.Namespace) -> None:
             if vs_lessons:
                 for e in vs_lessons:
                     val = json.loads(e["value_json"])
-                    print(f"  [knowledge] {val}")
+                    # Rendered text for either storage shape: mapping-shaped rows
+                    # (write_lesson's format and the onboarding import's) would
+                    # otherwise print as a Python dict repr.
+                    #
+                    # The label reads the row's own category so this surface agrees
+                    # with the dashboard's lessons panel; a legacy string row
+                    # carries none, and "knowledge" is the store's own default.
+                    category = val.get("category") if isinstance(val, dict) else None
+                    if not isinstance(category, str) or not category.strip():
+                        category = "knowledge"
+                    print(f"  [{category}] {_lesson_display_text(val) or val}")
             else:
                 lessons = jsonl_store.load_all()
                 if not lessons:
@@ -1471,6 +1481,11 @@ def _memory_cmd(args: argparse.Namespace) -> None:
                     val = json.loads(e["value_json"])
                 except Exception:
                     val = e["value_json"]
+                # A lesson row stores its rule and NOT-clause as separate fields,
+                # so printing the decoded value would show a Python dict repr on
+                # this surface while every other reader shows the prose.
+                if str(e["key"]).startswith("lesson."):
+                    val = _lesson_display_text(val) or val
                 print(f"  {e['key']}: {val}  (confidence={e['confidence']}, source={e['source']})")
 
         elif action == "search":

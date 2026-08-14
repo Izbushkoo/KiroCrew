@@ -1218,14 +1218,18 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
             if isinstance(all_vs, list):
                 total_lessons = len(all_vs)
                 # get_lessons() returns ORDER BY updated_at DESC (most recent first).
+                # Deferred import: ``vector_memory`` pulls snowballstemmer plus
+                # the optional numpy/faiss imports, and this renderer is the
+                # module's only use of it, on an owner-command path.
+                from kiro_crew.vector_memory import _lesson_display_text
+
                 for entry in all_vs[:5]:
                     try:
                         parsed = json.loads(entry["value_json"])
-                        rule = (
-                            parsed.get("rule", str(parsed))
-                            if isinstance(parsed, dict)
-                            else str(parsed)
-                        )
+                        # Rendered text for either storage shape, so a
+                        # mapping-shaped row keeps its NOT-clause instead of
+                        # showing rule-only (or a dict repr).
+                        rule = _lesson_display_text(parsed) or str(parsed)
                         lesson_lines.append(
                             f"• {redact_credentials(redact_exfiltration_urls(rule)[0])[0][:100]}"
                         )
