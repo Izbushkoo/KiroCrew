@@ -1955,8 +1955,11 @@ def token_auth_middleware(
         # one resolved, else the immediate address — byte-for-byte today's pin.
         peer_key = _peer_key_for_request()
 
+        # Bypass IP pin check for mobile users: mobile devices on
+        # 4G/5G/Wi-Fi/VPN rotate IP addresses frequently, so enforcing an
+        # IP pin would lock them out after every network switch.
         _pin_ok, _pin_mismatch = _check_pin(token)
-        if not _pin_ok:
+        if not _pin_ok and user_id != "mobile":
             _log_auth(request, _audit_uid(user_id), "denied", _pin_mismatch)
             return _deny(request, _pin_mismatch)
 
@@ -2042,12 +2045,17 @@ def token_auth_middleware(
             # binding itself. A session pinned to a daemon-verified tailnet peer
             # is per-client even though the request is proxied, so the flag is
             # only set when NO peer resolved.
-            bind_token_peer(
-                session_token,
-                peer_key,
-                session_exp,
-                proxied=is_proxied_request(request) and peer is None,
-            )
+            # Do NOT bind peer IP for mobile tokens: mobile devices switch
+            # between 4G/5G/Wi-Fi/VPN frequently, resulting in different source
+            # IPs. Binding would cause immediate session rejection on the next
+            # request from a new network.
+            if user_id != "mobile":
+                bind_token_peer(
+                    session_token,
+                    peer_key,
+                    session_exp,
+                    proxied=is_proxied_request(request) and peer is None,
+                )
             if peer is not None:
                 # The one permission decision that changes state: this session
                 # is now pinned to a verified identity and the audit trail
