@@ -13,10 +13,12 @@ import SimpleSelect from '../components/SimpleSelect'
 import CrewAvatar from '../components/CrewAvatar'
 import type { KiroCrewAgent } from '../components/AgentSelector'
 import InfoTip from '../components/InfoTip'
+import MasterDetailBack from '../components/MasterDetailBack'
 import { useProvider } from '../providers'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useAvailableModels } from '../hooks/useAvailableModels'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
+import { useMasterDetailView } from '../hooks/useMasterDetailView'
 import { fmtPercent } from '../i18n/format'
 import { formatCost } from '../utils/formatCost'
 
@@ -428,6 +430,8 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
   const defaultAgent = defaultAgentData ?? ''
 
   const [selectedAgent, setSelectedAgent] = useState<AgentDetail | null>(null)
+  // Narrow viewport shows one pane at a time; a desktop shows both.
+  const { isMobile, showList, showDetail, openDetail, closeDetail } = useMasterDetailView()
   const [tab, setTab] = useState<DetailTab>('overview')
   const [filter, setFilter] = useState('')
   const [confirmDelete, setConfirmDelete] = useState(false)
@@ -488,6 +492,10 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
 
   const select = async (a: InstalledAgent) => {
     const seq = ++selectSeq.current
+    // Drill into the detail before awaiting: while narrow the detail pane
+    // replaces the list, so waiting for the fetch would leave the tap with no
+    // visible effect for as long as it takes.
+    openDetail()
     // Synchronous, not effect-deferred: arming is destructive, so it must be
     // dropped the moment a different template is asked for.
     setConfirmDelete(false)
@@ -680,9 +688,12 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
           /* Inspector: a scrollable roster on the left, the selected template's
              full spec on the right. Sized against the viewport rather than a
              fixed pixel height so a tall window shows more of a prompt or a
-             denied-command list instead of scrolling it inside a short box. */
-          <div className="card-glow border border-border bg-card rounded-lg mb-4 animate-rise shadow-sm transition-all overflow-hidden flex h-[62vh] min-h-[420px] max-h-[760px]">
-            <div className="w-[288px] shrink-0 border-r border-border flex flex-col bg-bg-accent">
+             denied-command list instead of scrolling it inside a short box.
+             `svh` (chrome showing) not `vh` (chrome retracted), or on a phone —
+             where this is the only visible pane — the bottom runs under the
+             address bar. Identical on a desktop; `vh` stays as the fallback. */
+          <div className="card-glow border border-border bg-card rounded-lg mb-4 animate-rise shadow-sm transition-all overflow-hidden flex h-[62vh] supports-[height:100svh]:h-[62svh] min-h-[420px] max-h-[760px]">
+            {showList && <div className={`${isMobile ? 'w-full border-r-0' : 'w-[288px] border-r'} shrink-0 border-border flex flex-col bg-bg-accent`}>
               <div className="p-2.5 border-b border-border">
                 <SearchInput
                   className="w-full"
@@ -726,12 +737,13 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
                   </div>
                 )}
               </div>
-            </div>
+            </div>}
 
-            <div className="flex-1 min-w-0 flex flex-col">
+            {showDetail && <div className="flex-1 min-w-0 flex flex-col">
               {selectedAgent ? (<>
                 <div className="px-4 pt-3.5 border-b border-border">
                   <div className="flex items-center gap-2 flex-wrap">
+                    {isMobile && <MasterDetailBack label={i18nT('pages.agentsPage.installed_agents')} onBack={closeDetail} />}
                     <span className="text-[15px] font-mono font-bold text-text-strong">{selectedAgent.name}</span>
                     {listed?.source && <SourceBadge source={listed.source} />}
                     {defaultAgent === selectedAgent.name && (
@@ -962,7 +974,7 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
               </>) : (
                 <div className="flex items-center justify-center h-full text-muted text-[13px]">{i18nT('pages.agentsPage.select_an_agent_to_view_details')}</div>
               )}
-            </div>
+            </div>}
           </div>
         )}
 
