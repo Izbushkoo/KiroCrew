@@ -97,7 +97,6 @@ export default function MobileSyncModal({ onClose }: MobileSyncModalProps) {
     return `http://${local.host}:${local.port}?token=${encodeURIComponent(token)}`
   })()
 
-  const tunnelHost = syncData?.tunnel?.url ?? null
   const lanIp = syncData?.local.host ?? null
 
   const segments: Segment<NetworkMode>[] = [
