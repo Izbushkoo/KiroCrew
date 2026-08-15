@@ -443,7 +443,7 @@ export default function SttSettings({ cardIndex }: {
         {provider === 'openai' && (
           <>
             <SettingsInput label={i18nT('pages.settings.sttSettings.openai_api_key')} description={i18nT('pages.settings.sttSettings.openai_api_key_desc')} type="password" value={stt.openai_api_key || ''} onChange={v => set({ openai_api_key: v })} disabled={saving} />
-            <SettingsInput label={i18nT('pages.settings.sttSettings.openai_model')} description={i18nT('pages.settings.sttSettings.openai_model_desc')} value={stt.openai_model || 'whisper-1'} onChange={v => set({ openai_model: v })} disabled={saving} />
+            <SettingsSelect label={i18nT('pages.settings.sttSettings.openai_model')} description={i18nT('pages.settings.sttSettings.openai_model_desc')} value={stt.openai_model || 'whisper-1'} options={['whisper-1', 'gpt-4o-audio-preview']} optionLabels={['whisper-1 (Стандартная модель)', 'gpt-4o-audio-preview (Мультимодальная)']} onChange={v => set({ openai_model: v })} disabled={saving} />
           </>
         )}
 
