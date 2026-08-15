@@ -787,9 +787,10 @@ def validate_token(token: str, *, use_session_exp: bool = False) -> tuple[bool, 
         if _get_revoked_store().is_revoked(token_nonce):
             return False, "", "session revoked"
     else:
-        valid, reason = _state.is_nonce_valid(token_nonce)
-        if not valid:
-            return False, "", reason
+        if data.get("sub") != "mobile":
+            valid, reason = _state.is_nonce_valid(token_nonce)
+            if not valid:
+                return False, "", reason
     return True, data.get("sub", ""), ""
 
 
