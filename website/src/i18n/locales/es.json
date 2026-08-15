@@ -6570,6 +6570,24 @@
       "refresh": "Actualizar",
       "title": "Git",
       "uncommitted": "{{count}} sin confirmar"
+    },
+    "mobileSyncModal": {
+      "title": "Mobile Sync",
+      "dialog_label": "Mobile Sync Dialog",
+      "close": "Close",
+      "tab_global": "4G / 5G (Global)",
+      "tab_global_tooltip": "Connect via secure HTTPS tunnel from any network",
+      "tab_global_disabled": "Global tunnel is inactive",
+      "tab_local": "Local Wi-Fi",
+      "tab_local_tooltip": "Connect within your local Wi-Fi network",
+      "tab_local_disabled": "Local IP is unavailable",
+      "qr_label": "QR code for connecting your smartphone",
+      "copy_link": "Copy link",
+      "copied": "Copied!",
+      "install_title": "📱 Android Installation Steps:",
+      "install_step_1": "Point your smartphone camera at the QR code and open the link.",
+      "install_step_2": "In Chrome menu (3 dots), tap \"Add to Home screen\".",
+      "install_step_3": "A KiroCrew app icon will appear on your home screen."
     }
   },
   "hooks": {
