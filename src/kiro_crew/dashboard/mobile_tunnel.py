@@ -57,6 +57,10 @@ _PERSISTENT_TOKEN_TTL_SECS = 365 * 24 * 3600
 _tunnel_url: str | None = None
 _tunnel_process: asyncio.subprocess.Process | None = None
 
+#: Path where the last quick-tunnel URL is persisted so it can survive gateway
+#: restarts while the cloudflared process keeps running in the background.
+_QUICK_TUNNEL_URL_FILE = "cloudflare_quick_tunnel_url"
+
 
 def _data_home() -> Path:
     """Return the Kiro Crew data home directory."""
@@ -150,6 +154,76 @@ def _get_or_create_persistent_mobile_token() -> str:
     return token
 
 
+def _quick_tunnel_url_path() -> Path:
+    """Path to the persisted quick-tunnel URL file."""
+    return _data_home() / _QUICK_TUNNEL_URL_FILE
+
+
+def _persist_quick_tunnel_url(url: str) -> None:
+    """Write the quick-tunnel URL to disk so it survives gateway restarts."""
+    path = _quick_tunnel_url_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(url, encoding="utf-8")
+    except OSError:
+        logger.warning("Could not persist quick tunnel URL to %s", path)
+
+
+def _read_persisted_quick_tunnel_url() -> str | None:
+    """Read a previously persisted quick-tunnel URL, or None if absent."""
+    path = _quick_tunnel_url_path()
+    if not path.is_file():
+        return None
+    try:
+        url = path.read_text(encoding="utf-8").strip()
+        return url if url else None
+    except OSError:
+        return None
+
+
+def _clear_persisted_quick_tunnel_url() -> None:
+    """Remove the persisted quick-tunnel URL file."""
+    path = _quick_tunnel_url_path()
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _find_existing_cloudflared_pid() -> int | None:
+    """Find a running cloudflared process (not ours) via pgrep.
+
+    Returns the PID if a cloudflared process is found, otherwise None.
+    """
+    import shutil
+    import subprocess
+
+    pgrep = shutil.which("pgrep")
+    if not pgrep:
+        return None
+    try:
+        result = subprocess.run(
+            [pgrep, "-f", "cloudflared"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            # Return the first PID found.
+            first_line = result.stdout.strip().splitlines()[0]
+            return int(first_line)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def _tunnel_process_is_alive() -> bool:
+    """Return True if _tunnel_process is set and still running."""
+    if _tunnel_process is None:
+        return False
+    return _tunnel_process.returncode is None
+
+
 def _download_filename() -> str:
     """Return the platform-specific cloudflared binary filename."""
     system = sys.platform
@@ -236,9 +310,36 @@ async def start_tunnel(port: int) -> str | None:
     to quick-tunnel mode which auto-generates a trycloudflare.com URL. The
     persistent 1-year mobile auth token is used in both modes.
 
+    If a tunnel process is already alive with a known URL, it is reused without
+    restart. If the gateway restarted but a background cloudflared process
+    survived and a persisted URL exists on disk, the URL is restored without
+    killing the process.
+
     Returns the URL on success or ``None`` on failure.
     """
     global _tunnel_url, _tunnel_process
+
+    # -----------------------------------------------------------------------
+    # Fast path: reuse an already-tracked live tunnel process.
+    # -----------------------------------------------------------------------
+    if _tunnel_process_is_alive() and _tunnel_url:
+        logger.debug("Reusing existing tunnel process (pid=%s): %s", _tunnel_process.pid, _tunnel_url)
+        return _tunnel_url
+
+    # -----------------------------------------------------------------------
+    # Restore path: gateway restarted but cloudflared is still running in the
+    # background. If a persisted quick-tunnel URL exists and a cloudflared
+    # process is alive, reuse it without killing.
+    # -----------------------------------------------------------------------
+    if _tunnel_process is None:
+        persisted_url = _read_persisted_quick_tunnel_url()
+        if persisted_url and _find_existing_cloudflared_pid() is not None:
+            _tunnel_url = persisted_url
+            logger.info(
+                "Restored tunnel URL from previous session (cloudflared still running): %s",
+                _tunnel_url,
+            )
+            return _tunnel_url
 
     # Tear down any existing tunnel first.
     await stop_tunnel()
@@ -298,6 +399,7 @@ async def start_tunnel(port: int) -> str | None:
         url = await _read_tunnel_url(proc)
         if url:
             _tunnel_url = url
+            _persist_quick_tunnel_url(url)
             logger.info("Cloudflare tunnel active: %s", _tunnel_url)
         else:
             logger.warning("Cloudflare tunnel did not produce a URL within timeout")
@@ -354,7 +456,18 @@ async def stop_tunnel() -> None:
                 pass
         _tunnel_process = None
 
+    # Kill any orphaned cloudflared processes that may have survived.
+    try:
+        await asyncio.create_subprocess_exec(
+            "pkill", "-9", "-f", "cloudflared",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        logger.debug("pkill not available; skipping orphaned cloudflared cleanup")
+
     _tunnel_url = None
+    _clear_persisted_quick_tunnel_url()
 
 
 def get_tunnel_url() -> str | None:
