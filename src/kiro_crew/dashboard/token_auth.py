@@ -582,7 +582,7 @@ def _is_spa_shell_request(request: web.Request) -> bool:
 # Link click window — URL must be opened within this time
 LINK_WINDOW_SECS = 300  # 5 minutes
 # Maximum session TTL — cookie cannot exceed this
-MAX_SESSION_TTL_SECS = 20 * 3600  # 20 hours
+MAX_SESSION_TTL_SECS = 365 * 24 * 3600  # 365 days
 
 _403_HTML = (
     "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' "
@@ -701,7 +701,7 @@ def generate_token(
 
     payload_dict: dict[str, object] = {
         "sub": user_id,
-        "exp": now + LINK_WINDOW_SECS,
+        "exp": now + session_ttl,
         "session_exp": now + session_ttl,
         "iat": now,
         "nonce": nonce,
@@ -2103,7 +2103,7 @@ def token_auth_middleware(
             cookie_max_age = MAX_SESSION_TTL_SECS
             if session_exp:
                 remaining = int(session_exp - time.time())
-                if 0 < remaining <= MAX_SESSION_TTL_SECS:
+                if remaining > 0:
                     cookie_max_age = remaining
             resp.set_cookie(
                 cookie_name,
