@@ -105,6 +105,13 @@ async def api_voice_config(request: web.Request) -> web.Response:
     if "openai_api_key" in body:
         _vc.openai_api_key = str(body["openai_api_key"]).strip()
 
+    # Sanitize OpenAI-specific defaults when provider is openai
+    if _vc.provider == "openai":
+        if _vc.default_voice not in ("alloy", "echo", "fable", "onyx", "nova", "shimmer"):
+            _vc.default_voice = "alloy"
+        if _vc.default_engine not in ("tts-1", "tts-1-hd"):
+            _vc.default_engine = "tts-1"
+
     # Persist to config.json. MERGE into the existing voice_reply block rather
     # than rewriting it wholesale — the loader (slack/handler.py) also reads
     # auto_speak / auto_reply_to_voice from here, and a wholesale rewrite would

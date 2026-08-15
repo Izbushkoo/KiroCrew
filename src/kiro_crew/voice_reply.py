@@ -127,7 +127,7 @@ DEFAULT_LENGTH_SCALE = 1.0  # Piper speed: <1 faster, >1 slower
 OUTPUT_FORMAT = "mp3"
 MAX_CHARS = 2900  # Polly SSML limit ~3000 chars, leave margin
 
-VALID_ENGINES = frozenset({"neural", "generative", "long-form", "standard"})
+VALID_ENGINES = frozenset({"neural", "generative", "long-form", "standard", "tts-1", "tts-1-hd"})
 _RATE_RE = re.compile(r"^\d{1,3}%$")
 _PITCH_RE = re.compile(r"^[+-]\d{1,2}%$")
 
@@ -383,6 +383,12 @@ def _synthesize_openai(
     Uses urllib.request to POST to the OpenAI audio/speech endpoint.
     The caller is responsible for deleting the returned temp file.
     """
+    # Sanitize model and voice to prevent injection of invalid values
+    if model not in ("tts-1", "tts-1-hd"):
+        model = "tts-1"
+    if voice not in ("alloy", "echo", "fable", "onyx", "nova", "shimmer"):
+        voice = "alloy"
+
     if not openai_api_key:
         from kiro_crew.transcribe import _get_openai_api_key
 
