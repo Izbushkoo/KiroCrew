@@ -1014,6 +1014,15 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/browser/engine", handlers.api_browser_engine_install)
     app.router.add_get("/api/browser/view", handlers.api_browser_view_get)
     app.router.add_post("/api/browser/view/start", handlers.api_browser_view_start)
+    # Native browser command channel (agent->Electron). Loopback + internal-secret
+    # only; see the _STRICT_INTERNAL_API_PATHS entries and each handler's re-assert.
+    app.router.add_post("/api/browser/command", handlers.api_browser_command)
+    app.router.add_post("/api/browser/command-drain", handlers.api_browser_command_drain)
+    app.router.add_post("/api/browser/command-result", handlers.api_browser_command_result)
+    # Distinctive boot marker: this line exists ONLY in the command-bus-gateway
+    # build, so its presence in gateway.log proves this worktree's backend is the
+    # one actually running (vs a stale / frozen bundled backend).
+    logger.debug("browser-cmdbus gateway: /api/browser/command{,-drain,-result} registered")
     # Computer use: the thin ``kirocrew-computer`` stdio shim's only call. Lives
     # HERE (rather than in the dashboard-only block, where the browser-called
     # config pair sits) so the headless ``--slack-only`` server exposes it too —

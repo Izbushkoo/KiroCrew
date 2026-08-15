@@ -676,6 +676,57 @@ def _vet_messaging_governance(
         return None
 
 
+def _vet_browse_governance(caller_session: str) -> str | None:
+    """Return a denial reason if governance forbids web browsing, else None.
+
+    The ``browser`` MCP tool drives the native panel (and points at the
+    playwright-cli fallback), a web-egress surface an enterprise policy may
+    disable via ``capabilities.browse``. When DENIED the tool must refuse
+    outright and NOT fall back to playwright-cli -- falling back would let
+    browsing continue and defeat the control. This is distinct from the
+    no-native-panel case (capability ALLOWED, just no Electron), which is the
+    only condition that legitimately degrades to playwright-cli.
+
+    Same stdio-silent, best-effort discipline as :func:`_vet_messaging_governance`
+    (fail-OPEN on evaluation error: a broken policy eval must not brick browsing
+    on a default install). Runs inside the ``kirocrew-core`` stdio subprocess,
+    which boots the platform via ``cli.main`` so ``current_context()`` carries
+    the ceiling.
+    """
+    from kiro_crew.platform.context import PlatformCompositionError
+
+    try:
+        from kiro_crew.platform.governance_profiles import vet_and_audit
+
+        decision = vet_and_audit(
+            "capabilities.browse",
+            "",
+            session_key=caller_session,
+            tool_name="browser",
+            app=_governance_app(),
+            log_warning=False,
+        )
+        if not getattr(decision, "permitted", True):
+            return "web browsing is disabled by governance policy"
+        return None
+    except PlatformCompositionError:
+        raise
+    except Exception:
+        try:
+            from kiro_crew.platform.governance_profiles import audit_governance_degraded
+
+            audit_governance_degraded(
+                "browser",
+                session_key=caller_session,
+                scope="capabilities.browse",
+                app=_governance_app(),
+                log_warning=False,
+            )
+        except Exception:
+            pass
+        return None
+
+
 def _vet_channel_governance(caller_session: str, transport: str) -> str | None:
     """Return a denial reason if governance forbids messaging *via transport*.
 

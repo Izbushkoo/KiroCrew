@@ -789,6 +789,12 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "acp/session_handle.py",
         "platform/defaults.py",
         "platform/interfaces.py",
+        # Inbound sanitization: the browser MCP tool redacts UNTRUSTED native-panel
+        # content (a page's text/console output) before it returns into the agent's
+        # context. It scrubs what comes IN from an untrusted web page, not an output
+        # bound for a third party -- so it is defensive input hygiene, not an egress
+        # sink.
+        "mcp_tools/browser.py",
         # Comparison-only: applies the redactors to compute a match identity and
         # discards the result. The two files being merged can hold the same
         # message with and without redaction, so a raw comparison would keep both
