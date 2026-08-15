@@ -492,7 +492,7 @@ async def synthesize_speech(
         plain = strip_markdown(text).strip()
         if not plain:
             return None
-        return _synthesize_openai(plain, voice=voice_id or 'alloy', model=engine or 'tts-1', openai_api_key=openai_api_key)
+        return await asyncio.to_thread(_synthesize_openai, plain, voice=voice_id or 'alloy', model=engine or 'tts-1', openai_api_key=openai_api_key)
     logger.error("synthesize_speech: unknown provider %r", provider)
     return None
 
