@@ -1188,6 +1188,246 @@ class TestTranscribeFormatValidation:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# OpenAI STT provider
+# ---------------------------------------------------------------------------
+
+
+class TestOpenAiStt:
+    """Tests for the OpenAI STT provider: availability, key resolution, and API call."""
+
+    # -- is_available for provider == 'openai' --
+
+    def test_available_when_key_in_config(self):
+        cfg = SttConfig(enabled=True, provider="openai", openai_api_key="sk-test123")
+        assert is_available(cfg) is True
+
+    def test_available_when_key_in_env(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-env-key")
+        cfg = SttConfig(enabled=True, provider="openai", openai_api_key="")
+        assert is_available(cfg) is True
+
+    def test_available_when_key_in_file(self, tmp_path, monkeypatch):
+        key_file = tmp_path / ".kiro" / "openai_api_key"
+        key_file.parent.mkdir(parents=True)
+        key_file.write_text("sk-file-key\n")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        cfg = SttConfig(enabled=True, provider="openai", openai_api_key="")
+        assert is_available(cfg) is True
+
+    def test_unavailable_when_no_key(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        cfg = SttConfig(enabled=True, provider="openai", openai_api_key="")
+        assert is_available(cfg) is False
+
+    # -- _get_openai_api_key resolution priority --
+
+    def test_key_priority_config_first(self, monkeypatch, tmp_path):
+        """Config field takes priority over env and file."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+        key_file = tmp_path / ".kiro" / "openai_api_key"
+        key_file.parent.mkdir(parents=True)
+        key_file.write_text("sk-file")
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        from kiro_crew.transcribe import _get_openai_api_key
+
+        cfg = SttConfig(enabled=True, provider="openai", openai_api_key="sk-config")
+        assert _get_openai_api_key(cfg) == "sk-config"
+
+    def test_key_priority_env_over_file(self, monkeypatch, tmp_path):
+        """Env var takes priority over key file when config is empty."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+        key_file = tmp_path / ".kiro" / "openai_api_key"
+        key_file.parent.mkdir(parents=True)
+        key_file.write_text("sk-file")
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        from kiro_crew.transcribe import _get_openai_api_key
+
+        cfg = SttConfig(enabled=True, provider="openai", openai_api_key="")
+        assert _get_openai_api_key(cfg) == "sk-env"
+
+    def test_key_priority_file_as_last_resort(self, monkeypatch, tmp_path):
+        """Key file is used when config and env are empty."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        key_file = tmp_path / ".kiro" / "openai_api_key"
+        key_file.parent.mkdir(parents=True)
+        key_file.write_text("sk-file\n")
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        from kiro_crew.transcribe import _get_openai_api_key
+
+        cfg = SttConfig(enabled=True, provider="openai", openai_api_key="")
+        assert _get_openai_api_key(cfg) == "sk-file"
+
+    def test_key_returns_none_when_all_absent(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        from kiro_crew.transcribe import _get_openai_api_key
+
+        cfg = SttConfig(enabled=True, provider="openai", openai_api_key="")
+        assert _get_openai_api_key(cfg) is None
+
+    def test_key_whitespace_only_env_ignored(self, monkeypatch, tmp_path):
+        """A whitespace-only env var is treated as absent."""
+        monkeypatch.setenv("OPENAI_API_KEY", "   ")
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        from kiro_crew.transcribe import _get_openai_api_key
+
+        cfg = SttConfig(enabled=True, provider="openai", openai_api_key="")
+        assert _get_openai_api_key(cfg) is None
+
+    # -- _transcribe_openai_api (mocking urllib.request.urlopen) --
+
+    @pytest.mark.asyncio
+    async def test_successful_transcription(self, tmp_path, monkeypatch):
+        import json
+
+        audio = tmp_path / "test.webm"
+        audio.write_bytes(b"fake audio content")
+        cfg = SttConfig(
+            enabled=True, provider="openai", openai_api_key="sk-test", timeout_secs=30
+        )
+
+        response_body = json.dumps({"text": "Hello from OpenAI"}).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = response_body
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+            from kiro_crew.transcribe import _call_openai_transcriptions
+
+            result = _call_openai_transcriptions(str(audio), cfg)
+
+        assert result == "Hello from OpenAI"
+        mock_urlopen.assert_called_once()
+        req = mock_urlopen.call_args[0][0]
+        assert req.get_header("Authorization") == "Bearer sk-test"
+        assert "multipart/form-data" in req.get_header("Content-type")
+
+    @pytest.mark.asyncio
+    async def test_http_error_returns_none(self, tmp_path, monkeypatch):
+        import urllib.error
+
+        audio = tmp_path / "test.webm"
+        audio.write_bytes(b"fake audio content")
+        cfg = SttConfig(
+            enabled=True, provider="openai", openai_api_key="sk-test", timeout_secs=30
+        )
+
+        http_err = urllib.error.HTTPError(
+            url="https://api.openai.com/v1/audio/transcriptions",
+            code=429,
+            msg="Too Many Requests",
+            hdrs={},  # type: ignore[arg-type]
+            fp=MagicMock(read=MagicMock(return_value=b"rate limited")),
+        )
+
+        with patch("urllib.request.urlopen", side_effect=http_err):
+            from kiro_crew.transcribe import _call_openai_transcriptions
+
+            result = _call_openai_transcriptions(str(audio), cfg)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_url_error_returns_none(self, tmp_path, monkeypatch):
+        import urllib.error
+
+        audio = tmp_path / "test.webm"
+        audio.write_bytes(b"fake audio content")
+        cfg = SttConfig(
+            enabled=True, provider="openai", openai_api_key="sk-test", timeout_secs=30
+        )
+
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=urllib.error.URLError("connection refused"),
+        ):
+            from kiro_crew.transcribe import _call_openai_transcriptions
+
+            result = _call_openai_transcriptions(str(audio), cfg)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_json_decode_error_returns_none(self, tmp_path, monkeypatch):
+        audio = tmp_path / "test.webm"
+        audio.write_bytes(b"fake audio content")
+        cfg = SttConfig(
+            enabled=True, provider="openai", openai_api_key="sk-test", timeout_secs=30
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b"not json at all"
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            from kiro_crew.transcribe import _call_openai_transcriptions
+
+            result = _call_openai_transcriptions(str(audio), cfg)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_no_api_key_returns_none(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        audio = tmp_path / "test.webm"
+        audio.write_bytes(b"fake audio content")
+        cfg = SttConfig(
+            enabled=True, provider="openai", openai_api_key="", timeout_secs=30
+        )
+
+        from kiro_crew.transcribe import _call_openai_transcriptions
+
+        result = _call_openai_transcriptions(str(audio), cfg)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_file_too_large_returns_none(self, tmp_path, monkeypatch):
+        audio = tmp_path / "test.webm"
+        audio.write_bytes(b"x" * (26 * 1024 * 1024))  # > 25 MB
+        cfg = SttConfig(
+            enabled=True, provider="openai", openai_api_key="sk-test", timeout_secs=30
+        )
+
+        from kiro_crew.transcribe import _call_openai_transcriptions
+
+        result = _call_openai_transcriptions(str(audio), cfg)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_empty_text_returns_none(self, tmp_path, monkeypatch):
+        import json
+
+        audio = tmp_path / "test.webm"
+        audio.write_bytes(b"fake audio content")
+        cfg = SttConfig(
+            enabled=True, provider="openai", openai_api_key="sk-test", timeout_secs=30
+        )
+
+        response_body = json.dumps({"text": ""}).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = response_body
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            from kiro_crew.transcribe import _call_openai_transcriptions
+
+            result = _call_openai_transcriptions(str(audio), cfg)
+
+        assert result is None
+
+
 class TestProfileCredentialResolver:
     @pytest.mark.asyncio
     async def test_none_credentials_raises(self):

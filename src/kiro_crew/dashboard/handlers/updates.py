@@ -1151,9 +1151,35 @@ async def api_update_apply(request: web.Request) -> web.Response:
     async def _apply() -> None:
         try:
             state.push_update_progress("pulling", "Pulling latest changes…")
-            pull = await asyncio.create_subprocess_exec(
+
+            # Check if 'upstream' remote exists to rebase from the official repo.
+            remote_check = await asyncio.create_subprocess_exec(
                 "git",
-                "pull",
+                "remote",
+                cwd=proj,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                remote_out, _ = await asyncio.wait_for(remote_check.communicate(), timeout=10)
+            except asyncio.TimeoutError:
+                try:
+                    remote_check.kill()
+                except ProcessLookupError:
+                    pass
+                await remote_check.communicate()
+                remote_out = b""
+
+            remotes = remote_out.decode(errors="replace").splitlines()
+            has_upstream = "upstream" in remotes
+
+            if has_upstream:
+                pull_cmd = ["git", "pull", "--rebase", "upstream", "main"]
+            else:
+                pull_cmd = ["git", "pull"]
+
+            pull = await asyncio.create_subprocess_exec(
+                *pull_cmd,
                 cwd=proj,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
