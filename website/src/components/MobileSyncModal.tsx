@@ -1,21 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { motion, useReducedMotion } from 'framer-motion'
-import { X, Copy, Check, Smartphone, Wifi, Globe, Loader2 } from 'lucide-react'
+import { X, Copy, Check, Smartphone, Globe, Loader2, ShieldCheck } from 'lucide-react'
 import { QRCodeSVG } from 'qrcode.react'
 import { useTranslation } from 'react-i18next'
 
 import { useDialogFocusTrap } from '../hooks/useDialogFocusTrap'
 import { copyToClipboard } from '../utils/clipboard'
-import SegmentedControl, { type Segment } from './SegmentedControl'
-
-type NetworkMode = 'global' | 'local'
-
-interface MobileSyncLocalInfo {
-  host: string
-  port: number
-  token: string
-}
 
 interface MobileSyncTunnelInfo {
   url: string
@@ -23,7 +14,7 @@ interface MobileSyncTunnelInfo {
 }
 
 interface MobileSyncResponse {
-  local: MobileSyncLocalInfo
+  local: { host: string; port: number; token: string }
   tunnel: MobileSyncTunnelInfo | null
   token: string
   tunnel_active: boolean
@@ -36,13 +27,11 @@ interface MobileSyncModalProps {
 /**
  * Modal dialog for Android Mobile Sync.
  *
- * On mount, fetches `/api/system/mobile-sync` to obtain the LAN IP, tunnel URL,
- * and a fresh auth token. Displays a QR code encoding the dashboard URL so a
- * mobile device can scan and open it directly. A tab switcher toggles between a
- * global (4G/5G via Cloudflare Tunnel) URL and a local (Wi-Fi LAN IP) URL.
- * Includes a copy-link button and Android "Add to Home Screen" instructions.
- *
- * Never falls back to 'localhost' — smartphones cannot connect to it.
+ * On mount, fetches `/api/system/mobile-sync` to obtain the secure HTTPS
+ * Cloudflare Tunnel URL and a fresh auth token. Displays a QR code encoding
+ * the tunnel URL so a mobile device can scan and open it directly from any
+ * network (4G/5G/Wi-Fi). Includes a copy-link button and Android "Add to
+ * Home Screen" instructions.
  */
 export default function MobileSyncModal({ onClose }: MobileSyncModalProps) {
   const { t } = useTranslation()
@@ -51,7 +40,6 @@ export default function MobileSyncModal({ onClose }: MobileSyncModalProps) {
   const [syncData, setSyncData] = useState<MobileSyncResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [mode, setMode] = useState<NetworkMode>('local')
   const [copied, setCopied] = useState(false)
   const resetTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -70,7 +58,6 @@ export default function MobileSyncModal({ onClose }: MobileSyncModalProps) {
         if (cancelled) return
 
         setSyncData(data)
-        setMode(data.tunnel_active && data.tunnel ? 'global' : 'local')
       } catch (err) {
         if (cancelled) return
         setError(err instanceof Error ? err.message : String(err))
@@ -87,38 +74,12 @@ export default function MobileSyncModal({ onClose }: MobileSyncModalProps) {
     }
   }, [])
 
-  // Construct the sync URL from fetched data — never uses 'localhost'.
+  // Always use the secure HTTPS Cloudflare Tunnel URL.
   const syncUrl = (() => {
-    if (!syncData) return ''
-    const { local, tunnel, token } = syncData
-    if (mode === 'global' && tunnel) {
-      return `${tunnel.url}?token=${encodeURIComponent(token)}`
-    }
-    return `http://${local.host}:${local.port}?token=${encodeURIComponent(token)}`
+    if (!syncData?.tunnel) return ''
+    const { tunnel, token } = syncData
+    return `${tunnel.url}?token=${encodeURIComponent(token)}`
   })()
-
-  const lanIp = syncData?.local.host ?? null
-
-  const segments: Segment<NetworkMode>[] = [
-    {
-      key: 'global',
-      label: t('components.mobileSyncModal.tab_global'),
-      icon: <Globe className="lucide-inline" aria-hidden="true" />,
-      disabled: !syncData?.tunnel_active,
-      tooltip: syncData?.tunnel_active
-        ? t('components.mobileSyncModal.tab_global_tooltip')
-        : t('components.mobileSyncModal.tab_global_disabled'),
-    },
-    {
-      key: 'local',
-      label: t('components.mobileSyncModal.tab_local'),
-      icon: <Wifi className="lucide-inline" aria-hidden="true" />,
-      disabled: !lanIp,
-      tooltip: lanIp
-        ? t('components.mobileSyncModal.tab_local_tooltip')
-        : t('components.mobileSyncModal.tab_local_disabled'),
-    },
-  ]
 
   const handleCopy = async () => {
     try {
@@ -178,17 +139,21 @@ export default function MobileSyncModal({ onClose }: MobileSyncModalProps) {
           <div className="px-5 pb-5 text-sm text-error">
             {t('components.mobileSyncModal.fetch_error', { error })}
           </div>
+        ) : !syncData?.tunnel ? (
+          <div className="px-5 pb-5 text-sm text-error">
+            {t('components.mobileSyncModal.tunnel_unavailable')}
+          </div>
         ) : (
           <>
-            {/* Tab switcher */}
+            {/* Secure connection badge */}
             <div className="flex justify-center px-5 pb-4">
-              <SegmentedControl
-                segments={segments}
-                value={mode}
-                onChange={setMode}
-                layoutId="mobile-sync-mode"
-                collapse={false}
-              />
+              <div className="inline-flex items-center gap-2 rounded-full border border-ok/30 bg-ok/10 px-3 py-1.5">
+                <ShieldCheck className="lucide-inline text-ok" aria-hidden="true" />
+                <span className="text-[12px] font-medium text-ok">
+                  {t('components.mobileSyncModal.secure_badge')}
+                </span>
+                <Globe className="lucide-inline text-ok" aria-hidden="true" />
+              </div>
             </div>
 
             {/* QR code */}
