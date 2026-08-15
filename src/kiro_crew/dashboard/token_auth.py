@@ -2025,7 +2025,12 @@ def token_auth_middleware(
             # working within the 5-minute window (it just re-exchanges for a
             # fresh session cookie each time). Guarded by is_revoked so repeated
             # exchanges of the same link don't re-write the denylist file.
-            if _link_nonce and session_exp and not _get_revoked_store().is_revoked(_link_nonce):
+            if (
+                _link_nonce
+                and session_exp
+                and user_id != "mobile"
+                and not _get_revoked_store().is_revoked(_link_nonce)
+            ):
                 # revoke() does synchronous file I/O (mkdir/write/chmod/replace);
                 # offload so it never blocks the event loop. is_revoked above is
                 # an in-memory check and is cheap enough to run inline.
