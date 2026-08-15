@@ -271,6 +271,27 @@ def _find_mlx_whisper() -> str | None:
     return None
 
 
+def _get_openai_api_key(stt_config) -> str | None:  # type: ignore[no-untyped-def]
+    """Resolve OpenAI API key from config, env var, or key file."""
+    # 1. Config field
+    if stt_config.openai_api_key:
+        return stt_config.openai_api_key
+    # 2. Environment variable
+    env_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    # 3. Key file
+    key_file = Path(os.path.expanduser("~/.kiro/openai_api_key"))
+    try:
+        if key_file.is_file():
+            content = key_file.read_text().strip()
+            if content:
+                return content
+    except OSError:
+        pass
+    return None
+
+
 def is_available(stt_config=None) -> bool:  # type: ignore[no-untyped-def]
     """Check if STT is enabled in config and a provider is usable."""
     if stt_config is None:
@@ -304,6 +325,8 @@ def is_available(stt_config=None) -> bool:  # type: ignore[no-untyped-def]
         # there would freeze the gateway for up to 180s. `availability()` is
         # stats-only; the build happens inside the offloaded transcribe path.
         return apple_speech.availability().ok
+    if provider == "openai":
+        return _get_openai_api_key(stt_config) is not None
     ensure_ffmpeg_in_path()
     return _find_whisper(stt_config.whisper_path) is not None
 
@@ -352,6 +375,8 @@ async def transcribe_audio(audio_path: str, stt_config=None) -> str | None:  # t
         result = await _transcribe_mlx(audio_path, stt_config)
     elif provider == "apple":
         result = await _transcribe_apple(audio_path, stt_config)
+    elif provider == "openai":
+        result = await _transcribe_openai_api(audio_path, stt_config)
     else:
         await asyncio.to_thread(ensure_ffmpeg_in_path)
         result = await _transcribe_native(audio_path, stt_config)
@@ -359,6 +384,138 @@ async def transcribe_audio(audio_path: str, stt_config=None) -> str | None:  # t
     if result:
         result = await asyncio.to_thread(_redact_transcript, result)
     return result
+
+
+def _build_multipart_body(
+    audio_path: str, model: str, language: str
+) -> tuple[bytes, str]:
+    """Build a multipart/form-data body for the OpenAI transcriptions endpoint.
+
+    Returns (body_bytes, content_type_header).
+    """
+    import uuid
+
+    boundary = uuid.uuid4().hex
+    parts: list[bytes] = []
+
+    # model field
+    parts.append(f"--{boundary}\r\n".encode())
+    parts.append(b'Content-Disposition: form-data; name="model"\r\n\r\n')
+    parts.append(f"{model}\r\n".encode())
+
+    # language field (strip region, OpenAI expects ISO-639-1 like "en")
+    lang = language.split("-")[0] if language else "en"
+    parts.append(f"--{boundary}\r\n".encode())
+    parts.append(b'Content-Disposition: form-data; name="language"\r\n\r\n')
+    parts.append(f"{lang}\r\n".encode())
+
+    # file field
+    filename = os.path.basename(audio_path)
+    ext = os.path.splitext(filename)[1].lower()
+    mime_map = {
+        ".mp3": "audio/mpeg",
+        ".mp4": "audio/mp4",
+        ".mpeg": "audio/mpeg",
+        ".mpga": "audio/mpeg",
+        ".m4a": "audio/mp4",
+        ".ogg": "audio/ogg",
+        ".wav": "audio/wav",
+        ".webm": "audio/webm",
+        ".flac": "audio/flac",
+    }
+    content_type = mime_map.get(ext, "application/octet-stream")
+
+    parts.append(f"--{boundary}\r\n".encode())
+    parts.append(
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode()
+    )
+    parts.append(f"Content-Type: {content_type}\r\n\r\n".encode())
+    with open(audio_path, "rb") as f:
+        parts.append(f.read())
+    parts.append(b"\r\n")
+
+    # closing boundary
+    parts.append(f"--{boundary}--\r\n".encode())
+
+    body = b"".join(parts)
+    header = f"multipart/form-data; boundary={boundary}"
+    return body, header
+
+
+_OPENAI_TRANSCRIBE_MAX_BYTES = 25 * 1024 * 1024  # 25 MB OpenAI API limit
+
+
+def _call_openai_transcriptions(audio_path: str, stt_config) -> str | None:  # type: ignore[no-untyped-def]
+    """Synchronous helper that posts to the OpenAI transcriptions endpoint.
+
+    Uses only stdlib ``urllib.request`` — no third-party HTTP client needed.
+    Meant to be called via ``asyncio.to_thread``.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    api_key = _get_openai_api_key(stt_config)
+    if not api_key:
+        logger.error("OpenAI STT: no API key available")
+        return None
+
+    # Size guard
+    try:
+        file_size = os.path.getsize(audio_path)
+    except OSError as exc:
+        logger.error("OpenAI STT: cannot stat audio file: %s", exc)
+        return None
+    if file_size > _OPENAI_TRANSCRIBE_MAX_BYTES:
+        logger.error(
+            "OpenAI STT: audio file too large (%d bytes, limit %d)",
+            file_size,
+            _OPENAI_TRANSCRIBE_MAX_BYTES,
+        )
+        return None
+
+    model = getattr(stt_config, "openai_model", "whisper-1") or "whisper-1"
+    language = getattr(stt_config, "language_code", "en-US") or "en-US"
+
+    body, content_type_header = _build_multipart_body(audio_path, model, language)
+
+    url = "https://api.openai.com/v1/audio/transcriptions"
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": content_type_header,
+        },
+        method="POST",
+    )
+
+    timeout = getattr(stt_config, "timeout_secs", 300) or 300
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp_body = resp.read()
+            data = json.loads(resp_body)
+            return data.get("text", "").strip() or None
+    except urllib.error.HTTPError as exc:
+        error_body = ""
+        try:
+            error_body = exc.read().decode(errors="replace")[:500]
+        except Exception:
+            pass
+        logger.error(
+            "OpenAI STT HTTP %d: %s",
+            exc.code,
+            error_body,
+        )
+        return None
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        logger.error("OpenAI STT request failed: %s", exc)
+        return None
+
+
+async def _transcribe_openai_api(audio_path: str, stt_config) -> str | None:  # type: ignore[no-untyped-def]
+    """Transcribe using the OpenAI Whisper API (https://api.openai.com/v1/audio/transcriptions)."""
+    return await asyncio.to_thread(_call_openai_transcriptions, audio_path, stt_config)
 
 
 class _ProfileCredentialResolver(CredentialResolver):

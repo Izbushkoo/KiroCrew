@@ -562,6 +562,10 @@ async def api_stt_config(request: web.Request) -> web.Response:
                 stt["endpointing"] = body["endpointing"]
             if "dictation_panel" in body and isinstance(body["dictation_panel"], bool):
                 stt["dictation_panel"] = body["dictation_panel"]
+            if "openai_api_key" in body and isinstance(body["openai_api_key"], str):
+                stt["openai_api_key"] = body["openai_api_key"]
+            if "openai_model" in body and isinstance(body["openai_model"], str):
+                stt["openai_model"] = body["openai_model"]
             await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
             await asyncio.to_thread(_atomic_json_write, path, data)
         cfg = KiroCrewConfig.load()
@@ -603,6 +607,8 @@ async def api_stt_config(request: web.Request) -> web.Response:
             "transcribe_region": cfg.stt.transcribe_region,
             "transcribe_profile": cfg.stt.transcribe_profile,
             "language_code": cfg.stt.language_code,
+            "openai_api_key": cfg.stt.openai_api_key,
+            "openai_model": cfg.stt.openai_model,
             "models": _STT_MODEL_SIZES,
             "mlx_models": _STT_MLX_MODELS,
             "providers": _stt_providers(),

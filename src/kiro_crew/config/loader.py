@@ -3755,7 +3755,7 @@ class ChannelConfig:
         )
 
 
-_VALID_STT_PROVIDERS = ("whisper", "mlx", "apple", "transcribe")
+_VALID_STT_PROVIDERS = ("whisper", "mlx", "apple", "transcribe", "openai")
 _VALID_CHANNEL_PREFIXES = ("C", "D", "G")
 
 
@@ -4070,6 +4070,14 @@ class SttConfig:
             "Ignored when the browser lacks WebGL2 or the OS requests reduced motion — both "
             "fall back to the status bar.",
         ),
+    )
+    openai_api_key: str = field(
+        default="",
+        metadata=_meta("OpenAI API Key", "API key for OpenAI STT provider."),
+    )
+    openai_model: str = field(
+        default="whisper-1",
+        metadata=_meta("OpenAI Model", "Model name for OpenAI STT provider."),
     )
 
 
@@ -6310,6 +6318,8 @@ class KiroCrewConfig:
                 streaming=stt_data.get("streaming", False),
                 endpointing=_safe_bool(stt_data.get("endpointing"), False),
                 dictation_panel=_safe_bool(stt_data.get("dictation_panel"), True),
+                openai_api_key=stt_data.get("openai_api_key", ""),
+                openai_model=stt_data.get("openai_model", "whisper-1"),
             ),
             # Every numeric knob is clamped to the same ceiling the MCP tool
             # schemas enforce, so a hand-edited config.json cannot ask for an

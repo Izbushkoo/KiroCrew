@@ -31,6 +31,8 @@ interface SttConfig {
   provider: string
   model: string
   mlx_model?: string
+  openai_api_key?: string
+  openai_model?: string
   available: boolean
   streaming?: boolean
   endpointing?: boolean
@@ -96,6 +98,7 @@ const PROVIDER_LABEL_KEY: Record<string, string> = {
   mlx: 'pages.settings.sttSettings.provider_mlx',
   apple: 'pages.settings.sttSettings.provider_apple',
   transcribe: 'pages.settings.sttSettings.provider_transcribe',
+  openai: 'pages.settings.sttSettings.provider_openai',
 }
 
 /** Localised dropdown label for a provider id, falling back to the raw id. */
@@ -435,6 +438,13 @@ export default function SttSettings({ cardIndex }: {
 
         {provider === 'mlx' && (
           <SettingsSelect label={i18nT('pages.settings.sttSettings.mlx_model')} hint={i18nT('pages.settings.sttSettings.whisper_model_running_on_apple_mlx_metal_gpu_dow')} value={stt.mlx_model || ''} options={Object.keys(stt.mlx_models || {})} optionLabels={Object.entries(stt.mlx_models || {}).map(([n, s]) => `${n.replace('mlx-community/', '')} (${s})`)} onChange={v => set({ mlx_model: v })} disabled={saving} />
+        )}
+
+        {provider === 'openai' && (
+          <>
+            <SettingsInput label={i18nT('pages.settings.sttSettings.openai_api_key')} description={i18nT('pages.settings.sttSettings.openai_api_key_desc')} type="password" value={stt.openai_api_key || ''} onChange={v => set({ openai_api_key: v })} disabled={saving} />
+            <SettingsInput label={i18nT('pages.settings.sttSettings.openai_model')} description={i18nT('pages.settings.sttSettings.openai_model_desc')} value={stt.openai_model || 'whisper-1'} onChange={v => set({ openai_model: v })} disabled={saving} />
+          </>
         )}
 
         {canStream && (
