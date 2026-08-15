@@ -13,7 +13,7 @@ type VoiceConfig = {
   piper_binary: string; piper_model: string; piper_model_config: string; piper_length_scale: number
 }
 
-const PROVIDER_OPTIONS = ['piper', 'polly']
+const PROVIDER_OPTIONS = ['piper', 'polly', 'openai']
 /**
  * Catalog KEY per provider — not the label itself. This table is evaluated at
  * module load, so an `i18nT()` call here would freeze the boot language and
@@ -27,6 +27,7 @@ const PROVIDER_OPTIONS = ['piper', 'polly']
 const PROVIDER_LABEL_KEY: Record<string, string> = {
   piper: 'pages.settings.voicePanel.piper_local_offline',
   polly: 'pages.settings.voicePanel.amazon_polly_cloud',
+  openai: 'OpenAI TTS (Cloud)',
 }
 
 // Piper speed is controlled by length_scale (lower = faster). Map friendly
@@ -96,6 +97,7 @@ export function VoicePanel() {
 
   const voiceCfg = voiceQ.data ?? { enabled: false, provider: 'piper', voice: 'Ruth', engine: 'generative', rate: '100%', autoSpeak: false, aws_profile: '', region: '', piper_binary: '', piper_model: '', piper_model_config: '', piper_length_scale: 1.0 }
   const isPolly = voiceCfg.provider === 'polly'
+  const isOpenai = voiceCfg.provider === 'openai'
   const voiceOptions = voicesQ.data?.voices
     ? voicesQ.data.voices.map(v => ({ value: v.id, label: `${v.name} (${v.languageCode} ${v.gender[0]})`, engines: v.engines }))
     : VOICE_OPTIONS_FALLBACK.map(v => ({ ...v, engines: ENGINE_OPTIONS }))
@@ -154,6 +156,11 @@ export function VoicePanel() {
                   <SettingsSelect label={i18nT('pages.settings.voicePanel.speed')} description={i18nT('pages.settings.voicePanel.speech_rate')} value={voiceCfg.rate} options={SPEED_OPTIONS} onChange={v => setVoice({ rate: v })} disabled={voiceDisabled} />
                   <SettingsInput label={i18nT('pages.settings.voicePanel.aws_profile_polly')} description={i18nT('pages.settings.voicePanel.aws_credentials_profile_for_polly')} value={localProfile} onChange={setLocalProfile} onBlur={() => setVoice({ aws_profile: localProfile.trim() })} placeholder={i18nT('pages.settings.voicePanel.default')} disabled={voiceDisabled} />
                   <SettingsInput label={i18nT('pages.settings.voicePanel.aws_region_polly')} description={i18nT('pages.settings.voicePanel.aws_region_for_polly_api')} value={localRegion} onChange={setLocalRegion} onBlur={() => setVoice({ region: localRegion.trim() })} placeholder={i18nT('pages.settings.voicePanel.us_east_1')} disabled={voiceDisabled} />
+                </>
+              ) : isOpenai ? (
+                <>
+                  <SettingsSelect label={i18nT('pages.settings.voicePanel.voice')} description="OpenAI TTS voice" value={voiceCfg.voice} options={['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer']} optionLabels={['alloy (Стандартный нейтральный)', 'echo (Мужской тёплый)', 'fable (Выразительный британский)', 'onyx (Глубокий мужской)', 'nova (Энергичный женский)', 'shimmer (Тёплый женский)']} onChange={v => setVoice({ voice: v })} disabled={voiceDisabled} />
+                  <SettingsSelect label="Model" description="OpenAI TTS model" value={voiceCfg.engine} options={['tts-1', 'tts-1-hd']} optionLabels={['tts-1 (Стандартная быстрая)', 'tts-1-hd (Высокое качество HD)']} onChange={v => setVoice({ engine: v })} disabled={voiceDisabled} />
                 </>
               ) : (
                 <>

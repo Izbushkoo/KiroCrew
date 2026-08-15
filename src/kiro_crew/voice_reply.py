@@ -20,12 +20,14 @@ Supported providers:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
 import re
 import shutil
 import tempfile
+import urllib.request
 from typing import TYPE_CHECKING
 
 from kiro_crew.sandbox import (
@@ -44,7 +46,8 @@ logger = logging.getLogger(__name__)
 # ── Provider constants ──
 PROVIDER_POLLY = "polly"
 PROVIDER_PIPER = "piper"
-VALID_PROVIDERS = frozenset({PROVIDER_POLLY, PROVIDER_PIPER})
+PROVIDER_OPENAI = "openai"
+VALID_PROVIDERS = frozenset({PROVIDER_POLLY, PROVIDER_PIPER, PROVIDER_OPENAI})
 # Local offline TTS (Piper) is the documented recommended default — it needs no
 # AWS credentials or network. Polly remains fully supported when explicitly
 # selected (``provider="polly"``) with the ``aws`` CLI + credentials present.
@@ -81,6 +84,14 @@ def is_available(
         if not os.path.isfile(os.path.expanduser(piper_model)):
             return False
         return True
+    if provider == PROVIDER_OPENAI:
+        from kiro_crew.transcribe import _get_openai_api_key
+
+        # Use a stub config so _get_openai_api_key checks env var and key file
+        class _Stub:
+            openai_api_key = ""
+
+        return _get_openai_api_key(_Stub()) is not None
     logger.warning("is_available: unknown provider %r", provider)
     return False
 
@@ -361,6 +372,64 @@ async def _synthesize_piper(
                 pass
 
 
+def _synthesize_openai(
+    text: str,
+    voice: str = "alloy",
+    model: str = "tts-1",
+    openai_api_key: str = "",
+) -> str | None:
+    """Call OpenAI TTS API to generate MP3. Returns temp file path or None.
+
+    Uses urllib.request to POST to the OpenAI audio/speech endpoint.
+    The caller is responsible for deleting the returned temp file.
+    """
+    if not openai_api_key:
+        from kiro_crew.transcribe import _get_openai_api_key
+
+        class _Stub:
+            openai_api_key = ""
+
+        openai_api_key = _get_openai_api_key(_Stub()) or ""
+    if not openai_api_key:
+        logger.error("_synthesize_openai: no OpenAI API key available")
+        return None
+
+    payload = json.dumps({
+        "model": model,
+        "input": text,
+        "voice": voice,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/audio/speech",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {openai_api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    fd, path = tempfile.mkstemp(suffix=".mp3")
+    os.close(fd)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            with open(path, "wb") as f:
+                f.write(resp.read())
+        if os.path.getsize(path) < 100:
+            logger.error("OpenAI TTS output too small")
+            os.unlink(path)
+            return None
+        return path
+    except Exception:
+        logger.exception("OpenAI TTS synthesis error")
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return None
+
+
 async def synthesize_speech(
     text: str,
     provider: str = DEFAULT_PROVIDER,
@@ -417,6 +486,11 @@ async def synthesize_speech(
             piper_model_config=piper_model_config,
             length_scale=length_scale,
         )
+    if provider == PROVIDER_OPENAI:
+        plain = strip_markdown(text).strip()
+        if not plain:
+            return None
+        return _synthesize_openai(plain)
     logger.error("synthesize_speech: unknown provider %r", provider)
     return None
 
