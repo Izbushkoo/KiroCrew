@@ -25,6 +25,7 @@ from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.slack.handler import _vc
 from kiro_crew.voice_reply import (
+    PROVIDER_OPENAI,
     PROVIDER_PIPER,
     VALID_ENGINES,
     VALID_PROVIDERS,
@@ -171,8 +172,8 @@ async def api_voice_synthesize(request: web.Request) -> web.Response:
     # streaming_voice_reply is Polly-only, so route the selected provider through
     # the provider-aware synthesize_speech and emit one chunk + complete —
     # otherwise the DEFAULT (Piper) provider would yield no dashboard audio.
-    if _vc.provider == PROVIDER_PIPER:
-        return await _synthesize_nonstreaming(state, text, slot_key)
+    if _vc.provider in (PROVIDER_PIPER, PROVIDER_OPENAI):
+        return await _synthesize_nonstreaming(state, text, slot_key, voice_id=voice_id, engine=engine)
 
     chunk_paths: list[str] = []
     final_path: str | None = None
@@ -242,20 +243,23 @@ async def api_voice_synthesize(request: web.Request) -> web.Response:
 
 
 async def _synthesize_nonstreaming(
-    state: DashboardState, text: str, slot_key: str
+    state: DashboardState, text: str, slot_key: str,
+    voice_id: str | None = None, engine: str | None = None,
 ) -> web.Response:
     """Synthesize one clip via the provider-aware ``synthesize_speech`` and emit
     it as a single ``voice_chunk`` + ``voice_complete``.
 
-    Used for providers (Piper) that produce a single local file rather than the
-    sentence-chunked Polly SSML stream. The audio is delivered whole; the
-    dashboard player already handles a single-chunk reply.
+    Used for providers (Piper, OpenAI) that produce a single local file rather
+    than the sentence-chunked Polly SSML stream. The audio is delivered whole;
+    the dashboard player already handles a single-chunk reply.
     """
     audio_path: str | None = None
     try:
         audio_path = await synthesize_speech(
             text,
             provider=_vc.provider,
+            voice_id=voice_id or _vc.default_voice,
+            engine=engine or _vc.default_engine,
             piper_binary=_vc.piper_binary,
             piper_model=_vc.piper_model,
             piper_model_config=_vc.piper_model_config,
@@ -263,7 +267,7 @@ async def _synthesize_nonstreaming(
             openai_api_key=_vc.openai_api_key,
         )
         if not audio_path:
-            msg = "Piper TTS unavailable — check the piper binary and model path in Voice settings."
+            msg = f"{_vc.provider} TTS unavailable — check settings or API key."
             state.broadcast_ws("voice_error", {"slot": slot_key, "error": msg})
             return web.json_response({"ok": False, "error": msg}, status=502)
         with open(audio_path, "rb") as f:
@@ -278,7 +282,7 @@ async def _synthesize_nonstreaming(
         )
         return web.json_response({"ok": True, "chunks": 1})
     except Exception as exc:
-        logger.exception("Piper voice synthesis failed")
+        logger.exception("%s voice synthesis failed", _vc.provider)
         err_msg, _ = redact_exfiltration_urls(str(exc))
         err_msg, _ = redact_credentials(err_msg)
         state.broadcast_ws("voice_error", {"slot": slot_key, "error": err_msg})
