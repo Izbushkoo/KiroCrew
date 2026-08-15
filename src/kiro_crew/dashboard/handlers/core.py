@@ -1188,9 +1188,9 @@ async def api_stt_transcribe(request: web.Request) -> web.Response:
             state: DashboardState = request.app["state"]
             slot_key = request.query.get("slot", "")
             if slot_key and slot_key in state.slots:
-                state.slots[slot_key]._pending_stt_cost = round(
-                    state.slots[slot_key]._pending_stt_cost + stt_cost, 6
-                )
+                slot_obj = state.slots[slot_key]
+                prev_stt = getattr(slot_obj, '_pending_stt_cost', 0.0)
+                setattr(slot_obj, '_pending_stt_cost', round(prev_stt + stt_cost, 6))
 
         return web.json_response({"text": text or ""})
     except Exception:
