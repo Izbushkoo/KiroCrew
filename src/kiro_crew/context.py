@@ -2638,20 +2638,25 @@ class ContextBuilder:
                 parts.append(
                     "\n\n(If you need the user's answer to a blocking question BEFORE "
                     "you can continue the current turn, use the ask_question tool — it "
-                    "pauses and returns the answer as the tool result. This is situational, "
-                    "not per-turn: when you are ENDING your turn, use the final [OPTIONS:] "
-                    "line instead, and do not interrupt the user for a non-blocking choice.)"
+                    "pauses and returns the answer as the tool result. Use it SPARINGLY: "
+                    "only when you genuinely cannot proceed without the answer. When you "
+                    "are ENDING your turn, use the final [OPTIONS:] line instead. Never "
+                    "interrupt the user for a non-blocking choice, and never ask what you "
+                    "can reasonably decide or discover yourself.)"
                 )
                 # A follow-up card is distinct from both: it offers concrete NEXT
                 # tasks after work is done, optionally handing one to a worktree.
                 parts.append(
-                    "\n\n(When you have FINISHED a substantive piece of work and see "
-                    "concrete, worth-doing next steps, you MAY offer them with the "
-                    "suggest_followup tool — up to 3 items, each carrying a complete, "
-                    "standalone handoff prompt. This is situational, NOT per-turn: prefer "
-                    "silence when there is no real next step, do not repeat a card the user "
-                    "already acted on, and never use it to ask a clarifying question you "
-                    "need answered to continue — just ask that inline.)"
+                    "\n\n(The suggest_followup tool renders a card below the composer "
+                    "offering concrete NEXT tasks. DEFAULT TO SILENCE: only raise it when "
+                    "a follow-up is genuinely valuable to the user AND you have just "
+                    "finished a genuinely large task (multi-file changes, a full PR cycle, "
+                    "a major investigation). A card is an interruption — it must earn its "
+                    "place. NEVER raise it after small tasks (answering a question, a "
+                    "single-file edit, a quick lookup, a simple fix), never per-turn, never "
+                    "to repeat a card the user already acted on, and never to ask a "
+                    "clarifying question — just ask that inline. When in doubt, stay silent. "
+                    "Each item carries a complete, standalone handoff prompt; up to 3.)"
                 )
 
         # Widget instructions live in the bundled `widgets` skill.
