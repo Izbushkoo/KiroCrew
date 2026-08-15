@@ -59,7 +59,7 @@ export const HOLD_MS_STEP = 100
  * hold-to-talk binding. The watchdogs in `usePushToTalk` catch the common cases;
  * this is the backstop for the ones they don't.
  */
-export const MAX_HOLD_MS = 120_000
+export const MAX_HOLD_MS = 3_600_000
 
 /** Every modifier code, by the modifier FAMILY it belongs to. */
 const MODIFIER_FAMILY: Record<string, 'alt' | 'ctrl' | 'meta' | 'shift'> = {

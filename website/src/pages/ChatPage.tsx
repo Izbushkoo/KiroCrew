@@ -1931,20 +1931,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         lastDictationAnchorRef.current = anchor
         lastDictationValueRef.current = next
       }, [spliceDictation, rebaseFrozenCaret]),
-      // Semantic endpointing (stt.endpointing) judged the utterance complete:
-      // auto-submit. The composer already holds the streamed transcript via
-      // onPartial, and send() reads inputRef.current + stops the live capture
-      // itself (its recording+streaming branch), so this is the same path as
-      // pressing Enter mid-dictation — just triggered by the backend verdict.
-      onEndpoint: useCallback(() => {
-        // A manual stop is the user saying "stop capturing", so a backend
-        // endpoint verdict arriving during the drain must not turn that into an
-        // unrequested send. The endpoint flag is what covers a COLD-stream stop,
-        // where no partial landed and the append flag is deliberately left unset
-        // so the close-time final can still deliver the utterance.
-        if (sttDisarmedRef.current || sttAppendDisarmedRef.current || sttEndpointDisarmedRef.current) return
-        sendRef.current?.()
-      }, []),
+      // Semantic endpointing (stt.endpointing) judged the utterance complete.
+      // Previously this auto-submitted, but that prematurely cuts off dictation
+      // when the user pauses mid-sentence to think while composing long messages.
+      // Now we intentionally do nothing on silence endpoints and let the user
+      // submit manually (Enter / send button) when they are actually done.
+      onEndpoint: useCallback(() => {}, []),
     }
   )
   // Keep a ref to the latest `voice` so effects that intentionally omit
