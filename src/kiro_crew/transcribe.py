@@ -422,8 +422,12 @@ def _build_multipart_body(
         ".wav": "audio/wav",
         ".webm": "audio/webm",
         ".flac": "audio/flac",
+        ".oga": "audio/ogg",
     }
-    content_type = mime_map.get(ext, "application/octet-stream")
+    if not ext or ext not in mime_map:
+        ext = ".webm"
+        filename = filename + ".webm"
+    content_type = mime_map.get(ext, "audio/webm")
 
     parts.append(f"--{boundary}\r\n".encode())
     parts.append(
