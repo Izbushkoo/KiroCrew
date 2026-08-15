@@ -2563,18 +2563,17 @@ function ChatInput({
                   voiceRecording ? 'bg-danger-subtle text-danger animate-pulse' : voiceTranscribing ? 'bg-accent-subtle text-accent' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'
                 } disabled:opacity-30`}
                 onClick={(e) => { e.preventDefault(); e.stopPropagation() }}
-                onPointerDown={(e) => {
+                onTouchStart={(e) => {
                   e.preventDefault()
                   e.stopPropagation()
                   onVoicePrewarm?.()
-                  // Blur active input so soft keyboard collapses on mobile
                   if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
                   if (!voiceRecording) {
                     onVoiceToggle()
                     holdingMicRef.current = true
                   }
                 }}
-                onPointerUp={(e) => {
+                onTouchEnd={(e) => {
                   e.preventDefault()
                   e.stopPropagation()
                   if (voiceRecording || holdingMicRef.current) {
@@ -2582,7 +2581,7 @@ function ChatInput({
                   }
                   holdingMicRef.current = false
                 }}
-                onPointerLeave={(e) => {
+                onTouchCancel={(e) => {
                   e.preventDefault()
                   e.stopPropagation()
                   if (voiceRecording || holdingMicRef.current) {
@@ -2590,7 +2589,19 @@ function ChatInput({
                   }
                   holdingMicRef.current = false
                 }}
-                onPointerCancel={(e) => {
+                onMouseDown={(e) => {
+                  if (e.nativeEvent instanceof TouchEvent) return
+                  e.preventDefault()
+                  e.stopPropagation()
+                  onVoicePrewarm?.()
+                  if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
+                  if (!voiceRecording) {
+                    onVoiceToggle()
+                    holdingMicRef.current = true
+                  }
+                }}
+                onMouseUp={(e) => {
+                  if (e.nativeEvent instanceof TouchEvent) return
                   e.preventDefault()
                   e.stopPropagation()
                   if (voiceRecording || holdingMicRef.current) {
@@ -2598,10 +2609,15 @@ function ChatInput({
                   }
                   holdingMicRef.current = false
                 }}
-                onMouseDown={(e) => { e.preventDefault(); e.stopPropagation() }}
-                onMouseUp={(e) => { e.preventDefault(); e.stopPropagation() }}
-                onTouchStart={(e) => { e.preventDefault(); e.stopPropagation() }}
-                onTouchEnd={(e) => { e.preventDefault(); e.stopPropagation() }}
+                onMouseLeave={(e) => {
+                  if (e.nativeEvent instanceof TouchEvent) return
+                  e.preventDefault()
+                  e.stopPropagation()
+                  if (voiceRecording || holdingMicRef.current) {
+                    onVoiceToggle()
+                  }
+                  holdingMicRef.current = false
+                }}
                 onContextMenu={(e) => { e.preventDefault() }}
                 disabled={disabled || voiceTranscribing || optimizing}
                 aria-label={voiceRecording ? i18nT('components.chatInput.stop_recording') : voiceTranscribing ? i18nT('components.chatInput.transcribing') : i18nT('components.chatInput.voice_input')}
