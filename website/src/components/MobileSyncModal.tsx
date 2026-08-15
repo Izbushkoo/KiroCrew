@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { motion, useReducedMotion } from 'framer-motion'
-import { X, Copy, Check, Smartphone, Wifi, Globe } from 'lucide-react'
+import { X, Copy, Check, Smartphone, Wifi, Globe, Loader2 } from 'lucide-react'
 import { QRCodeSVG } from 'qrcode.react'
 import { useTranslation } from 'react-i18next'
 
@@ -11,61 +11,102 @@ import SegmentedControl, { type Segment } from './SegmentedControl'
 
 type NetworkMode = 'global' | 'local'
 
+interface MobileSyncLocalInfo {
+  host: string
+  port: number
+  token: string
+}
+
+interface MobileSyncTunnelInfo {
+  url: string
+  token: string
+}
+
+interface MobileSyncResponse {
+  local: MobileSyncLocalInfo
+  tunnel: MobileSyncTunnelInfo | null
+  token: string
+  tunnel_active: boolean
+}
+
 interface MobileSyncModalProps {
-  /** Current authentication token appended to the sync URL. */
-  authToken: string
-  /** LAN IP address for local Wi-Fi mode (e.g. "192.168.1.42"). */
-  lanIp?: string
-  /** Cloudflare Tunnel hostname for global mode (e.g. "crew.example.com"). */
-  tunnelHost?: string
-  /** Gateway port (defaults to 5476). */
-  port?: number
   onClose: () => void
 }
 
 /**
  * Modal dialog for Android Mobile Sync.
  *
- * Displays a QR code encoding the dashboard URL with an auth token so a mobile
- * device can scan and open it directly. A tab switcher toggles between a global
- * (4G/5G via Cloudflare Tunnel) URL and a local (Wi-Fi LAN IP) URL. Includes a
- * copy-link button and Android "Add to Home Screen" installation instructions.
+ * On mount, fetches `/api/system/mobile-sync` to obtain the LAN IP, tunnel URL,
+ * and a fresh auth token. Displays a QR code encoding the dashboard URL so a
+ * mobile device can scan and open it directly. A tab switcher toggles between a
+ * global (4G/5G via Cloudflare Tunnel) URL and a local (Wi-Fi LAN IP) URL.
+ * Includes a copy-link button and Android "Add to Home Screen" instructions.
+ *
+ * Never falls back to 'localhost' — smartphones cannot connect to it.
  */
-export default function MobileSyncModal({
-  authToken,
-  lanIp,
-  tunnelHost,
-  port = 5476,
-  onClose,
-}: MobileSyncModalProps) {
+export default function MobileSyncModal({ onClose }: MobileSyncModalProps) {
   const { t } = useTranslation()
   const dialogRef = useRef<HTMLDivElement>(null)
   const reduceMotion = useReducedMotion()
-  const [mode, setMode] = useState<NetworkMode>(tunnelHost ? 'global' : 'local')
+  const [syncData, setSyncData] = useState<MobileSyncResponse | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [mode, setMode] = useState<NetworkMode>('local')
   const [copied, setCopied] = useState(false)
   const resetTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useDialogFocusTrap(dialogRef, onClose)
 
-  useEffect(
-    () => () => {
-      if (resetTimer.current) clearTimeout(resetTimer.current)
-    },
-    [],
-  )
+  useEffect(() => {
+    let cancelled = false
 
-  const syncUrl =
-    mode === 'global' && tunnelHost
-      ? `https://${tunnelHost}?token=${encodeURIComponent(authToken)}`
-      : `http://${lanIp ?? 'localhost'}:${port}?token=${encodeURIComponent(authToken)}`
+    async function fetchSyncInfo() {
+      try {
+        const resp = await fetch('/api/system/mobile-sync')
+        if (!resp.ok) {
+          throw new Error(`HTTP ${resp.status}`)
+        }
+        const data: MobileSyncResponse = await resp.json()
+        if (cancelled) return
+
+        setSyncData(data)
+        setMode(data.tunnel_active && data.tunnel ? 'global' : 'local')
+      } catch (err) {
+        if (cancelled) return
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+
+    fetchSyncInfo()
+
+    return () => {
+      cancelled = true
+      if (resetTimer.current) clearTimeout(resetTimer.current)
+    }
+  }, [])
+
+  // Construct the sync URL from fetched data — never uses 'localhost'.
+  const syncUrl = (() => {
+    if (!syncData) return ''
+    const { local, tunnel, token } = syncData
+    if (mode === 'global' && tunnel) {
+      return `${tunnel.url}?token=${encodeURIComponent(token)}`
+    }
+    return `http://${local.host}:${local.port}?token=${encodeURIComponent(token)}`
+  })()
+
+  const tunnelHost = syncData?.tunnel?.url ?? null
+  const lanIp = syncData?.local.host ?? null
 
   const segments: Segment<NetworkMode>[] = [
     {
       key: 'global',
       label: t('components.mobileSyncModal.tab_global'),
       icon: <Globe className="lucide-inline" aria-hidden="true" />,
-      disabled: !tunnelHost,
-      tooltip: tunnelHost
+      disabled: !syncData?.tunnel_active,
+      tooltip: syncData?.tunnel_active
         ? t('components.mobileSyncModal.tab_global_tooltip')
         : t('components.mobileSyncModal.tab_global_disabled'),
     },
@@ -130,63 +171,75 @@ export default function MobileSyncModal({
           </button>
         </div>
 
-        {/* Tab switcher */}
-        <div className="flex justify-center px-5 pb-4">
-          <SegmentedControl
-            segments={segments}
-            value={mode}
-            onChange={setMode}
-            layoutId="mobile-sync-mode"
-            collapse={false}
-          />
-        </div>
-
-        {/* QR code */}
-        <div className="flex justify-center px-5 pb-4">
-          <div className="rounded-lg bg-white p-4" aria-label={t('components.mobileSyncModal.qr_label')}>
-            <QRCodeSVG
-              value={syncUrl}
-              size={200}
-              level="M"
-              includeMargin={false}
-            />
+        {loading ? (
+          <div className="flex justify-center items-center py-12">
+            <Loader2 className="lucide-inline animate-spin text-muted" aria-hidden="true" />
           </div>
-        </div>
+        ) : error ? (
+          <div className="px-5 pb-5 text-sm text-error">
+            {t('components.mobileSyncModal.fetch_error', { error })}
+          </div>
+        ) : (
+          <>
+            {/* Tab switcher */}
+            <div className="flex justify-center px-5 pb-4">
+              <SegmentedControl
+                segments={segments}
+                value={mode}
+                onChange={setMode}
+                layoutId="mobile-sync-mode"
+                collapse={false}
+              />
+            </div>
 
-        {/* URL display + copy */}
-        <div className="mx-5 mb-4 flex items-center gap-2 rounded-lg border border-border bg-bg-elevated px-3 py-2">
-          <code className="flex-1 truncate text-[12px] text-muted font-mono">
-            {syncUrl}
-          </code>
-          <button
-            type="button"
-            aria-label={
-              copied
-                ? t('components.mobileSyncModal.copied')
-                : t('components.mobileSyncModal.copy_link')
-            }
-            className="shrink-0 p-1.5 rounded-md text-muted hover:text-text hover:bg-bg-hover transition-colors cursor-pointer border-none bg-transparent"
-            onClick={handleCopy}
-          >
-            {copied ? (
-              <Check className="lucide-inline text-ok" aria-hidden="true" />
-            ) : (
-              <Copy className="lucide-inline" aria-hidden="true" />
-            )}
-          </button>
-        </div>
+            {/* QR code */}
+            <div className="flex justify-center px-5 pb-4">
+              <div className="rounded-lg bg-white p-4" aria-label={t('components.mobileSyncModal.qr_label')}>
+                <QRCodeSVG
+                  value={syncUrl}
+                  size={200}
+                  level="M"
+                  includeMargin={false}
+                />
+              </div>
+            </div>
 
-        {/* Android installation instructions */}
-        <div className="mx-5 mb-5 rounded-lg border border-border bg-bg-elevated px-4 py-3">
-          <h3 className="text-[12px] font-semibold text-text-strong mb-2">
-            {t('components.mobileSyncModal.install_title')}
-          </h3>
-          <ol className="list-decimal list-inside text-[12px] text-muted space-y-1.5 leading-relaxed">
-            <li>{t('components.mobileSyncModal.install_step_1')}</li>
-            <li>{t('components.mobileSyncModal.install_step_2')}</li>
-            <li>{t('components.mobileSyncModal.install_step_3')}</li>
-          </ol>
-        </div>
+            {/* URL display + copy */}
+            <div className="mx-5 mb-4 flex items-center gap-2 rounded-lg border border-border bg-bg-elevated px-3 py-2">
+              <code className="flex-1 truncate text-[12px] text-muted font-mono">
+                {syncUrl}
+              </code>
+              <button
+                type="button"
+                aria-label={
+                  copied
+                    ? t('components.mobileSyncModal.copied')
+                    : t('components.mobileSyncModal.copy_link')
+                }
+                className="shrink-0 p-1.5 rounded-md text-muted hover:text-text hover:bg-bg-hover transition-colors cursor-pointer border-none bg-transparent"
+                onClick={handleCopy}
+              >
+                {copied ? (
+                  <Check className="lucide-inline text-ok" aria-hidden="true" />
+                ) : (
+                  <Copy className="lucide-inline" aria-hidden="true" />
+                )}
+              </button>
+            </div>
+
+            {/* Android installation instructions */}
+            <div className="mx-5 mb-5 rounded-lg border border-border bg-bg-elevated px-4 py-3">
+              <h3 className="text-[12px] font-semibold text-text-strong mb-2">
+                {t('components.mobileSyncModal.install_title')}
+              </h3>
+              <ol className="list-decimal list-inside text-[12px] text-muted space-y-1.5 leading-relaxed">
+                <li>{t('components.mobileSyncModal.install_step_1')}</li>
+                <li>{t('components.mobileSyncModal.install_step_2')}</li>
+                <li>{t('components.mobileSyncModal.install_step_3')}</li>
+              </ol>
+            </div>
+          </>
+        )}
       </motion.div>
     </motion.div>,
     document.body,

@@ -2155,7 +2155,7 @@ export default function App() {
       <UpdateModal />
 
       {mobileSyncModalOpen && (
-        <MobileSyncModal authToken={new URLSearchParams(window.location.search).get('token') || ''} onClose={() => setMobileSyncModalOpen(false)} />
+        <MobileSyncModal onClose={() => setMobileSyncModalOpen(false)} />
       )}
 
       {/* First-run modal chrome mounted ONCE (scrim + accent panel + floating

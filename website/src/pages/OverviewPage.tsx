@@ -261,7 +261,6 @@ export default function OverviewPage() {
 
       {mobileSyncOpen && (
         <MobileSyncModal
-          authToken={new URLSearchParams(window.location.search).get('token') || ''}
           onClose={() => setMobileSyncOpen(false)}
         />
       )}
