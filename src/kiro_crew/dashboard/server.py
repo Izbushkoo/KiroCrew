@@ -553,7 +553,7 @@ _BASE_CSP = (
     # preview to "server stopped responding" and unmounted the iframe. The
     # probe is no-cors, so no response data is ever readable — this admits the
     # reachability check only, and to the same origins frame-src already allows.
-    "connect-src 'self' ws://localhost:* ws://127.0.0.1:* "
+    "connect-src 'self' wss: ws: ws://localhost:* ws://127.0.0.1:* "
     "https://esm.sh{connect_src_extra}; "
     "media-src 'self' blob:; "
     "worker-src 'self' blob:; "
