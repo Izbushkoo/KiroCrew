@@ -1229,6 +1229,7 @@ def set_orch_cfg(cfg: KiroCrewConfig) -> None:
     # would otherwise reach synthesis and be re-serialized as non-RFC JSON,
     # breaking the dashboard's config GET.
     _vc.piper_length_scale = _validate_length_scale(_vr.get("piper_length_scale", 1.0))
+    _vc.openai_api_key = _vr.get("openai_api_key", "")
 
 
 def set_dashboard_state(state: object) -> None:
