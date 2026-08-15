@@ -30,6 +30,7 @@ from kiro_crew import platform_compat
 from kiro_crew.acp._dispatch import (
     build_session_new_params,
     parse_session_modes,
+    redact_text,
     set_mode_params,
 )
 from kiro_crew.acp.client import (
@@ -72,10 +73,12 @@ from kiro_crew.acp.types import (
     METHOD_MCP_OAUTH_REQUEST,
     METHOD_MCP_SERVER_INIT_FAILURE,
     METHOD_MCP_SERVER_INITIALIZED,
+    METHOD_REQUEST_PERMISSION,
     METHOD_SESSION_LOAD,
     METHOD_SESSION_NEW,
     METHOD_SESSION_TERMINATE,
     METHOD_SET_MODE,
+    METHOD_SUBAGENT_LIST_UPDATE,
     JsonRpcMessage,
     JsonRpcRequest,
 )
@@ -236,6 +239,35 @@ _DROP_NO_SESSION = "-"
 # string: an absent `method`, or a value of the wrong JSON type (see
 # _drop_key_part).
 _DROP_KEY_PLACEHOLDER = "?"
+
+
+def _reject_option_id(params: dict) -> str | None:
+    """The least-destructive reject optionId a permission request advertises.
+
+    Used when auto-answering a ``session/request_permission`` for a session
+    this client never registered (a backend-internal subagent). Prefer the
+    request's own ``reject_once``-kind option; fall back to a legacy id that
+    names reject. ``None`` means the caller must answer with the ``cancelled``
+    outcome instead — kiro-cli maps that to cancelling the child's turn, which
+    is strictly worse than a per-tool reject, so this is the last resort.
+    """
+    raw = params.get("options")
+    if not isinstance(raw, list):
+        return None
+    options = [o for o in raw if isinstance(o, dict)]
+    for want_kind in ("reject_once", "reject_always"):
+        for opt in options:
+            opt_id = opt.get("optionId") or opt.get("id")
+            if opt.get("kind") == want_kind and isinstance(opt_id, str) and opt_id:
+                return opt_id
+    # Legacy kiro payloads omit `kind` — match well-known reject ids only, so
+    # an allow option can never be picked by accident.
+    for opt in options:
+        opt_id = opt.get("optionId") or opt.get("id")
+        if isinstance(opt_id, str) and opt_id in ("reject_once", "reject_always", "reject"):
+            return opt_id
+    return None
+
 
 KIRO_CLI_BIN = "kiro-cli"
 KIRO_CLI_SUBCMD = "acp"
@@ -644,6 +676,16 @@ class AcpRuntime:
         # dict needs no lock — asyncio.ensure_future(self._reader_loop()) is
         # called exactly once, in spawn(), and never re-entered.
         self._dropped_frames: dict[tuple[str, str], int] = {}
+        # In-flight SEL audit tasks for auto-rejected permission requests;
+        # held only to keep them alive (see _answer_unroutable_permission).
+        self._audit_tasks: set[asyncio.Task] = set()
+        # Backend-internal subagent session ids, snapshotted from each
+        # `_kiro.dev/subagent/list_update` frame (a FULL list every time, so
+        # replacement — not accumulation — keeps it bounded and current).
+        # Membership proves an unregistered sessionId is a real backend child,
+        # which is what authorizes routing its permission requests to a
+        # registered session's consumer instead of auto-rejecting.
+        self._subagent_sessions: set[str] = set()
         self._dropped_frames_flushed_at: float = 0.0
 
     @property
@@ -1096,6 +1138,100 @@ class AcpRuntime:
 
     # ── Reader Task (single owner of stdout) ──
 
+    def _snapshot_subagent_sessions(self, params: dict) -> None:
+        """Replace the known backend-subagent session-id set from a list_update.
+
+        The frame carries the backend's FULL current subagent list (kiro-cli
+        rebuilds it from `orchestrated_sessions` on every change), so replacing
+        the set keeps it bounded and self-cleaning: terminated children vanish
+        from the next update. Ids are backend-controlled — length-capped and
+        type-checked so a hostile payload cannot grow memory unboundedly.
+        """
+        raw = params.get("subagents")
+        if not isinstance(raw, list):
+            return
+        ids: set[str] = set()
+        for entry in raw[:256]:
+            if not isinstance(entry, dict):
+                continue
+            sid = entry.get("sessionId") or entry.get("session_id")
+            if isinstance(sid, str) and sid and len(sid) <= 128:
+                ids.add(sid)
+        self._subagent_sessions = ids
+
+    async def _answer_unroutable_permission(self, msg: JsonRpcMessage, session_id: str) -> None:
+        """Answer a permission REQUEST for a session with no registered queue.
+
+        The ACP contract for a server→client request is that the client always
+        replies; kiro-cli's own TUI answers even unowned-session permission
+        requests (``cancelled``) rather than dropping them. Auto-reject is
+        deliberate and conservative: never auto-approve here — no policy engine
+        has seen this tool call, and an approve would grant an invisible
+        escalation. Per-frame WARNING is safe (unlike the drop counter's flood
+        case): each request corresponds to one pending tool approval and the
+        backend cannot re-emit it without a new turn.
+        """
+        params = msg.params if isinstance(msg.params, dict) else {}
+        option_id = _reject_option_id(params)
+        if option_id is not None:
+            result = {"outcome": {"outcome": "selected", "optionId": option_id}}
+        else:
+            result = {"outcome": {"outcome": "cancelled"}}
+        tool_call = params.get("toolCall")
+        raw_title = tool_call.get("title") if isinstance(tool_call, dict) else None
+        # The title is backend/LLM-authored and may embed a credential-bearing
+        # command line — redact BEFORE truncating (truncation first could clip
+        # a secret mid-token so the redaction patterns no longer match, leaking
+        # a credential prefix into the logs).
+        title = redact_text(str(raw_title))[:120] if raw_title else "<unknown>"
+        logger.warning(
+            "auto-rejected permission request id=%s for unregistered session %s "
+            "(tool: %s): no surface on this client can answer it; answering with "
+            "%s so the backend subagent gets a tool error instead of hanging",
+            msg.id,
+            session_id,
+            title,
+            result["outcome"]["outcome"],
+        )
+        try:
+            await self.send_response(msg.id, result)
+        except AcpRuntimeDead:
+            # Runtime died mid-answer; the backend's wait dies with it.
+            return
+        # Every permission decision is SEL-audited (repo convention; the
+        # dashboard deny path does the same). Audited AFTER the response and
+        # OFF the reader task: sel() may do blocking filesystem work on first
+        # use (e.g. Windows ACLs), and this coroutine runs inline in the
+        # single-owner reader — blocking here stalls every multiplexed
+        # session. The decision is already "deny", so an audit failure must
+        # not undo or delay it; the failure is swallowed after logging.
+        # Lazy import: runtime is low-level and a module-level import of
+        # kiro_crew.sel would be circular (same pattern as sandbox.py).
+        request_id = msg.id if isinstance(msg.id, (str, int)) else ""
+
+        def _audit() -> None:
+            try:
+                from kiro_crew.sel import sel
+
+                sel().log_tool_invocation(
+                    session_key=f"acp:{session_id}",
+                    agent="kirocrew",
+                    source="acp_runtime",
+                    tool_name=title,
+                    outcome="denied",
+                    request_id=request_id,
+                    error="unregistered_session_auto_reject",
+                )
+            except Exception:
+                logger.exception("SEL audit for auto-rejected permission failed")
+
+        audit_task = asyncio.ensure_future(asyncio.to_thread(_audit))
+        # Retain the task so it cannot be garbage-collected mid-flight; the
+        # done callback drops the reference and surfaces nothing (audit
+        # failures are already logged inside _audit).
+        self._audit_tasks.add(audit_task)
+        audit_task.add_done_callback(self._audit_tasks.discard)
+
     def _note_dropped_frame(self, session_id: object, method: object) -> None:
         """Count one unroutable frame, flushing a summary at most once per interval.
 
@@ -1301,6 +1437,11 @@ class AcpRuntime:
 
                 # Route notifications by sessionId
                 session_id = (msg.params or {}).get("sessionId")
+                if not session_id and msg.is_method(METHOD_SUBAGENT_LIST_UPDATE):
+                    # Snapshot backend-internal subagent session ids before the
+                    # broadcast below delivers the frame to the UI consumers.
+                    # Each frame carries the FULL current list, so replace.
+                    self._snapshot_subagent_sessions(msg.params or {})
                 if session_id:
                     # A frame tagged with a sessionId belongs to exactly one
                     # session. Route to it if registered; otherwise DROP it.
@@ -1309,6 +1450,38 @@ class AcpRuntime:
                     queue = self._session_queues.get(session_id)
                     if queue is not None:
                         await queue.put(msg)
+                    elif msg.id is not None and msg.is_method(METHOD_REQUEST_PERMISSION):
+                        # A server→client REQUEST for a session this client never
+                        # created: a backend-internal subagent (e.g. kiro-cli's
+                        # own `subagent` tool) escalating a tool approval. Unlike
+                        # a notification, dropping a REQUEST strands the
+                        # backend's response oneshot — the child's whole tool
+                        # batch then wedges in WaitingForApproval until process
+                        # teardown (observed: a 2h crew stall, 2026-08-15, 13
+                        # approvals hung invisibly).
+                        #
+                        # A sessionId the backend itself announced via
+                        # `subagent/list_update` is routed to the slot's primary
+                        # session queue, so the child's approval flows through
+                        # the SAME policy pipeline as a main-agent one (security
+                        # gate, trust-mode handling, dashboard card). Routing is
+                        # only safe when the mapping is UNAMBIGUOUS: exactly one
+                        # registered session on this runtime (the dashboard-slot
+                        # shape, and the incident's). With several registered
+                        # sessions (session-sharing crew runtimes) the frame
+                        # carries nothing that names the right consumer, and an
+                        # arbitrary pick could hand the decision to a sibling
+                        # with different policy — so fail closed instead.
+                        target = (
+                            next(iter(self._session_queues.values()))
+                            if session_id in self._subagent_sessions
+                            and len(self._session_queues) == 1
+                            else None
+                        )
+                        if target is not None:
+                            await target.put(msg)
+                        else:
+                            await self._answer_unroutable_permission(msg, session_id)
                     elif self._session_inits_in_flight and (
                         msg.is_method(METHOD_MCP_OAUTH_REQUEST)
                         or msg.is_method(METHOD_MCP_SERVER_INITIALIZED)

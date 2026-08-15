@@ -5141,6 +5141,23 @@ class SubagentManager:
                         client, event.request_id, session_key, event, error="hook_deny"
                     )
                     continue
+                if event.sub_session_id:
+                    # Backend-internal child origin (runtime-routed): the
+                    # per-toolCallId command/shell caches never saw this
+                    # child's tool_call frames, so any APPROVE here would rest
+                    # on the LLM-authored title alone. The dashboard consumer
+                    # downgrades such approvals to its interactive card; this
+                    # consumer is headless — there is no card — so fail closed
+                    # before any approve branch (hook auto-approve or
+                    # parent_policy auto) can fire.
+                    await self._reject_and_log(
+                        client,
+                        event.request_id,
+                        session_key,
+                        event,
+                        error="child_origin_no_command_context",
+                    )
+                    continue
                 if tool_result.action == TOOL_AUTO_APPROVE:
                     await self._approve_and_log(
                         client,

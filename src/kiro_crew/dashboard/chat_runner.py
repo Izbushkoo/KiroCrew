@@ -152,8 +152,10 @@ from kiro_crew.hooks import (
     HOOK_EVENT_PRE_TOOL_USE,
     HOOK_EVENT_STOP,
     HOOK_EVENT_USER_PROMPT_SUBMIT,
+    TOOL_ALLOW,
     TOOL_AUTO_APPROVE,
     TOOL_DENY,
+    ToolHookResult,
     _normalize_tool_name,
     _tool_matches,
     fire_tool_hooks,
@@ -5441,6 +5443,21 @@ async def _run_chat(
                         # fragments, paths, or credentials.
                         _refusal_reasons.append((_deny_title, _deny_msg))
                         continue
+                    if tool_result.action == TOOL_AUTO_APPROVE and event.sub_session_id:
+                        # Backend-subagent origin: the per-toolCallId command/
+                        # shell caches never saw this child's tool_call frames,
+                        # so an auto-approve here would rest on the title alone
+                        # — exactly the benign-title/dangerous-command bypass
+                        # HookManager.on_tool_call warns about. Hard denies
+                        # above already applied; downgrade the APPROVE to the
+                        # interactive card so a human sees the request with the
+                        # same UI a normal-mode main-agent approval gets.
+                        logger.info(
+                            "downgrading auto-approve to interactive card for "
+                            "subagent-session permission request (child=%s)",
+                            event.sub_session_id,
+                        )
+                        tool_result = ToolHookResult(action=TOOL_ALLOW)
                     if tool_result.action == TOOL_AUTO_APPROVE:
                         try:
                             validated_tool = _validate_tool_name(

@@ -5505,3 +5505,370 @@ async def test_send_and_await_timeout_error_names_the_budget():
     assert "timed out" in msg
     assert "0.01s" in msg
     assert "probe/method" in msg
+
+
+# ── Unroutable permission requests (backend-internal subagents) ──────────────
+#
+# A `session/request_permission` REQUEST for a sessionId this client never
+# registered comes from a backend-internal subagent (e.g. kiro-cli's own
+# `subagent` tool). Dropping it strands the backend's response oneshot and
+# wedges the child's whole tool batch until process teardown — the 2026-08-15
+# crew incident hung 13 such approvals for 2 hours. These tests pin the fix:
+# the runtime answers the request itself, with the request's own reject
+# option, and never counts it as a dropped frame.
+
+
+def _last_written_frame(proc) -> dict:
+    """The most recent JSON frame written to the fake process stdin."""
+    assert proc.stdin.write.call_args is not None, "nothing was written to stdin"
+    raw = proc.stdin.write.call_args[0][0]
+    return json.loads(raw.decode())
+
+
+@pytest.fixture(autouse=True)
+def _stub_sel_for_permission_tests(request, monkeypatch):
+    """Stub the SEL for the auto-reject tests in this section.
+
+    The production path fires the audit on a background ``asyncio.to_thread``
+    task; letting it hit the real SEL from unit tests is slow (first-use
+    filesystem setup) and races the test's event-loop teardown ("Event loop is
+    closed" noise on loaded CI shards). Scoped by test-name prefix so the rest
+    of the module keeps its behavior.
+    """
+    if not request.node.name.startswith(
+        ("test_unroutable", "test_registered_session_permission", "test_ambiguous")
+    ):
+        yield
+        return
+    import kiro_crew.sel as sel_mod
+
+    class _StubSel:
+        def log_tool_invocation(self, **kwargs):  # noqa: D401 - stub
+            return None
+
+    monkeypatch.setattr(sel_mod, "sel", lambda: _StubSel())
+    yield
+
+
+async def _drain_audits(rt) -> None:
+    """Await in-flight audit tasks so none outlives the test's event loop."""
+    if rt._audit_tasks:
+        await asyncio.gather(*list(rt._audit_tasks), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_unroutable_permission_request_is_auto_rejected(caplog):
+    """Unknown-session permission REQUEST → answered with its reject option."""
+    import logging
+
+    rt, reader, proc = _make_runtime()
+    task = await _start_reader(rt)
+    try:
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.acp.runtime"):
+            _feed(
+                reader,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 77,
+                    "method": "session/request_permission",
+                    "params": {
+                        "sessionId": "ghost-child",
+                        "toolCall": {"toolCallId": "tc-1", "title": "glob /home"},
+                        "options": [
+                            {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                            {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+                        ],
+                    },
+                },
+            )
+            await _drain(reader)
+
+        frame = _last_written_frame(proc)
+        assert frame["id"] == 77
+        assert frame["result"] == {
+            "outcome": {"outcome": "selected", "optionId": "reject_once"}
+        }
+        # Answered, not dropped: the drop counter must stay empty so the
+        # summary log cannot misattribute an answered request as a drop.
+        assert rt._dropped_frames == {}
+        warnings = [r.getMessage() for r in caplog.records if "ghost-child" in r.getMessage()]
+        assert warnings and "auto-rejected" in warnings[0]
+        assert "glob /home" in warnings[0]
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_unroutable_permission_never_picks_an_allow_option():
+    """A payload with ONLY allow options must answer `cancelled`, never allow."""
+    rt, reader, proc = _make_runtime()
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "jsonrpc": "2.0",
+                "id": 78,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "ghost-child",
+                    "options": [
+                        {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "allow_always", "name": "Always", "kind": "allow_always"},
+                    ],
+                },
+            },
+        )
+        await _drain(reader)
+
+        frame = _last_written_frame(proc)
+        assert frame["id"] == 78
+        assert frame["result"] == {"outcome": {"outcome": "cancelled"}}
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_unroutable_permission_legacy_options_without_kind():
+    """Legacy kiro options omit `kind`; only a well-known reject id matches."""
+    rt, reader, proc = _make_runtime()
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "jsonrpc": "2.0",
+                "id": 79,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "ghost-child",
+                    "options": [
+                        {"optionId": "allow_once", "name": "Allow"},
+                        {"optionId": "reject_once", "name": "Reject"},
+                    ],
+                },
+            },
+        )
+        await _drain(reader)
+
+        frame = _last_written_frame(proc)
+        assert frame["result"]["outcome"] == {"outcome": "selected", "optionId": "reject_once"}
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_registered_session_permission_still_routes_to_queue():
+    """The fix must not intercept permission requests for registered sessions."""
+    rt, reader, proc = _make_runtime()
+    queues = _register(rt, "known-session")
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "jsonrpc": "2.0",
+                "id": 80,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "known-session",
+                    "options": [{"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}],
+                },
+            },
+        )
+        await _drain(reader)
+
+        routed = queues["known-session"].get_nowait()
+        assert routed.id == 80
+        # The runtime did not answer on the session's behalf.
+        proc.stdin.write.assert_not_called()
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_unroutable_non_permission_request_still_drops():
+    """Only permission requests get the auto-answer; other unknown-session
+    frames keep the counted-drop behavior."""
+    rt, reader, proc = _make_runtime()
+    task = await _start_reader(rt)
+    try:
+        _feed(reader, {"method": "session/update", "params": {"sessionId": "ghost"}})
+        await _drain(reader)
+        assert rt._dropped_frames == {("ghost", "session/update"): 1}
+        proc.stdin.write.assert_not_called()
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_subagent_list_update_snapshots_child_ids():
+    """A broadcast list_update replaces the known-child set (full list each time)."""
+    rt, reader, _ = _make_runtime()
+    _register(rt, "parent-session")
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "method": "_kiro.dev/subagent/list_update",
+                "params": {
+                    "subagents": [
+                        {"sessionId": "child-a", "sessionName": "correctness"},
+                        {"sessionId": "child-b", "sessionName": "security"},
+                    ],
+                    "pendingStages": [],
+                },
+            },
+        )
+        await _drain(reader)
+        assert rt._subagent_sessions == {"child-a", "child-b"}
+
+        # Next update omits child-a (terminated) — the set is replaced, not grown.
+        _feed(
+            reader,
+            {
+                "method": "_kiro.dev/subagent/list_update",
+                "params": {"subagents": [{"sessionId": "child-b"}]},
+            },
+        )
+        await _drain(reader)
+        assert rt._subagent_sessions == {"child-b"}
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_known_subagent_permission_routes_to_slot_queue():
+    """A child the backend announced gets the SAME policy pipeline as the main
+    agent: its permission request lands on the slot's session queue instead of
+    being auto-rejected."""
+    rt, reader, proc = _make_runtime()
+    queues = _register(rt, "parent-session")
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "method": "_kiro.dev/subagent/list_update",
+                "params": {"subagents": [{"sessionId": "child-a"}]},
+            },
+        )
+        _feed(
+            reader,
+            {
+                "jsonrpc": "2.0",
+                "id": 90,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "child-a",
+                    "toolCall": {"toolCallId": "tc-9", "title": "glob /home"},
+                    "options": [
+                        {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+                    ],
+                },
+            },
+        )
+        await _drain(reader)
+
+        # list_update broadcast + the routed permission request both arrive.
+        frames = []
+        while not queues["parent-session"].empty():
+            frames.append(queues["parent-session"].get_nowait())
+        assert any(f.id == 90 for f in frames), frames
+        # The runtime did NOT answer it — the slot's consumer owns the decision.
+        proc.stdin.write.assert_not_called()
+        assert rt._dropped_frames == {}
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_unannounced_session_permission_still_auto_rejected():
+    """A sessionId the backend never announced cannot ride the routing path —
+    it keeps the fail-closed auto-reject."""
+    rt, reader, proc = _make_runtime()
+    _register(rt, "parent-session")
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "method": "_kiro.dev/subagent/list_update",
+                "params": {"subagents": [{"sessionId": "child-a"}]},
+            },
+        )
+        _feed(
+            reader,
+            {
+                "jsonrpc": "2.0",
+                "id": 91,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "never-announced",
+                    "options": [
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}
+                    ],
+                },
+            },
+        )
+        await _drain(reader)
+
+        frame = _last_written_frame(proc)
+        assert frame["id"] == 91
+        assert frame["result"]["outcome"] == {"outcome": "selected", "optionId": "reject_once"}
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_multi_session_runtime_falls_back_to_reject():
+    """With several registered sessions the child→consumer mapping is ambiguous
+    — the frame names no owner — so the runtime fails closed instead of handing
+    the approval to an arbitrary sibling's policy."""
+    rt, reader, proc = _make_runtime()
+    queues = _register(rt, "session-one", "session-two")
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "method": "_kiro.dev/subagent/list_update",
+                "params": {"subagents": [{"sessionId": "child-a"}]},
+            },
+        )
+        _feed(
+            reader,
+            {
+                "jsonrpc": "2.0",
+                "id": 92,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "child-a",
+                    "options": [
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}
+                    ],
+                },
+            },
+        )
+        await _drain(reader)
+
+        frame = _last_written_frame(proc)
+        assert frame["id"] == 92
+        assert frame["result"]["outcome"] == {"outcome": "selected", "optionId": "reject_once"}
+        # Neither sibling consumer received the request frame.
+        for q in queues.values():
+            while not q.empty():
+                assert q.get_nowait().id != 92
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)

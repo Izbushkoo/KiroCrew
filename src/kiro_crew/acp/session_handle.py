@@ -2404,6 +2404,16 @@ class AcpSessionHandle:
         )
         if recorded is not None and event.request_id != "":
             self._permission_options[event.request_id] = recorded
+        # A frame the runtime routed here for a backend-internal subagent
+        # carries the CHILD's sessionId, not this handle's. Mark the origin so
+        # the policy consumer can tell reduced-fidelity requests apart: the
+        # per-toolCallId caches above only see slot-owned tool_call frames, so
+        # for a child the command/shell context is absent and an auto-approve
+        # decision would rest on the title alone (chat_runner downgrades those
+        # to the interactive card; hard denies still apply).
+        frame_sid = str((msg.params or {}).get("sessionId") or "")
+        if frame_sid and frame_sid != self._session_id:
+            event.sub_session_id = frame_sid
         return event
 
     def _handle_kas_update(self, session_update: str, update: dict) -> list[AcpEvent] | None:
