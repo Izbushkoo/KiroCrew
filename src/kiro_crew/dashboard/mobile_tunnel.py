@@ -327,19 +327,10 @@ async def start_tunnel(port: int) -> str | None:
         return _tunnel_url
 
     # -----------------------------------------------------------------------
-    # Restore path: gateway restarted but cloudflared is still running in the
-    # background. If a persisted quick-tunnel URL exists and a cloudflared
-    # process is alive, reuse it without killing.
+    # Always start fresh: a persisted quick-tunnel URL may point at a dead
+    # Cloudflare edge (Error 1033) if the process exited ungracefully. Kill
+    # any orphaned cloudflared and proceed to launch a new tunnel.
     # -----------------------------------------------------------------------
-    if _tunnel_process is None:
-        persisted_url = _read_persisted_quick_tunnel_url()
-        if persisted_url and _find_existing_cloudflared_pid() is not None:
-            _tunnel_url = persisted_url
-            logger.info(
-                "Restored tunnel URL from previous session (cloudflared still running): %s",
-                _tunnel_url,
-            )
-            return _tunnel_url
 
     # Tear down any existing tunnel first.
     await stop_tunnel()

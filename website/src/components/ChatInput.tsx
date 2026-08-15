@@ -288,6 +288,10 @@ interface ChatInputProps {
   voiceDeviceSwitchIsLive?: boolean
   voiceTranscribing?: boolean
   onVoiceToggle?: () => void
+  /** Start voice capture — called on press (touch/mouse down). Blurs active input to collapse the keyboard. */
+  onVoiceStart?: () => void
+  /** Stop voice capture — called on release (touch/mouse up, cancel, or leave). */
+  onVoiceStop?: () => void
   /** Cancel (discard) an in-progress dictation without transcribing — Esc. */
   onVoiceCancel?: () => void
   /** Pre-warm the mic on pointer-down so recording starts instantly on click. */
@@ -549,6 +553,8 @@ function ChatInput({
   voiceDeviceSwitchIsLive = false,
   voiceTranscribing = false,
   onVoiceToggle,
+  onVoiceStart,
+  onVoiceStop,
   onVoiceCancel,
   onVoicePrewarm,
   voiceError = null,
@@ -2569,7 +2575,7 @@ function ChatInput({
                   onVoicePrewarm?.()
                   if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
                   if (!voiceRecording) {
-                    onVoiceToggle()
+                    onVoiceStart?.()
                     holdingMicRef.current = true
                   }
                 }}
@@ -2577,7 +2583,7 @@ function ChatInput({
                   e.preventDefault()
                   e.stopPropagation()
                   if (voiceRecording || holdingMicRef.current) {
-                    onVoiceToggle()
+                    onVoiceStop?.()
                   }
                   holdingMicRef.current = false
                 }}
@@ -2585,7 +2591,7 @@ function ChatInput({
                   e.preventDefault()
                   e.stopPropagation()
                   if (voiceRecording || holdingMicRef.current) {
-                    onVoiceToggle()
+                    onVoiceStop?.()
                   }
                   holdingMicRef.current = false
                 }}
@@ -2596,7 +2602,7 @@ function ChatInput({
                   onVoicePrewarm?.()
                   if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
                   if (!voiceRecording) {
-                    onVoiceToggle()
+                    onVoiceStart?.()
                     holdingMicRef.current = true
                   }
                 }}
@@ -2605,7 +2611,7 @@ function ChatInput({
                   e.preventDefault()
                   e.stopPropagation()
                   if (voiceRecording || holdingMicRef.current) {
-                    onVoiceToggle()
+                    onVoiceStop?.()
                   }
                   holdingMicRef.current = false
                 }}
@@ -2614,7 +2620,7 @@ function ChatInput({
                   e.preventDefault()
                   e.stopPropagation()
                   if (voiceRecording || holdingMicRef.current) {
-                    onVoiceToggle()
+                    onVoiceStop?.()
                   }
                   holdingMicRef.current = false
                 }}
