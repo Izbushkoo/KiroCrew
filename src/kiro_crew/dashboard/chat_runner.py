@@ -1035,6 +1035,11 @@ def _attach_turn_stats(
     """
     if elapsed_ms <= 0:
         return
+    # Include any pending OpenAI STT cost accumulated before this turn.
+    pending_stt = getattr(slot, "_pending_stt_cost", 0.0)
+    if pending_stt > 0:
+        cost_usd = cost_usd + pending_stt
+        slot._pending_stt_cost = 0.0
     stats: dict[str, Any] = {"elapsed_ms": int(elapsed_ms)}
     if credits > 0:
         stats["credits"] = round(credits, 4)

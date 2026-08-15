@@ -495,7 +495,20 @@ def _call_openai_transcriptions(audio_path: str, stt_config) -> str | None:  # t
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             resp_body = resp.read()
             data = json.loads(resp_body)
-            return data.get("text", "").strip() or None
+            text_result = data.get("text", "").strip() or None
+            # Estimate STT cost based on file size (~$0.006/min, ~32KB/sec for
+            # typical audio). Minimum 1 second billed.
+            stt_cost = round(max(1.0, file_size / 32000.0) * 0.0001, 6)
+            if hasattr(stt_config, "_pending_stt_cost"):
+                stt_config._pending_stt_cost = round(
+                    getattr(stt_config, "_pending_stt_cost", 0.0) + stt_cost, 6
+                )
+            else:
+                try:
+                    stt_config._pending_stt_cost = stt_cost
+                except AttributeError:
+                    pass
+            return text_result
     except urllib.error.HTTPError as exc:
         error_body = ""
         try:

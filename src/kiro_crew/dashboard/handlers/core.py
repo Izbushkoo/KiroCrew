@@ -1177,6 +1177,21 @@ async def api_stt_transcribe(request: web.Request) -> web.Response:
 
             text, _ = redact_exfiltration_urls(text)
             text, _ = redact_credentials(text)
+
+        # Accumulate OpenAI STT cost estimate on the active slot so it can be
+        # included in the next turn's turn_stats by _attach_turn_stats.
+        from kiro_crew.config.loader import KiroCrewConfig as _Cfg  # noqa: F811
+
+        cfg = _Cfg.load()
+        if getattr(cfg, "stt", None) and getattr(cfg.stt, "provider", "") == "openai":
+            stt_cost = round(max(1.0, size / 32000.0) * 0.0001, 6)
+            state: DashboardState = request.app["state"]
+            slot_key = request.query.get("slot", "")
+            if slot_key and slot_key in state.slots:
+                state.slots[slot_key]._pending_stt_cost = round(
+                    state.slots[slot_key]._pending_stt_cost + stt_cost, 6
+                )
+
         return web.json_response({"text": text or ""})
     except Exception:
         logger.exception("STT transcribe failed")

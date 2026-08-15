@@ -290,6 +290,23 @@ async def _synthesize_nonstreaming(
             "voice_complete",
             {"slot": slot_key, "audio": audio_b64, "chunks": 1},
         )
+
+        # Track OpenAI TTS cost on the last assistant message's turn_stats.
+        if _vc.provider == PROVIDER_OPENAI and slot_key:
+            effective_engine = engine or _vc.default_engine
+            per_char = 0.000030 if effective_engine == "tts-1-hd" else 0.000015
+            tts_cost = round(len(text) * per_char, 6)
+            slot = state.slots.get(slot_key)
+            if slot and tts_cost > 0:
+                for m in reversed(slot.messages):
+                    if m.get("role") == "assistant":
+                        meta = m.setdefault("meta", {})
+                        ts = meta.setdefault("turn_stats", {})
+                        ts["cost_usd"] = round(
+                            ts.get("cost_usd", 0.0) + tts_cost, 6
+                        )
+                        break
+
         return web.json_response({"ok": True, "chunks": 1})
     except Exception as exc:
         logger.exception("%s voice synthesis failed", _vc.provider)

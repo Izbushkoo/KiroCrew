@@ -1901,10 +1901,11 @@ export const api = {
     language_code?: string
   }) => put('/api/config/stt', body).then(j),
   sttInstall: () => post('/api/stt/install').then(j),
-  sttTranscribe: (blob: Blob, ext = 'webm') => {
+  sttTranscribe: (blob: Blob, ext = 'webm', slot = '') => {
     const fd = new FormData()
     fd.append('audio', blob, `recording.${ext}`)
-    return fetch('/api/stt/transcribe', { method: 'POST', body: fd }).then(j)
+    const qs = slot ? `?slot=${encodeURIComponent(slot)}` : ''
+    return fetch(`/api/stt/transcribe${qs}`, { method: 'POST', body: fd }).then(j)
   },
   // Chat
   pullRequestSource: (url: string, refresh = false) => post('/api/source/pull-request', { url, refresh }).then(j) as Promise<PullRequestSource>,

@@ -1022,6 +1022,7 @@ class _ChatSlot:
         "_wait_last_ping",
         "_wait_contested",
         "_question_pending",
+        "_pending_stt_cost",
     )
 
     def __init__(
@@ -1468,6 +1469,7 @@ class _ChatSlot:
         # "the agent is done and asked you something", and which entries a user
         # message may retire.
         self._question_pending: dict[str, dict] = {}
+        self._pending_stt_cost: float = 0.0
 
     @property
     def _dirty(self) -> bool:

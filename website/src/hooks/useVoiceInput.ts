@@ -337,7 +337,7 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null) =
         if (blob.size < 100) { setSessionOwner(null); return }
         setTranscribing(true)
         try {
-          const res = await api.sttTranscribe(blob, ext)
+          const res = await api.sttTranscribe(blob, ext, sessionAtStart || '')
           if (res.error) {
             // eslint-disable-next-line no-console -- surface STT failures for debugging
             console.error('[voice] STT error:', res.error)

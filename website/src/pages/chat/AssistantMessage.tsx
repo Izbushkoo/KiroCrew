@@ -244,9 +244,10 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
         {(() => {
           const credits = turnStats.credits ?? 0
           const cost = turnStats.cost_usd ?? 0
-          const billed = credits > 0
-            ? `${fmtCredits(credits)} credits`
-            : cost > 0 ? `$${cost.toFixed(cost < 0.01 ? 4 : 2)}` : ''
+          const items: string[] = []
+          if (credits > 0) items.push(`${fmtCredits(credits)} credits`)
+          if (cost > 0) items.push(`OpenAI $${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(2)}`)
+          const billed = items.join(' · ')
           return <>
             {/* Model leads (what served), then cost (what it took), then time.
                 Trimmed for width; the untrimmed id is in the footer tooltip. */}
