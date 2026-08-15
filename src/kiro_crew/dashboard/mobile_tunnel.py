@@ -227,12 +227,12 @@ async def ensure_cloudflared() -> Path:
 async def start_tunnel(port: int) -> str | None:
     """Launch a cloudflared tunnel pointing at the local dashboard port.
 
-    If a persistent tunnel token file exists at
-    ``~/.kiro/crew/cloudflare_tunnel_token``, runs ``cloudflared tunnel run``
-    with that token (a named tunnel). Otherwise falls back to a quick-tunnel
-    (trycloudflare.com). When a custom domain file exists at
-    ``~/.kiro/crew/cloudflare_tunnel_domain``, its content is used as the
-    tunnel URL instead of parsing stdout.
+    Uses named tunnel mode (``cloudflared tunnel run --token``) only when BOTH
+    a persistent tunnel token (``~/.kiro/crew/cloudflare_tunnel_token``) AND a
+    custom domain file (``~/.kiro/crew/cloudflare_tunnel_domain``) are present.
+    In all other cases — including when only the token is present — falls back
+    to quick-tunnel mode which auto-generates a trycloudflare.com URL. The
+    persistent 1-year mobile auth token is used in both modes.
 
     Returns the URL on success or ``None`` on failure.
     """
@@ -250,8 +250,10 @@ async def start_tunnel(port: int) -> str | None:
     tunnel_token = _read_persistent_tunnel_token()
     custom_domain = _read_custom_domain()
 
-    if tunnel_token:
-        # Named tunnel mode: use the persistent token.
+    if tunnel_token and custom_domain:
+        # Named tunnel mode: requires both a persistent token AND a custom
+        # domain. The domain provides the known URL since named tunnels do not
+        # emit a trycloudflare.com URL on stdout.
         cmd = [
             str(binary),
             "tunnel",
@@ -262,7 +264,14 @@ async def start_tunnel(port: int) -> str | None:
         ]
         logger.info("Starting cloudflared named tunnel (persistent token)")
     else:
-        # Quick-tunnel mode (ephemeral trycloudflare.com URL).
+        # Quick-tunnel mode (ephemeral trycloudflare.com URL). Used when no
+        # tunnel token is configured, or when a token exists without a
+        # corresponding custom domain file.
+        if tunnel_token and not custom_domain:
+            logger.info(
+                "Tunnel token present but no custom domain configured; "
+                "falling back to quick-tunnel mode"
+            )
         cmd = [
             str(binary),
             "tunnel",
@@ -279,12 +288,11 @@ async def start_tunnel(port: int) -> str | None:
     _tunnel_process = proc
 
     if tunnel_token and custom_domain:
-        # For named tunnels with a custom domain, the URL is known in advance.
+        # For named tunnels the URL is known in advance from the domain file.
         _tunnel_url = custom_domain if custom_domain.startswith("https://") else f"https://{custom_domain}"
         logger.info("Cloudflare named tunnel active with custom domain: %s", _tunnel_url)
     else:
-        # Parse the URL from cloudflared output (quick-tunnel or named tunnel
-        # without a custom domain file).
+        # Parse the auto-generated trycloudflare.com URL from process output.
         url = await _read_tunnel_url(proc)
         if url:
             _tunnel_url = url
