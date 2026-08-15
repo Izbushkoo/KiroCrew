@@ -490,7 +490,7 @@ async def synthesize_speech(
         plain = strip_markdown(text).strip()
         if not plain:
             return None
-        return _synthesize_openai(plain)
+        return _synthesize_openai(plain, voice=voice_id or 'alloy', model=engine or 'tts-1')
     logger.error("synthesize_speech: unknown provider %r", provider)
     return None
 
