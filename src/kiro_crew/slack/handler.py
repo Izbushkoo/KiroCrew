@@ -541,6 +541,8 @@ class _VoiceConfig:
     piper_model: str = ""
     piper_model_config: str = ""
     piper_length_scale: float = 1.0
+    # OpenAI TTS API key (used when provider="openai"):
+    openai_api_key: str = ""
     # If True, a message carrying voice input (a transcribed voice memo)
     # automatically receives a voice reply, even without `!voice on`. The
     # config-load default follows ``enabled`` (see ``set_orch_cfg``); the
@@ -1399,6 +1401,7 @@ async def _safe_voice_reply(
             piper_model=_vc.piper_model,
             piper_model_config=_vc.piper_model_config,
             length_scale=_vc.piper_length_scale,
+            openai_api_key=_vc.openai_api_key,
         )
     except Exception:
         logger.debug("Voice reply failed", exc_info=True)

@@ -55,6 +55,7 @@ async def api_voice_config(request: web.Request) -> web.Response:
                 "piper_model": _vc.piper_model,
                 "piper_model_config": _vc.piper_model_config,
                 "piper_length_scale": _vc.piper_length_scale,
+                "openai_api_key": getattr(_vc, 'openai_api_key', ''),
             }
         )
 
@@ -98,6 +99,8 @@ async def api_voice_config(request: web.Request) -> web.Response:
         # inf/NaN, and <=0) so a bad value can't reach synthesis or be persisted
         # as unserializable JSON that breaks the browser's config GET.
         _vc.piper_length_scale = validate_length_scale(body["piper_length_scale"])
+    if "openai_api_key" in body:
+        _vc.openai_api_key = str(body["openai_api_key"]).strip()
 
     # Persist to config.json. MERGE into the existing voice_reply block rather
     # than rewriting it wholesale — the loader (slack/handler.py) also reads
@@ -124,6 +127,7 @@ async def api_voice_config(request: web.Request) -> web.Response:
                 "piper_model": _vc.piper_model,
                 "piper_model_config": _vc.piper_model_config,
                 "piper_length_scale": _vc.piper_length_scale,
+                "openai_api_key": _vc.openai_api_key,
             }
         )
         cfg["voice_reply"] = vr
@@ -256,6 +260,7 @@ async def _synthesize_nonstreaming(
             piper_model=_vc.piper_model,
             piper_model_config=_vc.piper_model_config,
             length_scale=_vc.piper_length_scale,
+            openai_api_key=_vc.openai_api_key,
         )
         if not audio_path:
             msg = "Piper TTS unavailable — check the piper binary and model path in Voice settings."

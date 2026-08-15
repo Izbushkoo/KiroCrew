@@ -11,6 +11,7 @@ type VoiceConfig = {
   enabled: boolean; provider: string; voice: string; engine: string; rate: string
   autoSpeak: boolean; aws_profile: string; region: string
   piper_binary: string; piper_model: string; piper_model_config: string; piper_length_scale: number
+  openai_api_key: string
 }
 
 const PROVIDER_OPTIONS = ['piper', 'polly', 'openai']
@@ -76,6 +77,7 @@ export function VoicePanel() {
   const [localRegion, setLocalRegion] = useState('')
   const [localPiperBinary, setLocalPiperBinary] = useState('')
   const [localPiperModel, setLocalPiperModel] = useState('')
+  const [localOpenaiKey, setLocalOpenaiKey] = useState('')
 
   // ── Text-to-Speech config (server-side) ──
   const voiceQ = useQuery<VoiceConfig>({ queryKey: ['voiceConfig'], queryFn: () => api.voiceConfig() })
@@ -92,10 +94,11 @@ export function VoicePanel() {
       setLocalRegion(voiceQ.data.region || '')
       setLocalPiperBinary(voiceQ.data.piper_binary || '')
       setLocalPiperModel(voiceQ.data.piper_model || '')
+      setLocalOpenaiKey(voiceQ.data.openai_api_key || '')
     }
   }, [voiceQ.data])
 
-  const voiceCfg = voiceQ.data ?? { enabled: false, provider: 'piper', voice: 'Ruth', engine: 'generative', rate: '100%', autoSpeak: false, aws_profile: '', region: '', piper_binary: '', piper_model: '', piper_model_config: '', piper_length_scale: 1.0 }
+  const voiceCfg = voiceQ.data ?? { enabled: false, provider: 'piper', voice: 'Ruth', engine: 'generative', rate: '100%', autoSpeak: false, aws_profile: '', region: '', piper_binary: '', piper_model: '', piper_model_config: '', piper_length_scale: 1.0, openai_api_key: '' }
   const isPolly = voiceCfg.provider === 'polly'
   const isOpenai = voiceCfg.provider === 'openai'
   const voiceOptions = voicesQ.data?.voices
@@ -161,6 +164,7 @@ export function VoicePanel() {
                 <>
                   <SettingsSelect label={i18nT('pages.settings.voicePanel.voice')} description="OpenAI TTS voice" value={voiceCfg.voice} options={['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer']} optionLabels={['alloy (Стандартный нейтральный)', 'echo (Мужской тёплый)', 'fable (Выразительный британский)', 'onyx (Глубокий мужской)', 'nova (Энергичный женский)', 'shimmer (Тёплый женский)']} onChange={v => setVoice({ voice: v })} disabled={voiceDisabled} />
                   <SettingsSelect label="Model" description="OpenAI TTS model" value={voiceCfg.engine} options={['tts-1', 'tts-1-hd']} optionLabels={['tts-1 (Стандартная быстрая)', 'tts-1-hd (Высокое качество HD)']} onChange={v => setVoice({ engine: v })} disabled={voiceDisabled} />
+                  <SettingsInput label="OpenAI API Key (TTS)" description="API key for OpenAI text-to-speech" type="password" value={localOpenaiKey} onChange={setLocalOpenaiKey} onBlur={() => setVoice({ openai_api_key: localOpenaiKey.trim() })} placeholder="sk-..." disabled={voiceDisabled} />
                 </>
               ) : (
                 <>

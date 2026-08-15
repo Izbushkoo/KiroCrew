@@ -445,6 +445,8 @@ async def synthesize_speech(
     piper_model: str = "",
     piper_model_config: str = "",
     length_scale: float = 1.0,
+    # OpenAI-specific:
+    openai_api_key: str = "",
 ) -> str | None:
     """Generate audio from *text* using the configured *provider*.
 
@@ -490,7 +492,7 @@ async def synthesize_speech(
         plain = strip_markdown(text).strip()
         if not plain:
             return None
-        return _synthesize_openai(plain, voice=voice_id or 'alloy', model=engine or 'tts-1')
+        return _synthesize_openai(plain, voice=voice_id or 'alloy', model=engine or 'tts-1', openai_api_key=openai_api_key)
     logger.error("synthesize_speech: unknown provider %r", provider)
     return None
 
@@ -769,6 +771,8 @@ async def voice_reply(
     piper_model: str = "",
     piper_model_config: str = "",
     length_scale: float = 1.0,
+    # OpenAI:
+    openai_api_key: str = "",
 ) -> bool:
     """Full pipeline: text → provider synthesis → Slack upload.
 
@@ -788,6 +792,7 @@ async def voice_reply(
         piper_model=piper_model,
         piper_model_config=piper_model_config,
         length_scale=length_scale,
+        openai_api_key=openai_api_key,
     )
     if not audio_path:
         return False
