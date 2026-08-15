@@ -18,7 +18,9 @@ from pathlib import Path
 
 from kiro_crew import __version__ as _mc_version
 from kiro_crew import diagnostics, platform_compat, sandbox
+from kiro_crew.acp import kas_assets, kas_auth
 from kiro_crew.acp.client import KIRO_CLI_BIN
+from kiro_crew.acp.types import ACP_BACKEND_KAS
 from kiro_crew.agent import AGENT_FILENAME
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config import KiroCrewConfig
@@ -946,6 +948,70 @@ def _doctor_headless_auth(issues: list[str]) -> None:
         print(f"{_INDENT}{line.strip()}" if line.strip() else "")
 
 
+def _kas_version_label(script: "Path") -> str:
+    """Derive the extracted-bundle version label from the KAS script path.
+
+    Bundles live at ``{data_dir}/kas/{version}/.../acp-server.js`` (see
+    :mod:`kiro_crew.acp.kas_assets`), so the version is the path component whose
+    parent directory is named ``kas``. Returns ``"unknown"`` for an unexpected
+    layout rather than raising — this is a diagnostic, not a gate.
+    """
+    for parent in script.parents:
+        if parent.parent is not None and parent.parent.name == "kas":
+            return parent.name
+    return "unknown"
+
+
+def _doctor_kas(issues: list[str]) -> None:
+    """Report KAS backend readiness, but only when KAS is the selected backend.
+
+    KAS is opt-in (``agent.acp_backend = "kas"``); when it is not selected this
+    is silent so a kiro-cli / Claude Code install sees no KAS noise. When it IS
+    selected, KAS runs from kiro-cli's extracted bundle and obtains its token
+    from kiro-cli, so this surfaces the two things that make a selected KAS
+    backend fail at session-create time: missing assets and an unobtainable
+    token. The token probe prints only the expiry, never the token bytes.
+    """
+    # Positive backend test (not ``!= ACP_BACKEND_KAS``): an inequality would
+    # silently capture every harness added later — see the harness-parity gate.
+    if KiroCrewConfig.load().agent.acp_backend == ACP_BACKEND_KAS:
+        _report_kas_backend(issues)
+
+
+def _report_kas_backend(issues: list[str]) -> None:
+    """Print the KAS diagnostic block (assets + bundle version + token probe).
+
+    Split from :func:`_doctor_kas` so the backend-selection check there stays a
+    positive ``== ACP_BACKEND_KAS`` rather than an early-return on inequality.
+    """
+    print("\nKAS backend")
+    node = kas_assets.find_kas_node()
+    script = kas_assets.find_kas_server_script()
+    print(f"  node:        {'✅ ' + str(node) if node else '❌ not found'}")
+    if script:
+        print(f"  bundle:      ✅ {_kas_version_label(script)}")
+    else:
+        print("  bundle:      ❌ KAS server script not found")
+    if not (node and script):
+        print("               Fix: install kiro-cli and run it once so it unpacks its")
+        print("               KAS bundle (or set KIROCREW_KAS_NODE / KIROCREW_KAS_SCRIPT).")
+        issues.append("KAS backend selected but assets missing")
+
+    # Token status — a bounded live probe through kiro-cli. Advisory: an
+    # unobtainable token is usually a transient login state, not a broken
+    # install, so it warns rather than failing the doctor run.
+    try:
+        resp = asyncio.run(kas_auth.resolve_kas_access_token(timeout=8.0))
+    except kas_auth.KasAuthCallbackError as exc:
+        print(f"  token:       ⚠️  not obtainable: {exc}")
+        print("               Fix: sign in with `kiro-cli login`.")
+    except Exception as exc:  # noqa: BLE001 - diagnostic must never abort the run
+        print(f"  token:       ⚠️  probe error: {exc}")
+    else:
+        expires = resp.get("expiresAt")
+        print(f"  token:       ✅ obtained via kiro-cli (expires {expires})")
+
+
 def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False) -> None:
     """Verify KiroCrew setup — check dependencies, config, credentials, connectivity.
 
@@ -1184,6 +1250,9 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # ── Data Home (+ leftover migration archive) ──
     _doctor_data_home()
     _doctor_trust_root()
+
+    # ── KAS backend (only when selected) ──
+    _doctor_kas(issues)
 
     # ── Pods (systemd --user session bus) ──
     _doctor_pod_session_bus(issues)

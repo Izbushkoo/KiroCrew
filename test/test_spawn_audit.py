@@ -595,6 +595,12 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "cli_commands.py::_register_app_crons_to_scheduler",
         "cli_doctor.py::_doctor",
         "cli_doctor.py::_doctor_mcp_tools",
+        # NOT a subprocess spawn here: the AST heuristic matches ``asyncio.run``
+        # (attr ``run`` on base ``asyncio``), used only to drive the async KAS
+        # token probe from the synchronous doctor. The actual child process is
+        # spawned inside ``acp/kas_auth.py::resolve_kas_access_token``, which is
+        # allowlisted separately above (kiro-cli reaching its own token store).
+        "cli_doctor.py::_report_kas_backend",
         # ``systemctl is-active <unit>`` probes for the memory-pressure
         # preparedness check: argv is hardcoded (systemd-oomd/earlyoom unit
         # names), no agent influence, 5s-capped, read-only query.
