@@ -12,6 +12,7 @@ from __future__ import annotations
 from aiohttp import web
 
 from kiro_crew.dashboard import handlers, ws
+from kiro_crew.dashboard.mobile_tunnel import handle_mobile_sync
 from kiro_crew.suggestions import api_suggestions
 from kiro_crew.tips import api_tips_feedback, api_tips_next, api_tips_status
 
@@ -61,6 +62,7 @@ def register(app: web.Application) -> None:
         handlers.api_kiro_prerequisite_repair_specs,
     )
     app.router.add_get("/api/governance/channels", handlers.api_governance_channels)
+    app.router.add_get("/api/system/mobile-sync", handle_mobile_sync)
 
     # Suggestions (pre-computed contextual prompts)
     app.router.add_get("/api/suggestions", api_suggestions)

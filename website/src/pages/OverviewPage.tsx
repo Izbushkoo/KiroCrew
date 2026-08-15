@@ -1,13 +1,14 @@
 import { type ReactNode, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { ArrowLeft, ArrowRight, BarChart3, Brain, CheckCircle, Zap } from 'lucide-react'
+import { ArrowLeft, ArrowRight, BarChart3, Brain, CheckCircle, Smartphone, Zap } from 'lucide-react'
 import { useAppSelector } from '../store'
 import { useUptime } from '../hooks/useUptime'
 import { api } from '../api/client'
 import { Card, CardTitle, StatCard } from '../components/ui'
 import { TunnelStatus } from '../components/TunnelStatus'
 import ErrorBoundary from '../components/ErrorBoundary'
+import MobileSyncModal from '../components/MobileSyncModal'
 import { getOverviewStatCards } from './overviewStatCards'
 import { MemoryTab, UsageTab } from './overview'
 import { useProvider } from '../providers'
@@ -155,6 +156,7 @@ export default function OverviewPage() {
   const [params, setParams] = useSearchParams()
   const [restarting, setRestarting] = useState(false)
   const [restartMsg, setRestartMsg] = useState<ReactNode>('')
+  const [mobileSyncOpen, setMobileSyncOpen] = useState(false)
 
   const rawView = params.get('view')
   const view: DrillView | null = DRILL_VIEWS.includes(rawView as DrillView) ? (rawView as DrillView) : null
@@ -195,6 +197,14 @@ export default function OverviewPage() {
         </div>
         <div className="flex items-center gap-2">
           {restartMsg && <span className="text-ok text-[13px] animate-rise">{restartMsg}</span>}
+          <button
+            onClick={() => setMobileSyncOpen(true)}
+            title="\u{1F4F1} \u0421\u043C\u0430\u0440\u0442\u0444\u043E\u043D / QR-\u043A\u043E\u0434"
+            className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-[13px] font-semibold font-body cursor-pointer transition-all duration-300 border-none bg-gradient-to-r from-accent to-accent-hover text-accent-fg shadow-[0_2px_8px_var(--accent-glow)] hover:shadow-[0_4px_20px_var(--accent-glow)] hover:-translate-y-0.5 active:translate-y-0"
+          >
+            <Smartphone className="lucide-inline" />
+            <span className="hidden sm:inline">{'\u{1F4F1}'} \u0421\u043C\u0430\u0440\u0442\u0444\u043E\u043D / QR-\u043A\u043E\u0434</span>
+          </button>
           <button
             onClick={restart}
             disabled={restarting}
@@ -248,6 +258,13 @@ export default function OverviewPage() {
         <UsageSummaryCard onOpen={() => setView('usage')} />
         <MemorySummaryCard onOpen={() => setView('memory')} />
       </div>
+
+      {mobileSyncOpen && (
+        <MobileSyncModal
+          authToken={new URLSearchParams(window.location.search).get('token') || ''}
+          onClose={() => setMobileSyncOpen(false)}
+        />
+      )}
     </>
   )
 }

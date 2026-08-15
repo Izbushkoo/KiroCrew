@@ -43,6 +43,7 @@ from kiro_crew.dashboard import (
     handlers,
     tailnet,
 )
+from kiro_crew.dashboard.mobile_tunnel import start_mobile_tunnel
 from kiro_crew.dashboard.crash_dump_store import (
     claim_dump_notification,
     dump_age_seconds,
@@ -3017,6 +3018,8 @@ async def start_dashboard(
     # gets its own launch window instead of landing on top of the app backends.
     await cautious_boot.pause_before("MCP server probe")
     asyncio.create_task(handlers._bg_mcp_probe())
+
+    asyncio.create_task(start_mobile_tunnel(port))
 
     # Refresh config.json's meta stamp when an upgrade left it naming the
     # previous build (#3102). Post-bind and fire-and-forget (never awaited on

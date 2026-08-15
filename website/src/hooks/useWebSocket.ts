@@ -1504,6 +1504,13 @@ export function useWebSocket() {
       sendFocus(document.hidden ? null : store.getState().chat.activeSlot)
     }
     document.addEventListener('visibilitychange', onVisibility)
+    // Reconnect when the device recovers network or returns from background/airplane mode
+    const onOnline = () => { forceReconnect() }
+    const onVisibilityReconnect = () => {
+      if (!document.hidden) forceReconnect()
+    }
+    window.addEventListener('online', onOnline)
+    document.addEventListener('visibilitychange', onVisibilityReconnect)
     return () => {
       closingRef.current = true
       clearTimeout(reconnectTimerRef.current)
@@ -1517,10 +1524,12 @@ export function useWebSocket() {
       window.removeEventListener('voice-stop', onVoiceStop)
       window.removeEventListener('voice-config-changed', onVoiceConfigChanged)
       document.removeEventListener('visibilitychange', onVisibility)
+      window.removeEventListener('online', onOnline)
+      document.removeEventListener('visibilitychange', onVisibilityReconnect)
       unsubFocus()
       sendSlotFocusedImpl = () => {}
     }
-  }, [connect, stopVoice, flushSlotActivity])
+  }, [connect, stopVoice, flushSlotActivity, forceReconnect])
 
   /** Subscribe to log events — call with callback on mount, null on unmount. */
   const subscribeLogs = useCallback((cb: LogCallback) => {
