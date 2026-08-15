@@ -83,6 +83,31 @@ _PROXY_FORWARD_HEADERS = (
     "X-Real-IP",
 )
 
+#: Domain suffixes of popular free tunnel providers that should pass
+#: Host/Origin security checks without explicit configuration.
+_KNOWN_TUNNEL_SUFFIXES = (
+    ".trycloudflare.com",
+    ".ngrok-free.app",
+    ".ngrok.io",
+    ".loca.lt",
+    ".bore.pub",
+)
+
+
+def _is_known_tunnel_origin(origin_base: str) -> bool:
+    """Return True if *origin_base* belongs to a known free tunnel provider."""
+    if not origin_base:
+        return False
+    # origin_base is like "https://abc.trycloudflare.com"
+    host = origin_base.split("://", 1)[-1] if "://" in origin_base else origin_base
+    host = host.lower()
+    return any(host.endswith(suffix) for suffix in _KNOWN_TUNNEL_SUFFIXES)
+
+
+def _is_known_tunnel_host(host: str) -> bool:
+    """Return True if *host* (lowercase, no port) belongs to a known tunnel provider."""
+    return any(host.endswith(suffix) for suffix in _KNOWN_TUNNEL_SUFFIXES)
+
 
 def is_direct_local_request(request: web.Request) -> bool:
     """Return ``True`` only for a request made directly from this machine.
@@ -241,7 +266,7 @@ def check_origin(
             return True
         return not require
     origin_base = "/".join(origin.split("/")[:3]) if "://" in origin else ""
-    if origin_base in allowed or origin_base.endswith('.trycloudflare.com'):
+    if origin_base in allowed or _is_known_tunnel_origin(origin_base):
         return True
     # Same-origin loopback fallback: allow a loopback Origin when it
     # matches the request's own Host, i.e. a genuine same-origin request. This
@@ -315,6 +340,6 @@ def check_host(request: web.Request) -> bool:
     # and the CSRF Origin check can never drift out of sync.
     allowed = build_allowed_hosts(allowed_origins)
     host = _host_without_port(raw_host).lower()
-    if host.endswith('.trycloudflare.com') or host in allowed:
+    if _is_known_tunnel_host(host) or host in allowed:
         return True
     return False

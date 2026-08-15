@@ -134,7 +134,9 @@ def _get_or_create_persistent_mobile_token() -> str:
             logger.warning("Could not read persistent mobile token from %s", path)
 
     # Generate a fresh 1-year token
-    token = generate_token("mobile", ttl_seconds=_PERSISTENT_TOKEN_TTL_SECS)
+    token = generate_token(
+        "mobile", ttl_seconds=_PERSISTENT_TOKEN_TTL_SECS, register_nonce=False
+    )
 
     # Persist to disk
     try:
