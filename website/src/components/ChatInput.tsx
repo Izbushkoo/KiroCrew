@@ -837,6 +837,8 @@ function ChatInput({
   const dictationUsable = useDictationPanelUsable(voiceDictationPanel)
   const showDictation =
     dictationUsable && voiceRecording && !voiceError && voiceSampleRef ? voiceSampleRef : null
+  const micBtnRef = useRef<HTMLButtonElement>(null)
+  const holdingMicRef = useRef(false)
   const wrapperRef = useRef<HTMLDivElement>(null)
   // Backdrop mirror that paints chip backgrounds behind paste tokens; its scroll
   // is kept in lockstep with the textarea (see syncMirrorScroll on the textarea).
@@ -885,8 +887,13 @@ function ChatInput({
   // next partial rebuilds away — the panel (showDictation) already handles the
   // visible streaming case, where the user watches rather than types.
   useEffect(() => {
-    if (showDictation || voiceTranscribing) inputRef.current?.focus()
-  }, [showDictation, voiceTranscribing])
+    if (voiceRecording) {
+      inputRef.current?.blur()
+      micBtnRef.current?.focus()
+    } else if (showDictation || voiceTranscribing) {
+      inputRef.current?.focus()
+    }
+  }, [showDictation, voiceTranscribing, voiceRecording])
 
   // Escape CANCELS dictation (discards the audio), from ANYWHERE. Deliberately a
   // document-level listener rather than the textarea's onKeyDown: starting a
@@ -2551,11 +2558,51 @@ function ChatInput({
           <div className="flex items-center gap-1 shrink-0">
             {onVoiceToggle && (
               <button
+                ref={micBtnRef}
                 className={`w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all border-none ${
                   voiceRecording ? 'bg-danger-subtle text-danger animate-pulse' : voiceTranscribing ? 'bg-accent-subtle text-accent' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'
                 } disabled:opacity-30`}
-                onClick={onVoiceToggle}
-                onPointerDown={onVoicePrewarm}
+                onClick={(e) => { e.preventDefault(); e.stopPropagation() }}
+                onPointerDown={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  onVoicePrewarm?.()
+                  // Blur active input so soft keyboard collapses on mobile
+                  if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
+                  if (!voiceRecording) {
+                    onVoiceToggle()
+                    holdingMicRef.current = true
+                  }
+                }}
+                onPointerUp={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  if (voiceRecording || holdingMicRef.current) {
+                    onVoiceToggle()
+                  }
+                  holdingMicRef.current = false
+                }}
+                onPointerLeave={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  if (voiceRecording || holdingMicRef.current) {
+                    onVoiceToggle()
+                  }
+                  holdingMicRef.current = false
+                }}
+                onPointerCancel={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  if (voiceRecording || holdingMicRef.current) {
+                    onVoiceToggle()
+                  }
+                  holdingMicRef.current = false
+                }}
+                onMouseDown={(e) => { e.preventDefault(); e.stopPropagation() }}
+                onMouseUp={(e) => { e.preventDefault(); e.stopPropagation() }}
+                onTouchStart={(e) => { e.preventDefault(); e.stopPropagation() }}
+                onTouchEnd={(e) => { e.preventDefault(); e.stopPropagation() }}
+                onContextMenu={(e) => { e.preventDefault() }}
                 disabled={disabled || voiceTranscribing || optimizing}
                 aria-label={voiceRecording ? i18nT('components.chatInput.stop_recording') : voiceTranscribing ? i18nT('components.chatInput.transcribing') : i18nT('components.chatInput.voice_input')}
                 title={voiceRecording ? i18nT('components.chatInput.stop_recording') : voiceTranscribing ? i18nT('components.chatInput.transcribing') : i18nT('components.chatInput.voice_input')}
