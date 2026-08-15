@@ -31,7 +31,7 @@ import { api, isAuthBannerShown } from './api/client'
 import type { KiroCreditUsage, KiroUsagePayload } from './api/client'
 import { safeSetItem } from './utils/safeStorage'
 import { gcOrphanedStorage } from './utils/storageGc'
-import { Rocket, Menu, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, LayoutGrid, SquareTerminal, Bot } from 'lucide-react'
+import { Rocket, Menu, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, LayoutGrid, SquareTerminal, Bot, Smartphone } from 'lucide-react'
 import { GithubIcon, DiscordIcon } from './components/BrandIcon'
 import { Toggle } from './components/ui'
 import OnboardingFlow from './components/OnboardingFlow'
@@ -78,6 +78,7 @@ import DeveloperPage from './pages/DeveloperPage'
 import SchedulePage from './pages/SchedulePage'
 import { useUpdateSubscription } from './hooks/useUpdateSubscription'
 import UpdateModal from './components/UpdateModal'
+import MobileSyncModal from './components/MobileSyncModal'
 
 import ComputerUseLiveView from './components/ComputerUseLiveView'
 import BottomTerminalPanel, { TerminalDetachedBar } from './components/BottomTerminalPanel'
@@ -1328,6 +1329,7 @@ export default function App() {
   const [devMode, setDevMode] = useState(() => localStorage.getItem('mc-dev-mode') === '1')
   const [devPageSeen, setDevPageSeen] = useState(true)
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
+  const [mobileSyncModalOpen, setMobileSyncModalOpen] = useState(false)
   const toggleShortcutsModal = useCallback(() => setShortcutsOpen(p => !p), [])
   // Search Everywhere command palette — global double-Shift / ⌘K
   // trigger + open state. Mounted once below at the app shell.
@@ -2152,6 +2154,10 @@ export default function App() {
       {(updating || showUpdateModal) && <UpdateOverlay onCancel={() => { setUpdating(false); setShowUpdateModal(false) }} />}
       <UpdateModal />
 
+      {mobileSyncModalOpen && (
+        <MobileSyncModal authToken={new URLSearchParams(window.location.search).get('token') || ''} onClose={() => setMobileSyncModalOpen(false)} />
+      )}
+
       {/* First-run modal chrome mounted ONCE (scrim + accent panel + floating
           mascots) so the import→customize hand-off swaps only the right-column
           content — the mascots never remount/replay, killing the transition
@@ -2503,6 +2509,15 @@ export default function App() {
                 collapsed={effectiveCollapsed}
                 onClick={closeMobileNav}
                 badge={updateAvailable ? <span title={i18nT('app.update_available')} role="status" aria-label={i18nT('app.update_available_2')} className={effectiveCollapsed ? 'absolute top-1 right-1 w-2 h-2 bg-accent rounded-full z-10' : 'absolute top-1/2 -translate-y-1/2 right-2 w-2 h-2 bg-accent rounded-full z-10'} /> : undefined}
+              />
+              <NavItem
+                path="#"
+                label="📱 Смартфон"
+                icon={<Smartphone size={16} />}
+                active={false}
+                collapsed={effectiveCollapsed}
+                onClick={closeMobileNav}
+                onClickOverride={() => setMobileSyncModalOpen(true)}
               />
               {/* Community row — a leading GitHub mark, then two links on ONE
                   line separated by a middot, then the icon-only Discord link.
