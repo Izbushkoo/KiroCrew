@@ -1187,10 +1187,11 @@ async def api_stt_transcribe(request: web.Request) -> web.Response:
             stt_cost = round(max(1.0, size / 32000.0) * 0.0001, 6)
             state: DashboardState = request.app["state"]
             slot_key = request.query.get("slot", "")
-            if slot_key and slot_key in state.slots:
-                slot_obj = state.slots[slot_key]
-                prev_stt = getattr(slot_obj, '_pending_stt_cost', 0.0)
-                setattr(slot_obj, '_pending_stt_cost', round(prev_stt + stt_cost, 6))
+            if slot_key:
+                slot_obj = state.get_slot(slot_key)
+                if slot_obj is not None:
+                    prev_stt = getattr(slot_obj, '_pending_stt_cost', 0.0)
+                    setattr(slot_obj, '_pending_stt_cost', round(prev_stt + stt_cost, 6))
 
         return web.json_response({"text": text or ""})
     except Exception:

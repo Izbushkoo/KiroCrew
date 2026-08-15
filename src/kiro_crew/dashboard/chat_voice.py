@@ -296,7 +296,7 @@ async def _synthesize_nonstreaming(
             effective_engine = engine or _vc.default_engine
             per_char = 0.000030 if effective_engine == "tts-1-hd" else 0.000015
             tts_cost = round(len(text) * per_char, 6)
-            slot = state.slots.get(slot_key)
+            slot = state.get_slot(slot_key)
             if slot and tts_cost > 0:
                 for m in reversed(slot.messages):
                     if m.get("role") == "assistant":
