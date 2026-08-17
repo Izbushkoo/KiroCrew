@@ -6810,8 +6810,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               voiceCaretRef={voiceCaretRef}
               voicePendingCaretRef={voicePendingCaretRef}
               onVoiceToggle={voiceInputSupported ? toggleVoice : undefined}
-              onVoiceStart={voiceInputSupported ? startVoice : undefined}
-              onVoiceStop={voiceInputSupported ? stopVoice : undefined}
               onVoiceCancel={voiceInputSupported ? cancelVoice : undefined}
               onVoicePrewarm={voiceInputSupported ? voice.prewarm : undefined}
               agentName={currentSlot?.agent || 'default'}

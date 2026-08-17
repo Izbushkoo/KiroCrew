@@ -293,10 +293,7 @@ interface ChatInputProps {
   voiceDeviceSwitchIsLive?: boolean
   voiceTranscribing?: boolean
   onVoiceToggle?: () => void
-  /** Start voice capture — called on press (touch/mouse down). Blurs active input to collapse the keyboard. */
-  onVoiceStart?: () => void
-  /** Stop voice capture — called on release (touch/mouse up, cancel, or leave). */
-  onVoiceStop?: () => void
+
   /** Cancel (discard) an in-progress dictation without transcribing — Esc. */
   onVoiceCancel?: () => void
   /** Pre-warm the mic on pointer-down so recording starts instantly on click. */
@@ -621,8 +618,7 @@ function ChatInput({
   voiceDeviceSwitchIsLive = false,
   voiceTranscribing = false,
   onVoiceToggle,
-  onVoiceStart,
-  onVoiceStop,
+
   onVoiceCancel,
   onVoicePrewarm,
   voiceError = null,
@@ -912,7 +908,6 @@ function ChatInput({
   const showDictation =
     dictationUsable && voiceRecording && !voiceError && voiceSampleRef ? voiceSampleRef : null
   const micBtnRef = useRef<HTMLButtonElement>(null)
-  const holdingMicRef = useRef(false)
   const wrapperRef = useRef<HTMLDivElement>(null)
   // Backdrop mirror that paints chip backgrounds behind paste tokens; its scroll
   // is kept in lockstep with the textarea (see syncMirrorScroll on the textarea).
@@ -2681,63 +2676,7 @@ function ChatInput({
                 className={`w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all border-none ${
                   voiceRecording ? 'bg-danger-subtle text-danger animate-pulse' : voiceTranscribing ? 'bg-accent-subtle text-accent' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'
                 } disabled:opacity-30`}
-                onClick={(e) => { e.preventDefault(); e.stopPropagation() }}
-                onTouchStart={(e) => {
-                  e.preventDefault()
-                  e.stopPropagation()
-                  onVoicePrewarm?.()
-                  if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
-                  if (!voiceRecording) {
-                    onVoiceStart?.()
-                    holdingMicRef.current = true
-                  }
-                }}
-                onTouchEnd={(e) => {
-                  e.preventDefault()
-                  e.stopPropagation()
-                  if (voiceRecording || holdingMicRef.current) {
-                    onVoiceStop?.()
-                  }
-                  holdingMicRef.current = false
-                }}
-                onTouchCancel={(e) => {
-                  e.preventDefault()
-                  e.stopPropagation()
-                  if (voiceRecording || holdingMicRef.current) {
-                    onVoiceStop?.()
-                  }
-                  holdingMicRef.current = false
-                }}
-                onMouseDown={(e) => {
-                  if (e.nativeEvent instanceof TouchEvent) return
-                  e.preventDefault()
-                  e.stopPropagation()
-                  onVoicePrewarm?.()
-                  if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
-                  if (!voiceRecording) {
-                    onVoiceStart?.()
-                    holdingMicRef.current = true
-                  }
-                }}
-                onMouseUp={(e) => {
-                  if (e.nativeEvent instanceof TouchEvent) return
-                  e.preventDefault()
-                  e.stopPropagation()
-                  if (voiceRecording || holdingMicRef.current) {
-                    onVoiceStop?.()
-                  }
-                  holdingMicRef.current = false
-                }}
-                onMouseLeave={(e) => {
-                  if (e.nativeEvent instanceof TouchEvent) return
-                  e.preventDefault()
-                  e.stopPropagation()
-                  if (voiceRecording || holdingMicRef.current) {
-                    onVoiceStop?.()
-                  }
-                  holdingMicRef.current = false
-                }}
-                onContextMenu={(e) => { e.preventDefault() }}
+                onClick={onVoiceToggle}
                 disabled={disabled || voiceTranscribing || optimizing}
                 aria-label={voiceRecording ? i18nT('components.chatInput.stop_recording') : voiceTranscribing ? i18nT('components.chatInput.transcribing') : i18nT('components.chatInput.voice_input')}
                 title={voiceRecording ? i18nT('components.chatInput.stop_recording') : voiceTranscribing ? i18nT('components.chatInput.transcribing') : i18nT('components.chatInput.voice_input')}
