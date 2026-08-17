@@ -45,6 +45,7 @@
     "k_search_for_anything": "⌘K — 搜索任何内容…",
     "kiro_credit_usage_checking": "Kiro 额度用量 — 检查中…",
     "kiro_credit_usage_checking_2": "Kiro 额度用量 — 检查中",
+    "kiro_credit_usage_unavailable": "Kiro 额度用量 — 不可用",
     "kiro_discord_community": "Kiro Discord 社区",
     "main_navigation": "主导航",
     "manage_account": "管理账户",
@@ -1284,6 +1285,144 @@
         "page_label": "开发机群"
       }
     },
+    "designTweak": {
+      "comments": {
+        "an_earlier_comment": "较早的一条评论",
+        "element_count": "{{n}} 个元素",
+        "follow_up_to": "↩ 针对 {{label}} 的追加评论",
+        "meta": "{{label}} · {{element}} · {{ago}}",
+        "open_in_preview": "点击在预览中打开此评论",
+        "remove_from_draft": "从草稿中移除此评论"
+      },
+      "devServer": {
+        "detect_hint": "从该项目正在运行的开发服务器预览（可保持热重载）",
+        "dev_server": "开发服务器",
+        "looking": "正在查找…",
+        "preview_from_disk_instead": "改为从磁盘预览",
+        "url_placeholder": "http://localhost:5173",
+        "use": "使用"
+      },
+      "layout": {
+        "drag_to_resize": "拖动以调整大小"
+      },
+      "modes": {
+        "edit": "编辑",
+        "preview": "预览"
+      },
+      "page": {
+        "tagline": "指一指、说一说，代码随之跟上。",
+        "title": "Design Tweak"
+      },
+      "preview": {
+        "backend_did_not_answer": "应用后端未响应。如果你刚刚修改过它，请在“应用”页面将 Design Tweak 关闭再重新开启。",
+        "dev_server_not_reachable": "无法连接开发服务器",
+        "dim_desktop": "桌面",
+        "dim_mobile": "手机",
+        "dim_tablet": "平板",
+        "dimensions": "尺寸",
+        "fallback_name": "预览",
+        "frame_title": "应用预览",
+        "loading_name": "正在加载 {{name}}…",
+        "needs_dev_server_title": "这是一个 Web 应用 — 需要开发服务器",
+        "no_dev_script_in_package_json": "package.json 中未找到 dev 脚本 — 请自行启动，然后点击下方的“开发服务器”。",
+        "no_html_entry": "没有可从磁盘直接提供的 HTML 入口，因此必须由它自己的开发服务器构建并提供服务。",
+        "not_reachable": "无法连接预览",
+        "nothing_answered_at": "{{url}} 没有任何响应。请启动该项目的开发服务器后重试 — 或清除其 URL，改为从磁盘预览文件。",
+        "refresh_preview": "刷新预览",
+        "retry": "重试",
+        "runs_command_in_project": "在 {{name}} 中运行 {{command}}",
+        "start_dev_server": "启动开发服务器",
+        "starting": "正在启动…",
+        "timed_out": "超时",
+        "unbundled_entry": "它的入口是 {{entry}} — TypeScript/JSX，浏览器无法直接运行。这些文件需要在提供服务时构建，因此无法从磁盘预览。"
+      },
+      "projects": {
+        "add": "添加",
+        "browse_or_type_path": "浏览选择文件夹，或输入其路径",
+        "click_again_to_disconnect": "再次点击以断开连接",
+        "connect": "连接",
+        "connected": "已连接",
+        "dev_badge": "dev",
+        "load_new_app": "加载新应用",
+        "loading": "正在加载…",
+        "loading_your_apps": "正在加载你的应用…",
+        "looking_for_connected_apps": "正在查找你已连接的应用…",
+        "needs_dev_server": "需要开发服务器（{{command}}）",
+        "no_app_selected": "未选择 Web 应用。请在下拉菜单中选择一个 — 切换是即时的。",
+        "no_dev_script": "未找到 dev 脚本",
+        "none_loaded": "尚未加载任何 Web 应用。",
+        "path_placeholder": "/path/to/your/app",
+        "previewing_from": "正在从 {{url}} 预览",
+        "remove_from_list": "从列表中移除",
+        "select_app": "选择 Web 应用…"
+      },
+      "requests": {
+        "archive_to_history": "归档到历史",
+        "chip_done": "{{n}} 项已完成",
+        "chip_in_progress": "{{n}} 项进行中",
+        "chip_not_sent": "{{n}} 项未发送",
+        "chip_queued": "{{n}} 项已排队",
+        "delete_confirm": "删除请求 {{number}}？其评论将被永久删除，此操作无法撤销。",
+        "delete_request": "删除请求",
+        "empty_for_app": "{{name}} 还没有任何修改请求。将预览切换到编辑模式，右键点击某个元素，然后描述你想要的改动。评论会汇集成一个请求，供你批量发送。",
+        "empty_no_app": "尚未连接 Web 应用。请在上方下拉菜单中选择一个 — 每个应用都有各自的请求、历史和聊天会话。",
+        "history": "历史",
+        "more_actions": "请求 {{number}} 的更多操作",
+        "no_comments": "暂无评论。",
+        "open_in_chat": "在聊天中打开",
+        "request_number": "请求 {{number}}",
+        "sending": "正在发送…",
+        "send_request": "作为请求 {{number}} 发送",
+        "send_missing_request": "发送请求 {{number}}",
+        "this_app": "此应用"
+      },
+      "status": {
+        "add_failed": "添加失败：{{error}}",
+        "added_comment": "已添加 {{label}} — 请求 {{number}} 中现有 {{n}}，尚未发送。",
+        "added_dev_previewing": "已添加 {{name}}（开发服务器）— 正在预览。",
+        "added_found_dev_server": "已添加 {{name}} — 在 {{url}} 找到了它的开发服务器。",
+        "added_many_dev_servers": "已添加 {{name}} — 有 {{n}} 个开发服务器匹配此文件夹，因此未自动选定。请在下拉菜单中指定一个。",
+        "added_previewing": "已添加 {{name}} — 正在预览。",
+        "already_registered": "已注册过 — 已切换到 {{name}}。",
+        "already_sent": "请求 {{number}} 已发送。",
+        "archive_failed": "归档失败：{{error}}",
+        "capture_failed": "捕获失败：{{error}}",
+        "could_not_start_dev_server": "无法启动开发服务器。",
+        "delete_failed": "删除失败：{{error}}",
+        "detect_failed": "检测失败：{{error}}",
+        "dev_server_running": "开发服务器正在 {{url}} 运行。",
+        "dev_server_stopped": "开发服务器已停止 — 正在从磁盘预览。",
+        "failed": "失败：{{error}}",
+        "follow_up_added": "追加评论 {{label}} 已加入请求 {{number}} — 尚未发送。",
+        "follow_up_failed": "追加失败：{{error}}",
+        "follow_up_origin_missing": "找不到要追加的那条评论。",
+        "looking_for_dev_server": "正在查找开发服务器…",
+        "no_dev_server_found": "未找到此文件夹的开发服务器 — 请先启动它，或输入其 URL。",
+        "opening_folder_picker": "正在打开文件夹选择器…",
+        "picker_unavailable": "选择器不可用（{{error}}）— 请改为手动输入路径。",
+        "preview_refreshed": "预览已刷新 — {{label}} 已完成",
+        "previewing_from_disk": "正在从磁盘预览 {{name}}。",
+        "previewing_from_url": "正在从 {{url}} 预览 {{name}}。",
+        "remove_failed": "移除失败：{{error}}",
+        "send_failed": "发送失败：{{error}}",
+        "dispatch_failed_unconfirmed": "请求 {{number}} 已封存，但无法确认送达（{{error}}）。正在检查会话——列表将会更新。",
+        "sent_request_to_session": "已发送请求 {{number}}（{{n}}）→ {{label}} 会话。",
+        "no_session_for_request": "请求 {{number}} 已就绪，但此应用没有文件夹，因此没有可发送的会话。请先设置应用的文件夹，然后从列表中发送。",
+        "servers_match_folder": "有 {{n}} 个服务器匹配此文件夹（{{ports}}）— 请选择一个。",
+        "set_dev_server_for": "已为 {{name}} 设置开发服务器。",
+        "starting_command": "正在启动 {{command}}…",
+        "starting_dev_server": "正在启动开发服务器…",
+        "stop_failed": "停止失败：{{error}}",
+        "unknown": "未知",
+        "unknown_error": "未知错误",
+        "using_running_dev_server": "使用已在 {{url}} 运行的开发服务器。"
+      },
+      "manifest": {
+        "display_name": "Design Tweak",
+        "description": "在应用的实时预览中直观地选取元素，并将其转化为限定范围、与源码映射的编辑请求供 Agent 处理 — 就像 Figma 评论，但用于代码。",
+        "page_label": "Design Tweak"
+      }
+    },
     "fileExplorer": {
       "fileExplorerPage": {
         "backend_not_reachable": "无法连接后端：",
@@ -1372,6 +1511,9 @@
           "regenerate_summary": "重新生成摘要",
           "retry": "重试"
         },
+        "detailOverflowMenu": {
+          "more_actions": "更多操作"
+        },
         "filterRow": {
           "sign_in_with_the_gh_cli_to_use_this_filter": "使用 gh CLI 登录后才能使用此筛选条件"
         },
@@ -1405,10 +1547,8 @@
           "assignees": "负责人",
           "by": "· 由",
           "changed_the_title": "修改了标题",
-          "close": "关闭",
           "close_as_completed": "标记为已完成并关闭",
           "close_as_not_planned": "标记为不计划并关闭",
-          "close_this_issue": "关闭此 issue",
           "closed": "已关闭",
           "closed_as_not_planned": "已按不计划关闭",
           "closed_this": "关闭了此项",
@@ -1416,7 +1556,6 @@
           "copy_link_to_this_issue": "复制此 issue 链接",
           "couldn_t_load_activity": "无法加载动态：",
           "dates": "日期",
-          "dismiss_menu": "关闭菜单",
           "done": "已完成",
           "edit": "编辑",
           "finding_suggestions": "正在查找建议…",
@@ -1440,7 +1579,6 @@
           "opened": "创建了",
           "opened_2": "创建时间",
           "opened_this_issue": "创建了此 issue",
-          "re_fetch_issue_and_timeline_from": "从 {{provider}} 重新获取此 issue 及其时间线",
           "read_only_connect_with_triage_push_access_to_app": "只读 — 需以具备 triage/push 权限的身份连接才能应用。",
           "read_only_connect_with_triage_push_access_to_app_2": "只读 — 需以具备 triage/push 权限的身份连接才能应用",
           "referenced_this_in": "在以下位置引用了此项：",
@@ -1449,7 +1587,6 @@
           "removed_the": "移除了",
           "removed_this_from_the": "将此从以下位置移除：",
           "reopen": "重新打开",
-          "reopen_this_issue": "重新打开此 issue",
           "reopened_this": "重新打开了此项",
           "self_assigned_this": "自行接手了此项",
           "suggested": "建议",
@@ -1638,7 +1775,6 @@
           "opened": "创建了",
           "opened_2": "创建时间",
           "passed": "通过",
-          "re_fetch_this_and_its_timeline_from": "从 {{provider}} 重新获取此 {{subject}} 及其时间线",
           "referenced_this_in": "在以下位置引用了此项：",
           "refresh_details": "刷新 {{subject}} 详情",
           "removed_the": "移除了",
@@ -2259,6 +2395,9 @@
         "view_folders": "文件夹",
         "view_list": "平铺列表"
       },
+      "preview": {
+        "mermaidError": "无效的 Mermaid 图表——显示其源代码。"
+      },
       "row": {
         "delete": "删除笔记",
         "deleteAction": "删除",
@@ -2299,6 +2438,7 @@
         "recording": "录制中…",
         "remove": "移除",
         "removeConfirm": "从应用中移除此仓库？磁盘上的文件不会改动 —— 仅忘记该连接。",
+        "removeFailed": "无法移除该仓库：{{message}}",
         "removeIt": "确认移除",
         "reset": "重置",
         "save": "保存",
@@ -2310,9 +2450,11 @@
         "syncSection": "同步",
         "title": "设置",
         "tokenCleared": "令牌已清除。",
+        "tokenClearFailed": "无法清除令牌：{{message}}",
         "tokenPlaceholderEmpty": "github_pat_…",
         "tokenPlaceholderStored": "替换已存储的令牌…",
         "tokenSaved": "令牌已保存。",
+        "tokenSaveFailed": "无法保存令牌：{{message}}",
         "vaultsSection": "仓库"
       },
       "sort": {
@@ -2602,12 +2744,14 @@
         "copy_markdown": "复制 Markdown",
         "dismiss": "忽略",
         "edit_resend": "编辑并重新发送",
+        "open_in_file_explorer": "在文件资源管理器中打开",
+        "open_in_finder": "在 Finder 中打开",
         "pinned_files": "已置顶文件",
         "pins": "置顶",
         "preview": "预览",
         "remove_screenshot": "移除截图",
-        "reveal_in_finder": "在文件管理器中显示",
         "screenshot": "截图",
+        "show_in_file_manager": "在文件管理器中显示",
         "watchlist": "监视列表"
       },
       "clear": {
@@ -4130,6 +4274,20 @@
     "viewPr": "拉取请求"
   },
   "components": {
+    "crewWakeSection": {
+      "active": "运行中",
+      "could_not_load_this_crew_s_schedules_so_what_wak": "无法加载这个 Crew 的定时任务，因此不知道什么会唤醒它。",
+      "no_schedules_run_this_crew_automatically": "没有定时任务会自动运行这个 Crew。",
+      "open_schedule": "打开定时任务",
+      "pause_named": "暂停 {{name}}",
+      "paused": "已暂停",
+      "resume_named": "恢复 {{name}}",
+      "run_named_now": "立即运行 {{name}}",
+      "running": "执行中",
+      "schedule": "定时",
+      "schedules_that_run_this_crew_without_you_asking": "会在你不开口的情况下运行这个 Crew 的定时任务。与上面的 Triggers 不同，后者只决定编排器何时选中这个 Crew。",
+      "what_wakes_this_crew": "什么会唤醒这个 Crew"
+    },
     "kiroAccountModal": {
       "account_details_unavailable": "账户详情暂不可用",
       "checking_account": "正在检查账户…",
@@ -4455,6 +4613,7 @@
       "describe_what_you_want_the_agent_to_accomplish": "描述你希望代理完成的目标…",
       "give_the_agent_a_goal_and_it_will_keep_working_t": "为代理设定目标。Kiro Crew 会按下面的间隔向代理发送一条包含该目标的推动消息，直到目标完成或达到轮次上限。",
       "goal_active_cycle": "目标进行中（第 {{cycle}} 轮）",
+      "goal_interrupted_cycle": "目标循环待命（第 {{cycle}} 轮）— 上一轮被中断；恢复聊天或等待下一轮",
       "goal_description": "目标描述",
       "seconds_between_nudges": "推动间隔秒数",
       "last_fire": "上次触发：",
@@ -4471,16 +4630,14 @@
       "focus_popout": "聚焦弹出窗口",
       "hide_terminal_panel": "隐藏终端面板",
       "maximum_terminals": "最多 {{n}} 个终端",
-      "move_to_side_panel": "移至侧边面板",
       "new_terminal": "新建终端",
-      "open_a_chat_page_to_move_this_terminal_there": "打开一个聊天页面即可把此终端移到那里",
       "pop_out_to_window": "弹出到窗口",
       "resize_terminal_panel": "调整终端面板大小",
       "terminal": "终端",
       "terminal_is_in_its_own_window": "终端已在独立窗口中打开",
-      "move_panel_to_right": "Move panel to right",
-      "move_panel_to_bottom": "Move panel to bottom",
-      "more_actions": "More actions"
+      "move_panel_to_right": "将面板移至右侧",
+      "move_panel_to_bottom": "将面板移至底部",
+      "more_actions": "更多操作"
     },
     "chatInput": {
       "add_files_options": "添加文件与选项",
@@ -5016,11 +5173,15 @@
       "tunnel_error": "隧道错误",
       "tunnel_state": "隧道{{state}}。",
       "n_unread": "{{n}} 条未读",
-      "switch_crew_active": "切换 Crew，当前为 {{name}}",
-      "switch_crew_active_unread": "切换 Crew，当前为 {{name}}，其他 Crew 有 {{n}} 条未读",
+      "switch_crew": "切换 Crew",
+      "switch_crew_unread": "切换 Crew，其他处有 {{n}} 条未读",
       "stopped": "已停止",
-      "show_all_crews": "展开所有 Crew",
-      "collapse_crews": "收起 Crew"
+      "pin_crews": "置顶 Crew…",
+      "pinned": "已置顶",
+      "pinned_no_room": "已置顶，顶栅空间不足",
+      "no_room": "空间不足",
+      "pin_crew": "将 {{name}} 置顶到顶栅",
+      "unpin_crew": "取消置顶 {{name}}"
     },
     "instancesViewport": {
       "connecting": "正在连接…",
@@ -5074,8 +5235,11 @@
       "unknown_author": "未知作者",
       "untitled": "无标题",
       "updated_time": "更新于 {{time}}",
-      "jira_open_in_browser": "Jira issue — open in browser to view details.",
-      "open_in_jira": "Open in Jira"
+      "open_in_jira": "Open in Jira",
+      "provider_github": "GitHub",
+      "provider_jira": "Jira",
+      "provider_gitlab": "GitLab",
+      "jira_no_credentials": "No Jira credentials configured for this host. Add a jira_auth entry to config.json and set JIRA_API_TOKEN (or JIRA_TOKEN_<hex-host> for multi-host) in your .env file."
     },
     "jobForm": {
       "a_short_label_for_this_job": "此任务的简短标签",
@@ -5281,6 +5445,8 @@
       "open_artifact": "打开工件 {{name}}",
       "open_as_artifact": "作为工件打开",
       "open_folder": "打开文件夹 {{path}}",
+      "open_in_file_explorer": "在文件资源管理器中打开",
+      "open_in_finder": "在 Finder 中打开",
       "open_with_default_app": "用默认应用打开",
       "path_copied_to_clipboard_no_desktop_available": "路径已复制到剪贴板（无可用桌面环境）",
       "preview": "预览",
@@ -5312,8 +5478,12 @@
       "word_wrap": "自动换行"
     },
     "markdownRenderer": {
+      "click_to_browse_shift_click_to_open_in_file_explorer": "点击浏览 / Shift+点击在文件资源管理器中显示",
       "click_to_browse_shift_click_to_reveal_in_finder": "点击浏览 / Shift+点击在 Finder 中显示",
+      "click_to_browse_shift_click_to_show_in_file_manager": "点击浏览 / Shift+点击在文件管理器中显示",
+      "click_to_open_shift_click_to_open_in_file_explorer": "点击打开 / Shift+点击在文件资源管理器中显示",
       "click_to_open_shift_click_to_reveal_in_finder": "点击打开 / Shift+点击在 Finder 中显示",
+      "click_to_open_shift_click_to_show_in_file_manager": "点击打开 / Shift+点击在文件管理器中显示",
       "close": "关闭",
       "download_d": "下载（d）",
       "download_image": "下载图片",
@@ -5774,11 +5944,13 @@
       "include_recent_logs": "包含最近日志",
       "note_placeholder": "例如：更新后每条消息都失败，报“process exited (rc=None)”。",
       "open_github_issue": "新建 GitHub issue",
+      "open_in_file_explorer": "在文件资源管理器中打开",
+      "open_in_finder": "在 Finder 中打开",
       "prefill_hint": "打开后会自动填好详情 — 再把 zip 拖进去即可。",
       "redaction_notice": "Bearer 令牌、会话 cookie 和 AWS 密钥会在生成 zip 前自动移除。",
       "report_a_problem": "反馈问题",
       "saved_to": "保存至",
-      "show_in_finder": "在 Finder 中显示",
+      "show_in_file_manager": "在文件管理器中显示",
       "what_happened": "发生了什么？"
     },
     "resizeHandle": {
@@ -6160,8 +6332,13 @@
       "no_noun_match": "没有匹配的{{noun}}"
     },
     "updateModal": {
+      "back_to_dashboard": "返回仪表板",
       "dismiss": "忽略",
       "dismiss_update_dialog": "关闭更新对话框",
+      "install_failed": "更新安装失败",
+      "install_failed_body": "无法应用此更新。Kiro Crew 正在恢复本地网关——你可以继续使用当前版本，并在“设置 > 关于”中重试。",
+      "installing_update": "正在安装更新…",
+      "installing_update_body": "Kiro Crew 正在停止本地网关并安装更新。这可能需要一分钟——请勿退出应用，它会自行重新启动。",
       "is_downloaded_and_ready_to_install": "已下载完成，可以安装。",
       "kirocrew": "Kiro Crew",
       "later": "稍后",
@@ -6412,6 +6589,14 @@
       "install_step_1": "Point your smartphone camera at the QR code and open the link.",
       "install_step_2": "In Chrome menu (3 dots), tap \"Add to Home screen\".",
       "install_step_3": "A KiroCrew app icon will appear on your home screen."
+    },
+    "skillsMultiSelect": {
+      "add_skill": "Add skill",
+      "remove_skill": "Remove {{name}}",
+      "filter_skills": "Filter skills...",
+      "no_matching_skills": "No matching skills",
+      "skills_hint": "Skills loaded when this hook matches — no command needed.",
+      "selected": "Selected"
     }
   },
   "hooks": {
@@ -6426,6 +6611,8 @@
     },
     "useCronActions": {
       "failed_to_cancel_job": "取消任务失败",
+      "failed_to_pause_job": "暂停任务失败",
+      "failed_to_resume_job": "恢复任务失败",
       "failed_to_open_in_chat": "在聊天中打开失败",
       "failed_to_run_job": "运行任务失败"
     },
@@ -6472,7 +6659,8 @@
       "subagents": "子代理",
       "summary": "摘要",
       "workflows": "工作流",
-      "git": "Git"
+      "git": "Git",
+      "pins": "置顶"
     },
     "useSceneInteraction": {
       "all_slots_are_occupied": "所有槽位都已占用",
@@ -7185,7 +7373,8 @@
       "ver": "版本",
       "widgets_files_and_snippets_live_tracked_with_ver": "小组件、文件和代码片段 — 实时跟踪并保留版本历史",
       "your_artifacts": "你的工件",
-      "local_preview": "Local preview"
+      "local_preview": "Local preview",
+      "more_actions": "更多操作"
     },
     "capabilitiesPage": {
       "agent_capabilities": "代理能力",
@@ -7419,9 +7608,11 @@
       "folderPanel": {
         "empty_folder": "空目录",
         "loading": "正在加载…",
+        "open_in_file_explorer": "在文件资源管理器中打开",
+        "open_in_finder": "在 Finder 中打开",
         "parent_folder": "上级目录",
         "refresh": "刷新",
-        "reveal_in_finder": "在 Finder 中显示",
+        "show_in_file_manager": "在文件管理器中显示",
         "unable_to_list_folder": "无法列出目录内容"
       },
       "knowledgePicker": {
@@ -7551,7 +7742,9 @@
         "this_app_render_is_no_longer_available": "此应用渲染已不可用。请重新运行工具以查看。",
         "turn_diff": "本轮差异",
         "menu_git": "Git",
-        "menu_git_desc": "分支、更改和最近的提交"
+        "menu_git_desc": "分支、更改和最近的提交",
+        "menu_pins": "置顶",
+        "menu_pins_desc": "你在这个会话里标记的消息"
       },
       "stopEventCard": {
         "stop_failed_session_reset": "停止失败，会话已重置",
@@ -7581,11 +7774,12 @@
         "expand_agent_list": "展开子代理列表",
         "more_running_normally": "个仍在正常运行…",
         "no_activity": "— 无活动",
+        "no_activity_for": "已无活动 {{secs}} 秒",
         "no_activity_possibly_stalled": "无活动 — 可能已停滞",
         "open_in_subagents_sidebar": "在子代理侧边栏中打开 {{label}}",
+        "possibly_stalled": "可能已停滞",
         "retry_failed_count": "重试失败项（{{count}}）",
         "s": "s",
-        "stalled": "已停滞",
         "stop": "停止",
         "stop_all_running_subagents": "停止所有运行中的子代理",
         "stop_running_subagent": "停止运行中的子代理",
@@ -7647,6 +7841,7 @@
         "send": "发送",
         "send_enter": "发送 (Enter)",
         "steered_into_the_running_turn": "已引导到正在运行的这一轮",
+        "message_unconfirmed": "Message not confirmed — may not have been delivered",
         "pin_message": "置顶消息",
         "unpin_message": "取消置顶"
       },
@@ -7669,9 +7864,8 @@
       },
       "pins": {
         "pinned_messages": "已置顶消息",
-        "close_panel": "关闭置顶消息面板",
         "loading": "加载中…",
-        "no_pinned_messages": "暂无置顶消息。置顶重要消息以便快速查找。",
+        "no_pinned_messages": "还没有置顶消息。把鼠标移到聊天中的某条消息上，点击图钉图标即可保存到这里。",
         "message_unavailable": "此置顶消息在已加载的历史记录中不再可用。",
         "pin_failed": "无法置顶消息，请重试。",
         "unpin_failed": "无法取消置顶消息，请重试。",
@@ -7684,7 +7878,6 @@
         "copy_preview": "复制文本",
         "copy_link": "复制消息链接",
         "unpin": "取消置顶",
-        "open_pinned_messages": "打开置顶消息",
         "jump_to_message": "跳转到消息"
       },
       "sessionSummary": {
@@ -7807,7 +8000,8 @@
       "upload_failed_check_file_type_and_size_max_50_mb": "上传失败 — 检查文件类型和大小（最大 50 MB）",
       "upload_failed_error": "上传失败：{{error}}",
       "what_can_i_do_for_you": "我能帮你做什么？",
-      "worktree_creation_returned_no_path": "创建工作树未返回路径"
+      "worktree_creation_returned_no_path": "创建工作树未返回路径",
+      "loading_earlier_messages": "正在加载较早的消息…"
     },
     "chatSidebar": {
       "1_skipped_currently_selected": "（跳过 1 个 — 当前已选中）",
@@ -7884,6 +8078,7 @@
       "folders": "文件夹",
       "goal_loop_cycle": "目标循环 · 第 {{count}} 轮，共 {{total}} 轮",
       "goal_loop_cycle_no_cap": "目标循环 · 第 {{count}} 轮（无上限）",
+      "goal_loop_interrupted_title": "目标循环待命 — 上一轮被中断；恢复聊天或等待下一轮",
       "hidden": "已隐藏",
       "hidden_because_parent_hidden": "{{name}} 已隐藏，因为上级文件夹处于隐藏状态",
       "hidden_folder": "个隐藏的文件夹",
@@ -7893,7 +8088,6 @@
       "hide_from_flat_view": "在平铺视图中隐藏 {{name}}",
       "hide_when_empty": "为空时隐藏",
       "hours": "小时",
-      "in_folder": "所在文件夹：{{name}}",
       "include_untagged_sessions": "包含无标签的会话",
       "incognito_no_memory_writes": "隐身 — 不写入记忆",
       "last_30_days": "最近 30 天",
@@ -7901,6 +8095,7 @@
       "load_more": "加载更多…",
       "loop": "循环 {{count}}/{{total}}",
       "loop_2": "循环 · {{count}}",
+      "loop_interrupted": "已中断",
       "manage_tags": "管理标签…",
       "manage_tags_2": "管理标签",
       "match_mode": "匹配模式",
@@ -7954,6 +8149,7 @@
       "show_collapsed_folders": "显示折叠的文件夹：",
       "show_folder": "显示文件夹",
       "show_in_flat_view": "在平铺视图中显示 {{name}}",
+      "show_only_sessions_tagged": "仅显示带有 {{name}} 标签的会话",
       "show_the_folder_list": "展开文件夹列表",
       "skip": "跳过",
       "sort_and_filter_sessions": "排序和筛选会话",
@@ -7967,6 +8163,7 @@
       "sort_oldest": "最早",
       "started_in_channel": "此对话开始于 {{channel}}。",
       "started_in_direct_message": "此对话开始于私信。",
+      "stop_filtering_by_tag": "取消按 {{name}} 筛选",
       "streaming": "流式输出中",
       "switch_all_sessions": "切换所有会话",
       "switch_all_to_model": "全部切换到模型…",
@@ -7976,6 +8173,7 @@
       "switch_to_folder_view": "切换到文件夹视图",
       "switch_to_list_view": "切换到列表视图",
       "switching": "正在切换…",
+      "tags": "标签",
       "temporary_no_memory_reads_or_writes": "临时 — 不读取也不写入记忆",
       "thinking": "正在思考…",
       "today": "今天",
@@ -8091,6 +8289,7 @@
       "build_pending": "待构建",
       "build_pending_restart_gateway_to_apply_kirocrew": "待构建 — 重启网关以生效 (kirocrew restart)",
       "building": "正在构建…",
+      "build_finished_restarting_gateway": "构建完成 — 正在重启网关…",
       "built": "已构建",
       "built_and_ready_spin_up_a_pod_from_the_row_menu": "已构建就绪 — 从行菜单启动 pod 即可对此分支做 QA",
       "built_but_pods_cannot_run_on_this_host_preview_i": "已构建 — 但此主机无法运行 pod；改用 ./dev-backend.sh 预览",
@@ -8126,6 +8325,10 @@
       "filter_worktrees": "筛选工作树…",
       "filter_worktrees_2": "筛选工作树",
       "finished": "已完成",
+      "force_remove_confirm_desc": "{{count}} 个工作树存在未合并或未提交的改动。移除后将永久删除所有本地更改，无法撤销。",
+      "force_remove_confirm_title": "强制移除工作树？",
+      "force_remove_warning": "所选工作树存在未合并的改动 — 移除是永久性的，无法撤销。",
+      "force_remove": "强制移除 {{name}}",
       "gateway_did_not_come_back_within_60s_reload_the": "网关在 60 秒内未恢复 — 手动重新加载页面，或查看 `kirocrew logs`。",
       "gateway_restarted_mid_sync_run_lost_check_git_st": "网关在同步中重启 — 本次运行已丢失；检查 git 状态并重新运行拉取+构建",
       "git_status_failed": "git status 失败",
@@ -8134,6 +8337,7 @@
       "hide_logs": "隐藏日志",
       "issues": "问题：",
       "just_now": "刚刚",
+      "kept_force_hint": "勾选以强制移除 — 将删除未合并的工作。",
       "kept": "已保留",
       "last_commit_activity": "最近提交活动",
       "legacy_worktrees_hidden_show": "已隐藏 {{n}} 个旧版工作树 · 展开",
@@ -8183,6 +8387,7 @@
       "pr_merged_safe_to_remove_runs_git_worktree_remov": "PR 已合并 — 可以安全移除。会执行 `git worktree remove`。无法撤销。",
       "pr_merged_uncommitted_changes": "PR 已合并，存在未提交改动",
       "pr_open_or_unmerged_commits": "PR 未关闭或存在未合并提交",
+      "protected_worktree": "受保护 — 主工作树或当前正在运行",
       "provision": "预配",
       "provision_failed": "预配失败",
       "provision_failed_exit_code": "预配失败（退出码 {{code}}）",
@@ -8206,7 +8411,7 @@
       "pull_build_failed_to_start": "拉取+构建启动失败",
       "pull_build_main": "拉取 + 构建 main",
       "pulls_main_and_rebuilds_6_min_does_not_restart": "拉取 main 并重新构建（约 6 分钟）。不会重启。",
-      "pulls_main_rebuilds_then_restarts_automatically": "Pulls main, rebuilds (~6 min), then restarts the gateway automatically.",
+      "pulls_main_rebuilds_then_restarts_keep_page_open": "拉取 main，重新构建（约6分钟），然后自动重启网关。请保持此页面打开直到构建完成。",
       "purpose": "用途：",
       "qa_pod_is_running_but_failing_its_health_check": "QA pod 正在运行，但健康检查未通过",
       "qa_pod_is_running_click_open_to_use_it": "QA pod 正在运行 — 点击“打开”即可使用",
@@ -8391,7 +8596,8 @@
       "timeout": "超时",
       "total": "总计",
       "total_runs": "运行总次数",
-      "user": "用户"
+      "user": "用户",
+      "matcher_mode": "Matcher mode"
     },
     "kiroCrewAgentsPage": {
       "a_unique_identifier_for_this_workspace_agents_re": "此工作区的唯一标识符。代理通过名称引用工作区。",
@@ -8509,7 +8715,6 @@
         "months_ago": "{{n}} 个月前",
         "search_across_all_knowledge_filter_by_type_or_ex": "搜索全部知识、按类型筛选，或探索实体图谱",
         "supported_formats": "支持的格式：{{formats}}",
-        "supported_formats_list": "Markdown、纯文本、代码文件 (.py, .ts, .java, .go, .rs 等)、HTML、JSON、YAML、CSV、DOCX、Org Mode (.org)、PDF",
         "weeks_ago": "{{n}} 周前",
         "welcome_to_the_knowledge_library": "欢迎使用知识库",
         "your_centralized_knowledge_base_with_entity_extr": "你的集中式知识库，支持实体抽取、图谱关系和全文搜索。"
@@ -8531,6 +8736,7 @@
         "embedding_model_loading": "正在加载嵌入模型（{{name}}）",
         "embeddings_initializing": "○ 嵌入初始化中",
         "embeddings_loading": "嵌入加载中",
+        "embeddings_count": "嵌入（{{value}}）",
         "entities": "实体",
         "esc": "Esc",
         "filter_by_namespace": "按命名空间筛选",
@@ -8627,9 +8833,10 @@
         "ignore_patterns": "忽略规则",
         "ignore_patterns_one_per_line_e_g_trash_templates": "忽略规则（每行一条，例如 .trash/*）\nTemplates/*",
         "include_subdirectories_recursive": "包含子目录（递归）",
-        "indexing_uses_kiro_requests_each_source_costs_mo": "索引会消耗 Kiro 请求：每个来源所需的请求数与其大小成正比，受监视的文件夹会随着文件增加持续消耗。费用会随时间逐步产生，而不是一次性收取。",
+        "indexing_uses_kiro_requests_each_source_costs_mo": "索引会按来源大小成比例消耗 Kiro 请求，受监视的文件夹会随文件新增持续消耗，费用随时间逐步产生而非一次性收取。",
         "items": "个条目",
-        "kiro_requests_left": "约剩 {{calls}} 次 Kiro 请求",
+        "kiro_requests_left": "完成还需约 {{calls}} 次 Kiro 请求",
+        "max_file_size": "每个文件最大 50 MB。",
         "local_file": "本地文件",
         "local_folder": "本地文件夹",
         "manual": "○ 手动",
@@ -8652,13 +8859,14 @@
         "retry": "重试",
         "save_name": "保存名称",
         "scanning_this_many_files_will_take_several_minut": "扫描这么多文件需要几分钟，并会占用大量资源。",
+        "show_failed_files": "查看失败的文件",
         "skip": "跳过",
         "source_name": "来源名称",
         "source_name_optional": "来源名称（可选）",
         "start_scanning": "开始扫描",
         "starting": "正在启动…",
         "supported_file_found_other": "找到 {{count}} 个受支持的文件",
-        "supports_markdown_plain_text_code_files_html_jso": "支持：Markdown、纯文本、代码文件、HTML、JSON、YAML、CSV、DOCX、Org Mode、PDF。每个文件最大 50 MB。",
+        "supports_formats": "支持：{{formats}}。",
         "sync": "同步",
         "sync_source": "同步来源",
         "this_folder_will_be_watched_any_supported_files": "将监视此文件夹。在此添加的任何受支持文件都会在下一个扫描周期（约 5 分钟）自动导入。",
@@ -8752,6 +8960,36 @@
       "without_gateway_per_session_copies": "不使用网关（每会话独立副本）"
     },
     "mcpManagement": {
+      "assessment": {
+        "col_assessment": "评估",
+        "col_evidence": "证据",
+        "col_running_as": "运行方式",
+        "connections_link": "Connections",
+        "how_measured": "一个 server 在 Kiro Crew 探测它之前都显示为未测量；在 {{link}} 下刷新 MCP server 列表时，每次会测两个。",
+        "lede": "Kiro Crew 对每台服务器观察到的信息，以及这些信息与它此刻运行方式的吻合程度。此视图不会更改任何内容 — 开关都在 Servers 里。",
+        "legend": "要推荐共享后端，服务器得声明自己能区分不同调用方，而很少有服务器这么声明 — 所以大多数健康的服务器都停在“未发现异议”。这是保守的答案，而非缺失的答案，是否共享仍由你决定。",
+        "open_servers": "打开 Servers",
+        "reason_all_tools_read_only": "每个工具都声明自己只读",
+        "reason_caller_sensitive": "对两个不同调用方给出了不同的握手应答",
+        "reason_declares_caller_identity": "声明自己能区分不同调用方",
+        "reason_first_party": "一台 Kiro Crew 服务器，设计上绑定到单个会话",
+        "reason_no_objection_found": "未发现足以否决的因素，这比能证明共享安全的证据要弱",
+        "reason_no_tool_annotations": "没有工具声明自己是否只读",
+        "reason_no_tools_listed": "没有提供可供检查的工具",
+        "reason_not_probed": "从未测量过，因此无法对任何一方下结论",
+        "reason_not_stdio": "不是 stdio 服务器，因此没有可在前面加桩的管道",
+        "reason_observed_hazard": "共享时已观察到它对不同调用方表现不同",
+        "reason_per_client_capability": "声明了只属于单个客户端的能力",
+        "reason_preflight_not_run": "已声明，但尚未测量",
+        "reason_preflight_passed": "在两个不同调用方下测量，两次应答一致",
+        "reason_rotating_secret_env": "读取一个取值随会话而变的凭据",
+        "shared_without_support": "后端共享已经生效，但证据反对共享。受影响的 server：{{count}}",
+        "strength_declared": "为共享而建",
+        "strength_disqualified": "不适合共享",
+        "strength_no_objection": "未发现异议",
+        "strength_refuted": "共享时不安全",
+        "strength_unknown": "未测量"
+      },
       "cancel": "取消",
       "col_server": "服务器",
       "col_state": "状态",
@@ -8763,6 +9001,7 @@
       "confirm_stateful": "持有会话级状态的服务器应该只开桩，或者做好与其他会话共处一个后端的准备。",
       "confirm_title": "要在会话之间共享后端吗？",
       "confirm_turn_on": "开启共享",
+      "confirm_unsupported": "其中 {{count}} 个的证据反对共享。",
       "learn_more": "了解更多",
       "learn_more_docs": "查看文档了解更多",
       "lede": "Kiro Crew 可以在 MCP 服务器前面放一个自己的桩，而不是让每个会话各自去启动那台服务器。桩是服务器自绘界面（MCP Apps）的前提，也是共享后端唯一能路由到的东西 —— 所以它按服务器逐台开启。 {{link}}",
@@ -8784,7 +9023,10 @@
       "stub_failed": "改动没能生效。它可能已经保存但尚未生效 —— 下面的开关现在显示已存状态。",
       "stub_not_live": "已保存，但尚未生效 —— 网关没能启动。开关显示的是存下来的设置，并非当前运行状态。",
       "stubbed_of_total": "{{total}} 台中有 {{stubbed}} 台已插桩",
-      "unsupported_platform": "共享后端需要 Unix 域套接字，因此在当前平台不可用。"
+      "unsupported_platform": "共享后端需要 Unix 域套接字，因此在当前平台不可用。",
+      "view_assessment": "共享评估",
+      "view_servers": "服务器",
+      "views_aria": "MCP 管理视图"
     },
     "migrationPage": {
       "app_migration": "应用迁移",
@@ -9190,7 +9432,8 @@
         "version_range": "(v{{from}} → v{{to}})",
         "workspace": "工作区",
         "auto_create_hint": "Kiro Crew 还可以从已完成的会话中自动起草技能 — 默认关闭，由 <settingRef/> 控制。",
-        "approval_required_hint": "候选项在此等待你的批准 — 由 <settingRef/> 要求。"
+        "approval_required_hint": "候选技能在此等待你的批准。当 <settingRef/> 关闭时，纯文本技能可以自动发布 — 包含脚本的技能始终需要审查。",
+        "scripts_always_require_review": "捆绑的脚本始终需要人工审查，即使已关闭技能审批。"
       },
       "steeringTab": {
         "always_on_markdown_conventions_injected_into_eve": "注入到每个会话的常开 markdown 约定。全局文件位于 ~/.kiro/steering，在所有位置生效；工作区文件位于 <project>/.kiro/steering，仅对相应项目生效。",
@@ -9667,7 +9910,11 @@
       "view_last_result": "查看最近一次结果",
       "writes_badge_tooltip": "此模板的定时任务会推送分支、开 PR 或修改 issue。它的防护约束只是对代理的指示，并非强制策略。",
       "writes_notice": "此模板的定时任务会在你的仓库里推送分支、开 PR 或修改 issue。提示词里的限制（例如“绝不推送到默认分支”）只是对代理的指示，并非强制策略 — 保存前请先看一遍提示词。",
-      "writes_to_your_repos": "会写入你的仓库"
+      "writes_to_your_repos": "会写入你的仓库",
+      "script_source": "脚本源代码",
+      "script_source_download": "下载脚本",
+      "script_source_failed": "无法加载脚本源代码。",
+      "script_source_truncated": "已截断 — 脚本超出预览大小限制。"
     },
     "servicesTab": {
       "connected": "已连接",
@@ -9926,6 +10173,9 @@
         "session_folder_name_desc": "保存这些设置时若不存在会自动创建。"
       },
       "browserPanel": {
+        "use_builtin_label": "使用内置浏览器",
+        "use_builtin_desc": "在 Kiro Crew 的内置面板中打开页面。关闭后改用 playwright-cli 浏览。",
+        "use_builtin_desktop_only": "仅在桌面应用中可用。在浏览器或远程网关中，助手会使用 playwright-cli。",
         "browsing": "网页浏览",
         "cannot_load": "无法加载浏览器状态。网关在运行吗？",
         "available": "助手可以浏览网页。",

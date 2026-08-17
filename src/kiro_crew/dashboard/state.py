@@ -394,6 +394,95 @@ def parse_cls_meta(cls_val: str) -> dict | None:
     return meta
 
 
+def is_stop_event_row(m: dict) -> bool:
+    """True when *m* is the card recorded because the user pressed Stop.
+
+    Three carriers, and the in-memory one is the easy miss: the stop is appended
+    as ``slot.append("system", stop_msg, stop_msg)`` with **no** ``meta=`` kwarg,
+    so ``_ChatSlot.append`` never creates a ``meta`` key and the discriminator
+    exists ONLY inside the JSON-encoded ``cls``/``content``. ``parse_cls_meta()``
+    is what unpacks it, and it runs on the way OUT to a client
+    (``_prepare_messages`` / ``_broadcast_chat_message``) — which is why the
+    frontend sees ``meta.kind`` while the live window does not. Checking only
+    ``kind``/``meta.kind`` here therefore matched a restored row but never a
+    freshly-stopped one, silently diverging from the frontend mirror in exactly
+    the case the two must agree on.
+
+    Mirrors ``isStopEvent`` in ``website/src/store/chatSlice.ts``.
+    """
+    if m.get("kind") == "stop_event":
+        return True
+    meta = m.get("meta") or {}
+    if meta.get("kind") == "stop_event":
+        return True
+    # Live window: the discriminator is still JSON inside `cls`. Prefilter on
+    # the literal before parsing — this runs from `to_dict()` on the
+    # push_slots_update path for every walked tail row, and `parse_cls_meta`
+    # costs a json.loads plus credential/URL redaction when the row carries a
+    # string tool_input (permission cards). `"stop_event"` is the literal
+    # discriminator, so a cls without the substring can never parse to a match.
+    # Non-string `cls` (an object-valued row from a foreign writer or a
+    # corrupted transcript) is refused up front: the membership test would
+    # raise on it, and `parse_cls_meta` would only swallow it into None anyway.
+    cls_val = m.get("cls") or ""
+    if not isinstance(cls_val, str) or "stop_event" not in cls_val:
+        return False
+    parsed = parse_cls_meta(cls_val)
+    return bool(parsed and parsed.get("kind") == "stop_event")
+
+
+def is_turn_interrupted(messages: list[dict]) -> bool:
+    """True when the transcript shows a turn that ended without a reply.
+
+    Two shapes qualify: the last conversational row is the USER's (nothing came
+    back at all — a gateway restart mid-turn leaves exactly this), or it is the
+    ASSISTANT's but an error row follows it (the turn streamed partway then died,
+    which is otherwise shape-identical to a clean completion).
+
+    One shape is explicitly excluded: a trailing ``stop_event``. The user pressing
+    Stop is a deliberate ending, not an interruption, and stopping before the
+    reply emitted any text produces the same ``[user, ...]`` tail as a crash.
+
+    Selects the wording injected for the model (``_MANUAL_RESUME_MSG`` vs
+    ``_MANUAL_CONTINUE_MSG``), gates whether the composer offers the Resume
+    control (the ``continuable && interrupted`` composition in
+    ``website/src/pages/ChatPage.tsx``), and feeds the ``interrupted`` field of
+    the slot summary so the sidebar can stop rendering a goal loop as actively
+    working while its session sits behind a Resume button. A False result means
+    "as far as the transcript shows, the last turn finished or was ended on
+    purpose", NOT "there is nothing to do": a force-quit runs no ``finally``, so
+    the error row that would have proved an interruption was never written.
+
+    Mirrors ``selectTurnInterrupted`` in ``website/src/store/chatSlice.ts`` —
+    the two must agree, or the composer promises one thing and the agent is
+    told another.
+
+    Deliberately does not distinguish "produced some output" from "produced
+    none": ``_MANUAL_RESUME_MSG`` is worded to hold in both cases, so the
+    distinction would buy a branch and nothing else.
+    """
+    saw_trailing_error = False
+    for m in reversed(messages):
+        role = m.get("role")
+        meta = m.get("meta") or {}
+        # A deliberate Stop ENDS the turn; it does not interrupt it. Tested
+        # before the user/assistant branch because stopping before the reply
+        # emitted any text leaves ``[user, stop_event]`` -- shape-identical to
+        # "the gateway died before anything came back". See ``is_stop_event_row``
+        # for why the discriminator has to be resolved from three carriers.
+        # Only the NEWEST turn's terminator reaches here -- an older stop card
+        # is never scanned, because a later user/assistant row returns first.
+        if is_stop_event_row(m):
+            return False
+        if role == "assistant" and meta.get("kind") == "compaction":
+            continue
+        if role in ("user", "assistant") and m.get("content"):
+            return True if role == "user" else saw_trailing_error
+        if role == "error":
+            saw_trailing_error = True
+    return False
+
+
 def _mark_permission_resolved(
     messages: list[dict],
     request_id: str,
@@ -509,6 +598,12 @@ _WIRE_ONLY_ROLES = frozenset({"chunk", "done", "streaming"})
 #: card whose answer channel is already gone (server retired, client did not).
 #: Widening coverage is a data edit here.
 _QUESTION_RETIRING_ROLES = frozenset({"user", "nudge"})
+#: Roles that carry an inbound PROMPT -- the rows that ask this session to do
+#: something, as opposed to the rows produced while it works. ``user`` is a human
+#: send from any surface; ``inject`` is automation delivering a cron notification
+#: or a subagent completion event. Used to rank a session by when its work was
+#: requested while the answer is still streaming (``to_dict``'s ``last_turn_ts``).
+_PROMPT_ROLES = frozenset({"user", "inject"})
 _MAX_SOURCE_LINKS_PER_SLOT = 64
 # How many source links each slot payload actually serializes (the sidebar
 # renders at most this many chips). Shared with the periodic check-status
@@ -919,6 +1014,7 @@ class _ChatSlot:
         "event",
         "_pending",
         "_queue",
+        "_last_enqueue_ts",
         "_approval_futures",
         "_trust",
         "_trust_scope",
@@ -933,6 +1029,7 @@ class _ChatSlot:
         "_title_retry_pending",
         "_summary_in_flight",
         "_summary_turn_mark",
+        "_detail_render_lock",
         "_last_stop_reason",
         "_artifact",
         "_channel_folder_filed",
@@ -1057,6 +1154,9 @@ class _ChatSlot:
         self.event = asyncio.Event()
         self._pending: list[dict[str, str]] = []
         self._queue: list[dict[str, str]] = []  # [{"id": uuid, "content": str}, ...]
+        # Newest enqueue instant, read only while ``_queue`` is non-empty — see
+        # ``_note_enqueue``.
+        self._last_enqueue_ts: str = ""
         self._approval_futures: dict[str, asyncio.Future[str]] = {}  # type: ignore[type-arg]
         self._trust: bool = False  # auto-approve tools for this slot
         # SafetyOverride scope key holding an EXPIRING, SEL-audited auto-approve
@@ -1098,6 +1198,13 @@ class _ChatSlot:
         # summary pass outlives the turn that triggered it, so a fast follow-up
         # turn would otherwise start a second pass over the same transcript.
         self._summary_in_flight: bool = False
+        # Serializes the slot-detail render offload (see api_chat_slot_detail):
+        # rendering redacts the ENTIRE history with a regex battery, so on a
+        # multi-MB session two concurrent refetches (WS reconnect + switchSlot)
+        # would burn that CPU twice in parallel worker threads for the same
+        # payload. The lock queues them instead; each holder re-renders from
+        # fresh state, so a queued waiter never serves a stale response.
+        self._detail_render_lock = asyncio.Lock()
         # User-turn count at the last successful summary, so the configured
         # regeneration cadence can be honored without re-reading the sidecar.
         self._summary_turn_mark: int = 0
@@ -1745,6 +1852,23 @@ class _ChatSlot:
             # The frozen prefix grew → its cached bytes are stale.
             self._frozen_prefix_cache = None
 
+    def push_wire_frame(self, cls: str, content: str) -> None:
+        """Queue an ephemeral wire-only frame for live SSE readers.
+
+        Unlike ``append_message`` this touches NOTHING durable: the frame is
+        not added to ``messages``, not counted in ``total_messages``, not
+        persisted, and not WS-broadcast. It only lands in ``_pending`` so an
+        attached HTTP stream reader drains it before the turn's ``done``.
+        Use for out-of-band signals (e.g. the context meter) that a WebSocket
+        client gets via a typed broadcast but an SSE-only client would miss.
+        The queue/ordering contract lives here so callers never hand-roll a
+        raw ``_pending`` append at a distance.
+        """
+        self._pending.append(
+            {"role": cls, "content": content, "cls": cls, "ts": ""}
+        )
+        self.event.set()
+
     def drain(self) -> list[dict[str, str]]:
         """Return and clear pending messages."""
         out = self._pending[:]
@@ -1813,7 +1937,23 @@ class _ChatSlot:
         if meta:
             item["meta"] = meta
         self._queue.append(item)
+        self._note_enqueue()
         return qid
+
+    def _note_enqueue(self) -> None:
+        """Record that work was just queued for this slot.
+
+        Held BESIDE the queue rather than on the entry: an entry dict is compared
+        wholesale in a great many places, and widening its shape would make every
+        one of those comparisons depend on a clock.
+
+        Read only while ``_queue`` is non-empty (see ``to_dict``), so the value
+        cannot outlive the queue it describes. Individual removals leave it
+        pointing at the most recent enqueue rather than at the oldest surviving
+        entry, which is the same statement for ranking purposes: work is waiting,
+        and it was asked for at this instant.
+        """
+        self._last_enqueue_ts = datetime.now(timezone.utc).isoformat()
 
     def queue_insert(self, index: int, content: str, kind: str = "", payload: str = "") -> str:
         """Insert a message at a specific queue position. Returns the queue ID.
@@ -1825,6 +1965,7 @@ class _ChatSlot:
         """
         qid = uuid.uuid4().hex[:12]
         self._queue.insert(index, {"id": qid, "content": content, "kind": kind, "payload": payload})
+        self._note_enqueue()
         return qid
 
     def queue_pop(self, index: int = 0) -> dict[str, str]:
@@ -2163,6 +2304,42 @@ class _ChatSlot:
             if found_conv and last_msg and last_activity_ts:
                 break
         pending_approval = any(not f.done() for f in self._approval_futures.values())
+        # Ordering instant for the session list: the last time this session
+        # SETTLED -- work was asked of it, or a turn finished. Deliberately not
+        # ``last_ts``, which is the newest row of ANY role and therefore advances
+        # on every streamed tool call: a list ranked by that reshuffles
+        # continuously whenever several sessions are working, so rows swap under
+        # the pointer. A turn in flight instead holds the rank of the prompt that
+        # started it, and the single re-rank lands when the turn ends -- at which
+        # point the newest row IS the completion.
+        #
+        # A send that arrived behind a running turn is QUEUED, not appended, so
+        # the message scan alone would not see it and this snapshot would rank the
+        # session by the older prompt -- overwriting the client's own bump and
+        # dropping the row the user just typed into. Ranking queued entries here
+        # makes this the single owner of the key instead of racing the client.
+        #
+        # Both scans are running-only, so an idle slot (the common case in a long
+        # sidebar) costs nothing, and a running one is bounded by its own turn.
+        last_turn_ts = last_ts
+        if self.running:
+            prompt_ts = next(
+                (
+                    m.get("ts") or ""
+                    for m in reversed(self.messages)
+                    if m.get("role") in _PROMPT_ROLES
+                ),
+                "",
+            )
+            queued_ts = self._last_enqueue_ts if self._queue else ""
+            last_turn_ts = prompt_ts
+            if queued_ts:
+                # Parse-based, not string ``max``: rows carry both aware and naive
+                # isoformat, and comparing those as strings can pick the earlier
+                # one. Consulted only while something is queued, so a prompt row
+                # whose own ``ts`` is unparseable still ranks the session instead
+                # of being discarded by the combiner.
+                last_turn_ts = latest_transcript_ts(prompt_ts, queued_ts) or queued_ts
         # waiting_for_input: turn ended (not running), no options, no approval,
         # and the last conversational message is from the assistant (not user).
         waiting_for_input = (
@@ -2191,6 +2368,16 @@ class _ChatSlot:
         # Separate from `pending_approval`, whose answer is allow/deny on a tool
         # rather than input, and which keeps its own precedence and label.
         needs_input = bool(self._question_pending)
+        # interrupted: the transcript shows the last turn ending without the
+        # assistant handing the floor back (trailing error row, or an unanswered
+        # user row) — the state behind the composer's Resume button. Surfaced on
+        # the summary because the sidebar has no transcript to derive it from,
+        # and it must stop rendering a goal-loop session as actively working
+        # while the session actually sits dead until the user resumes it (or the
+        # loop's next idle-timer cycle fires, up to idle_secs away). Gated on
+        # ``not running``: while a turn is in flight the trailing error belongs
+        # to a superseded turn and the live status already tells the truth.
+        interrupted = not self.running and is_turn_interrupted(self.messages)
         # If an approval is pending, surface the tool metadata from the most
         # recent unresolved permission message so the Board can show inline
         # Approve/Trust/Reject buttons without a second API call.
@@ -2248,6 +2435,7 @@ class _ChatSlot:
             "last_activity_ts": last_activity_ts,
             "waiting_for_input": waiting_for_input,
             "needs_input": needs_input,
+            "interrupted": interrupted,
             "stop_state": self._stop_state,
             # In-flight `wait` sleep, or None. Carries the absolute deadline the
             # transcript counts down against and the wait_id the "End wait"
@@ -2257,6 +2445,7 @@ class _ChatSlot:
             "wait_state": self._wait_state,
             "created": self.created_at,
             "last_ts": last_ts,
+            "last_turn_ts": last_turn_ts,
             "last_message": last_msg,
             "source_links": [
                 {
@@ -2325,8 +2514,15 @@ class DashboardState:
     # __init__ installs the real per-instance lock.
     _slots_broadcast_lock: "threading.Lock | None" = None
     _slots_broadcast_timer: "asyncio.TimerHandle | None" = None
-    _slots_broadcast_loop: "asyncio.AbstractEventLoop | None" = None
     _slots_broadcast_last: float = 0.0
+    # The one loop this dashboard is served on. Every surface that hands work in
+    # from a foreign thread -- the coalesced slots broadcast, an off-loop
+    # websocket send, the log handler's fan-out -- resolves it through
+    # :attr:`serving_loop` rather than keeping a copy of its own: two copies are
+    # two answers to one question and can disagree, and a caller that finds its
+    # own copy unset drops the work silently. Bound at app startup; the property
+    # latches lazily so a ``__new__``-built state still resolves one.
+    _serving_loop: "asyncio.AbstractEventLoop | None" = None
     # Keys the last open-tab restore could not read (not keys it proved absent).
     # _persist_open_slots folds these back into the snapshot so a transient read
     # failure cannot erase the reopen seed. The class-level baseline is an
@@ -4526,7 +4722,7 @@ class DashboardState:
         #
         # 1. This is the LIVE oauth banner's egress path. _emit_mcp_oauth_request
         #    appends the banner with a real `oauth_url`, already gated by
-        #    _oauth_url_contains_credential — the shared security gate, which
+        #    security.oauth_url_contains_credential — the shared security gate, which
         #    exempts standard high-entropy OAuth values only at exact code-owned
         #    authorization endpoints while scanning everything else fail-closed.
         #    Running _redact_meta_for_role here would blank a genuine
@@ -5406,8 +5602,9 @@ class DashboardState:
             return
 
         with lock:
-            if self._slots_broadcast_loop is None:
-                self._slots_broadcast_loop = self._running_loop()
+            # Resolved once here, at the top of the lock, so the timer branch
+            # below and any later cross-thread caller agree on one loop.
+            serving = self.serving_loop
 
             elapsed = now - self._slots_broadcast_last
             if elapsed >= _SLOTS_BROADCAST_INTERVAL_S:
@@ -5417,9 +5614,9 @@ class DashboardState:
                     self._slots_broadcast_timer = None
                 broadcast_now = True
             elif self._slots_broadcast_timer is None:
-                # Scheduling onto the captured loop is preferred over broadcasting
+                # Scheduling onto the serving loop is preferred over broadcasting
                 # from a foreign thread; a closed loop falls back to an immediate send.
-                loop = self._slots_broadcast_loop
+                loop = serving
                 remaining = _SLOTS_BROADCAST_INTERVAL_S - elapsed
                 try:
                     if loop is None:
@@ -5447,6 +5644,33 @@ class DashboardState:
             return asyncio.get_running_loop()
         except RuntimeError:
             return None
+
+    def bind_serving_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Record the loop this dashboard is served on, before any request runs.
+
+        Called from an app startup hook: that is the earliest point the loop
+        exists, so every later reader finds it already bound instead of racing to
+        latch a copy from whichever thread happens to arrive first.
+        """
+        self._serving_loop = loop
+
+    @property
+    def serving_loop(self) -> "asyncio.AbstractEventLoop | None":
+        """The loop to hand cross-thread work to, or None when it is unknowable.
+
+        Prefers the loop bound at startup. When nothing bound one -- a
+        ``__new__``-built state, a unit test, a process whose startup hook has not
+        run -- it latches the running loop the first time it is read FROM that
+        loop, so an off-loop caller arriving later still has a target. ``None``
+        means this state has never seen a loop, and the caller owns the decision
+        about what to do with the work rather than being handed a guess.
+        """
+        loop = self._serving_loop
+        if loop is None:
+            loop = self._running_loop()
+            if loop is not None:
+                self._serving_loop = loop
+        return loop
 
     def _schedule_trailing_flush(self, delay: float) -> None:
         """Arm the trailing flush. Must run ON the event loop."""
@@ -5675,7 +5899,47 @@ class DashboardState:
         mid-send — silently dropping the websocket message (a lost dashboard update).
         Track it in ``_background_tasks`` (the existing pattern in this module) and
         discard on completion so the reference is held for the task's lifetime.
+
+        A fan-out can be reached from a worker thread: ``push_slots_update``'s
+        leading edge broadcasts inline on whatever thread called it, and several
+        subsystems notify the dashboard from sync callbacks. Off the loop there is
+        nothing to attach a coroutine to, so the send HOPS to the serving loop and
+        the coroutine is created there.
+
+        **Only a PEER failure escapes this method.** A synchronous raise from
+        ``send_str`` (``ConnectionResetError`` on a gone client) propagates, because
+        the fan-out uses it to reap that client. Everything else — no serving loop,
+        a loop mid-shutdown — is this process's own problem, is logged, and costs
+        the frame but never the registration. Conflating the two is what let a
+        thread-origin broadcast unregister every healthy socket: ``ensure_future``
+        raises off-loop, the fan-out read that as a dead peer, and the client kept
+        an open connection that would never receive another frame.
         """
+        loop = self._running_loop()
+        if loop is None:
+            target = self.serving_loop
+            if target is not None and not target.is_closed():
+                try:
+                    target.call_soon_threadsafe(self._spawn_ws_send, ws, msg)
+                    return
+                except RuntimeError:
+                    # Raced a shutdown between the is_closed check and the call.
+                    logger.debug("WS send: serving loop is shutting down")
+            # Nowhere to run it. Still CALL send_str so a peer that refuses
+            # synchronously is reported to the caller, then close the coroutine
+            # rather than abandoning it — an un-awaited coroutine loses the frame
+            # just as silently and additionally warns at collection time.
+            coro = ws.send_str(msg)
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            logger.debug("WS send dropped: no serving loop to run it on")
+            return
+        # Latch through the accessor, never by assigning the field: the read
+        # records this loop only when nothing bound one, so a loop bound at
+        # startup stays authoritative and bind_serving_loop remains the only
+        # writer that can override. The send below runs on the loop we are on.
+        self.serving_loop
         task = asyncio.ensure_future(ws.send_str(msg))
         self._background_tasks.add(task)
         task.add_done_callback(self._on_ws_send_done)
@@ -5858,8 +6122,23 @@ class DashboardState:
             if not self._ws_client_allowed(ws, msg_type, data):
                 continue
             try:
-                self._spawn_ws_send(ws, self._serialize_for_client(ws, msg_type, data, msg))
+                payload = self._serialize_for_client(ws, msg_type, data, msg)
             except Exception:
+                # A payload-shaping bug is ours, not the peer's. Unregistering here
+                # would strip a healthy socket of every future broadcast while
+                # leaving it open, so the client renders a frozen snapshot with
+                # nothing surfaced anywhere.
+                logger.warning(
+                    "WS payload shaping failed for %s; keeping the client registered",
+                    msg_type,
+                    exc_info=True,
+                )
+                continue
+            try:
+                self._spawn_ws_send(ws, payload)
+            except Exception:
+                # send_str refused synchronously — this peer is gone. Scheduling
+                # problems never reach here; see _spawn_ws_send.
                 dead.append(ws)
         for ws in dead:
             self._remove_ws(ws)
@@ -5874,6 +6153,7 @@ class DashboardState:
             try:
                 self._spawn_ws_send(ws, msg)
             except Exception:
+                # Synchronous refusal from the peer; see _send_ws_all.
                 dead.append(ws)
         for ws in dead:
             self._remove_ws(ws)
@@ -5919,6 +6199,17 @@ class DashboardState:
         slot = self.get_slot(slot_key)
         if slot is None:
             return
+        # SSE-only consumers (API clients, soak harness) never open a
+        # WebSocket, so the broadcast above is invisible to them. Mirror the
+        # SAME payload into the slot's live stream queue as an ephemeral
+        # wire-only frame under the SAME ``context_usage`` name the WS
+        # transport uses. Done HERE, inside the single writer, so every
+        # producer (end-of-turn, compaction, cron injection, reset) feeds the
+        # SSE channel identically and it cannot drift from the WS channel.
+        try:
+            slot.push_wire_frame("context_usage", json.dumps(payload))
+        except (TypeError, ValueError):
+            pass  # non-serializable payload (e.g. a test mock) — skip the SSE mirror
         # Ephemeral tabs (incognito/temporary) leave no memory behind by
         # contract — same filter as _persist_open_slots.
         if getattr(slot, "memory_mode", "persistent") != "persistent":
@@ -6123,10 +6414,21 @@ class DashboardState:
         self.broadcast_ws("browser_event", payload)
 
     def register_ws(self, ws: web.WebSocketResponse, *, owner: bool = False) -> None:
-        """Register a WebSocket client and its owner authorization state."""
+        """Register a WebSocket client and its owner authorization state.
+
+        Latches the serving loop here rather than on the first send. Registration
+        runs on the aiohttp handler's loop, so this is the earliest point that
+        loop is known; latching on first send instead left a window where the
+        FIRST frame after a connect, if it originated off-loop, had no loop to
+        run on and was dropped -- a live notification lost until the client
+        reconnected.
+        """
         self._ws_clients.append(ws)
         if owner:
             self._owner_ws_clients.add(ws)
+        # Same one-sink rule as _spawn_ws_send: reading the accessor latches
+        # this loop when nothing bound one and leaves a startup bind alone.
+        self.serving_loop
 
     def unregister_ws(self, ws: web.WebSocketResponse) -> None:
         """Remove a WebSocket client on disconnect."""
@@ -6175,7 +6477,20 @@ class DashboardState:
             if not self._ws_client_allowed(ws, msg_type, data):
                 continue
             try:
-                self._spawn_ws_send(ws, self._serialize_for_client(ws, msg_type, data, msg))
+                payload = self._serialize_for_client(ws, msg_type, data, msg)
+            except Exception:
+                # Same split as _send_ws_all: a payload-shaping fault is ours and
+                # must not unregister a healthy subscriber (_remove_ws strips
+                # _ws_clients too, so an eviction here freezes that client's whole
+                # dashboard, not just its subagent stream).
+                logger.warning(
+                    "WS subagent payload shaping failed for %s; keeping the client registered",
+                    msg_type,
+                    exc_info=True,
+                )
+                continue
+            try:
+                self._spawn_ws_send(ws, payload)
             except Exception:
                 dead.append(ws)
         for ws in dead:

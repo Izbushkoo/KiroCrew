@@ -152,8 +152,10 @@ from kiro_crew.hooks import (
     HOOK_EVENT_PRE_TOOL_USE,
     HOOK_EVENT_STOP,
     HOOK_EVENT_USER_PROMPT_SUBMIT,
+    TOOL_ALLOW,
     TOOL_AUTO_APPROVE,
     TOOL_DENY,
+    ToolHookResult,
     _normalize_tool_name,
     _tool_matches,
     fire_tool_hooks,
@@ -1068,17 +1070,6 @@ def _redact_acp_string(s: str) -> str:
     return s
 
 
-def _oauth_url_contains_credential(url: str) -> bool:
-    """True if the URL embeds an actual credential or exfiltration payload.
-
-    The security module owns the exact endpoint allowlist and parameter-level
-    entropy exemption. This wrapper preserves the historical dashboard API
-    while avoiding ``redact_credentials`` here: that broader redactor includes
-    the bare-secret entropy rule that legitimate state/PKCE values trigger.
-    """
-    return oauth_url_contains_credential(url)
-
-
 def _emit_mcp_oauth_request(
     state: "DashboardState",
     slot: "_ChatSlot",
@@ -1121,23 +1112,38 @@ def _emit_mcp_oauth_request(
             },
         )
         return
-    if _oauth_url_contains_credential(oauth_url):
-        # Legitimate OAuth consent URLs carry state/code_challenge/client_id —
-        # never AKIA*/Bearer/etc.  Surface this so the user can ask the server
-        # owner to fix it instead of just seeing nothing happen.
+    if oauth_url_contains_credential(oauth_url):
+        # Two distinct causes reach this branch and the user cannot tell them
+        # apart from the banner alone:
+        #   1. A genuinely bogus URL — legitimate OAuth consent URLs carry
+        #      state/code_challenge/client_id, never AKIA*/Bearer/etc.
+        #   2. A legitimate consent URL at an endpoint outside
+        #      ``_OAUTH_AUTHORIZATION_ENDPOINTS``. The PKCE entropy carve-out
+        #      applies only at an approved (host, path), so an unlisted
+        #      self-hosted IdP has its ``code_challenge`` scanned as a bare
+        #      secret and fails closed.
+        # Case 2 has a remedy (the ``oauth_endpoints.json`` operator keystone,
+        # see security._load_operator_oauth_endpoints) but it is agent-fenced
+        # with no dashboard writer, so naming it here is the only way the user
+        # learns it exists. Without this the failure reads as unfixable.
         logger.warning(
             "ACP: rejecting MCP OAuth URL with credential/exfil pattern for %s",
             server_name or "(unknown)",
         )
         slot.append(
             "mcp_oauth",
-            f"🚫 {label} sent an authentication URL containing a credential pattern (rejected).",
+            f"🚫 {label} sent an authentication URL containing a credential "
+            "pattern (rejected). If this is a self-hosted or otherwise "
+            "unlisted identity provider, its authorization endpoint may need "
+            "adding to oauth_endpoints.json in the Kiro Crew data home; "
+            "otherwise ask the server owner to fix the URL.",
             "msg msg-warn",
             meta={
                 "server_name": safe_name,
                 "failed": True,
                 "rejected_url": True,
                 "error": "URL contained credential or exfiltration pattern",
+                "remedy": "oauth_endpoints.json",
             },
         )
         return
@@ -1285,9 +1291,10 @@ def _mark_mcp_oauth_completed(
     # NOT preserve realistic `oauth_url`s: it calls `redact_exfiltration_urls`,
     # whose query-length (>=200) and base64-blob heuristics blank a real Google OIDC
     # or GitHub PKCE consent URL. (Measured: those two are blanked; only a short URL
-    # survives.) The emit-path gate `_oauth_url_contains_credential` deliberately
-    # exempts OAuth params from exactly those heuristics — its docstring notes they
-    # "would reject every real OAuth URL".
+    # survives.) The emit-path gate `security.oauth_url_contains_credential`
+    # deliberately exempts OAuth params from exactly those heuristics — it is
+    # "the sole path allowed to exempt standard OAuth entropy from the generic
+    # URL heuristics" (its docstring).
     #
     # That is harmless HERE only because `oauth_url` is dead data by this point:
     # every path through this function sets `completed` or `failed`, and
@@ -5380,6 +5387,13 @@ async def _run_chat(
                     _flush_segment(state, slot, assistant_text)
                     assistant_text = ""
                 _pre_tool_hooks_fired = False
+                # Backend-subagent request whose SECURITY context is absent
+                # (structured params missing, or shell with no recoverable
+                # command — see AcpEvent.child_low_fidelity): every
+                # auto-approve gate below is skipped for it, falling through
+                # to the interactive card. A child WITH full context takes the
+                # same branches as the main agent (mode parity).
+                _child_low_fidelity = event.child_low_fidelity
                 if state.context_builder:
                     # Pass the raw shell command (not just the display title)
                     # so the security gate evaluates what actually executes.
@@ -5446,6 +5460,23 @@ async def _run_chat(
                         # fragments, paths, or credentials.
                         _refusal_reasons.append((_deny_title, _deny_msg))
                         continue
+                    if _child_low_fidelity:
+                        # Backend-subagent origin whose tool_call frames never
+                        # reached us (cache miss): command bytes are absent, so
+                        # every gate below would judge the LLM-authored title
+                        # alone. Fail closed past all auto-approve paths — the
+                        # request falls through to the interactive card. When
+                        # the child's session/update frames WERE routed (the
+                        # normal case), tool_input carries the real command
+                        # bytes and the child takes the exact same mode
+                        # branches as the main agent below.
+                        if tool_result.action == TOOL_AUTO_APPROVE:
+                            logger.info(
+                                "downgrading auto-approve to interactive card for "
+                                "low-fidelity subagent permission request (child=%s)",
+                                event.sub_session_id,
+                            )
+                            tool_result = ToolHookResult(action=TOOL_ALLOW)
                     if tool_result.action == TOOL_AUTO_APPROVE:
                         try:
                             validated_tool = _validate_tool_name(
@@ -5557,7 +5588,9 @@ async def _run_chat(
                 # parent turn. Deny-by-default (CWE-1188): with no active crew this
                 # predicate is False no matter the trust flags, so the tool falls
                 # through to the normal interactive/trust gate below.
-                if _native_crew_should_auto_approve(_native_tracker, state, slot):
+                if _native_crew_should_auto_approve(
+                    _native_tracker, state, slot
+                ) and not _child_low_fidelity:
                     logger.debug(
                         "Native crew auto-approve: %r (request_id=%s)",
                         _safe_native_crew_debug_title(event.title),
@@ -5597,7 +5630,7 @@ async def _run_chat(
                 # use event.title as it IS the provider-controlled tool name.
                 # When tool_input exists but isn't recognized as bash, skip pattern
                 # matching entirely (deny-by-default).
-                if slot._trusted_patterns:
+                if slot._trusted_patterns and not _child_low_fidelity:
                     _tp_cmd = _extract_bash_command(event.tool_input) if event.tool_input else ""
                     if _tp_cmd:
                         _tp_check_title = f"Running: {_tp_cmd}"
@@ -5779,8 +5812,13 @@ async def _run_chat(
                             metadata={"reason": "trust_reads"},
                         )
                         continue
-                # Trust mode (per-slot) or YOLO mode (global) — auto-approve
-                if slot_trusted or yolo_active:
+                # Trust mode (per-slot) or YOLO mode (global) — auto-approve.
+                # Low-fidelity child events (backend subagents whose command
+                # bytes never reached the caches) are excluded from every
+                # auto-approve path and fall through to the interactive card;
+                # children WITH cached bytes take these branches exactly like
+                # the main agent (mode parity).
+                if (slot_trusted or yolo_active) and not _child_low_fidelity:
                     try:
                         validated_tool = _validate_tool_name(event.title, is_shell=event.is_shell)
                     except ValueError as e:
@@ -6372,18 +6410,18 @@ async def _run_chat(
                 # turn (depth > 0), which the branches below never re-queue —
                 # it dies with "please retry", a user-visible fault that must
                 # reach fault_rate.
+                if event.stop_reason == STOP_REASON_STALE_RECOVER:
+                    _turn_exhausted = _prompt_depth > 0 or slot._stale_recovery_retries >= 3
+                elif event.stop_reason == STOP_REASON_TOOL_STALL:
+                    _turn_exhausted = _prompt_depth > 0 or slot._tool_stall_retries >= 3
+                else:
+                    _turn_exhausted = False
                 _emit_turn_metric(
                     event.usage.duration_ms,
                     event.stop_reason,
                     slot.key,
                     elapsed_ms=_turn_elapsed_ms,
-                    exhausted=(
-                        (_prompt_depth > 0 or slot._stale_recovery_retries >= 3)
-                        if event.stop_reason == STOP_REASON_STALE_RECOVER
-                        else (_prompt_depth > 0 or slot._tool_stall_retries >= 3)
-                        if event.stop_reason == STOP_REASON_TOOL_STALL
-                        else False
-                    ),
+                    exhausted=_turn_exhausted,
                 )
                 _stop_reason = event.stop_reason
                 # Recorded on the slot so post-turn consumers reached later

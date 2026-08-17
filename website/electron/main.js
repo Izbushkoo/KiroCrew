@@ -20,6 +20,7 @@ const {
 const { createWindowOpenHandler, openExternalSafely } = require("./external-scheme");
 const { resolveThemeSource } = require("./native-theme");
 const { initAutoUpdate } = require("./auto-update");
+const { makeUpdaterLogger } = require("./update-logger");
 const {
   classifyBundleLocation,
   containingDirForBundle,
@@ -1473,6 +1474,10 @@ function setupWindowContents(win, backendUrl) {
       return [...new Set([...browserPanels.keys(), ...reachableSessions])];
     },
     dispatch: async (sessionKey, op, args) => {
+      // Proves the op crossed the bus into THIS Electron process (drain worked
+      // and a native panel is being driven). Refusals below throw and are logged
+      // by the channel's onError; a dispatch with no following error is a success.
+      console.warn(`[browser-cmdbus] dispatch op=${op} session=${sessionKey}`);
       // A `navigate` may CREATE the panel it needs, so the agent's first
       // "open this page" can reach the native view instead of falling back to the
       // Playwright mirror. Any other op has no page to act on until one exists, so
@@ -3534,6 +3539,7 @@ app.whenReady().then(async () => {
       recoverWedgedGateway(mainWindow).catch((e) => glog(`post-install-failure recovery failed: ${e && e.message}`));
     },
     onUpdateState: broadcastUpdateState,
+    log: makeUpdaterLogger(glog),
     });
   } catch (e) {
     glog(`auto-update init failed — continuing WITHOUT auto-update: ${(e && e.stack) || e}`);

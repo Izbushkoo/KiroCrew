@@ -996,6 +996,7 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/crons/{job_id}/ack", handlers.api_cron_ack)
     app.router.add_get("/api/crons/{job_id}/history", handlers.api_cron_history)
     app.router.add_get("/api/crons/{job_id}/history/{run_id}", handlers.api_cron_history_detail)
+    app.router.add_get("/api/crons/{job_id}/script", handlers.api_cron_script_source)
     app.router.add_get("/api/cron-folders", handlers.api_cron_folders)
     app.router.add_post("/api/cron-folders", handlers.api_cron_folders_create)
     app.router.add_patch("/api/cron-folders/{folder_id}", handlers.api_cron_folders_update)
@@ -1015,6 +1016,15 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/browser/engine", handlers.api_browser_engine_install)
     app.router.add_get("/api/browser/view", handlers.api_browser_view_get)
     app.router.add_post("/api/browser/view/start", handlers.api_browser_view_start)
+    # Native browser command channel (agent->Electron). Loopback + internal-secret
+    # only; see the _STRICT_INTERNAL_API_PATHS entries and each handler's re-assert.
+    app.router.add_post("/api/browser/command", handlers.api_browser_command)
+    app.router.add_post("/api/browser/command-drain", handlers.api_browser_command_drain)
+    app.router.add_post("/api/browser/command-result", handlers.api_browser_command_result)
+    # Distinctive boot marker: this line exists ONLY in the command-bus-gateway
+    # build, so its presence in gateway.log proves this worktree's backend is the
+    # one actually running (vs a stale / frozen bundled backend).
+    logger.debug("browser-cmdbus gateway: /api/browser/command{,-drain,-result} registered")
     # Computer use: the thin ``kirocrew-computer`` stdio shim's only call. Lives
     # HERE (rather than in the dashboard-only block, where the browser-called
     # config pair sits) so the headless ``--slack-only`` server exposes it too —
@@ -1360,9 +1370,7 @@ async def _start_unix_site(runner: web.AppRunner, port: int) -> Path | None:
         logger.info("dashboard internal API also listening on unix socket %s", path)
         return path
     except Exception as exc:
-        logger.warning(
-            "dashboard unix socket unavailable (%s); internal API stays TCP-only", exc
-        )
+        logger.warning("dashboard unix socket unavailable (%s); internal API stays TCP-only", exc)
         return None
 
 
@@ -1745,6 +1753,7 @@ def _register_instances_hooks(app: web.Application, state: DashboardState, port:
             base_port=_cfg.instances.tunnel_base_port,
             connect_timeout_secs=_cfg.instances.connect_timeout_secs,
             ssh_compression=_cfg.instances.ssh_compression,
+            mint_timeout_secs=_cfg.instances.mint_timeout_secs,
             max_recovery_attempts=_cfg.instances.max_recovery_attempts,
             recover_backoff_max_secs=_cfg.instances.recover_backoff_max_secs,
             probe_failure_threshold=_cfg.instances.probe_failure_threshold,
@@ -1987,6 +1996,82 @@ def _arm_prevent_sleep_poll(state: DashboardState) -> None:
     state._prevent_sleep_task = task  # prevent GC; cancelled on cleanup
 
 
+# Deep link at the approval toggle itself (Settings -> Skills, highlighted), so
+# the notification can offer the opt-out at the exact moment the user is being
+# asked to review yet another candidate. Same highlight=key:<configKey> format
+# the frontend's <SettingRef> builds, consumed by useSettingHighlight.
+_SKILL_APPROVAL_SETTING_URL = "/settings?tab=skills&highlight=key:skills.approval_required"
+
+
+def _pending_skill_notification(info: dict) -> tuple[str, str, str, list[dict[str, str]]]:
+    """Build the bell-feed payload for a staged skill candidate.
+
+    Returns ``(title, body, review_url, actions)``. Module-level (rather than
+    inline in the staged hook) so the notification CONTENT is unit-testable
+    without booting the dashboard app.
+    """
+    name = str(info.get("name") or info.get("slug") or "skill")
+    slug = str(info.get("slug") or "")
+    is_update = info.get("kind") == "update"
+    target = str(info.get("target") or "")
+    description = str(info.get("description") or "").strip()
+    triggers = str(info.get("triggers") or "").strip()
+    subject = target or name if is_update else name
+    title = "Skill update awaiting review" if is_update else "New skill awaiting review"
+    # The body LEADS with name + description because the feed row
+    # renders only its first ~80 characters, stripped to one line.
+    # The title already says a skill is awaiting review, so opening
+    # with "was generated from a session and needs your approval"
+    # spends exactly the characters that decide whether the reader
+    # opens the queue on words they have already read. Identity plus
+    # purpose first; the approval sentence still follows for the
+    # detail panel, which renders the whole body as markdown.
+    head = f"**{subject}**"
+    if description:
+        head += f" — {description}"
+    lines = [head]
+    lines.append(
+        "\nGenerated from a session. Needs your approval before "
+        + ("it takes effect." if is_update else "it can be used.")
+    )
+    if triggers:
+        lines.append(f"\n**Triggers:** {triggers}")
+    if info.get("has_scripts"):
+        lines.append("\n_Bundles executable scripts — review them before approving._")
+    body = "\n".join(lines)
+    # Deep-link straight at the candidate, not just the tab: the
+    # queue can hold several rows, and "go find it" is the failure
+    # mode this notification exists to prevent. quote() keeps a slug
+    # from opening a second query parameter -- slugs are validated
+    # against a restrictive pattern upstream, but the URL is built
+    # here and must not depend on that invariant holding.
+    review_url = "/capabilities?tab=skills"
+    if slug:
+        review_url += f"&review={quote(slug, safe='')}"
+    actions = [
+        {
+            "id": "review-skill",
+            "label": "Review update" if is_update else "Review skill",
+            "url": review_url,
+        },
+        # The opt-out shortcut: lands on the approval_required toggle in
+        # Settings. Offered on every staged candidate — including
+        # script-bearing ones, where it still governs FUTURE prose-only
+        # skills (scripts always stage; the setting's own description
+        # explains that boundary). The label shares the destination
+        # toggle's polarity ("Require approval …" is ON; this stops it),
+        # and the trailing ellipsis signals that the button NAVIGATES to a
+        # settings page rather than flipping the setting itself —
+        # notification actions are navigation-only.
+        {
+            "id": "auto-approve-skills",
+            "label": "Stop requiring skill approval…",
+            "url": _SKILL_APPROVAL_SETTING_URL,
+        },
+    ]
+    return title, body, review_url, actions
+
+
 async def start_dashboard(
     sessions: SessionManager,
     crons: CronService,
@@ -2074,63 +2159,17 @@ async def start_dashboard(
         # call ``asyncio.ensure_future``, which RAISES off-loop — and
         # ``_send_ws_all`` treats that raise as a dead socket and EVICTS every
         # connected client. Marshal the emit back onto the loop instead.
-        try:
-            _gw_loop: "asyncio.AbstractEventLoop | None" = asyncio.get_running_loop()
-        except RuntimeError:  # pragma: no cover - sync/embedded launch
-            _gw_loop = None
-
         def _on_pending_skill_staged(info: dict) -> None:
             try:
-                name = str(info.get("name") or info.get("slug") or "skill")
                 slug = str(info.get("slug") or "")
                 is_update = info.get("kind") == "update"
                 target = str(info.get("target") or "")
-                description = str(info.get("description") or "").strip()
-                triggers = str(info.get("triggers") or "").strip()
-                subject = target or name if is_update else name
-                title = "Skill update awaiting review" if is_update else "New skill awaiting review"
-                # The body LEADS with name + description because the feed row
-                # renders only its first ~80 characters, stripped to one line.
-                # The title already says a skill is awaiting review, so opening
-                # with "was generated from a session and needs your approval"
-                # spends exactly the characters that decide whether the reader
-                # opens the queue on words they have already read. Identity plus
-                # purpose first; the approval sentence still follows for the
-                # detail panel, which renders the whole body as markdown.
-                head = f"**{subject}**"
-                if description:
-                    head += f" — {description}"
-                lines = [head]
-                lines.append(
-                    "\nGenerated from a session. Needs your approval before "
-                    + ("it takes effect." if is_update else "it can be used.")
-                )
-                if triggers:
-                    lines.append(f"\n**Triggers:** {triggers}")
-                if info.get("has_scripts"):
-                    lines.append("\n_Bundles executable scripts — review them before approving._")
-                body = "\n".join(lines)
+                title, body, review_url, actions = _pending_skill_notification(info)
                 payload = {
                     "slug": slug,
                     "candidate_kind": "update" if is_update else "new",
                     "target": target,
                 }
-                # Deep-link straight at the candidate, not just the tab: the
-                # queue can hold several rows, and "go find it" is the failure
-                # mode this notification exists to prevent. quote() keeps a slug
-                # from opening a second query parameter -- slugs are validated
-                # against a restrictive pattern upstream, but the URL is built
-                # here and must not depend on that invariant holding.
-                review_url = "/capabilities?tab=skills"
-                if slug:
-                    review_url += f"&review={quote(slug, safe='')}"
-                actions = [
-                    {
-                        "id": "review-skill",
-                        "label": "Review" if is_update else "Review skill",
-                        "url": review_url,
-                    }
-                ]
 
                 def _emit() -> None:
                     try:
@@ -2146,11 +2185,12 @@ async def start_dashboard(
                     except Exception:
                         logger.debug("pending-skill notification failed", exc_info=True)
 
-                if _gw_loop is not None and not _gw_loop.is_closed():
+                loop = state.serving_loop
+                if loop is not None and not loop.is_closed():
                     # Safe from the loop thread too — call_soon_threadsafe just
                     # schedules. RuntimeError means the loop is shutting down.
                     try:
-                        _gw_loop.call_soon_threadsafe(_emit)
+                        loop.call_soon_threadsafe(_emit)
                     except RuntimeError:  # pragma: no cover - loop closing
                         pass
                 else:
@@ -2185,9 +2225,10 @@ async def start_dashboard(
                     except Exception:
                         logger.debug("pending-skill notification resolve failed", exc_info=True)
 
-                if _gw_loop is not None and not _gw_loop.is_closed():
+                loop = state.serving_loop
+                if loop is not None and not loop.is_closed():
                     try:
-                        _gw_loop.call_soon_threadsafe(_resolve)
+                        loop.call_soon_threadsafe(_resolve)
                     except RuntimeError:  # pragma: no cover - loop closing
                         pass
                 # Without a loop there is no serving dashboard (sync/embedded
@@ -2342,6 +2383,19 @@ async def start_dashboard(
         client_max_size=60 * 1024 * 1024
     )  # 60 MB: covers 50 MB upload + multipart overhead
     app["state"] = state
+    # Bind the serving loop once, here: this runs ON that loop, so every
+    # surface that later hands work in from a foreign thread -- slots
+    # coalescing, an off-loop websocket send, the log handler's fan-out --
+    # resolves the same loop instead of each latching its own copy from
+    # whichever thread happens to arrive first.
+    state.bind_serving_loop(asyncio.get_running_loop())
+    # Voice settings live in slack/handler's module state and are otherwise
+    # loaded only on the Slack startup path (set_orch_cfg) — without this a
+    # dashboard-only gateway (no Slack tokens) resets TTS to defaults on
+    # every restart (see load_voice_reply_config).
+    from kiro_crew.slack.handler import load_voice_reply_config
+
+    await asyncio.to_thread(load_voice_reply_config)
     # ── Tunnel teardown (FIRST cleanup hook, deliberately) ───────────────────
     # aiohttp dispatches ``on_cleanup`` in registration order and gateway
     # shutdown has a hard deadline, so this is registered ahead of every other
@@ -3299,6 +3353,19 @@ async def start_api_server(
         client_max_size=60 * 1024 * 1024
     )  # 60 MB: covers 50 MB upload + multipart overhead
     app["state"] = state
+    # Bind the serving loop once, here: this runs ON that loop, so every
+    # surface that later hands work in from a foreign thread -- slots
+    # coalescing, an off-loop websocket send, the log handler's fan-out --
+    # resolves the same loop instead of each latching its own copy from
+    # whichever thread happens to arrive first.
+    state.bind_serving_loop(asyncio.get_running_loop())
+    # Voice settings live in slack/handler's module state and are otherwise
+    # loaded only on the Slack startup path (set_orch_cfg) — without this a
+    # dashboard-only gateway (no Slack tokens) resets TTS to defaults on
+    # every restart (see load_voice_reply_config).
+    from kiro_crew.slack.handler import load_voice_reply_config
+
+    await asyncio.to_thread(load_voice_reply_config)
     from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
 
     app["kiro_prerequisite_service"] = await asyncio.to_thread(

@@ -191,6 +191,9 @@ export interface CronJob {
   cron_expr?: string | null; every?: number | null; every_secs?: number | null
   at?: number | null; created_ts?: number | null
   agent?: string; model?: string; channel?: string; approval_mode?: string; silent?: boolean
+  /** Crews a sequence job runs, in order. Takes PRECEDENCE over `agent` at run
+   *  time, so any consumer attributing a job to a crew must read this first. */
+  agent_sequence?: string[]
   strict_schedule?: boolean
   /** When true, this cron's runs do not appear as a chat session in the active
    * session list (results still go to Slack/notifications + History). Default false. */
@@ -530,7 +533,7 @@ export interface ConfiguredChannelTarget {
 }
 
 export interface ChatSlot {
-  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; clean_mode?: boolean; project?: string; forked_from?: string | null; source_links?: { provider: 'github' | 'gitlab' | 'jira'; number: number; url: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
+  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; clean_mode?: boolean; project?: string; forked_from?: string | null; source_links?: { provider: 'github' | 'gitlab' | 'jira'; number: number; url: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
   /** Artifact companion binding: slug of the artifact this slot is a companion
    * chat for. Set at slot create and persisted in the history meta line, so the
    * binding survives a gateway restart and a History-page resume. */
@@ -544,6 +547,11 @@ export interface ChatSlot {
    * `waiting_for_input` (true of every finished turn, and therefore no signal)
    * and separate from `pending_approval` (a tool gate). */
   needs_input?: boolean
+  /** The transcript shows the last turn ending without a reply (trailing error
+   * row or unanswered user row) — the state behind the composer's Resume
+   * button. Always false while `running`. Lets the sidebar stop rendering a
+   * goal-loop session as actively working when it is actually stalled. */
+  interrupted?: boolean
   // Soft-stop state machine
   stop_state?: 'idle' | 'soft_pending' | 'killing'
   /** In-flight `wait` tool sleep, absent when nothing is sleeping. `deadline_ts`
@@ -621,8 +629,13 @@ export interface IssueComment {
 }
 
 /** A pull request / merge request the provider reports as linked to the issue. */
+/** A linked change: a pull request (GitHub/GitLab) or a linked issue (Jira). */
 export interface IssueLinkedChange {
-  provider: 'github' | 'gitlab'; url: string; number: number; title: string; state: string
+  provider: 'github' | 'gitlab' | 'jira'; url: string; number: number; title: string; state: string
+  /** Jira link relationship label (e.g. "blocks", "is blocked by"). */
+  relation?: string
+  /** Full Jira issue key (e.g. "PROJ-123"). */
+  issueKey?: string
 }
 
 /** Reaction tallies. Null on providers (or issues) that report none. */
@@ -632,7 +645,7 @@ export interface IssueReactions {
 }
 
 export interface IssueSource {
-  provider: 'github' | 'gitlab'
+  provider: 'github' | 'gitlab' | 'jira'
   /** Always the validated request url, never the provider's echo of it. */
   url: string
   number: number
@@ -716,6 +729,16 @@ export interface SubagentActivity {
   startedAt: number; elapsed: number; error?: string
   toolCount?: number      // observed tool calls (incl. auto-approved) — running-card progress
   stalled?: boolean       // reaper flagged this subagent as idle/stalled
+  /** Seconds of no stream activity measured when the reaper raised `stalled`
+   *  (the `idle_secs` the backend already sends with `subagent_stalled`).
+   *  Distinct from `elapsed` (total runtime): only the idle span justifies the
+   *  warning, so the card shows this rather than making the user infer it. */
+  idleSecs?: number
+  /** Client clock when that stall frame arrived. The backend emits `idle_secs`
+   *  ONCE, on the not-stalled→stalled transition, so this is what lets the row
+   *  advance the figure instead of freezing it beside a live elapsed counter —
+   *  while `stalled` holds there is by definition no activity to reset it. */
+  stalledAt?: number
   retrying?: boolean      // transient-backend retry (or cancel auto-continue) in flight
   approval_id?: string
   approving?: boolean
@@ -733,6 +756,7 @@ export interface ToolActivity {
   input?: string        // tool input (commands, file content, etc.)
   output?: string       // tool output (stdout, results, etc.)
   ts: number
+  execution_started_at?: number // when execution began (after approval); survives remount
   auto?: boolean        // auto-approved tool call
   approval_id?: string  // pending approval ID
   approval_type?: string // 'chat' or 'spawn'

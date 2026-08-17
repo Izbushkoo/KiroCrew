@@ -44,6 +44,7 @@ import reducer, {
   selectSlotPendingSpawnApprovals,
   selectSlotPendingApproval,
   selectComposerBusy,
+  sweepStaleOptimistic,
 } from '../store/chatSlice'
 import './mockApiClient'
 
@@ -964,6 +965,124 @@ describe('sseChatMessage', () => {
     // The steered bubble is untouched.
     expect(state.messages[0].meta?.steer).toBe(true)
     expect(state.messages[0].meta?.mid).toBe('m-steer-1')
+  })
+})
+
+describe('sseChatMessage — pipelined sends reconcile (#3898)', () => {
+  const initial = reducer(undefined, { type: '@@INIT' })
+  const withSlot = { ...initial, activeSlot: 'slot-1' }
+
+  it('reconciles echo for first message when second was sent before echo arrived', () => {
+    let state = withSlot
+    // User sends message A, then message B in quick succession (pipelined).
+    state = reducer(state, appendMessage({ role: 'user', content: 'first', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-first' } }))
+    state = reducer(state, appendMessage({ role: 'user', content: 'second', cls: '', ts: '2026-08-16T10:00:01.000Z', meta: { sendId: 's-second' } }))
+    expect(state.messages).toHaveLength(2)
+    expect(state.messages[0].meta?.optimistic).toBe(true)
+    expect(state.messages[1].meta?.optimistic).toBe(true)
+
+    // Echo for message A arrives — must find it past message B.
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'first',
+      ts: '2026-08-16T10:00:00.100Z', meta: { mid: 'm-first', sendId: 's-first' },
+    }))
+
+    // Should NOT duplicate — still 2 messages.
+    expect(state.messages).toHaveLength(2)
+    expect(state.messages[0].meta?.mid).toBe('m-first')
+    expect(state.messages[0].meta?.optimistic).toBeUndefined()
+    // sendId stripped after reconcile
+    expect(state.messages[0].meta?.sendId).toBeUndefined()
+    // Second message still optimistic
+    expect(state.messages[1].meta?.optimistic).toBe(true)
+    expect(state.messages[1].meta?.sendId).toBe('s-second')
+  })
+
+  it('reconciles echo for second message after first was already reconciled', () => {
+    let state = withSlot
+    state = reducer(state, appendMessage({ role: 'user', content: 'first', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-first' } }))
+    state = reducer(state, appendMessage({ role: 'user', content: 'second', cls: '', ts: '2026-08-16T10:00:01.000Z', meta: { sendId: 's-second' } }))
+
+    // Reconcile first
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'first',
+      ts: '2026-08-16T10:00:00.100Z', meta: { mid: 'm-first', sendId: 's-first' },
+    }))
+    // Reconcile second
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'second',
+      ts: '2026-08-16T10:00:01.100Z', meta: { mid: 'm-second', sendId: 's-second' },
+    }))
+
+    expect(state.messages).toHaveLength(2)
+    expect(state.messages[0].meta?.mid).toBe('m-first')
+    expect(state.messages[1].meta?.mid).toBe('m-second')
+    expect(state.messages[0].meta?.optimistic).toBeUndefined()
+    expect(state.messages[1].meta?.optimistic).toBeUndefined()
+    expect(state.messages[0].meta?.sendId).toBeUndefined()
+    expect(state.messages[1].meta?.sendId).toBeUndefined()
+  })
+
+  it('reconciles pipelined sends even with streaming frames interleaved', () => {
+    let state = withSlot
+    state = reducer(state, appendMessage({ role: 'user', content: 'msg-a', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-a' } }))
+    // Streaming from first turn starts
+    state = reducer(state, sseChatMessage({ slot: 'slot-1', role: 'chunk', content: 'Thinking...' }))
+    // User sends second message (new turn)
+    state = reducer(state, appendMessage({ role: 'user', content: 'msg-b', cls: '', ts: '2026-08-16T10:00:02.000Z', meta: { sendId: 's-b' } }))
+    expect(state.messages.filter(m => m.role === 'user')).toHaveLength(2)
+
+    // Echo for msg-a arrives
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'msg-a',
+      ts: '2026-08-16T10:00:00.050Z', meta: { mid: 'm-a', sendId: 's-a' },
+    }))
+
+    // Should reconcile without duplication
+    const userMsgs = state.messages.filter(m => m.role === 'user')
+    expect(userMsgs).toHaveLength(2)
+    expect(userMsgs[0].meta?.mid).toBe('m-a')
+    expect(userMsgs[0].meta?.optimistic).toBeUndefined()
+  })
+
+  it('strips sendId from meta after successful reconcile', () => {
+    let state = withSlot
+    state = reducer(state, appendMessage({ role: 'user', content: 'hello', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-hello' } }))
+    expect(state.messages[0].meta?.sendId).toBe('s-hello')
+
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'hello',
+      ts: '2026-08-16T10:00:00.100Z', meta: { mid: 'm-hello', sendId: 's-hello' },
+    }))
+
+    // sendId stripped — it was a wire-only correlation ID
+    expect(state.messages[0].meta?.sendId).toBeUndefined()
+    expect(state.messages[0].meta?.mid).toBe('m-hello')
+  })
+
+  it('sweepStaleOptimistic marks timed-out bubbles as stale', () => {
+    let state = withSlot
+    // Simulate an optimistic message with an old timestamp by using a custom
+    // appendMessage with a backdated optimisticTs (Immer freezes state, so
+    // we dispatch a raw action with the timestamp already set).
+    const oldTs = Date.now() - 35_000
+    state = reducer(state, appendMessage({ role: 'user', content: 'old msg', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-old', optimistic: true, optimisticTs: oldTs } }))
+
+    state = reducer(state, { type: 'chat/sweepStaleOptimistic' })
+
+    expect(state.messages[0].meta?.stale).toBe(true)
+    expect(state.messages[0].meta?.optimistic).toBe(true) // still optimistic, just stale
+  })
+
+  it('sweepStaleOptimistic does not mark fresh optimistic bubbles as stale', () => {
+    let state = withSlot
+    state = reducer(state, appendMessage({ role: 'user', content: 'fresh msg', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-fresh' } }))
+    // optimisticTs is Date.now() — fresh
+
+    state = reducer(state, { type: 'chat/sweepStaleOptimistic' })
+
+    expect(state.messages[0].meta?.stale).toBeUndefined()
+    expect(state.messages[0].meta?.optimistic).toBe(true)
   })
 })
 

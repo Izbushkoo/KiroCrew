@@ -933,7 +933,12 @@ async def test_restart_gateway_refuses_confined_status(monkeypatch):
 
     out = await mod._restart_gateway()
 
-    assert out == {"ok": False, "error": "gateway is not running as a user service"}
+    assert out["ok"] is False
+    # The error message now comes from _make_live_status_error, surfacing the
+    # specific reason the gateway cannot be restarted, plus the manual remedy.
+    assert "user service" in out["error"]
+    assert "not running" in out["error"]
+    assert "kirocrew restart" in out["error"]
 
 
 @pytest.mark.asyncio

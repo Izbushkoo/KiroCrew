@@ -80,6 +80,7 @@ from kiro_crew.apps.registry import (
     install_from_registry,
     is_registry_source,
     known_registry_repos,
+    list_catalog_apps,
     list_registry,
     registry_name_from_source,
 )
@@ -1512,7 +1513,12 @@ async def handle_open_app(request: web.Request) -> web.Response:
 
 async def handle_registry(request: web.Request) -> web.Response:
     """GET /api/apps/registry — list all apps available for installation."""
-    apps = await list_registry()
+    # The published catalog is the storefront's source of truth when it is
+    # reachable: its rows replace the seed + per-app manifest fetch. Offline the
+    # catalog is empty and the seed listing answers instead.
+    apps = await list_catalog_apps()
+    if not apps:
+        apps = await list_registry()
     # Published rail order and layout ride along on the response the store already
     # makes, rather than endpoints the page would have to wait on separately. Off
     # the event loop: the first call after a cache expiry does network I/O. Both
@@ -1959,8 +1965,13 @@ _SAFE_SCP_URL_RE = re.compile(r"^[A-Za-z0-9._\-]+@[A-Za-z0-9.\-]+:[A-Za-z0-9._/\
 _SAFE_SSH_URL_RE = re.compile(
     r"^ssh://(?:[A-Za-z0-9._\-]+@)?[A-Za-z0-9.\-]+(?::[0-9]+)?/[A-Za-z0-9._/\-]+$"
 )
-_SAFE_REF_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
-_SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+# `\Z`, not `$`: Python's `$` also matches immediately BEFORE a trailing newline, so with
+# the `.match` calls in the blob handler a value like "main\n" passes -- and both of these
+# feed git argv and a filesystem join. Same defect class as the catalog-side coordinate
+# patterns; these are the blob handler's instances. (The class is wider than this file:
+# other `$`-anchored request-path patterns exist elsewhere, e.g. papyrus's GIT_URL_RE.)
+_SAFE_REF_RE = re.compile(r"^[A-Za-z0-9._/-]+\Z")
+_SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_./-]+\Z")
 _BLOB_ALLOWED_EXT = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico"})
 
 

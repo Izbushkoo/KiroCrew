@@ -10,6 +10,7 @@
     "node": ">=22"
   },
   "scripts": {
+    "postinstall": "node scripts/patch-happy-dom-iframe.mjs",
     "clean": "rm -rf dist && rm -rf node_modules",
     "dev": "vite",
     "build": "tsc -b && node --max-old-space-size=6144 ./node_modules/vite/bin/vite.js build",
@@ -32,8 +33,10 @@
     "i18n:pseudo": "node scripts/gen-pseudolocale.mjs",
     "i18n:render": "node scripts/check-i18n-render.mjs --build",
     "i18n:check": "node scripts/i18n-check.mjs",
+    "verify:flex-input-min-w-0": "node scripts/capture-flex-input-min-w-0.mjs",
     "verify:path-chips": "node scripts/capture-path-chips.mjs",
     "verify:reveal-fade": "node scripts/probe-reveal-fade.mjs",
+    "verify:topbar-badge-overhang": "node scripts/capture-topbar-badge-overhang.mjs",
     "pretest": "npm run jscpd"
   },
   "files": [

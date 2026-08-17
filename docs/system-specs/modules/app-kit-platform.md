@@ -638,3 +638,60 @@ resolution), `dashboard/state.py` (`_send_ws_all`, `_ws_client_allowed`,
 for developer-facing diagnostics, drift-guarded by
 `website/src/test/appSdkEventScope.test.ts`). Runtime-facing summary for app
 authors: [../../../src/kiro_crew/docs/app-platform-trust-model.md](../../../src/kiro_crew/docs/app-platform-trust-model.md).
+
+## 14. The published catalog is the store's inventory
+
+`GET /api/apps/registry` answers from the published catalog when it is reachable:
+`handle_registry` prefers `list_catalog_apps` (`registry.py`), which maps the
+published `official-registry.json` entries through
+`official_catalog.list_catalog_rows` and then applies the same install-status and
+trust stamping as the seed path. The bundled `app-registry.json` seed is the
+catalog's OFFLINE SNAPSHOT, not a peer source: a reachable catalog means the
+store renders the published document's list, display copy, AND installable
+inventory; an unreachable one degrades the listing to the seed.
+
+The catalog is trusted only as far as TLS, so its power is bounded by
+pin-or-refuse rather than by withholding coordinates.
+`official_catalog.inventory()` materialises each `git`-source entry as an
+installable row carrying `gitUrl`/`repo`/`commit` (`builtin` entries produce
+nothing); a row that fails coordinate validation (https-only URL, 40/64-hex
+`ref`, contained relative `subdir`, kebab-case name, no duplicates) is dropped,
+never repaired. What keeps a compromised document from pointing an install at
+attacker-selected code with owner credentials is the posture stack, each layer
+independently load-bearing:
+
+- **Pin or refuse.** A catalog row installs by `_git_fetch_commit` — fetch the
+  pinned SHA, assert the landed commit equals the pin, hard-fail otherwise. The
+  row carries no `branch`, so no code path can quietly clone a tip and succeed.
+- **Credential-free clone posture.** Catalog rows clone anonymously
+  (`anonymous_git_env`); they never inherit the owner-designated credential
+  carve-out.
+- **No provenance minting.** `inventory()` rows never carry `origin`,
+  `author`, or `_registry`; `verified` stays `false` for a catalog `git` app
+  until the catalog signature is checked — wiring signature verification into
+  `official_catalog` is what flips that, not a field the catalog can assert
+  about itself.
+- **Install coordinates never come from a cache.** `inventory_for_install` and
+  `list_registry`'s inventory both resolve through `fetch_inventory_entries`, a
+  fresh HTTPS fetch; the on-disk cache may enrich display fields of a row that
+  exists from another source but may never introduce or rewrite one
+  (`annotate` skips `_catalog` rows).
+- **Refuse, don't fall back.** A catalog fetch failure refuses installs,
+  updates, and execution grants for catalog-listed names rather than falling
+  back to the unpinned seed or an agent-writable external cache —
+  `_resolve_registry_row` distinguishes "the document does not name this app"
+  (seed may answer) from "the document could not be asked" (refuse).
+- **Supersession is URL-scoped.** A catalog row replaces a same-repo seed row
+  (scheme/host case-folded, path case preserved); a different-repo name
+  collision keeps the seed, so a republished document cannot silently re-home
+  an app to a new repository under a familiar name.
+
+A name is a filesystem path on install, so `inventory()` and
+`list_catalog_rows` drop any entry whose name fails the manifest name contract
+(`app_name_error` / `KEBAB_RE`), and the catalog fetch runs off the event loop
+(`asyncio.to_thread`) so a cache-expired request never blocks the gateway loop.
+
+Writers: `apps/official_catalog.py` (`list_catalog_rows`, `inventory`,
+`fetch_inventory_entries`, `inventory_for_install`), `apps/registry.py`
+(`list_catalog_apps`, `_resolve_registry_row`, `_git_fetch_commit`),
+`apps/routes.py` (`handle_registry`).

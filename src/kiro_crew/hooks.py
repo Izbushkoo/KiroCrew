@@ -37,6 +37,7 @@ from kiro_crew.security import (
     is_sensitive_path,
     is_sensitive_write_path,
 )
+from kiro_crew.validation import _bounded_pattern_search
 
 logger = logging.getLogger(__name__)
 
@@ -1557,6 +1558,34 @@ def _normalize_tool_name(tool_name: str) -> str:
     return tool_name
 
 
+def _context_matches(matcher: str, mode: str, context: str) -> bool:
+    """Match a hook's matcher against the user message context.
+
+    Modes:
+    - ``glob``: fnmatch glob pattern (default, backward-compatible).
+    - ``regex``: bounded regex match (case-insensitive) — supports ``\\b``, ``|``, etc.
+      Uses ``_bounded_pattern_search`` to prevent ReDoS: the match runs in a
+      killable subprocess with a wall-clock timeout, so a catastrophic-backtracking
+      pattern cannot freeze the gateway event loop.
+    - ``contains``: pipe-delimited substrings, case-insensitive OR.
+    """
+    if mode == "regex":
+        # Prepend (?i) for case-insensitive matching (the subprocess runs raw re.search)
+        pattern = f"(?i){matcher}" if not matcher.startswith("(?") else matcher
+        result = _bounded_pattern_search(pattern, context)
+        if result is None:
+            # Timeout, oversized, or invalid pattern — fail closed (no match)
+            logger.warning("Hook regex matcher timed out or invalid: %s", matcher[:80])
+            return False
+        return result
+    elif mode == "contains":
+        ctx_lower = context.lower()
+        return any(term.strip().lower() in ctx_lower for term in matcher.split("|") if term.strip())
+    else:
+        # Default: glob (fnmatch)
+        return fnmatch.fnmatch(context.lower(), matcher.lower())
+
+
 def _tool_matches(pattern: str, tool_name: str) -> bool:
     """Match a tool pattern against a tool name.
 
@@ -2274,8 +2303,6 @@ def safe_copy_file_nolink(raw: str, dest_dir: str) -> str | None:
     the inode actually opened and copied, so no check-to-use window remains.
     If the fd's real path cannot be determined, fail closed.
     """
-    import tempfile
-
     path = validate_file_path(raw)
     if path is None:
         return None
@@ -2672,7 +2699,9 @@ class ScriptHook:
     name: str = ""
     event: str = HOOK_EVENT_USER_PROMPT_SUBMIT
     matcher: str = ""  # tool matcher for PreToolUse/PostToolUse (empty = all tools)
+    matcher_mode: str = "glob"  # "glob" (fnmatch, default), "regex" (re.search), "contains" (case-insensitive pipe-delimited substrings)
     command: str = ""  # shell command to execute
+    skills: list = field(default_factory=list)  # skill keys to inject when matched (no subprocess needed)
     timeout: int = 30  # seconds (Kiro CLI default is 30s)
     enabled: bool = True
     last_run: float = 0.0
@@ -2683,15 +2712,19 @@ class ScriptHook:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict) -> ScriptHook:
+    def from_dict(cls, data: dict) -> "ScriptHook":
         # Support legacy "pattern" field as fallback for "matcher"
         matcher = data.get("matcher", data.get("pattern", ""))
+        skills_raw = data.get("skills", [])
+        skills = skills_raw if isinstance(skills_raw, list) else []
         return cls(
             id=data.get("id", str(uuid.uuid4())[:8]),
             name=data.get("name", ""),
             event=data.get("event", HOOK_EVENT_USER_PROMPT_SUBMIT),
             matcher=matcher,
+            matcher_mode=data.get("matcher_mode", "glob"),
             command=data.get("command", ""),
+            skills=[str(s) for s in skills if isinstance(s, str)],
             timeout=data.get("timeout", 30),
             enabled=data.get("enabled", True),
             last_run=data.get("last_run", 0.0),
@@ -3067,9 +3100,12 @@ class ScriptHookStore:
                 t = data["timeout"]
                 if not isinstance(t, int) or not (1 <= t <= 300):
                     raise ValueError("timeout must be an integer between 1 and 300")
-            for k in ("name", "event", "matcher", "command", "timeout", "enabled"):
+            for k in ("name", "event", "matcher", "matcher_mode", "command", "timeout", "enabled"):
                 if k in data:
                     setattr(hook, k, data[k])
+            if "skills" in data:
+                skills_raw = data["skills"]
+                hook.skills = [str(s) for s in skills_raw if isinstance(s, str)] if isinstance(skills_raw, list) else []
             self._save()
         return hook
 
@@ -3150,8 +3186,79 @@ class ScriptHookStore:
                 if event in (HOOK_EVENT_PRE_TOOL_USE, HOOK_EVENT_POST_TOOL_USE):
                     if not _tool_matches(hook.matcher, tool_name):
                         continue
-                elif context and not fnmatch.fnmatch(context.lower(), hook.matcher.lower()):
+                elif context:
+                    # Offload to a thread: regex mode spawns a bounded subprocess
+                    # (_bounded_pattern_search), which must not block the event loop.
+                    matched = await asyncio.to_thread(
+                        _context_matches, hook.matcher, hook.matcher_mode, context
+                    )
+                    if not matched:
+                        continue
+            # Skills-only hooks: inject skill-loading directive without subprocess.
+            # Only meaningful for UserPromptSubmit/AgentSpawn — on tool hooks or Stop
+            # the synthesized "Load skills:" text has no consumer.
+            if hook.skills and not hook.command and event in (
+                HOOK_EVENT_USER_PROMPT_SUBMIT, HOOK_EVENT_AGENT_SPAWN,
+            ):
+                # Governance: skills-only hooks must respect the same capability
+                # gate as command hooks — a disabled capabilities.script_hooks
+                # must not be bypassable by omitting the command field.
+                sk = parent_session_key or ""
+                gov_denied = _script_hooks_capability_denied(sk)
+                if gov_denied:
+                    hook.last_run = time.time()
+                    hook.last_status = "blocked"
+                    hook.run_count += 1
+                    try:
+                        from kiro_crew.sel import sel
+
+                        sel().log_governance_decision(
+                            session_key=sk,
+                            tool_name=f"skills_only_hook:{hook.name or hook.id}",
+                            scope="capabilities.script_hooks",
+                            outcome="denied",
+                            reason=gov_denied,
+                        )
+                    except Exception:
+                        logger.debug("skills_only_hook deny audit failed", exc_info=True)
+                    logger.info(
+                        "Hook %s (%s): skills-only blocked by governance: %s",
+                        hook.name, event, gov_denied,
+                    )
                     continue
+                # Audit the allow decision before proceeding.
+                try:
+                    from kiro_crew.sel import sel
+
+                    sel().log_governance_decision(
+                        session_key=sk,
+                        tool_name=f"skills_only_hook:{hook.name or hook.id}",
+                        scope="capabilities.script_hooks",
+                        outcome="allowed",
+                        reason="skills-only hook permitted",
+                    )
+                except Exception:
+                    logger.debug("skills_only_hook allow audit failed", exc_info=True)
+                skills_directive = " ".join(f"${s.split('/')[-1]}" for s in hook.skills)
+                hook.last_run = time.time()
+                hook.last_status = "ok"
+                hook.run_count += 1
+                result = ScriptHookResult(
+                    hook_id=hook.id,
+                    hook_name=hook.name,
+                    event=hook.event,
+                    stdout=f"Load skills: {skills_directive}",
+                    exit_code=0,
+                    duration_ms=0,
+                )
+                results.append(result)
+                logger.info(
+                    "Hook %s (%s): skills-only injection (%d skills)",
+                    hook.name,
+                    event,
+                    len(hook.skills),
+                )
+                continue
             result = await run_script_hook(hook, context, hook_event)
             results.append(result)
             logger.info(

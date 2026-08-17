@@ -92,6 +92,50 @@ function isRedeliveredMessage(
   return false
 }
 
+/** Reconcile a server echo (carrying both `sendId` and `mid`) against the
+ *  optimistic user bubble that was appended client-side at send time.
+ *
+ *  Scans backward over non-steer user messages looking for a `sendId` match.
+ *  On match: updates ts/meta, clears the `optimistic` flag, and strips the
+ *  one-shot `sendId` from persisted meta (it served its correlation purpose).
+ *
+ *  Returns `true` if reconciliation succeeded (caller should `return` to skip
+ *  the push), `false` if no match was found (caller falls through to push).
+ *
+ *  FIX for #3898: the prior inline scan used an unconditional `break` after the
+ *  first non-matching user message, preventing reconciliation of pipelined sends
+ *  (user A then user B — echo for A could never reach past B). Now uses
+ *  `continue` to keep scanning. */
+function reconcileOptimisticEcho(
+  msgs: ChatMessage[],
+  echoSendId: string,
+  meta: Record<string, unknown>,
+  ts?: string,
+): boolean {
+  const reconcileFloor = Math.max(0, msgs.length - 50)
+  for (let i = msgs.length - 1; i >= reconcileFloor; i--) {
+    const m = msgs[i]
+    if (m.role !== 'user') continue
+    if (m.meta?.steer) break // steer boundary — stop scanning
+    if (m.meta?.sendId === echoSendId) {
+      if (ts) m.ts = ts
+      m.meta = { ...(m.meta || {}), ...meta }
+      // The sendId is a one-shot wire correlation ID — strip it from the
+      // persisted meta now that reconciliation succeeded (#3898 item 2).
+      delete (m.meta as Record<string, unknown>).sendId
+      delete (m.meta as Record<string, unknown>).optimistic
+      return true
+    }
+    // #3898 fix: continue scanning past non-matching user messages so
+    // pipelined sends (multiple optimistic bubbles) can all be reconciled.
+  }
+  return false
+}
+
+/** Timeout (ms) after which an unconfirmed optimistic bubble is marked stale.
+ *  The UI renders a retry affordance for stale messages (#3898 item 3). */
+export const OPTIMISTIC_TIMEOUT_MS = 30_000
+
 /** Frame roles that retire a slot's pending STATELESS question card.
  *
  *  Deliberately NARROWER than "every role that starts a turn". The card's
@@ -827,31 +871,14 @@ function applyNonActiveFrame(
       }
     }
     // Reconcile the optimistic user bubble (appendSlotMessage) rather than
-    // pushing a 2nd identical one when the server echoes the user frame — same
-    // pattern as sseSideResult / steer reconcile. The bubble is NOT necessarily
-    // the last message: the agent can start streaming (thinking/tool/assistant
-    // frames) before the server echoes the user frame, so a tail-only check
-    // misses the bubble and the echo is pushed as a duplicate — or worse, the
-    // original bubble never receives its `mid`, making it un-pinnable (#2845).
-    // PRIMARY: sendId correlation. FALLBACK: tail content match for paths
-    // that don't generate a sendId (split-pane, queued promotions).
+    // pushing a 2nd identical one when the server echoes the user frame (#2845).
+    // Uses shared helper that scans past non-matching pipelined sends (#3898).
     const echoSendId = meta?.sendId as string | undefined
     if (echoSendId && meta?.mid) {
-      const reconcileFloor = Math.max(0, msgs.length - 50)
-      for (let i = msgs.length - 1; i >= reconcileFloor; i--) {
-        const m = msgs[i]
-        if (m.role !== 'user') continue
-        if (m.meta?.steer) break
-        if (m.meta?.sendId === echoSendId) {
-          if (ts) m.ts = ts
-          m.meta = { ...(m.meta || {}), ...meta }
-          delete (m.meta as Record<string, unknown>).optimistic
-          return
-        }
-        break
-      }
+      if (reconcileOptimisticEcho(msgs, echoSendId, meta as Record<string, unknown>, ts)) return
     } else if (meta?.mid) {
-      // Fallback: tail content match (pre-existing behavior).
+      // Fallback: no sendId on the echo — use tail content match for paths
+      // that don't generate a sendId (split-pane, queued promotions).
       const last = msgs[msgs.length - 1]
       if (last?.role === 'user' && last.content === content && !last.meta?.mid) {
         if (ts) last.ts = ts
@@ -966,6 +993,26 @@ export const switchSlot = createAsyncThunk(
 )
 
 /** Re-fetch messages for a slot without changing activeSlot. Only applies if still active. */
+/**
+ * True when a `user` row ends the turn before it.
+ *
+ * A steered message is injected INTO the running turn, so a CONFIRMED steer is
+ * not a boundary. An OPTIMISTIC steer bubble (`meta.optimistic`, set at dispatch
+ * and cleared when the server's `steer_push` echo reconciles it) IS treated as a
+ * boundary, because it may not be a steer at all: the backend's steer branch is
+ * gated on `slot.running or slot._in_stage_execution`, so text sent while
+ * `chat_done` is still in flight takes the NEW TURN path instead, and no echo
+ * ever arrives to clear the flag. Exempting that row would splice the new turn's
+ * reasoning onto the previous turn's block — corrupting content rather than
+ * merely misplacing it.
+ *
+ * `selectSlotPendingApproval`'s scan deliberately does NOT use this: it exempts
+ * every steer row, optimistic included, because the distinction can only hide or
+ * show an approval bar there, never corrupt one.
+ */
+const isTurnBoundaryUser = (m: { role: string; meta?: Record<string, unknown> }): boolean =>
+  m.role === 'user' && !(m.meta?.steer && !m.meta?.optimistic)
+
 /** Re-insert client-only reasoning (`thinking`) messages into a server-refreshed
  *  message list. The backend never persists reasoning, so a refresh (e.g. the
  *  one fired on chat_done) would otherwise drop the thinking block the instant a
@@ -975,7 +1022,7 @@ export const switchSlot = createAsyncThunk(
  *  block whose anchor isn't found is appended so it is never silently lost.
  *  Returns `incoming` unchanged (reference-equal) when there is nothing to
  *  preserve. */
-function mergePreservedThinking<M extends { role: string; content: string; cls?: string }>(
+function mergePreservedThinking<M extends { role: string; content: string; cls?: string; meta?: Record<string, unknown> }>(
   existing: M[],
   incoming: M[],
 ): M[] {
@@ -987,7 +1034,12 @@ function mergePreservedThinking<M extends { role: string; content: string; cls?:
     for (let j = i + 1; j < existing.length; j++) {
       const r = existing[j].role
       if (r === 'assistant' || r === 'streaming') { anchor = existing[j].content.trimEnd(); break }
-      if (r === 'user') break
+      // A confirmed steer does not end this block's turn, so the assistant row
+      // after it is still its anchor. Breaking here instead leaves `anchor`
+      // null, and an unanchored block is appended at the tail — below the answer
+      // and its footer — where the forward scan can never reach an assistant row
+      // again, so it stays there and is re-appended on every later refresh.
+      if (isTurnBoundaryUser(existing[j])) break
     }
     preserved.push({ msg: m, anchor })
   }
@@ -1863,9 +1915,11 @@ const chatSlice = createSlice({
       // Non-steer user bubbles carry a `sendId` in meta (set by ChatPage at
       // send time) that serves as both the optimistic marker and the correlation
       // ID for reconciliation. The `optimistic` flag is kept as a simple boolean
-      // so the reconcile scan knows this bubble is pending confirmation (#2845).
+      // so the reconcile scan knows this bubble is pending confirmation.
+      // `optimisticTs` records when the bubble was created so the UI can show a
+      // retry affordance after OPTIMISTIC_TIMEOUT_MS (#3898 item 3).
       if (m.role === 'user' && !m.meta?.steer && m.meta?.sendId) {
-        m.meta = { ...(m.meta || {}), optimistic: true }
+        m.meta = { ...(m.meta || {}), optimistic: true, optimisticTs: (m.meta as Record<string, unknown>)?.optimisticTs ?? Date.now() }
       }
       state.messages.push(ensureMsgId(m))
     },
@@ -1937,7 +1991,7 @@ const chatSlice = createSlice({
       // Mark non-steer user bubbles as optimistic so the sseChatMessage
       // reconcile can distinguish them from channel-replayed messages (#2845).
       if (message.role === 'user' && !message.meta?.steer && message.meta?.sendId) {
-        message.meta = { ...(message.meta || {}), optimistic: true }
+        message.meta = { ...(message.meta || {}), optimistic: true, optimisticTs: (message.meta as Record<string, unknown>)?.optimisticTs ?? Date.now() }
       }
       msgs.push(ensureMsgId(message))
     },
@@ -1953,6 +2007,24 @@ const chatSlice = createSlice({
       else { state.messages.push({ role: 'assistant', content: payload.content, cls: 'msg msg-a', ts: payload.ts }) }
     },
     removeThinking(state) { state.messages = state.messages.filter(m => m.role !== 'thinking') },
+    /** Mark optimistic bubbles older than OPTIMISTIC_TIMEOUT_MS as stale so the
+     *  UI can show a "retry" affordance. Called periodically from useWebSocket's
+     *  client-side interval timer (10s). Does not remove — the bubble stays in
+     *  place. (#3898, #3973) */
+    sweepStaleOptimistic(state) {
+      const now = Date.now()
+      const sweep = (msgs: ChatMessage[]) => {
+        for (const m of msgs) {
+          if (m.meta?.optimistic && m.meta?.optimisticTs && !m.meta?.stale) {
+            if (now - (m.meta.optimisticTs as number) > OPTIMISTIC_TIMEOUT_MS) {
+              m.meta = { ...(m.meta || {}), stale: true }
+            }
+          }
+        }
+      }
+      sweep(state.messages)
+      for (const msgs of Object.values(state.slotMessages)) sweep(msgs)
+    },
     removeByApprovalId(state, action: PayloadAction<string>) { state.messages = state.messages.filter(m => m.meta?.approval_id !== action.payload) },
     resolveByApprovalId(state, action: PayloadAction<{ id: string; decision?: string }>) {
       const decision = action.payload.decision || 'approved'
@@ -2195,6 +2267,8 @@ const chatSlice = createSlice({
         a.lastTool = action.payload.tool; a.status = 'tool'
         if (typeof action.payload.tool_count === 'number') a.toolCount = action.payload.tool_count
         a.stalled = false
+        a.idleSecs = undefined
+        a.stalledAt = undefined
         a.retrying = false
       }
     },
@@ -2205,27 +2279,42 @@ const chatSlice = createSlice({
       const { slot, id } = action.payload
       if (id === '__proto__' || id === 'constructor' || id === 'prototype') return
       const a = getSlotSubs(state, slot)?.[id]
-      if (a) { a.retrying = true; a.stalled = false }
+      if (a) { a.retrying = true; a.stalled = false; a.idleSecs = undefined; a.stalledAt = undefined }
     },
     sseSubagentStalled(state, action: PayloadAction<{ slot: string; id: string; stalled: boolean; idle_secs?: number }>) {
       const { slot, id } = action.payload
       // Prototype-pollution guard is centralized in getSlotSub.
       const a = getSlotSub(state, slot, id)
-      if (a) a.stalled = action.payload.stalled
+      if (!a) return
+      a.stalled = action.payload.stalled
+      // Keep the idle span with the flag it justifies, and clear it on the
+      // un-stall frame so a resumed agent cannot keep showing a stale
+      // "no activity for Ns" from its previous quiet stretch.
+      // `stalledAt` is the receipt instant: the backend emits `idle_secs` only on
+      // the transition, so the row advances the figure from here rather than
+      // freezing it next to a live elapsed counter.
+      a.idleSecs = action.payload.stalled ? action.payload.idle_secs : undefined
+      a.stalledAt = action.payload.stalled ? Date.now() : undefined
     },
     /** One coalesced ~1s frame carrying the latest delta per agent (scale
      *  plumbing — replaces per-event tool/stalled/retrying frames when many
      *  agents run). Field presence decides what to apply; latest wins. */
-    sseSubagentBatchUpdate(state, action: PayloadAction<{ updates: { id: string; slot: string; tool?: string; tool_count?: number; stalled?: boolean; attempt?: number }[] }>) {
+    sseSubagentBatchUpdate(state, action: PayloadAction<{ updates: { id: string; slot: string; tool?: string; tool_count?: number; stalled?: boolean; idle_secs?: number; attempt?: number }[] }>) {
       for (const u of action.payload.updates || []) {
         const a = getSlotSub(state, u.slot, u.id)
         if (!a) continue
         // Order matters: retrying (attempt) applies FIRST so a tool field in
         // the same merged entry — meaning work resumed — clears it last.
-        if (typeof u.attempt === 'number') { a.retrying = true; a.stalled = false }
+        if (typeof u.attempt === 'number') { a.retrying = true; a.stalled = false; a.idleSecs = undefined; a.stalledAt = undefined }
         if (typeof u.tool === 'string' && u.tool) { a.lastTool = u.tool; if (a.status === 'running') a.status = 'tool'; a.retrying = false }
         if (typeof u.tool_count === 'number') a.toolCount = u.tool_count
-        if (typeof u.stalled === 'boolean') a.stalled = u.stalled
+        if (typeof u.stalled === 'boolean') {
+          a.stalled = u.stalled
+          // Mirror the per-event frame: the idle span lives and dies with the
+          // flag, so a coalesced un-stall cannot leave a stale idle figure.
+          a.idleSecs = u.stalled ? u.idle_secs : undefined
+          a.stalledAt = u.stalled ? Date.now() : undefined
+        }
       }
     },
     /** One coalesced ~1s frame of concatenated streaming text per agent
@@ -2667,6 +2756,8 @@ const chatSlice = createSlice({
           if (action.payload.input_preview) existing.input = action.payload.input_preview
           if (action.payload.kind) existing.kind = action.payload.kind
           if (action.payload.is_shell !== undefined) existing.is_shell = action.payload.is_shell
+          // Update ts for recency sorting but NEVER overwrite executionStartedAt
+          // — the elapsed timer must reflect real wall time since the tool began.
           existing.ts = Date.now()
           return
         }
@@ -2683,9 +2774,25 @@ const chatSlice = createSlice({
         const id = action.payload.approval_id
         const entry = log.find(e => e.type === 'approval' && e.approval_id === id)
         if (entry) entry.type = 'approval_resolved'
-        // Also mark the permission message as resolved so ApprovalBar hides it
-        const msg = state.messages.findLast(m => m.role === 'permission' && (m.meta as Record<string,unknown>)?.approval_id === id)
+        // Resolve against the OWNING slot's message array — active slot uses
+        // state.messages, a background slot its slotMessages entry. Reading only
+        // state.messages would miss a background-slot approval, so its tool
+        // timer would never get the post-approval anchor and would inflate by
+        // the whole approval wait after switching back to that slot.
+        const msgs = action.payload.slot !== state.activeSlot
+          ? (state.slotMessages[safeKey(action.payload.slot)] ?? [])
+          : state.messages
+        const msg = msgs.findLast(m => m.role === 'permission' && (m.meta as Record<string,unknown>)?.approval_id === id)
         if (msg && !(msg.meta as Record<string,unknown>).resolved) (msg.meta as Record<string,unknown>).resolved = 'approved'
+        // Stamp execution_started_at on the EXACT tool entry linked to this
+        // approval via the permission message's tool_call_id. This persists in
+        // Redux and survives component remounts, preventing the elapsed timer
+        // from inflating by the approval wait time.
+        const tcid = (msg?.meta as Record<string, unknown>)?.tool_call_id as string | undefined
+        if (tcid) {
+          const toolEntry = log.findLast(e => e.type === 'tool' && e.tool_call_id === tcid)
+          if (toolEntry && !toolEntry.execution_started_at) toolEntry.execution_started_at = Date.now()
+        }
         return
       }
       const entry: ToolActivity = { type: action.payload.kind, text: action.payload.text, ts: Date.now() }
@@ -2767,13 +2874,17 @@ const chatSlice = createSlice({
      *  single content-bearing `thinking`-role message for the current turn.
      *  Reasoning normally arrives before the visible answer, so the block sits
      *  above the streamed assistant text. Scans back to the turn boundary (the
-     *  last user message) to keep one reasoning block per turn. */
+     *  last non-steer user message) to keep one reasoning block per turn. */
     sseThinkingChunk(state, action: PayloadAction<{ slot: string; content: string }>) {
       const { slot, content } = action.payload
       if (slot !== state.activeSlot || !content) return
       for (let i = state.messages.length - 1; i >= 0; i--) {
         if (state.messages[i].role === 'thinking') { state.messages[i].content += content; return }
-        if (state.messages[i].role === 'user') break
+        // A confirmed steer does not start a new turn, so reasoning after it
+        // belongs to this turn's existing block. Treating it as a boundary mints
+        // a second block for one answer, and that block lands at the end of the
+        // array, below the answer.
+        if (isTurnBoundaryUser(state.messages[i])) break
       }
       state.messages.push({ role: 'thinking', content, cls: '', meta: { clientTs: mintMsgId() } })
     },
@@ -2936,45 +3047,14 @@ const chatSlice = createSlice({
           }
         }
         // Reconcile the optimistic user bubble rather than pushing a duplicate
-        // when the server echoes the user frame. The bubble is NOT necessarily
-        // the last message: the agent can start streaming (thinking/tool/
-        // assistant frames) before the server echoes the user frame, so a
-        // tail-only check misses the bubble and the echo is pushed as a
-        // duplicate — or worse, the original bubble never receives its `mid`,
-        // making it un-pinnable (#2845).
-        //
-        // PRIMARY: match by `sendId` — a client-generated correlation ID
-        // stamped at send time into both the optimistic bubble and the POST
-        // body. The server preserves meta fields, so the echo carries the same
-        // sendId plus the server-minted `mid`. This is a cryptographic-strength
-        // identity match — distinct messages with identical text but different
-        // sendIds are never conflated.
-        //
-        // FALLBACK: for code paths that create optimistic bubbles without a
-        // sendId (split-pane sends, queued message promotions), fall back to
-        // the pre-existing tail-check: if the last user message matches
-        // content and has no mid yet, reconcile it. This preserves the
-        // original behavior for those paths.
+        // when the server echoes the user frame (#2845). Uses shared helper that
+        // scans past non-matching pipelined sends (#3898).
         const echoSendId = meta?.sendId as string | undefined
         if (echoSendId && meta?.mid) {
-          const reconcileFloor = Math.max(0, state.messages.length - 50)
-          for (let i = state.messages.length - 1; i >= reconcileFloor; i--) {
-            const m = state.messages[i]
-            if (m.role !== 'user') continue
-            if (m.meta?.steer) break
-            if (m.meta?.sendId === echoSendId) {
-              if (ts) m.ts = ts
-              m.meta = { ...(m.meta || {}), ...meta }
-              delete (m.meta as Record<string, unknown>).optimistic
-              return
-            }
-            break
-          }
+          if (reconcileOptimisticEcho(state.messages, echoSendId, meta as Record<string, unknown>, ts)) return
         } else if (meta?.mid) {
-          // Fallback: no sendId on the echo — use tail content match (the
-          // pre-existing reconcile that worked when the echo arrived before
-          // any streaming). Only checks the LAST message (not a backward scan)
-          // to limit false-match risk to the original code's window.
+          // Fallback: no sendId on the echo — use tail content match for paths
+          // that don't generate a sendId (split-pane, queued promotions).
           const last = state.messages[state.messages.length - 1]
           if (last?.role === 'user' && last.content === content && !last.meta?.mid) {
             if (ts) last.ts = ts
@@ -3466,7 +3546,7 @@ const chatSlice = createSlice({
 
 export const {
   setActiveSlot, clearSlotState, setPendingInput, setAgentSwitchNotice, setQuestionCard, retireStatelessQuestion, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
-  removeThinking, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, startLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
+  removeThinking, sweepStaleOptimistic, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, startLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
   sseContextUsage, setVoicePlaying, setVoiceAudio,
   toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, requestSlotReveal, clearSlotReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, sseSubagentSpawn, sseSubagentChunk, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued,
   sseSubagentBatchUpdate, sseSubagentBatchChunks, selectSubagent, clearTerminalSubagents,

@@ -4,6 +4,178 @@ All notable changes to KiroCrew are documented in this file.
 
 ## [Unreleased]
 
+- **Every builtin app now starts its content 8px from a phone screen edge, not 24px.**
+  The narrow-first page gutter (`px-2 md:px-6`) reached the core pages and Issue
+  Radar, while the remaining builtin apps kept an unconditional `px-6`, so their
+  content was inset 24px before any card inset stacked on top. Meetings, Code
+  Review Sage, Auto Research, Workflows, Mochi, Papyrus, PPTX Maker and Ops
+  Mission Control now carry the same gutter, converted a whole file at a time so
+  a header and the rows beneath it cannot render on two different left edges.
+  Centered empty states keep their `px-6`, where it is the element's only inset
+  and flushing it would push centered copy toward the edge for no width gain; a
+  guard test states that exclusion so a later pass does not read it as a miss.
+
+- **Destructive buttons look destructive on a phone.** `Btn`'s `danger`
+  variant coloured its label only on `:hover`, and a touch viewport never
+  produces `hover` — so a destructive button rendered identically to the
+  non-destructive buttons beside it. Same class of defect as a hover-revealed
+  control: the affordance existed only under a pointer. Found on the Channels
+  page at 390px, where `Close` (which dismisses every agent in the channel) sat
+  in a wrapped header row beside the frequent `3 agents` and `Clear Context`
+  buttons at identical visual weight. The label is now `text-danger`
+  unconditionally; hover still raises the border and adds a subtle fill, so the
+  pointer affordance is not lost, only made unnecessary for recognising the
+  control. (#3937)
+
+- **A parent agent can read its own sub-agent's result file again on a host
+  whose home is a symlink.** The result path handed back in a completion event
+  was built through `Path.resolve()`, which is correct for the traversal check
+  it exists to serve and wrong for a path somebody is told to go read: on an
+  Amazon cloud desktop, where `/home/<user>` is a symlink to
+  `/local/home/<user>`, that resolved spelling carries a `/local/home/...`
+  prefix the reader's own path allowlist -- keyed on the `$HOME` it was given --
+  does not match. The file was always readable; only the spelling was
+  unrecognized. So the read was refused, and refused as an approval prompt that
+  times out rather than as an error, which made a whole wave of sub-agent
+  results look unreadable while the parent concluded it lacked permission.
+  Paths emitted as TEXT (the completion event, the batch digest, `spawn_status`,
+  the prior-result hint on an unresumable conversation, and `info.result_path`
+  wherever it surfaces) now carry the declared home spelling, while every path
+  used to open a file stays symlink-resolved so the traversal check is unchanged.
+  Validation is delegated to the resolving helper rather than duplicated, so the
+  two cannot drift apart.
+
+- **A long-running cron job's next tick is no longer dispatched up to 30s
+  late.** A job is invisible to the scheduler's wake computation while it's
+  executing (`_next_wake_secs` skips anything in `self._executing`), so for
+  a job whose run takes most of its interval, the timer's last wake before
+  completion — capped at the 30s poll interval — is what the next dispatch
+  had to wait for, since finishing a job never re-armed the timer. Measured
+  in the field on a 60s-interval job with a ~57s run: 20% of ticks landed
+  ≥20s late, costing roughly double the job's own `interval - duration`
+  idle-time floor. Job completion now re-arms the timer with its real
+  next-due delay. The naive version of this fix is unsafe: a job's
+  completion runs on its own task, not the timer's, so a blind
+  `_arm_timer()` call racing the timer's own in-flight dispatch sweep
+  (`_on_timer`, yielded at its worker-thread scan) would cancel that sweep
+  mid-flight and drop any due jobs not yet spawned for that tick. A job
+  completing in that narrow window now no-ops instead — `_on_timer`'s own
+  tick already unconditionally re-arms once the sweep finishes, by which
+  point the completed job is no longer `_executing`, so the corrected delay
+  still gets picked up, just moments later rather than being computed
+  twice.
+
+- **Removing a worktree in Dev Fleet no longer strands its pod's isolated
+  HOME.** Reclamation was gated on the pod's unit still being ACTIVE, which the
+  ordinary path never is: you stop the pod when testing ends and prune days
+  later once the PR merges. So the delete path that reclaims the HOME was
+  effectively never called, and every removal leaked a full isolated
+  `KIROCREW_HOME` — dominated by a per-instance copy of the embedding model, so
+  ~0.6 GB each — with the directory becoming unattributable the moment the
+  worktree's env pin went away. Removal now reclaims the HOME whether or not the
+  pod is running, using the same `orphan_homes` predicate as `pod ls` / `pod
+  prune` (so symlinks are skipped, and a macOS name mid-`up` is treated as
+  installed rather than orphaned). Attribution and teardown are ONE transaction
+  held under `pod_name_mutex`: pod identities are global basenames, so checking
+  ownership in one process and tearing down in another leaves a window where a
+  concurrent `pod up` from a different checkout claims the same name and the
+  teardown would stop that pod and delete its HOME. Both call sites — the
+  live-unit path and the orphaned-HOME path — go through the one locked helper,
+  which is necessarily in-process: the mutex is held per open-file-description
+  and `stop_pod` re-acquires it, so holding it around a `pod down` shell-out
+  would block the child being waited on. Because the delete needs positive
+  attribution, an ABSENT checkout pin refuses rather than assuming ownership
+  (`pod prune` still reclaims those), and a name handed to a new pod mid-teardown
+  refuses the removal outright, since that pod may be running out of the very
+  worktree about to be deleted.
+  The two outcomes are reported separately (`stopped_pod` vs
+  `reclaimed_pod_home`) rather than conflated into a shutdown that never
+  happened. Liveness checks keep failing CLOSED — they guard against deleting a
+  checkout under a live pod — while a reclamation that cannot run now degrades
+  to a logged leftover instead of refusing the removal, and a provably absent
+  pod backend logs the HOME it is leaving behind at WARNING with the verb that
+  reclaims it, replacing a debug-level line that hid the residue entirely.
+
+- **The one-time config migration no longer leaves a `.json.bak` orphan beside a
+  config path it does not own.** `KiroCrewConfig.load()` copied the
+  pre-migration config to `<path>.bak`, where `<path>` is whatever
+  `config_path()` resolved to -- so every caller that redirects the loader at
+  its own `tempfile` entry (tests and embedders do) silently accumulated one
+  orphan per load, since the caller unlinks the path it created and never learns
+  a sibling appeared. One dev host reached 72,327 such files in `/tmp`, 7% of a
+  tmpfs inode budget whose exhaustion fails every process on the box. The copy
+  is now gated on the config living in `config_dir()`, the one directory whose
+  contents we own; the production backup is unchanged, and a copy that fails
+  still aborts the migration save exactly as before, so a config we could not
+  copy aside is not rewritten either. The name is also built by
+  appending rather than `with_suffix(".json.bak")`, which REPLACED the final
+  suffix and so renamed a non-`*.json` config instead of backing it up.
+
+
+- **A knowledge source that errored during ingestion is no longer re-synced on
+  every sweep.** `KnowledgeIngestion` marks failure in the `sync_status`
+  **column**, but `SyncScheduler.sync_all`'s skip predicate read only the
+  `sync_status` copy inside the properties JSON, which the ingestion path never
+  sets. So an ingestion-errored source (bad credentials, deleted remote,
+  unparseable content) was retried on every sweep forever, flooding logs with
+  the same failing network call and giving the user no way to quiesce it short
+  of deleting the source. `sync_all` now treats an `'error'` value in EITHER
+  store as errored (legacy JSON-only rows are still skipped), and
+  `_record_failure` writes the column alongside the properties copy it keeps for
+  `consecutive_failures`.
+
+- **`test_redaction_timing_scales_linearly` no longer fails CI
+  intermittently** (observed "Redaction scaled super-linearly: 3.2x, limit
+  3.0x" on an otherwise-healthy matcher). The test took ONE
+  `perf_counter` sample per input size, so it billed itself for whatever
+  the OS gave the core to the sibling pytest-xdist workers — and one
+  unlucky reading of the SMALL input, the ratio's denominator, was enough
+  to push it over the bound. It now measures with `time.thread_time()`
+  (redaction is single-threaded pure-regex work, so per-thread CPU is its
+  complete cost) and takes best-of-3 per size, since scheduler noise only
+  ever adds and the minimum is the closest estimate of the true cost —
+  the same two techniques `TestIsDeniedReDoSResistance` already uses for
+  this class of assertion. The 3.0x bound is unchanged and detection is
+  intact: a genuinely quadratic implementation still measures ~4.3x.
+
+- **Opted-in MCP servers no longer silently fall back to unpooled backends.**
+  On one live host, 988 degradations accrued in 15 hours with no signal: 79%
+  were guaranteed-ENOENT pooled spawns of bare commands the gateway daemon's
+  systemd PATH cannot resolve, and 20% were crash-loops of servers whose
+  declared `env` the shared backend deliberately withholds
+  (`mcp_gateway.forward_declared_env` off). The rewriter now resolves bare
+  commands through the same augmented search path the MCP probe uses and
+  refuses to emit a stub it can prove will degrade — such servers are left
+  for the session to launch directly, with a warning naming the fix (absolute
+  path / the forwarding knob). The fallback audit log gains the reader it
+  never had: gatewayd's `stats` reply now carries per-server fallback counts
+  for the last 24 h, and the log rotates at 1 MiB instead of growing without
+  bound. (#3495)
+
+- **`TestIsDeniedReDoSResistance::test_cpu_cost_is_immune_to_other_threads_where_process_time_is_not`
+  no longer intermittently fails CI** (observed "process_time did not exceed
+  thread_time under a 2-spinner burst"). The test's 5-sample loop required
+  every single process-time/thread-time comparison to succeed, so one sample
+  where a shared CI runner's scheduler didn't interleave the burst threads
+  within the narrow measurement window failed the whole test even though the
+  invariant it checks — that `_cpu_cost` doesn't see other threads' CPU —
+  held on every other sample. Now tolerates a minority (≤1 of 5) of failed
+  samples; a genuine break in `_cpu_cost` still fails every sample. (The
+  companion flake in `test_mid_dotstar_chain_spam_stays_linear`, tracked in
+  the same upstream issue kirodotdev/KiroCrew#3080, was independently fixed
+  by #3692 while this PR was open — this change covers the one flaky
+  assertion #3692 didn't touch.)
+
+- **The instance token-mint timeout is now user-configurable.** The remote
+  `kirocrew token` mint ran with a hardcoded 30s budget, so a user behind a
+  slow ProxyCommand/jump host timed out in the mint step even when the ssh
+  forward itself came up (the connect flow spawns two proxy-bound ssh
+  children, and the mint is the second one). A new
+  `instances.mint_timeout_secs` (unset by default: SSH 30s, SSM 90s; clamped
+  to [10, 120]) now threads through the tunnel manager to both the SSH and
+  SSM mint paths; an explicit value applies to both transports, including a
+  value equal to either transport's default. (#3566)
+
 - **A Teams answer no longer gets silently truncated by a rate-limited
   chunk.** The Bot Framework Connector API enforces per-bot rate limits and
   can return HTTP 429, but the Teams outbound send raised immediately with
@@ -32,6 +204,47 @@ All notable changes to KiroCrew are documented in this file.
   resolves its own username via `getMe` at startup and only strips a mention
   that matches it (case-insensitively); any other mention, or none resolved
   yet, is left attached and falls through as unrecognized. (#3734)
+
+- **`agent.dangerously_skip_permissions` no longer treats a string value as an
+  affirmative grant.** The config loader coerced this field with a bare
+  `bool(...)`, so a plausible config shape like `"dangerously_skip_permissions":
+  "false"` (any non-empty string is truthy in Python) silently activated the
+  standing, unattended tool-auto-approve grant this key controls — every tool
+  call gets auto-approved with no confirmation prompt — instead of the
+  explicit disable the value said. Now requires a real boolean, matching
+  every other boolean field in the loader; a non-bool value falls through to
+  the next accepted spelling instead of being read as a grant. (#3730)
+
+- **A session no longer risks two interleaved turns after a mid-turn reset.**
+  `record_failure`'s circuit breaker calls `reset(key)` while the failing
+  caller still nominally holds that session's turn semaphore; `reset` pops the
+  session and tears it down without touching the semaphore. If a concurrent
+  `get_or_create` for the same key registered a replacement session in that
+  window, the original caller's later `release(key)` — a fresh lookup by key,
+  not the specific session object it acquired — released the REPLACEMENT's
+  semaphore instead, an over-release that could hand out a surplus permit and
+  let a third message start a turn while a second was still in flight on the
+  same live provider session. The per-session semaphore is now a
+  `BoundedSemaphore`, so a stray release beyond its one permit raises instead
+  of silently succeeding; `release()` catches that specific error and logs a
+  warning rather than propagating into a caller's `finally`. (#3749)
+
+- **Notes: a failed GitHub token Save/Clear in Settings no longer gets stuck
+  disabled with no explanation.** Neither the Save/Clear button handlers nor
+  the `savePat` action they call had any error handling, so a rejected
+  request (an invalid token, a transient network error) left `busy` stuck
+  `true` — the button permanently disabled — with neither the success
+  confirmation nor any error shown, an unhandled promise rejection, and the
+  only recovery being to close and reopen Settings. Failures are now caught
+  and reported inline next to the button, styled like the sibling per-vault
+  knowledge-toggle error state, and the button always recovers. A review
+  pass caught a sibling with the same root cause: the vault Remove confirm
+  button's `onForget` call still swallowed its failure into the shared
+  `error` banner, which only renders in the main-editor branch and is
+  invisible while Settings is open — the confirm bar also dismissed itself
+  immediately, so nothing indicated the removal was even attempted. Remove
+  now catches inline too, keeps the confirm bar up on failure so the user
+  can retry without reopening it, and clears on success. (#3743)
 
 - **A folder knowledge source added from the dashboard can now be started.**
   The row's `sync_status` was stored twice — as a table column and inside the
@@ -219,6 +432,33 @@ All notable changes to KiroCrew are documented in this file.
   deliberately: restoring an approval from a file the agent can write would
   bypass the PreToolUse gate. The two in-process checks are kept as defence in
   depth for a mid-session disable. (#3482)
+
+- **Folder-write audit lines now name the internal component that made the
+  write, instead of inferring the caller's identity from the internal secret's
+  presence.** Every MCP stdio server now declares its component name on
+  loopback gateway requests (`X-Internal-Caller`, attached centrally by the
+  shared request helpers), and the folder endpoints validate it against a
+  known-caller set before trusting it into the security event log's `caller`
+  field — `source` stays in SEL's interface vocabulary (`mcp`), so operator
+  queries over `source == "mcp"` keep matching folder writes. The old
+  inference was correct only while exactly one internal caller existed — a
+  second internal caller would have silently inherited the same label. An
+  authenticated internal write with a missing or unrecognized caller name is
+  audited as `caller="unknown-internal"` with a warning, so a new caller shows
+  up loudly until it is added to the known set alongside its own test. Browser
+  writes still audit as `dashboard`; the caller header alone grants nothing.
+  (#3503)
+
+- **`kirocrew policy show` no longer hides the 139 built-in denied-command
+  rules from the agent.** The rules are visible and configurable to the
+  user (Settings → Security), but the agent's only way to discover them was
+  to attempt a command and be refused — so it could plan multi-step work
+  that turned out to be impossible from the first step, walking the user
+  through setup effort (e.g. exporting AWS credentials) for a task a
+  hard-denied command would block later anyway. `policy show` now prints
+  the rule count grouped by category on every install, enterprise policy or
+  not; `--ids` lists each category's rule ids for citing a specific rule
+  when relaying a refusal. (#3454)
 
 - **Side-panel oversize-question refusal now reports an accurate character
   target for every script, not just emoji.** The refusal derived its

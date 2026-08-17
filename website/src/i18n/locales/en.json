@@ -819,6 +819,13 @@
         "stop_this_run_and_discard_it": "Stop this run and discard it"
       }
     },
+    "designTweak": {
+      "manifest": {
+        "display_name": "Design Tweak",
+        "description": "Visually select elements in your live app preview and turn them into scoped, source-mapped edit requests for the agent — like Figma comments, but for code.",
+        "page_label": "Design Tweak"
+      }
+    },
     "devFleet": {
       "manifest": {
         "description": "A control panel for working on Kiro Crew itself. Lists every feature worktree alongside its pull request state, commit count, and disk usage, and can bring any of them up as a pod: a complete preview instance on its own port with its own data directory, so you can click through an unfinished change without disturbing your live gateway. It also handles the chores around that — pulling main and rebuilding, rebasing a branch, streaming pod logs, and pruning worktrees whose work has already merged.",
@@ -904,6 +911,9 @@
           "regenerate_summary": "Regenerate summary",
           "retry": "Retry"
         },
+        "detailOverflowMenu": {
+          "more_actions": "More actions"
+        },
         "filtersSection": {
           "assigned_to_me": "Assigned to me",
           "clear": "clear",
@@ -924,17 +934,14 @@
           "assignees": "Assignees",
           "by": "· by",
           "changed_the_title": "changed the title",
-          "close": "Close",
           "close_as_completed": "Close as completed",
           "close_as_not_planned": "Close as not planned",
-          "close_this_issue": "Close this issue",
           "closed": "Closed",
           "closed_as_not_planned": "Closed as not planned",
           "closed_this": "closed this",
           "copy_link_to_this_issue": "Copy link to this issue",
           "couldn_t_load_activity": "Couldn't load activity:",
           "dates": "Dates",
-          "dismiss_menu": "Dismiss menu",
           "done": "Done",
           "edit": "Edit",
           "finding_suggestions": "Finding suggestions…",
@@ -962,7 +969,6 @@
           "removed_the": "removed the",
           "removed_this_from_the": "removed this from the",
           "reopen": "Reopen",
-          "reopen_this_issue": "Reopen this issue",
           "reopened_this": "reopened this",
           "self_assigned_this": "self-assigned this",
           "suggested": "Suggested",
@@ -1452,6 +1458,9 @@
         "view_folders": "Folders",
         "view_list": "Flat list"
       },
+      "preview": {
+        "mermaidError": "Invalid Mermaid diagram — showing its source."
+      },
       "row": {
         "delete": "Delete note",
         "deleteAction": "Delete",
@@ -1491,6 +1500,7 @@
         "recording": "Recording…",
         "remove": "Remove",
         "removeConfirm": "Remove this vault from the app? Your files are left untouched on disk — only the connection is forgotten.",
+        "removeFailed": "Could not remove the vault: {{message}}",
         "removeIt": "Remove it",
         "reset": "Reset",
         "save": "Save",
@@ -1502,9 +1512,11 @@
         "syncSection": "Sync",
         "title": "Settings",
         "tokenCleared": "Token cleared.",
+        "tokenClearFailed": "Could not clear the token: {{message}}",
         "tokenPlaceholderEmpty": "github_pat_…",
         "tokenPlaceholderStored": "Replace stored token…",
         "tokenSaved": "Token saved.",
+        "tokenSaveFailed": "Could not save the token: {{message}}",
         "vaultsSection": "Vaults"
       },
       "sort": {
@@ -1791,7 +1803,6 @@
         "pins": "Pins",
         "preview": "Preview",
         "remove_screenshot": "Remove screenshot",
-        "reveal_in_finder": "Show in file manager",
         "screenshot": "Screenshot",
         "watchlist": "Watchlist"
       },
@@ -3236,6 +3247,14 @@
     }
   },
   "components": {
+    "crewWakeSection": {
+      "could_not_load_this_crew_s_schedules_so_what_wak": "Could not load this crew's schedules, so what wakes it is unknown.",
+      "no_schedules_run_this_crew_automatically": "No schedules run this crew automatically.",
+      "open_schedule": "Open Schedule",
+      "schedule": "schedule",
+      "schedules_that_run_this_crew_without_you_asking": "Schedules that run this crew without you asking. Separate from Triggers above, which only decides when the orchestrator picks this crew.",
+      "what_wakes_this_crew": "What wakes this crew"
+    },
     "agentDropdownList": {
       "no_matches": "No matches"
     },
@@ -3471,7 +3490,6 @@
       "pop_out_to_window": "Pop out to window",
       "close_terminal": "Close terminal",
       "hide_terminal_panel": "Hide terminal panel",
-      "move_to_side_panel": "Move to side panel",
       "new_terminal": "New terminal",
       "resize_terminal_panel": "Resize terminal panel",
       "move_panel_to_right": "Move panel to right",
@@ -3767,8 +3785,8 @@
       "local": "Local",
       "local_dashboard": "Local dashboard",
       "n_unread": "{{n}} unread",
-      "switch_crew_active": "Switch crew, currently {{name}}",
-      "switch_crew_active_unread": "Switch crew, currently {{name}}, {{n}} unread elsewhere"
+      "switch_crew": "Switch crew",
+      "switch_crew_unread": "Switch crew, {{n}} unread elsewhere"
     },
     "instancesViewport": {
       "loading_pane": "Loading pane…",
@@ -5326,9 +5344,10 @@
         "backend_hiccup_retrying": "backend hiccup — retrying…",
         "more_running_normally": "more running normally…",
         "no_activity": "— no activity",
+        "no_activity_for": "no activity for {{secs}}s",
         "no_activity_possibly_stalled": "No activity — possibly stalled",
+        "possibly_stalled": "possibly stalled",
         "s": "s",
-        "stalled": "stalled",
         "stop": "Stop",
         "stop_this_subagent": "Stop this subagent",
         "waiting_to_start_queued_behind_the_concurrency_l": "Waiting to start — queued behind the concurrency limit"
@@ -5362,6 +5381,7 @@
         "send": "Send",
         "send_enter": "Send (Enter)",
         "steered_into_the_running_turn": "Steered into the running turn",
+        "message_unconfirmed": "Message not confirmed — may not have been delivered",
         "pin_message": "Pin message",
         "unpin_message": "Unpin message"
       },
@@ -5382,9 +5402,8 @@
       },
       "pins": {
         "pinned_messages": "Pinned messages",
-        "close_panel": "Close pinned messages panel",
         "loading": "Loading pins…",
-        "no_pinned_messages": "No pinned messages yet. Pin important messages from the chat to find them quickly.",
+        "no_pinned_messages": "No pinned messages yet. Hover a message in the chat and click the pin icon to save it here.",
         "message_unavailable": "This pinned message is no longer available in the loaded history.",
         "pin_failed": "Could not pin the message. Try again.",
         "unpin_failed": "Could not unpin the message. Try again.",
@@ -5397,7 +5416,6 @@
         "copy_preview": "Copy text",
         "copy_link": "Copy link to message",
         "unpin": "Unpin",
-        "open_pinned_messages": "Open pinned messages",
         "jump_to_message": "Jump to message"
       }
     },
@@ -5541,13 +5559,16 @@
       "show_all_folders": "Show all folders",
       "show_collapsed_folders": "Show collapsed folders:",
       "show_folder": "Show folder",
+      "show_only_sessions_tagged": "Show only sessions tagged {{name}}",
       "show_the_folder_list": "Show the folder list",
       "skip": "Skip",
       "sort_and_filter_sessions": "Sort and filter sessions",
       "sort_by": "Sort by",
       "sort_filter_sessions": "Sort & filter sessions",
+      "stop_filtering_by_tag": "Stop filtering by {{name}}",
       "switch_all_sessions": "Switch All Sessions",
       "switch_all_to_model": "Switch all to model…",
+      "tags": "Tags",
       "temporary_no_memory_reads_or_writes": "Temporary — no memory reads or writes",
       "untagged": "+ untagged",
       "will_be_moved_to_older_sessions": "will be moved to older sessions.",
@@ -5912,7 +5933,6 @@
         "skip": "Skip",
         "source_name": "Source name",
         "source_name_optional": "Source name (optional)",
-        "supports_markdown_plain_text_code_files_html_jso": "Supports: Markdown, plain text, code files, HTML, JSON, YAML, CSV, DOCX, Org Mode, PDF. Max 50 MB per file.",
         "sync": "Sync",
         "sync_source": "Sync source",
         "type_new_to_create": "Type new to create",
@@ -6253,7 +6273,7 @@
         "skill_md": "SKILL.md",
         "skills": "Skills",
         "auto_create_hint": "Kiro Crew can also draft skills from completed sessions automatically — off by default, controlled by <settingRef/>.",
-        "approval_required_hint": "Candidates wait here until you approve them — required by <settingRef/>."
+        "approval_required_hint": "Candidates wait here for your approval. Prose-only skills can go live automatically when <settingRef/> is off — skills that bundle scripts always require review."
       },
       "steeringTab": {
         "api_standards_md": "api-standards.md",
@@ -6750,6 +6770,9 @@
       },
       "browserPanel": {
         "browsing": "Browsing",
+        "use_builtin_label": "Use the built-in browser",
+        "use_builtin_desc": "Open pages in Kiro Crew's built-in panel. Turn off to browse with playwright-cli instead.",
+        "use_builtin_desktop_only": "Only works in the desktop app. In a browser or on a remote gateway the agent uses playwright-cli.",
         "cannot_load": "Cannot load browser status. Is the gateway running?",
         "available": "The agent can browse web pages.",
         "presence_is_consent": "Browsing is available because the Playwright CLI is installed. Removing it is what takes the capability away.",

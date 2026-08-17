@@ -235,3 +235,45 @@ class TestIdentityProbeEnvFileFallback:
         await service.snapshot(force=True)
 
         assert seen["whoami"].get(CRED_KIRO_API_KEY) == "key-from-environ"
+
+
+class TestJiraTokenScrubGuard:
+    """Per-host JIRA_TOKEN_* keys are blocked by the re-injection guard."""
+
+    def test_entrypoint_scrubs_dynamic_jira_tokens(self) -> None:
+        """docker/entrypoint.sh feeds JIRA_TOKEN_* into the credential scrub loop."""
+        text = _ENTRYPOINT.read_text()
+        # The dynamic key capture must exist, restrict to hex suffix, and feed into loop
+        assert "JIRA_TOKEN_[0-9A-Fa-f]" in text
+        assert "JIRA_DYNAMIC" in text
+        assert "$CRED_KEYS $JIRA_DYNAMIC" in text
+
+    def test_loader_skips_jira_token_when_scrubbed(self, monkeypatch, tmp_path) -> None:
+        """load_credentials() must NOT re-inject JIRA_TOKEN_* into os.environ
+        when _KIROCREW_CREDS_SCRUBBED=1."""
+        import os
+
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        # Set up a minimal .env with a per-host Jira token
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        env_file = config_dir / ".env"
+        env_file.write_text("JIRA_TOKEN_AABBCC=secret-token\n")
+        env_file.chmod(0o600)
+
+        # Simulate Docker scrub signal
+        monkeypatch.setenv("_KIROCREW_CREDS_SCRUBBED", "1")
+        # Remove any pre-existing value
+        monkeypatch.delenv("JIRA_TOKEN_AABBCC", raising=False)
+
+        # Patch config_dir to point at our tmp
+        monkeypatch.setattr(
+            "kiro_crew.config.loader.config_dir", lambda: config_dir
+        )
+
+        cfg = KiroCrewConfig.load()
+        cfg.load_credentials()
+
+        # The token must NOT have been re-injected
+        assert os.environ.get("JIRA_TOKEN_AABBCC") is None

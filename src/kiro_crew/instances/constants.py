@@ -88,6 +88,40 @@ DEFAULT_SSM_CONNECT_TIMEOUT_SECS: float = 25.0
 # generous enough for any realistic proxy chain while still bounding the wait.
 CONNECT_TIMEOUT_CEILING_SECS: float = 120.0
 
+# Cap on the ssh ConnectTimeout the diagnostics probes (_probe_ssh,
+# _probe_remote_dashboard) borrow from instances.connect_timeout_secs. The
+# tunable above is sized for how long a slow-proxy CONNECT should be allowed
+# to take — a diagnosis is a different use case with its own UX budget: a user
+# who tuned connect_timeout_secs up to, say, 90s for a genuinely slow proxy
+# still wants a diagnosis to resolve in well under a minute, not silently
+# inherit the full tunable. Diagnostics use min(configured, this).
+DIAGNOSTICS_CONNECT_TIMEOUT_CAP_SECS: float = 15.0
+
+# How long (secs) to wait for the remote `kirocrew token` to return before
+# giving up on a mint attempt. The mint runs over the same ssh transport as the
+# tunnel itself, so a host behind a ProxyCommand or jump host pays the proxy
+# handshake again here (the connect flow spawns two proxy-bound ssh children;
+# ``connect_timeout_secs`` above budgets the first, this budgets the second —
+# an operator who raised one typically needs to raise both). Exposed as a
+# user-tunable via ``kirocrew config set instances.mint_timeout_secs <value>``.
+DEFAULT_MINT_TIMEOUT_SECS: float = 30.0
+
+# The SSM mint dispatches ``aws ssm send-command`` and polls
+# ``get-command-invocation``: send-command has its own dispatch latency (agent
+# poll interval) on top of the remote command's runtime, so its default is
+# higher than the direct-ssh mint's. When the user supplies an explicit
+# (non-None) ``mint_timeout_secs`` override, it wins for both transports.
+DEFAULT_SSM_MINT_TIMEOUT_SECS: float = 90.0
+
+# Bounds on a user-configured instances.mint_timeout_secs. Below the floor
+# falls back to the default (a mint that can't finish in under 10s of budget
+# would fail every realistic proxy chain anyway, so a tiny value is a
+# misconfiguration, not a tuning choice); above the ceiling is clamped down
+# (with a warning) so a pathological value can't make a failed mint hang the
+# connect flow indefinitely.
+MINT_TIMEOUT_FLOOR_SECS: float = 10.0
+MINT_TIMEOUT_CEILING_SECS: float = 120.0
+
 # Proactively re-mint each instance's dashboard token at this fraction of its
 # TTL, before the 20h cap. 0.8 = refresh at 80% elapsed.
 DEFAULT_TOKEN_REFRESH_FRACTION: float = 0.8
@@ -113,6 +147,25 @@ DEFAULT_TOKEN_PROBE_TIMEOUT_SECS: float = 2.0
 # request is still bounded rather than unlimited, so an unresponsive peer
 # surfaces as a clean transfer error instead of hanging the caller's turn.
 DEFAULT_SESSION_TRANSFER_TIMEOUT_SECS: float = 30.0
+
+# Timeout (secs) for one federated session-search request over an already-open
+# tunnel (GET the peer's /api/sessions/search — no SSH spawn). Sized between the
+# token probe (2s, a bare status ping) and the transfer (30s, a ~20 MB bundle):
+# a search reply is a small JSON page but the peer does real scanning work
+# (bounded by its own _SEARCH_SCAN_WINDOW), so the probe budget would produce
+# false "unreachable" verdicts on a loaded peer, while anything transfer-sized
+# would let one dead tunnel stall an interactive, keystroke-driven search. The
+# fan-out runs peers concurrently, so this is also the worst-case latency a
+# slow peer adds to the aggregated response.
+DEFAULT_SEARCH_PROXY_TIMEOUT_SECS: float = 6.0
+
+# Byte ceiling for one peer's federated-search reply, enforced BEFORE JSON
+# decoding (resp.json() buffers the whole body first, so a hostile/broken peer
+# streaming an unbounded reply could exhaust hub memory before any per-field
+# clamp runs). Sized generously above any honest reply: the aggregator caps
+# limit at 200 rows and every string field is clamped to 2 KiB downstream, so
+# a truthful worst case is well under 1 MiB; 4 MiB only ever bites on garbage.
+SEARCH_REPLY_MAX_BYTES: int = 4 * 1024 * 1024
 
 
 # Accepted shape for a dashboard-token lifetime: a positive integer of at most

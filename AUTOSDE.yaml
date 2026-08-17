@@ -211,6 +211,23 @@ custom-rules:
       and named in the corresponding conftest allowlist with a comment saying
       why.
 
+      NEVER use bare `tempfile.mkdtemp()` or `tempfile.TemporaryDirectory()`
+      without cleanup. These create directories in /tmp that survive the test
+      run and accumulate across runs, exhausting inodes. Use pytest's `tmp_path`
+      fixture (automatically cleaned) or, in unittest.TestCase setUp, pair
+      every `mkdtemp()` with `self.addCleanup(shutil.rmtree, path,
+      ignore_errors=True)`. The rule is: if you create it, you must register
+      its destruction in the same scope.
+
+      NEVER use relative `Path("src/...")` or bare string paths to read source
+      files from a test. Under pytest-xdist, workers may change CWD, making
+      relative paths non-deterministic. Always anchor to the repo root via
+      `_REPO_ROOT = Path(__file__).resolve().parents[1]` (for test/ files) or
+      the equivalent number of parent hops for deeper test directories, then
+      use `_REPO_ROOT / "src/kiro_crew/..."`. This pattern is already
+      established in test_builtin_app_assets.py, test_platform_compat.py, and
+      test_skill_home_paths.py.
+
   - id: top-level-imports
     blocking: false
     file-patterns:

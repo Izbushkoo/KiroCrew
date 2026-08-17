@@ -34,6 +34,7 @@ mint, diagnostics, injection validation, run-marker) plus
 - [12. The gateway run-marker (`run_marker.py`)](#12-the-gateway-run-marker-run_markerpy)
 - [13. The SSM connection method (`connection_method`)](#13-the-ssm-connection-method-connection_method)
 - [14. Session transfer (send a session to another instance)](#14-session-transfer-send-a-session-to-another-instance)
+- [15. Federated session search (search every connected instance at once)](#15-federated-session-search-search-every-connected-instance-at-once)
 
 ---
 
@@ -46,9 +47,12 @@ dashboard token on the remote, and embedding the remote dashboard in an
 `<iframe>`. You switch panes from a dropdown (`InstanceTabBar`, plus
 Cmd/Ctrl+digit in the Electron shell); the hub keeps the most-recently-used set
 "warm" (tunnel + iframe live) and lazily reconnects the rest. The switcher is a
-menu rather than a row of chips because the number of configured crews is
-unbounded: the strip costs constant width, and unread counts stay visible on the
-closed trigger as an aggregate badge over every crew that is not on screen.
+menu rather than a row of chips by DEFAULT because the number of configured crews
+is unbounded: the closed trigger costs constant width, and unread counts stay
+visible on it as an aggregate badge over every crew that is not on screen. A user
+who switches between the same two or three crews can PIN those out of the menu
+into always-visible chips beside it, spending header width only on the
+destinations they actually use — see [Pinned crew chips](#pinned-crew-chips).
 
 **Key properties**
 
@@ -234,6 +238,7 @@ cannot drift.
 | `instances.tunnel_base_port` | `7778` | First local loopback port the allocator hands out. Out-of-range values fall back to the default. |
 | `instances.ssh_compression` | `true` | Add `-C` to the tunnel argv. See §5.2. |
 | `instances.connect_timeout_secs` | unset (SSH `15.0`, SSM `25.0`) | How long (secs) to wait for the local forward port to accept connections before declaring a connect attempt failed. Hosts behind a ProxyCommand or jump host need longer (the proxy handshake runs before ssh begins the forward). An explicit value applies to both transports, including a value equal to either transport's default. Values below 1 fall back to the transport defaults; values above 120 are clamped to 120. |
+| `instances.mint_timeout_secs` | unset (SSH `30.0`, SSM `90.0`) | How long (secs) to wait for the remote `kirocrew token` mint before failing a connect. The mint rides the same ssh transport as the tunnel, so a host behind a ProxyCommand or jump host pays the proxy handshake here too (the connect flow spawns two proxy-bound ssh children: `connect_timeout_secs` budgets the first, this budgets the second). An explicit value applies to both transports, including a value equal to either transport's default — size it for the slowest transport in use. Values below 10 fall back to the transport defaults; values above 120 are clamped with a warning. |
 | `instances.max_recovery_attempts` | `8` | Consecutive self-heal attempts before the tunnel is left disconnected. Below 1 falls back to the default; above `MAX_RECOVERY_ATTEMPTS_CEILING` (100) is clamped with a warning, so a pathological setting cannot turn bounded self-heal into a near-infinite retry loop. |
 | `instances.recover_backoff_max_secs` | `30.0` | Cap on the per-attempt backoff. Non-positive falls back to the default; above `RECOVER_BACKOFF_MAX_CEILING_SECS` (300) is clamped, bounding the worst-case wall-clock recovery window. |
 | `instances.probe_failure_threshold` | `3` | Consecutive health-probe failures before a non-forwarding tunnel is torn down. Below 1 falls back to the default. |
@@ -242,11 +247,11 @@ cannot drift.
 kirocrew config set instances.warm_set_cap 3
 kirocrew config set instances.ssh_compression false
 kirocrew config set instances.connect_timeout_secs 45
+kirocrew config set instances.mint_timeout_secs 60
 ```
 
 Constants that are **not** user-configurable: the probe interval (30s), the token
-refresh fraction (0.8), the stored-token probe timeout (2s), and the mint
-timeout (30s).
+refresh fraction (0.8), and the stored-token probe timeout (2s).
 
 ### 5.2 `instances.ssh_compression`
 
@@ -452,7 +457,9 @@ what its own edit invalidated, and never reopens anything on the user's behalf.
    returns to your own dashboard). In the Electron shell, Cmd/Ctrl+digit jumps
    between panes in switcher order. Each row names its tunnel state in words on
    screen next to the status dot — colour is reinforcement, not the carrier, so
-   the row that errored is findable without hovering every entry.
+   the row that errored is findable without hovering every entry. Crews you switch
+   between often can be PINNED beside the trigger as chips, so the switch costs no
+   dropdown click — see [Pinned crew chips](#pinned-crew-chips).
 6. **Diagnose** a flaky instance (runs the ladder), or **Disconnect** from its
    row. **Edit settings** / **Remove** live in the row's overflow menu — a row
    shows two primary actions plus that menu, so everything past them is one
@@ -512,6 +519,55 @@ clicked, since the menu has already closed by then.
 > Prerequisite: you can already `ssh <ssh_host>` non-interactively from the hub
 > (a valid key or cert in your `ssh-agent`, no password prompt), and the remote
 > has `kirocrew` installed with a gateway running on its loopback port.
+
+### Pinned crew chips
+
+Switching between two crews through the dropdown costs a click every time. Any
+entry — including **Local** — can be PINNED from the dropdown's *Pin crews*
+section, which lifts it out of the menu into an always-visible chip beside the
+trigger. Nothing is pinned by default, so a single-crew user pays no header width
+for the feature and sees no chip row at all.
+
+Pinning is per crew rather than one expand-everything switch because the header's
+budget is a PIXEL budget, not a crew count: three crews named after real hosts
+outgrow it while six short names fit. Choosing WHICH crews are worth header space
+is what keeps that budget spendable on the ones actually being switched between.
+
+| Concern | Behaviour |
+|---|---|
+| Storage | `localStorage` key `mc-crew-switcher-pinned`, a JSON array of instance ids (`__local__` for the local dashboard). A module-level store broadcasts changes, because several bars in one realm are mounted at once and hidden with `display:none` rather than unmounted — a per-component hook would leave a hidden bar on a stale value until it remounted. A remote pane's embedded bar is a separate cross-origin realm and so carries its own pin set. |
+| Migration | The predecessor was one expand-everything flag, `mc-crew-switcher-expanded`. On first read a `'1'` there migrates to a pinned **Local** rather than to an empty set: that user wanted chips, and migrating them to nothing would read as the feature having been removed. The legacy key is dropped in the same pass. |
+| Order | The crew on screen leads as its own chip, then the pinned chips, then the dropdown. The dropdown TRAILS the chips so it stays adjacent to the last one and reads as "and the rest"; it carries the aggregate unread for every crew not on screen, clipped ones included. The active crew is never also a pinned chip — two copies of one name would spend the budget twice. |
+| Width bound | None of its own. The switcher sits in the topbar's left grid track (`minmax(0,1fr)`) inside `.tb-left`, which carries `min-width:0` and `overflow:hidden`, so the track structurally prevents it from reaching the centered search column — see [the three-track topbar](#pinned-crew-chips). Earlier revisions of this feature carried a `vw`-derived `max-width` because the search overlay was absolutely positioned and a left-side cluster could squeeze it; the grid layout removed that failure mode along with the need for the cap. |
+| Overflow | The row is a single `nowrap` line with `overflow: hidden`, and the chip at the boundary is CUT rather than dropped. Wrapping into a hidden second row would keep every chip whole, but a wrapped row still holds its full ALLOCATED width with the wrapped chips' space empty — which pushes the trailing dropdown away from the last visible chip by a gap that changes with the viewport. Filling the row keeps the two adjacent (measured at the 4px flex gap, asserted by the capture harness). A trailing fade marks the cut edge, so a cut chip reads as "there is more, in the dropdown next to me" rather than as a rendering fault. Cut chips stay reachable in the dropdown, whose row marks them *no room* so a pin with no visible chip does not read as a pin that failed. |
+
+**Why the switcher needs no width cap.** The topbar is a three-track CSS grid:
+`minmax(0,1fr) | clamp(240px,22vw,480px) | minmax(0,1fr)`. The search column is a
+flow-internal track, not an absolutely positioned overlay, so a wide left cluster
+cannot reach it: `.tb-left` is `min-width:0` with `overflow:hidden`, and the track
+simply gives the chips less room. That is the whole bound, and it holds at every
+viewport width and under the macOS Electron 84px header inset (which narrows the
+tracks rather than shifting content over them).
+
+This is worth stating because the obvious alternative is wrong in a way that
+already shipped once: a hardcoded fraction. `max-w-[42vw]` on the chip row reached
+~538px at 1280px, which under the previous absolutely-positioned search overlay
+pushed its available space under the minimum width and unmounted it outright. A
+fraction cannot track a viewport-relative sibling; a grid track does it by
+construction.
+
+
+Counting which chips were cut off is read-only and one-directional: the result is
+consumed only by the dropdown's rows, which are portalled and contribute nothing
+to the header's width, so nothing sized by the measurement lives inside the thing
+being measured. The dropdown's own unread badge is absolutely positioned for the
+same reason — appearing must not change the button's width, since the chip row is
+sized from the space that button leaves. The rule itself (a chip whose trailing
+edge passes the row's visible width is cut) is a pure function, `clippedChipIds`,
+because jsdom performs no layout and a rendered test could never distinguish a
+fitted row from a clipped one. `offsetLeft` is only sound there because the row
+carries `position: relative`, making it the chips' offsetParent and putting both
+in the same coordinate space as its `clientWidth`.
 
 ---
 
@@ -1085,3 +1141,98 @@ other direction is therefore done by registering the peers you want on each host
 that should originate a transfer, and a hub-initiated **pull** (read a peer's
 session over the same forward) is the natural follow-on that would make
 remote → hub and remote → remote work without any reverse reachability.
+
+## 15. Federated session search (search every connected instance at once)
+
+`GET /api/instances/search-sessions` answers one query with sessions from the
+local gateway **and** every instance whose tunnel is currently `CONNECTED`. The
+dashboard's two search surfaces switch to it automatically whenever at least one
+warm connection exists (the ⌘K palette's Sessions tab and the sidebar's Older
+Sessions search); with no warm instance they keep calling the plain local
+`/api/sessions/search`, so a peerless install never pays the detour.
+
+### 15.1 It is the hub-initiated pull §14.6 anticipated
+
+The search reuses the transfer's transport shape exactly: the hub GETs a peer's
+own `/api/sessions/search` **over the already-open forward** — no SSH spawn, no
+new port, no reverse reachability. `SshTunnelManager.search_sessions_remote`
+follows `send_session_bundle`'s credential rules to the letter: **the token
+never leaves the manager** (§6's invariant holds — `connect` and `refresh-token`
+remain the only routes whose response carries one), it travels as the
+port-scoped cookie so it cannot land in the peer's access log, and a `401/403`
+gets exactly one transparent re-mint retry, because a retained credential can go
+stale while the tunnel stays `CONNECTED`.
+
+Each peer request runs under `DEFAULT_SEARCH_PROXY_TIMEOUT_SECS` (6s) — sized
+between the token probe (2s, a bare ping, which would produce false
+"unreachable" verdicts on a loaded peer doing real scan work) and the transfer
+budget (30s, which would let one dead tunnel stall a keystroke-driven search).
+Peers are fanned out concurrently, so the slowest peer bounds the whole reply.
+
+### 15.2 Merging without a cross-instance score
+
+The aggregator **rank-interleaves**: position *k* of the reply cycles through
+each source's *k*-th best hit, local source first. Raw scores are never compared
+across gateways — each instance may run a different ranking version (a newer hub
+searching an older peer, or vice versa), so a numeric merge would silently
+prefer whichever version inflates its scores. Interleaving needs no score wire
+format, keeps every source represented in the top rows, and preserves each
+source's own internal order.
+
+An unreachable or refusing peer never fails the request: it is reported in the
+reply's `unreachable` array as `{id, name, code}` so a caller can tell what was
+NOT searched instead of having the result set silently narrowed. The shipped
+dashboard surfaces log the report (a visible "N instances unreachable" affordance
+is a follow-up); only CONNECTED peers are fanned out, so a miss here is a rare
+mid-search transient rather than the steady state for a down instance.
+Machine-readable codes distinguish a stale credential (`search_unauthorized`)
+from a dead tunnel (`search_unreachable`), a peer error (`search_peer_refused`),
+and a garbled reply (`search_malformed_reply`); the same codes are recorded in
+the SEL audit event for the request, so an operator can audit which peer failed
+and why without reproducing the search.
+
+### 15.3 Peer replies are untrusted input
+
+A peer's rows are re-shaped through a strict allowlist before they reach the
+browser: only known fields are copied, strings are type-checked, and `title` /
+`snippet` are re-run through the local credential + exfiltration redaction — the
+peer claims to have redacted, but this hub does not take its word for it. Rows
+from a peer additionally carry `instance_id` + `instance_name`; local rows carry
+neither, so the reply shape for a hub with no peers degrades to exactly the
+local search's own.
+
+The endpoint runs behind the same `_guard()` as every §6 route (owner-only,
+never Slack, `instances.enabled`, SEL-audited as `instances_search_sessions`)
+and mirrors the local search's input contract (`q` sanitized, capped at 256
+chars, min `SEARCH_MIN_CHARS`; `limit` default 50, max 200). The local rows are
+also redacted here: the aggregator calls `conversation_log.search_sessions`
+directly rather than going through the `/api/sessions/search` handler where the
+local redaction normally lives.
+
+### 15.4 What the UI does with a remote row
+
+A remote row's transcript lives on the other gateway, so the local dashboard can
+neither resume nor delete it:
+
+- **Activation switches panes.** Both surfaces route through
+  `useSelectInstance` (the single owner of switch-to-a-pane semantics, §3), so
+  clicking a remote row activates that instance's embedded pane —
+  reconnecting it first if needed. Deep-linking to the specific session inside
+  the embedded SPA is a follow-up: the iframe protocol has no open-session
+  message yet.
+- **The local delete action is hidden** on remote rows. `deleteHistorySession`
+  targets the LOCAL session file; with colliding keys across gateways it would
+  delete a same-keyed, unrelated local conversation.
+- **⌘Enter (open in local split grid) is inert** for remote rows in the
+  palette — bound to an explicit no-op, because an absent handler makes the
+  palette's Enter dispatch fall back to plain activation and the chord would
+  silently switch panes.
+- Remote rows are badged with the instance's **raw name** (never translated —
+  it is the user's own label, which also keeps the change i18n-neutral), and
+  result ids are namespaced by instance so two gateways' same-keyed sessions
+  cannot collide in the palette's keyed list. Snippet-highlight offsets are
+  shifted by the prefix length so remote rows highlight the same match a local
+  row would.
+- Any federated-endpoint failure in the UI — including the `403` when the
+  instances feature is off — falls back to the plain local search, which is
+  always the floor.

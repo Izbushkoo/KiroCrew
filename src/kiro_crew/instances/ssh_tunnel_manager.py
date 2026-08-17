@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
+import json
 import logging
 import os
 import re
@@ -69,20 +70,29 @@ from kiro_crew.instances.constants import (
     DEFAULT_CONNECT_TIMEOUT_SECS as _DEFAULT_CONNECT_TIMEOUT_SECS,
 )
 from kiro_crew.instances.constants import DEFAULT_MAX_RECOVERY_ATTEMPTS as _MAX_RECOVERY
+from kiro_crew.instances.constants import DEFAULT_MINT_TIMEOUT_SECS as _DEFAULT_MINT_TIMEOUT_SECS
 from kiro_crew.instances.constants import DEFAULT_PROBE_FAILURE_THRESHOLD as _PROBE_FAILS
 from kiro_crew.instances.constants import DEFAULT_PROBE_INTERVAL_SECS as _PROBE_INTERVAL
 from kiro_crew.instances.constants import (
     DEFAULT_RECOVER_BACKOFF_MAX_SECS as _RECOVER_BACKOFF_MAX_SECS,
 )
+from kiro_crew.instances.constants import DEFAULT_SEARCH_PROXY_TIMEOUT_SECS as _SEARCH_PROXY_TIMEOUT
 from kiro_crew.instances.constants import DEFAULT_SESSION_TRANSFER_TIMEOUT_SECS as _TRANSFER_TIMEOUT
 from kiro_crew.instances.constants import (
     DEFAULT_SSM_CONNECT_TIMEOUT_SECS as _DEFAULT_SSM_CONNECT_TIMEOUT_SECS,
+)
+from kiro_crew.instances.constants import (
+    DEFAULT_SSM_MINT_TIMEOUT_SECS as _DEFAULT_SSM_MINT_TIMEOUT_SECS,
 )
 from kiro_crew.instances.constants import DEFAULT_TOKEN_PROBE_TIMEOUT_SECS as _TOKEN_PROBE_TIMEOUT
 from kiro_crew.instances.constants import DEFAULT_TOKEN_REFRESH_FRACTION as _REFRESH_FRACTION
 from kiro_crew.instances.constants import (
     DEFAULT_TUNNEL_BASE_PORT,
 )
+from kiro_crew.instances.constants import (
+    DIAGNOSTICS_CONNECT_TIMEOUT_CAP_SECS as _DIAGNOSTICS_CONNECT_TIMEOUT_CAP_SECS,
+)
+from kiro_crew.instances.constants import SEARCH_REPLY_MAX_BYTES as _SEARCH_REPLY_MAX_BYTES
 from kiro_crew.instances.diagnostics import diagnose_instance, diagnose_instance_ssm
 from kiro_crew.instances.port_allocator import PortAllocator, _is_port_free
 from kiro_crew.instances.registry import _UNALLOCATED_PORT, Instance, InstancesRegistry
@@ -763,6 +773,7 @@ class SshTunnelManager:
         max_recovery_attempts: int = _MAX_RECOVERY,
         recover_backoff_max_secs: float = _RECOVER_BACKOFF_MAX_SECS,
         probe_failure_threshold: int = _PROBE_FAILS,
+        mint_timeout_secs: float | None = None,
         mint_token: Callable[..., Awaitable[str]] = mint_remote_token,
         tunnel_factory: Callable[..., _SshTunnel] | None = None,
         parent_port: int | None = None,
@@ -790,6 +801,7 @@ class SshTunnelManager:
         self._max_recovery = max_recovery_attempts
         self._recover_backoff_max = recover_backoff_max_secs
         self._probe_fails = probe_failure_threshold
+        self._mint_timeout = mint_timeout_secs
         self._mint_token = mint_token
         self._tunnel_factory = tunnel_factory or _SshTunnel
         # Only the real ssh path reaps OS-level orphans; injected fakes (tests)
@@ -888,6 +900,22 @@ class SshTunnelManager:
         if method == "ssm":
             return _DEFAULT_SSM_CONNECT_TIMEOUT_SECS
         return _DEFAULT_CONNECT_TIMEOUT_SECS
+
+    def _mint_timeout_for(self, method: str) -> float:
+        """Token-mint timeout for *method*, honoring an explicit override.
+
+        Mirrors :meth:`_connect_timeout_for`: the SSM mint dispatches
+        ``aws ssm send-command`` and polls ``get-command-invocation``, whose
+        dispatch latency (agent poll interval) makes its default higher. A
+        caller that passed an explicit ``mint_timeout_secs`` (config, tests)
+        wins for both transports — including a value equal to either
+        transport's default.
+        """
+        if self._mint_timeout is not None:
+            return self._mint_timeout  # explicit override
+        if method == "ssm":
+            return _DEFAULT_SSM_MINT_TIMEOUT_SECS
+        return _DEFAULT_MINT_TIMEOUT_SECS
 
     async def _ps_lines(self) -> list[str]:
         """Return ``<pid> <command>`` lines for all processes (portable ps).
@@ -992,6 +1020,7 @@ class SshTunnelManager:
                 ttl=inst.ttl,
                 remote_port=inst.remote_port,
                 embed_parent_port=self._parent_port,
+                timeout_secs=self._mint_timeout_for(params.method),
             )
         return await self._mint_token(
             params.ssh_host,
@@ -999,6 +1028,7 @@ class SshTunnelManager:
             ttl=inst.ttl,
             remote_port=inst.remote_port,
             embed_parent_port=self._parent_port,
+            timeout_secs=self._mint_timeout_for(params.method),
         )
 
     async def connect(self, instance_id: str) -> TunnelStatus:
@@ -1522,7 +1552,14 @@ class SshTunnelManager:
                 ssm_run_as=inst.ssm_run_as,
             )
         else:
-            result = await diagnose_instance(inst.ssh_host, inst.remote_port, local_port)
+            result = await diagnose_instance(
+                inst.ssh_host,
+                inst.remote_port,
+                local_port,
+                connect_timeout_secs=min(
+                    self._connect_timeout_for("ssh"), _DIAGNOSTICS_CONNECT_TIMEOUT_CAP_SECS
+                ),
+            )
         diag = result.to_dict()
         # Re-fetch the tunnel (it may have changed during the probes) and attach.
         tunnel = self._tunnels.get(instance_id)
@@ -1566,6 +1603,7 @@ class SshTunnelManager:
                 "restart",
                 remote_bin=params.remote_bin,
                 marker_port=inst.remote_port,
+                connect_timeout_secs=self._mint_timeout_for(params.method),
             )
         if rc == 0:
             logger.info("Restarted remote gateway for %s", instance_id)
@@ -1785,6 +1823,122 @@ class SshTunnelManager:
         return False, {
             "error": "peer rejected the credential",
             "code": "transfer_unauthorized",
+        }
+
+    async def search_sessions_remote(
+        self, instance_id: str, query: str, limit: int
+    ) -> tuple[bool, dict]:
+        """GET a connected peer's ``/api/sessions/search`` over its tunnel.
+
+        Returns ``(ok, payload)``: on success *payload* is the peer's JSON reply
+        (``{"sessions": [...]}``); on failure it carries ``error`` and a
+        machine-readable ``code`` so the aggregator can tell a stale credential
+        from an unreachable peer.
+
+        Runs entirely over the already-open forward — **no SSH spawn** — and
+        follows :meth:`send_session_bundle`'s credential rules: **the token
+        never leaves this object** (``connect``/``refresh-token`` stay the only
+        routes where one crosses the API boundary), it travels as the
+        port-scoped cookie so it cannot land in the peer's access log, and a
+        401/403 gets exactly one transparent re-mint retry — a retained
+        credential can go stale while the tunnel stays CONNECTED.
+        """
+        st = self.status(instance_id)
+        if st is None or st.state is not TunnelState.CONNECTED:
+            return False, {
+                "error": "instance is not connected",
+                "code": "search_peer_not_connected",
+            }
+        local_port = st.local_port
+        if local_port <= 0:
+            return False, {
+                "error": "no live credential for this instance; reconnect it",
+                "code": "search_no_credential",
+            }
+        url = f"http://{_LOOPBACK}:{int(local_port)}/api/sessions/search"
+        # Port-scoped cookie name, for the same reason as send_session_bundle:
+        # the peer keys its cookie on the port the CLIENT connected to.
+        cookie_name = f"mc_token_{int(local_port)}"
+        timeout = aiohttp.ClientTimeout(total=_SEARCH_PROXY_TIMEOUT)
+        reminted = False
+        for _attempt in range(2):
+            token = self._tokens.get(instance_id, "")
+            if not token:
+                return False, {
+                    "error": "no live credential for this instance; reconnect it",
+                    "code": "search_no_credential",
+                }
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(
+                        url,
+                        params={"q": query, "limit": str(int(limit))},
+                        headers={"Cookie": f"{cookie_name}={token}"},
+                        # The tunnel endpoint is the ONLY legitimate target. A
+                        # compromised peer answering 30x would otherwise make
+                        # aiohttp fetch an attacker-chosen URL FROM THE HUB
+                        # (SSRF into its loopback control planes).
+                        allow_redirects=False,
+                    ) as resp:
+                        if resp.status in (401, 403):
+                            if not reminted and await self.refresh_token(instance_id):
+                                reminted = True
+                                continue  # retry once with the fresh credential
+                            return False, {
+                                "error": "peer rejected the credential",
+                                "code": "search_unauthorized",
+                            }
+                        if not 200 <= resp.status < 300:
+                            return False, {
+                                "error": f"peer refused the search (HTTP {resp.status})",
+                                "code": "search_peer_refused",
+                            }
+                        # Byte-cap BEFORE decoding: resp.json() buffers the whole
+                        # body first, so a hostile/broken peer streaming an
+                        # unbounded reply could exhaust hub memory before any
+                        # per-field clamp runs. StreamReader.read(n) returns as
+                        # soon as ANY buffered data exists, so a single call can
+                        # yield a prefix of a multi-chunk reply — accumulate to
+                        # EOF, refusing the moment the cap is crossed. An honest
+                        # reply (<=200 clamped rows) sits far below the cap.
+                        chunks: list[bytes] = []
+                        received = 0
+                        oversized = False
+                        async for chunk in resp.content.iter_chunked(65536):
+                            received += len(chunk)
+                            if received > _SEARCH_REPLY_MAX_BYTES:
+                                oversized = True
+                                break
+                            chunks.append(chunk)
+                        if oversized:
+                            return False, {
+                                "error": "peer search reply exceeds the size cap",
+                                "code": "search_malformed_reply",
+                            }
+                        try:
+                            payload = json.loads(b"".join(chunks))
+                        except Exception:
+                            payload = None
+                        if not isinstance(payload, dict):
+                            return False, {
+                                "error": "peer returned a malformed search reply",
+                                "code": "search_malformed_reply",
+                            }
+                        return True, payload
+            except Exception as e:
+                logger.info(
+                    "Federated session search to %s failed (%s)",
+                    instance_id,
+                    type(e).__name__,  # never the credential, never the query
+                )
+                return False, {
+                    "error": f"could not reach the instance ({type(e).__name__})",
+                    "code": "search_unreachable",
+                }
+        # Both attempts came back unauthorized.
+        return False, {
+            "error": "peer rejected the credential",
+            "code": "search_unauthorized",
         }
 
     def token_ttl_remaining(self, instance_id: str) -> int | None:

@@ -72,7 +72,8 @@ from kiro_crew.dashboard.state import (
     _ChatSlot,
     _mark_permission_resolved,
     _normalize_slot_key,
-    parse_cls_meta,
+    is_stop_event_row,
+    is_turn_interrupted,
     request_slot_origin,
 )
 from kiro_crew.dashboard.turn_dispatch import spawn_guarded_turn
@@ -1023,6 +1024,9 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
+    denied = _deny_cross_app_slot_access(request, slot, name, "slot_detail")
+    if denied is not None:
+        return denied
 
     limit_raw = request.query.get("limit")
     before_raw = request.query.get("before")
@@ -1110,31 +1114,58 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
         # and drops done, so their count is not the span consumed here.
         next_before = start
 
-    prepared = _prepare_messages(messages, slot.running)
+    # Snapshot every slot field the response needs BEFORE leaving the event
+    # loop: the render below runs in a worker thread, and it must not read
+    # attributes the loop keeps mutating mid-turn. `messages` is already a
+    # fresh top-level list in both branches above; the message dicts inside it
+    # are shared with live mutation, which _prepare_messages tolerates by the
+    # same snapshot discipline the flush-thread save path relies on.
+    key = slot.key
+    running = slot.running
+    stopping = slot._stopping
+    display_title = slot.display_title
+    queue_snapshot = [{"id": q["id"], "content": q["content"]} for q in slot._queue]
+    context_fields = await _context_snapshot_fields(state, slot)
 
-    return web.json_response(
-        {
-            "key": slot.key,
-            # Redacted at emit like every sibling path (_ChatSlot.to_dict does the
-            # same for the sidebar payload). Titles can be LLM-generated or set by
-            # a rename, so they are content, not configuration.
-            "title": _redact_for_display(slot.display_title),
-            "running": slot.running,
-            "stopping": slot._stopping,
-            "messages": prepared,
-            "queue": [
-                {"id": q["id"], "content": _redact_for_display(q["content"])} for q in slot._queue
-            ],
-            "total": total,
-            "has_more": has_more,
-            "next_before": next_before,
-            # Seeds the context meter on open. Turn-scoped WS frames alone leave
-            # it empty for a session reopened in a new tab; omitted entirely
-            # (not zeroed) when genuinely unknown, so the frontend can tell
-            # "no reading" from "0% used".
-            **(await _context_snapshot_fields(state, slot)),
-        }
-    )
+    def _render() -> str:
+        # Off-loop on purpose. _prepare_messages applies a regex-heavy
+        # redaction battery to the ENTIRE history; on a multi-MB session that
+        # blocked the event loop past the loop-stall watchdog's exit budget
+        # and hard-exited the gateway. json.dumps of the same payload is a
+        # second loop-blocking cost, so it lives in the thread too.
+        prepared = _prepare_messages(messages, running)
+        return json.dumps(
+            {
+                "key": key,
+                # Redacted at emit like every sibling path (_ChatSlot.to_dict
+                # does the same for the sidebar payload). Titles can be
+                # LLM-generated or set by a rename, so they are content, not
+                # configuration.
+                "title": _redact_for_display(display_title),
+                "running": running,
+                "stopping": stopping,
+                "messages": prepared,
+                "queue": [
+                    {"id": q["id"], "content": _redact_for_display(q["content"])}
+                    for q in queue_snapshot
+                ],
+                "total": total,
+                "has_more": has_more,
+                "next_before": next_before,
+                # Seeds the context meter on open. Turn-scoped WS frames alone
+                # leave it empty for a session reopened in a new tab; omitted
+                # entirely (not zeroed) when genuinely unknown, so the frontend
+                # can tell "no reading" from "0% used".
+                **context_fields,
+            }
+        )
+
+    # Per-slot single-flight: concurrent refetches of the same slot (WS
+    # reconnect + switchSlot + chat_done all refetch) queue here instead of
+    # each burning a worker thread on the same multi-MB redaction pass.
+    async with slot._detail_render_lock:
+        body = await asyncio.to_thread(_render)
+    return web.Response(text=body, content_type="application/json")
 
 
 async def api_chat_slot_create(request: web.Request) -> web.Response:
@@ -1657,6 +1688,9 @@ async def api_chat_slot_stop(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return _slot_not_found()
+    denied = _deny_cross_app_slot_access(request, slot, name, "slot_stop")
+    if denied is not None:
+        return denied
     # Before ANY side effect — the escalation branch below clears the queue and
     # drops pending steers before it reaches stop_turn, so a guard placed later
     # would still let a foreign caller mutate the slot.
@@ -2007,73 +2041,22 @@ def _has_conversation(slot: _ChatSlot) -> bool:
 def _is_stop_event(m: dict) -> bool:
     """True when *m* is the card recorded because the user pressed Stop.
 
-    Three carriers, and the in-memory one is the easy miss: the stop is appended
-    as ``slot.append("system", stop_msg, stop_msg)`` with **no** ``meta=`` kwarg,
-    so ``_ChatSlot.append`` never creates a ``meta`` key and the discriminator
-    exists ONLY inside the JSON-encoded ``cls``/``content``. ``parse_cls_meta()``
-    is what unpacks it, and it runs on the way OUT to a client
-    (``_prepare_messages`` / ``_broadcast_chat_message``) — which is why the
-    frontend sees ``meta.kind`` while this module, reading the live window, does
-    not. Checking only ``kind``/``meta.kind`` here therefore matched a restored
-    row but never a freshly-stopped one, silently diverging from the frontend
-    mirror in exactly the case the two must agree on.
-
-    Mirrors ``isStopEvent`` in ``website/src/store/chatSlice.ts``.
+    Thin alias over ``state.is_stop_event_row`` — the predicate lives there
+    (next to ``parse_cls_meta``, its one dependency) so the slot-summary
+    builder can share it without importing this handler module.
     """
-    if m.get("kind") == "stop_event":
-        return True
-    meta = m.get("meta") or {}
-    if meta.get("kind") == "stop_event":
-        return True
-    # Live window: the discriminator is still JSON inside `cls`.
-    parsed = parse_cls_meta(m.get("cls") or "")
-    return bool(parsed and parsed.get("kind") == "stop_event")
+    return is_stop_event_row(m)
 
 
 def _is_interrupted(slot: _ChatSlot) -> bool:
     """True when the transcript shows a turn that ended without a reply.
 
-    Two shapes qualify: the last conversational row is the USER's (nothing came
-    back at all — a gateway restart mid-turn leaves exactly this), or it is the
-    ASSISTANT's but an error row follows it (the turn streamed partway then died,
-    which is otherwise shape-identical to a clean completion).
-
-    One shape is explicitly excluded: a trailing ``stop_event``. The user pressing
-    Stop is a deliberate ending, not an interruption, and stopping before the
-    reply emitted any text produces the same ``[user, ...]`` tail as a crash.
-
-    Still selects the wording injected for the model (``_MANUAL_RESUME_MSG`` vs
-    ``_MANUAL_CONTINUE_MSG``), and on the dashboard it now also gates whether the
-    composer offers the control at all — see the ``continuable && interrupted``
-    composition in ``website/src/pages/ChatPage.tsx``. A False result means "as
-    far as the transcript shows, the last turn finished or was ended on purpose",
-    NOT "there is nothing to do": a force-quit runs no ``finally``, so the error
-    row that would have proved an interruption was never written.
-
-    Deliberately does not distinguish "produced some output" from "produced
-    none": ``_MANUAL_RESUME_MSG`` is worded to hold in both cases, so the
-    distinction would buy a branch and nothing else.
+    Thin adapter over ``state.is_turn_interrupted``, which owns the scan and
+    its contract (see its docstring). Shared with the slot-summary builder so
+    the Continue endpoint, the composer's Resume gate, and the sidebar's
+    ``interrupted`` field can never disagree about what an interruption is.
     """
-    saw_trailing_error = False
-    for m in reversed(slot.messages):
-        role = m.get("role")
-        meta = m.get("meta") or {}
-        # A deliberate Stop ENDS the turn; it does not interrupt it. Tested
-        # before the user/assistant branch because stopping before the reply
-        # emitted any text leaves ``[user, stop_event]`` -- shape-identical to
-        # "the gateway died before anything came back". See ``_is_stop_event``
-        # for why the discriminator has to be resolved from three carriers.
-        # Only the NEWEST turn's terminator reaches here -- an older stop card
-        # is never scanned, because a later user/assistant row returns first.
-        if _is_stop_event(m):
-            return False
-        if role == "assistant" and meta.get("kind") == "compaction":
-            continue
-        if role in ("user", "assistant") and m.get("content"):
-            return True if role == "user" else saw_trailing_error
-        if role == "error":
-            saw_trailing_error = True
-    return False
+    return is_turn_interrupted(slot.messages)
 
 
 async def api_chat_slot_end_wait(request: web.Request) -> web.Response:
@@ -2098,6 +2081,9 @@ async def api_chat_slot_end_wait(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    denied = _deny_cross_app_slot_access(request, slot, name, "slot_end_wait")
+    if denied is not None:
+        return denied
     try:
         body = await request.json() if request.content_length else {}
     except Exception:
@@ -2144,6 +2130,9 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return _slot_not_found()
+    denied = _deny_cross_app_slot_access(request, slot, name, "slot_interrupt")
+    if denied is not None:
+        return denied
     # Before the _stop_state claim and the queue promotion below, both of which
     # mutate the slot ahead of stop_turn.
     # Resolved once, before the request-body await below, and used for both the
@@ -2264,6 +2253,9 @@ async def api_chat_slot_queue_cancel(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
+    denied = _deny_cross_app_slot_access(request, slot, name, "slot_queue_cancel")
+    if denied is not None:
+        return denied
     content = slot.queue_remove_by_id(queue_id)
     if content is None:
         return web.json_response({"error": "queue item not found"}, status=404)
@@ -2297,6 +2289,9 @@ async def api_chat_slot_queue_edit(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
+    denied = _deny_cross_app_slot_access(request, slot, name, "slot_queue_edit")
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -2335,6 +2330,9 @@ async def api_chat_slot_queue_reorder(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
+    denied = _deny_cross_app_slot_access(request, slot, name, "slot_queue_reorder")
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -2870,6 +2868,9 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
+    denied = _deny_cross_app_slot_access(request, slot, name, "slot_agent")
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -3130,6 +3131,9 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
+    denied = _deny_cross_app_slot_access(request, slot, name, "slot_model")
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -3278,6 +3282,9 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
+    denied = _deny_cross_app_slot_access(request, slot, name, "slot_reasoning_effort")
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -3347,6 +3354,9 @@ async def api_chat_slot_workspace(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
+    denied = _deny_cross_app_slot_access(request, slot, name, "slot_workspace")
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -3375,6 +3385,9 @@ async def api_chat_slot_project(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
+    denied = _deny_cross_app_slot_access(request, slot, name, "slot_project")
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -3460,6 +3473,37 @@ def _redact_followup_item(item: dict) -> dict:
         if scrubbed == branch:
             out["branch"] = branch
     return out
+
+
+def _deny_cross_app_slot_access(
+    request: web.Request, slot, name: str, operation: str
+) -> web.Response | None:
+    """Deny app tokens acting on slots they don't own (App Kit §5.2).
+
+    Returns a 404 response if the caller is an app that doesn't own this slot,
+    or None to proceed. Dashboard users (empty request_app) always pass.
+    Anti-enumeration: uses 404 not 403 (CWE-204).
+    """
+    request_app = request.get("app", "")
+    if not request_app:
+        return None  # Dashboard user -- no restriction
+    if slot._app and request_app == slot._app:
+        return None  # App owns this slot
+    reason = (
+        "app does not own this slot" if slot._app else "app cannot access unscoped slots"
+    )
+    try:
+        sel().log_api_access(
+            caller=request_app,
+            operation=operation,
+            outcome="denied",
+            source="app_isolation",
+            resources=f"slot={name}",
+            error=reason,
+        )
+    except Exception:
+        pass
+    return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
 
 
 def deny_non_dashboard_caller(request: web.Request, operation: str) -> web.Response | None:
@@ -3941,6 +3985,9 @@ async def api_chat_mode(request: web.Request) -> web.Response:
     pending approval — it preemptively sets the mode for future tools.
     """
     state: DashboardState = request.app["state"]
+    denied = deny_non_dashboard_caller(request, "chat_mode")
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -4138,6 +4185,9 @@ def _get_pattern_from_pending(slot: _ChatSlot, request_id: str, field: str) -> s
 async def api_chat_slot_approve(request: web.Request) -> web.Response:
     """POST /api/chat/slots/{slot}/approve — resolve a pending tool approval."""
     state: DashboardState = request.app["state"]
+    denied = deny_non_dashboard_caller(request, "chat_slot_approve")
+    if denied is not None:
+        return denied
     name = request.match_info["slot"]
     slot = state._slots.get(name)
     if not slot:

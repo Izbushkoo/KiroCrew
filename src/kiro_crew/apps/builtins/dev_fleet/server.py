@@ -2608,6 +2608,92 @@ async def _pod_checkout_guard(name: str) -> str | None:
     return None
 
 
+def _reclaim_pod_locked(cfg, name: str, expected_checkout: str) -> tuple[str, str]:
+    """Attribute pod *name* and tear it down as ONE locked transaction.
+
+    Runs entirely inside ``rt.pod_name_mutex``, which is the cross-process flock
+    every mutating pod path cooperates on. That is the whole point of this
+    helper: checking the checkout pin in one process and then tearing down in
+    another leaves a window where a concurrent ``pod up`` from a DIFFERENT
+    checkout claims the same global basename, so the teardown would stop that
+    pod and delete its isolated HOME. Reading the pin under the same lock the
+    teardown holds closes it.
+
+    Necessarily in-process rather than via the ``pod down`` CLI: the lock is held
+    per open-file-description and ``stop_pod`` re-acquires it, so a caller that
+    held it around a shell-out would block the very child it waits on.
+    ``pod_name_mutex`` is reentrant WITHIN A THREAD, and this function is
+    submitted to the executor as one callable, so ``stop_pod``'s own acquisition
+    nests instead of deadlocking.
+
+    *expected_checkout* is this repo's worktree path for *name*, resolved by the
+    caller before the lock -- it is not the racy half, since a foreign ``up``
+    moves the PIN, never our own worktree.
+
+    Mirrors :func:`_pod_checkout_guard`'s attribution rules, and the CLI's
+    post-teardown env-file clear, so behaviour matches the paths it replaces.
+
+    Returns ``(outcome, detail)`` with outcome one of:
+      ``reclaimed``  -- ours, torn down, HOME verified gone
+      ``handed_over`` -- a new pod claimed the name mid-teardown; its state (and
+                        its pin) is deliberately left untouched. Callers treat
+                        this as a REFUSAL, not a success: a live pod may now be
+                        running out of the very checkout they are about to
+                        delete, and which pod holds the name is unknowable here.
+      ``foreign``    -- not attributable to this checkout; nothing was touched
+      ``failed``     -- attribution or teardown could not be completed
+    """
+    with rt.pod_name_mutex(cfg, name):
+        try:
+            env_exists, pinned = _read_pin_strict(cfg, name)
+        except Exception as exc:  # noqa: BLE001
+            # Pin state exists but cannot be positively read -> never treat as
+            # "unpinned"; that ambiguity is the cross-repo hole itself.
+            return "failed", f"cannot verify pod checkout pin: {_redact(str(exc))}"
+        if not env_exists:
+            # No pin means the HOME cannot be attributed to ANY checkout, and
+            # this path deletes it. ``_pod_checkout_guard`` allows an unpinned
+            # name when no unit is live, which is right for OPERATING on a pod
+            # the caller located; deletion is the stricter case and demands
+            # POSITIVE attribution, because a same-basename leftover from
+            # another checkout looks identical from here. Refusing costs an
+            # unpinned orphan an automatic reclaim -- `pod prune` still takes
+            # it -- while allowing it risks deleting another repo's data.
+            return "foreign", (
+                f"pod {name!r} has no checkout pin, so its HOME cannot be "
+                "attributed to this checkout (unattributable pod identity)"
+            )
+        if not pinned:
+            return "foreign", (
+                f"pod {name!r} has a pin file without a verifiable CHECKOUT "
+                "(ambiguous pod identity)"
+            )
+        try:
+            mine = Path(pinned).resolve() == Path(expected_checkout).resolve()
+        except OSError as exc:
+            return "failed", f"cannot resolve checkout paths: {_redact(str(exc))}"
+        if not mine:
+            return "foreign", (
+                f"pod {name!r} is pinned to a different checkout "
+                "(basename collision)"
+            )
+        cp = rt.stop_pod(cfg, name)
+        if cp.returncode != 0:
+            # Redacted like every other detail this helper returns: it reaches the
+            # worktree-remove response and therefore the dashboard, and teardown
+            # stderr can carry a path or credential from the pod's own output.
+            err = _redact((cp.stderr or "").strip())
+            return "failed", err or f"stop rc={cp.returncode}"
+        if rt.RECLAIMED_MARKER in (cp.stdout or ""):
+            # The env file now pins the NEW pod's checkout -- clearing it would
+            # strip that pod's identity.
+            return "handed_over", f"pod {name!r} was reclaimed by a new pod mid-teardown"
+        # Clear the pinned CHECKOUT=/SEED= so a later `up` re-resolves cleanly,
+        # the same post-reclaim step the CLI performs.
+        cfg.env_file(name).unlink(missing_ok=True)
+        return "reclaimed", ""
+
+
 async def _pod_up(name: str) -> dict:
     guard = await _pod_checkout_guard(name)
     if guard:
@@ -2847,6 +2933,7 @@ async def _worktree_remove(
 
     pr = (await _pr_status_cached(branch)) if branch else None
     own = await _own_commits_count(path)
+
     if not force and not _is_pr_merged(pr):
         if own is None or own > 0:
             return {
@@ -3080,6 +3167,10 @@ async def _worktree_remove(
         progress("stopping_pod")
     cfg = _load_cfg()
     stopped_pod = False
+    # Distinct from ``stopped_pod``: nothing was running, an already-stopped
+    # pod's isolated HOME was reclaimed. Conflating the two would report a
+    # shutdown that never happened.
+    reclaimed_pod_home = False
     if _POD_AVAILABLE and cfg is None:
         return {"ok": False, "error": "cannot load pod configuration to verify pod state"}
     if _POD_AVAILABLE and cfg:
@@ -3107,9 +3198,23 @@ async def _worktree_remove(
                     }
             except Exception:
                 pass  # unit_state also fails → backend truly gone
-            logger.debug(
-                "dev-fleet worktree_remove: pod backend absent; "
-                "skipping pod-state check for %r",
+            # Name the residue instead of hiding the skip at debug level. The
+            # HOME cannot be reclaimed here — without a backend the pod's
+            # liveness is unprovable, and deleting a HOME that may belong to a
+            # live gateway is the one outcome teardown must never risk — but an
+            # operator who is told the path can reclaim it with `pod down`.
+            # Resolving the path is itself best-effort: a diagnostic must never
+            # be the reason a removal fails.
+            try:
+                residue: object = rt.pod_home(cfg, name)
+            except Exception:  # noqa: BLE001
+                residue = "its isolated HOME under the pod root"
+            logger.warning(
+                "dev-fleet worktree_remove: pod backend absent, so %r's pod state "
+                "cannot be verified and %s is left in place; reclaim it with "
+                "`kirocrew pod down %s` once the backend is back",
+                name,
+                residue,
                 name,
             )
         else:
@@ -3119,10 +3224,26 @@ async def _worktree_remove(
                     subprocess_executor(), rt.active_names, cfg
                 )
                 if name in active:
-                    r = await _pod_down(name)
-                    if not r.get("ok"):
-                        return {"ok": False, "error": f"pod shutdown failed: {r.get('error')}"}
+                    outcome, detail = await loop.run_in_executor(
+                        subprocess_executor(), _reclaim_pod_locked, cfg, name, path
+                    )
+                    if outcome == "foreign":
+                        return {"ok": False, "error": f"refusing pod shutdown: {detail}"}
+                    if outcome == "handed_over":
+                        # A new pod holds this name. Which checkout it belongs to
+                        # is unknowable from here, and it may be running out of
+                        # THIS worktree -- removing the files under a live pod is
+                        # exactly what the liveness gate exists to prevent, and
+                        # the post-stop recheck below cannot be relied on to see
+                        # a unit that is still bootstrapping.
+                        return {"ok": False, "error": f"refusing removal: {detail}"}
+                    if outcome == "failed":
+                        return {"ok": False, "error": f"pod shutdown failed: {detail}"}
                     stopped_pod = True
+                    # ``reclaimed_pod_home`` deliberately stays False here: the
+                    # teardown did reclaim the HOME, but the flag's job is to
+                    # distinguish a leftover reclaimed with NOTHING running from a
+                    # real shutdown, and ``stopped_pod`` already reports this one.
                     try:
                         active2 = await loop.run_in_executor(
                             subprocess_executor(), rt.active_names, cfg
@@ -3134,6 +3255,80 @@ async def _worktree_remove(
                             "ok": False,
                             "error": f"cannot verify pod shutdown: {_redact(str(exc))}",
                         }
+                else:
+                    # A STOPPED pod still owns its isolated HOME, and removing the
+                    # worktree is the last moment anything can attribute that
+                    # directory to this checkout: afterwards the pin naming it is
+                    # gone and only a bulk sweep could find it. Real usage stops
+                    # the pod when testing ends and prunes days later once the PR
+                    # merges, so gating reclamation on a LIVE unit meant the common
+                    # path never reclaimed anything — each removal stranded a full
+                    # isolated HOME (a per-instance model copy dominates it) for
+                    # good.
+                    #
+                    # ``orphan_homes`` is the authoritative predicate rather than a
+                    # bare directory probe, so this agrees with `pod ls` / `pod
+                    # prune` by construction: it skips symlinks, and on macOS it
+                    # treats a per-pod plist as "installed, not orphaned" so a name
+                    # mid-``up`` is never reclaimed underneath itself. It keys on
+                    # the pod root, liveness and plist and never on the checkout
+                    # pin, so attribution is the locked helper's job, not its.
+                    #
+                    # Two different fail directions, so two different scopes. The
+                    # ENUMERATION is best-effort cleanup: an orphan scan says
+                    # nothing about liveness, so its failure degrades to a named
+                    # leftover rather than turning a lost directory into a lost
+                    # removal. The RECLAIM is teardown, so it fails CLOSED -- a
+                    # returned failure refuses the removal, and a raised one is
+                    # deliberately left to the liveness handler below rather than
+                    # swallowed here, because a teardown that died mid-flight
+                    # (a stop that timed out against a still-activating unit) is
+                    # exactly the state in which removing the checkout is unsafe.
+                    try:
+                        # Probe the pod root FIRST: ``orphan_homes`` swallows an
+                        # enumeration OSError and answers ``[]``, which is
+                        # indistinguishable from "nothing to reclaim" -- so an
+                        # unreadable pod root would silently skip the HOME without
+                        # the warning this block promises. Reading it here puts the
+                        # error on a path that reaches that warning.
+                        await loop.run_in_executor(
+                            subprocess_executor(), lambda: list(cfg.pod_root.iterdir())
+                        )
+                        orphans = await loop.run_in_executor(
+                            subprocess_executor(), rt.orphan_homes, cfg
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "dev-fleet worktree_remove: could not look for %r's pod "
+                            "HOME (%s); the worktree is still removed — sweep the "
+                            "leftover with `kirocrew pod prune`",
+                            name,
+                            _redact(str(exc)),
+                        )
+                        orphans = []
+                    if name in orphans:
+                        outcome, detail = await loop.run_in_executor(
+                            subprocess_executor(), _reclaim_pod_locked, cfg, name, path
+                        )
+                        if outcome == "reclaimed":
+                            reclaimed_pod_home = True
+                        elif outcome == "foreign":
+                            # Not ours to delete, which is a reason to leave it --
+                            # never a reason to refuse this checkout's own removal,
+                            # since nothing of ours is at risk.
+                            logger.warning(
+                                "dev-fleet worktree_remove: left a pod HOME named "
+                                "%r in place (%s); continuing the removal",
+                                name,
+                                _redact(detail),
+                            )
+                        else:
+                            # failed, or handed_over -- a new pod now holds this
+                            # name and may be running out of this worktree.
+                            return {
+                                "ok": False,
+                                "error": f"pod home reclaim failed: {detail}",
+                            }
             except Exception as exc:
                 return {
                     "ok": False,
@@ -3189,7 +3384,14 @@ async def _worktree_remove(
                 )
             return {"ok": False, "error": _redact((stderr or stdout).strip()[:300])}
 
-        # Delete branch if shipped/empty — atomically against the pinned OID.
+        # Delete branch ref only when the PR is MERGED — atomically against
+        # the pinned OID. Unmerged branch refs are always retained, even when
+        # own == 0 (every commit already reachable from the upstream base, so
+        # no unique commits exist): keying deletion to PR state alone is a
+        # deliberately simpler, fail-closed policy (recoverable > irrecoverable).
+        # Known cost: removing an unmerged empty worktree leaves refs/heads/
+        # <branch> behind, which blocks re-creating a worktree under the same
+        # branch name until the ref is deleted manually.
         # Fail-closed ancestry gate: even when the cached PR status says MERGED,
         # verify the branch OID is actually contained in the base branch. A stale
         # or wrong merged verdict cannot delete the only local pointer to unmerged
@@ -3200,7 +3402,7 @@ async def _worktree_remove(
         # using the pr_head_oid already fetched above (or fresh if needed).
         if branch and branch != BASE_BRANCH and verdict_oid:
             should_delete = False
-            if _is_pr_merged(pr) or own == 0:
+            if _is_pr_merged(pr):
                 remote = await _upstream_remote()
                 rc_anc, _, _ = await _run_cmd(
                     [
@@ -3212,7 +3414,7 @@ async def _worktree_remove(
                 should_delete = rc_anc == 0
                 # Squash-safe fallback: ancestry fails for squash/rebase merges.
                 # Use the containment check (branch OID is ancestor of PR head).
-                if not should_delete and _is_pr_merged(pr):
+                if not should_delete:
                     head_oid = pr_head_oid or await _fetch_pr_head_oid(
                         branch, repo=(pr or {}).get("_repo")
                     )
@@ -3237,7 +3439,13 @@ async def _worktree_remove(
         (verdict_oid or "").strip()[:12] if verdict_oid else "none",
     )
     _fleet_forget(name)
-    return {"ok": True, "removed": True, "stopped_pod": stopped_pod, "pr": _redact_pr(pr)}
+    return {
+        "ok": True,
+        "removed": True,
+        "stopped_pod": stopped_pod,
+        "reclaimed_pod_home": reclaimed_pod_home,
+        "pr": _redact_pr(pr),
+    }
 
 
 # --- sync (pull + build) ---
@@ -3655,16 +3863,22 @@ async def _prune_candidates() -> dict:
         if v["ok"]:
             candidates.append(row)
         else:
+            # Surface dirty flag so the frontend can pre-disable force-selection
+            # for dirty+unmerged worktrees (the backend refuses force=True on
+            # those anyway — exposing the flag avoids a misleading checkbox).
+            if v.get("dirty") is True:
+                row["dirty"] = True
             kept.append(row)
     return {"ok": True, "candidates": candidates, "kept": kept, "scanned": len(worktrees) - 1}
 
 
-async def _prune_run(names: list[str]) -> dict:
+async def _prune_run(names: list[str], force_names: set[str] | None = None) -> dict:
     # Deduplicate while preserving order: the API accepts any list of names,
     # and a duplicate would spawn two workers racing to remove the SAME
     # worktree — the second one then reports a spurious failure over the
     # first one's success.
     names = list(dict.fromkeys(names))
+    _force = force_names or set()
     async with _PRUNE_LOCK:
         if _PRUNE_STATE["running"]:
             return {"ok": False, "error": "prune already running"}
@@ -3706,23 +3920,50 @@ async def _prune_run(names: list[str]) -> dict:
                     error = err
                     result = {"name": nm, "ok": False, "error": err}
                 else:
-                    verdict = await _prunable(target["path"], target.get("branch"))
-                    if not verdict.get("ok"):
-                        error = f"not prunable: {verdict.get('code', 'unknown')}"
-                        result = {"name": nm, "ok": False, "error": error}
-                    else:
-                        def _progress(phase: str, _nm: str = nm) -> None:
-                            # phase in {"stopping_pod", "removing"}
-                            items[_nm]["status"] = phase
+                    is_forced = nm in _force
+                    if not is_forced:
+                        verdict = await _prunable(target["path"], target.get("branch"))
+                        if not verdict.get("ok"):
+                            error = f"not prunable: {verdict.get('code', 'unknown')}"
+                            result = {"name": nm, "ok": False, "error": error}
+                    if not error:
+                        # For forced items: hold _MAKE_LIVE_LOCK from the
+                        # protection recheck through _worktree_remove so a
+                        # concurrent /make-live cannot stage the target between
+                        # our check and the actual deletion.
+                        if is_forced:
+                            async with _MAKE_LIVE_LOCK:
+                                _lp = await _live_worktree_path()
+                                _ln = Path(_lp).name if _lp else None
+                                _sp = _staged_target()
+                                _sn = Path(_sp).name if _sp else None
+                                if (_ln and nm == _ln) or (_sn and nm == _sn):
+                                    error = "became protected during batch (staged or live)"
+                                    result = {"name": nm, "ok": False, "error": error}
+                                else:
+                                    def _progress(phase: str, _nm: str = nm) -> None:
+                                        items[_nm]["status"] = phase
 
-                        res = await _worktree_remove(
-                            nm, force=False, progress=_progress, _caller="prune"
-                        )
-                        result = {"name": nm, **res}
-                        if res.get("ok"):
-                            status, error = "done", None
+                                    res = await _worktree_remove(
+                                        nm, force=True, progress=_progress, _caller="prune"
+                                    )
+                                    result = {"name": nm, **res}
+                                    if res.get("ok"):
+                                        status, error = "done", None
+                                    else:
+                                        status, error = "failed", res.get("error")
                         else:
-                            status, error = "failed", res.get("error")
+                            def _progress(phase: str, _nm: str = nm) -> None:
+                                items[_nm]["status"] = phase
+
+                            res = await _worktree_remove(
+                                nm, force=False, progress=_progress, _caller="prune"
+                            )
+                            result = {"name": nm, **res}
+                            if res.get("ok"):
+                                status, error = "done", None
+                            else:
+                                status, error = "failed", res.get("error")
             except Exception as exc:  # noqa: BLE001
                 error = _redact(str(exc))
                 result = {"name": nm, "ok": False, "error": error}
@@ -4102,11 +4343,52 @@ async def api_dev_fleet_prune_run(request: web.Request) -> web.Response:
         return web.json_response(
             {"ok": False, "error": "'names' must be a list of strings"}, status=400
         )
+    raw_force = body.get("force_names") or []
+    if not isinstance(raw_force, list) or not all(isinstance(n, str) for n in raw_force):
+        return web.json_response(
+            {"ok": False, "code": "invalid_force_names", "error": "'force_names' must be a list of strings"},
+            status=400,
+        )
     valid = await _valid_worktree_names()
-    names = [n for n in raw_names if n in valid]
-    if not names:
-        return web.json_response({"ok": False, "error": "no valid names"}, status=400)
-    return web.json_response(await _prune_run(names))
+    force_set: set[str] = set()
+    if raw_force:
+        # Guard: never force-remove the main checkout, the currently live
+        # worktree, or a staged cutover target (removing a staged target
+        # would leave live_target.json pointing at a missing checkout,
+        # silently abandoning the pending restart).
+        # Per-item _MAKE_LIVE_LOCK is held inside _prune_one for each forced
+        # removal (recheck + _worktree_remove atomically), preventing a
+        # concurrent /make-live from staging between check and deletion.
+        live_path = await _live_worktree_path()
+        live_name = Path(live_path).name if live_path else None
+        staged_path = _staged_target()
+        staged_name = Path(staged_path).name if staged_path else None
+        guarded: set[str] = set()
+        for nm in raw_force:
+            wt, _ = await _find_worktree(nm)
+            if wt and wt.get("is_main"):
+                guarded.add(nm)
+            elif live_name and nm == live_name:
+                guarded.add(nm)
+            elif staged_name and nm == staged_name:
+                guarded.add(nm)
+        if guarded:
+            return web.json_response(
+                {"ok": False, "code": "protected_worktree",
+                 "error": f"cannot force-remove protected worktrees: {', '.join(sorted(guarded))}"},
+                status=400,
+            )
+        force_set = {n for n in raw_force if n in valid}
+    # Merge both lists: regular + forced (forced items skip the prunable verdict).
+    all_names = [n for n in raw_names if n in valid]
+    for fn in raw_force:
+        if fn in valid and fn not in all_names:
+            all_names.append(fn)
+    if not all_names:
+        return web.json_response({"ok": False, "code": "no_valid_names", "error": "no valid names"}, status=400)
+    if force_set:
+        return web.json_response(await _prune_run(all_names, force_names=force_set))
+    return web.json_response(await _prune_run(all_names))
 
 
 async def _pod_name_action(request: web.Request, action) -> web.Response:
@@ -4637,15 +4919,34 @@ async def _restart_gateway() -> dict:
         status = await _live_user_unit_status()
         if _foreground_eligible(status):
             fg = _foreground_backend()
-            if fg is not None and await fg.status() == gateway_service.STATUS_OK:
-                start_id = await _gateway_start_id()
-                ok, err = await fg.restart_detached()
-                if not ok:
-                    return {"ok": False, "error": _redact(err)}
-                _MAKE_LIVE_COMMITTED = True
-                return {"ok": True, "start_id": start_id}
+            if fg is not None:
+                fg_status = await fg.status()
+                if fg_status == gateway_service.STATUS_OK:
+                    start_id = await _gateway_start_id()
+                    ok, err = await fg.restart_detached()
+                    if not ok:
+                        return {"ok": False, "error": _redact(err)}
+                    _MAKE_LIVE_COMMITTED = True
+                    return {"ok": True, "start_id": start_id}
+                # Foreground eligible but confined/broken — surface the
+                # foreground's own refusal reason plus the manual remedy.
+                return {
+                    "ok": False,
+                    "error": (
+                        f"foreground gateway cannot restart ({fg_status})"
+                        f" — run `{_manual_restart_command()}` to apply the build"
+                    ),
+                }
 
-    return {"ok": False, "error": "gateway is not running as a user service"}
+        # Neither the service backend nor the foreground fallback can drive the
+        # restart — surface the specific reason plus the manual remedy.
+        return {
+            "ok": False,
+            "error": (
+                f"{_make_live_status_error(status)}"
+                f" — run `{_manual_restart_command()}` to apply the build"
+            ),
+        }
 
 
 @_audited("dev_fleet_restart_gateway")

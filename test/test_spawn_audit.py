@@ -47,6 +47,19 @@ operator-configured rather than agent-selected in the finding's sense):
 ``apps/builtins/code_reviewer/git.py`` git against a locally-checked-out CR
 repo, and ``sync/*`` push/pull. Routing these would also need their real-git
 unit tests to tolerate the sandbox wrapper.
+
+The Design Tweak builtin (``apps/builtins/design_tweak/backend/server.py``)
+adds three spawns in the same non-agent-selected categories:
+``_lsof_fields`` (fixed-argv ``lsof`` on numeric pids the backend discovered —
+a system probe like the sysctl/ps ones above), ``_h_pick_folder`` (fixed-argv
+``osascript`` running a hardcoded AppleScript for the macOS folder picker — a
+desktop-UI spawn), and ``_start_dev_proc`` (the user's OWN registered project
+dev server: cwd is the user-selected project dir and the argv is that project's
+package-manager dev script — operator/user-configured, reached only via the
+HMAC-signed gateway proxy, not agent-prompt-selected). ``_start_dev_proc`` is
+directly analogous to ``code_reviewer/git.py`` and is a follow-up sandbox-routing
+candidate; routing a long-lived dev server would need the resource/filesystem
+wrapper not to starve it.
 """
 
 from __future__ import annotations
@@ -94,12 +107,15 @@ _ROUTED_TOKENS = (
 # fixed-argv internal probes (no agent-influenced child) are exempted in
 # ``PREEXEC_EXEMPT`` below.
 #
-# ``create_subprocess_limited`` is the preferred form: it delivers the same
-# limits AFTER exec via the spawn shim instead of in a fork child of this
-# threaded gateway. The two ``*_preexec`` names remain valid only for the
-# synchronous spawns that have not moved yet.
+# ``create_subprocess_limited`` (async) and ``run_limited`` / ``popen_limited``
+# (sync) are the preferred forms: they deliver the same limits AFTER exec via the
+# spawn shim instead of in a fork child of this threaded gateway. The two
+# ``*_preexec`` names remain valid only for the spawns that have not moved yet --
+# the builtin app backends and the standalone deploy scripts.
 _PREEXEC_TOKENS = (
     "create_subprocess_limited",
+    "run_limited",
+    "popen_limited",
     "resource_limit_preexec",
     "session_host_preexec",
 )
@@ -523,6 +539,9 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         #     body (--input -), never argv.
         # No binary or cwd is agent-selected.
         "apps/builtins/issue_radar/backend/gitlab_client.py::_glab_run",
+        "apps/builtins/design_tweak/backend/server.py::_h_pick_folder",
+        "apps/builtins/design_tweak/backend/server.py::_lsof_fields",
+        "apps/builtins/design_tweak/backend/server.py::_start_dev_proc",
         "apps/builtins/workflows/server.py::handle_run",
         # _start_run's worker spawns argv that is ALWAYS pre-wrapped by its
         # callers through sandboxed_spawn_argv (sync wraps each step with
@@ -595,6 +614,12 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "cli_commands.py::_register_app_crons_to_scheduler",
         "cli_doctor.py::_doctor",
         "cli_doctor.py::_doctor_mcp_tools",
+        # NOT a subprocess spawn here: the AST heuristic matches ``asyncio.run``
+        # (attr ``run`` on base ``asyncio``), used only to drive the async KAS
+        # token probe from the synchronous doctor. The actual child process is
+        # spawned inside ``acp/kas_auth.py::resolve_kas_access_token``, which is
+        # allowlisted separately above (kiro-cli reaching its own token store).
+        "cli_doctor.py::_report_kas_backend",
         # ``systemctl is-active <unit>`` probes for the memory-pressure
         # preparedness check: argv is hardcoded (systemd-oomd/earlyoom unit
         # names), no agent influence, 5s-capped, read-only query.
@@ -783,11 +808,22 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # would be circular: it constructs the cgroup boundary agent spawns
         # are confined by.
         "sandbox.py::ensure_agents_slice_limits",
+        # The agent-slice MemoryHigh reconciler. Fixed argv: `systemctl --user
+        # set-property --runtime kirocrew-agents.slice MemoryHigh=<value>`, where
+        # the binary is resolved with shutil.which (never a caller-supplied PATH)
+        # and <value> is derived from host RAM, never from agent input.
+        # Sandboxing it would also be circular: it CONFIGURES the cgroup
+        # containment that agent spawns are wrapped in.
+        "sandbox.py::_ensure_agent_slice_memory_high",
         # The chokepoint wrapper itself. It spawns whatever argv it is handed, so
         # it cannot route on its own behalf — its CALLERS are the ones this audit
         # holds to sandboxed_spawn_argv / wrap_argv, and they still appear here
         # individually because _SPAWN_NAMES collects bare-name calls to it.
         "sandbox.py::create_subprocess_limited",
+        # The synchronous siblings of the above, same reasoning: they wrap an argv
+        # they are handed and cannot route on its behalf.
+        "sandbox.py::run_limited",
+        "sandbox.py::popen_limited",
         # The AppArmor profile installer. All three spawn FIXED, operator-facing
         # tooling with no agent-influenced input: `apparmor_parser --version`,
         # `apparmor_parser -Q --skip-cache <temp profile this module generated>`.

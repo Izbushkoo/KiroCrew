@@ -125,7 +125,6 @@ import MessageErrorBoundary from '../components/MessageErrorBoundary'
 import TypewriterText from '../components/TypewriterText'
 import { useChatNavigation } from '../hooks/useChatNavigation'
 import { useChatPins } from '../hooks/useChatPins'
-import { PinnedMessagesPanel } from './chat/PinnedMessagesPanel'
 import SubagentProgressBar from './chat/SubagentProgressBar'
 import TaskProgressBar from './chat/TaskProgressBar'
 import SidePanel, { CHAT_PANE_MIN_W, sidePanelFillWidth } from './chat/SidePanel'
@@ -168,7 +167,7 @@ import { focusComposerAfter } from './chat/composerFocus'
 import { useHoverIntent } from '../hooks/useHoverIntent'
 import { useKnowledgeFetch, extractKnowledgeQuery, expandKnowledgeBlock } from './chat/useKnowledgeFetch'
 import { KnowledgePicker } from './chat/KnowledgePicker'
-import { BookOpen, EyeOff, Loader, Pen, ChevronDown, ChevronRight, Plug, ArrowDown, MessageSquare, MessageSquareDot, Sparkles, VenetianMask, Clock, Undo2, Columns2, ExternalLink, Paperclip, Folder, Pin, X } from 'lucide-react'
+import { BookOpen, EyeOff, Loader, Pen, ChevronDown, ChevronRight, Plug, ArrowDown, MessageSquare, MessageSquareDot, Sparkles, VenetianMask, Clock, Undo2, Columns2, ExternalLink, Paperclip, Folder, X } from 'lucide-react'
 import { PanelLeftSolid, PanelLeftLight, PanelRightSolid } from '../components/icons/panels'
 
 import InfoTip from '../components/InfoTip'
@@ -4721,7 +4720,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     return !isNaN(v) && v >= SIDEBAR_MIN && v <= SIDEBAR_MAX ? v : 260
   })
   const [sidebarDragging, setSidebarDragging] = useState(false)
-  const [editingTitle, setEditingTitle] = useState(false)
+  // Pinned to the slot the rename opened on: activeSlot moves the instant the user
+  // switches sessions, and a live-resolved commit would rename the wrong session.
+  const [editingTitleSlot, setEditingTitleSlot] = useState<string | null>(null)
+  const editingTitle = editingTitleSlot !== null && editingTitleSlot === activeSlot
+  // Leaving abandons the draft. The pin alone closes the editor but keeps it, so a
+  // return would revive stale text and a blur could overwrite a newer title.
+  useEffect(() => { setEditingTitleSlot(null) }, [activeSlot])
   // Native session grid "split mode": an in-place tiling of the chat surface (NOT an
   // overlay). The flag is EPHEMERAL per mount — nav/refresh lands on single chat —
   // but the LAYOUT persists per anchor slot (splitLayoutStore). So a split is
@@ -5377,7 +5382,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     unpinMessage,
     unpinById,
   } = useChatPins(activeSlot ?? undefined)
-  const [pinsPanelOpen, setPinsPanelOpen] = useState(false)
   const [pinNotice, setPinNotice] = useState<string | null>(null)
   const [pendingPinnedJump, setPendingPinnedJump] = useState<{
     slotKey: string
@@ -5385,7 +5389,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     mid?: string
   } | null>(null)
   const pinnedJumpPageLoadsRef = useRef(0)
-  const togglePinsPanel = useCallback(() => setPinsPanelOpen(p => !p), [])
   const jumpToLoadedPinnedMessage = useCallback((messageTs: string, mid?: string): boolean => {
     // Prefer mid-based resolution (unique identity); fall back to ts for legacy pins.
     let msgIdx = -1
@@ -5460,11 +5463,34 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     slotOldestIndex,
   ])
   const handleTogglePinForMessage = useCallback((mid: string, messageTs: string, role: 'user' | 'assistant', content: string) => {
-    const action = isPinned(mid)
-      ? unpinMessage(mid)
-      : pinMessage({ mid, message_ts: messageTs, role, preview: content })
-    void action.catch(() => {}) // useChatPins exposes the localized error state.
-  }, [isPinned, pinMessage, unpinMessage])
+    if (isPinned(mid)) {
+      void unpinMessage(mid).catch(() => {}) // useChatPins exposes the localized error state.
+      return
+    }
+    // A session's FIRST pin opens the Pins tab, so the pin has a visible
+    // destination -- the same shape as the Issues reveal, and for the same
+    // reason: Pins is an on-demand view, so nothing would surface it otherwise.
+    // A session pinned earlier reaches it through the + menu (Issues' zero
+    // option for pre-existing links), which is what keeps this free of a
+    // persisted reveal claim.
+    // Read before the mutation so the optimistic insert has not landed yet.
+    const isFirstPin = chatPins.length === 0
+    void pinMessage({ mid, message_ts: messageTs, role, preview: content }).catch(() => {})
+    if (isFirstPin && activeSlot) {
+      // Addressed by slot, not through tabsCtl, for the same reason as the
+      // source-reveal path: that binding can be a chat being left.
+      openPanelView(activeSlot, 'pins')
+      // Pinning is NOT a navigation request, so it must not cost the user state
+      // they are mid-way through. Unlike the source-reveal path this does not
+      // close the find pane: someone who searched the transcript to FIND the
+      // message they are pinning would lose the pane and its results on the very
+      // click that acts on a result. Below the mobile breakpoint the panel opens
+      // full width, so opening it would navigate them off the chat entirely.
+      // The tab is still created above -- it is revealed quietly instead.
+      if (!search.isOpen && !isMobile) dispatch(openActivityPanel())
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- search re-identifies on every keystroke; only its isOpen flag is read
+  }, [activeSlot, chatPins.length, dispatch, isMobile, isPinned, pinMessage, search.isOpen, unpinMessage])
   const handleUnpinById = useCallback((id: string) => {
     void unpinById(id).catch(() => {})
   }, [unpinById])
@@ -6176,8 +6202,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             OVER it — leaving no way to close a panel that covers the whole
             screen. It would also be pointing at a chat pane the panel has
             squeezed to zero width. Sessions stay reachable meanwhile via the
-            left-edge swipe (useSwipeEdge above). */}
-        {isMobile && !sidebarOpen && !inlineSidePanelShowing && !(activeSlot && (messages.length > 0 || slotRunning)) && (
+            left-edge swipe (useSwipeEdge above).
+
+            Suppressed when EMBEDDED for the same reason it is suppressed
+            behind the side panel: `fixed` anchors it to the VIEWPORT, not to
+            the host's pane, so it lands on whatever the host put in that
+            corner -- in Papyrus, on the toolbar's back button, giving two
+            overlapping tap targets on the app's primary exit. A host that
+            embeds one scoped conversation has no sessions list to open. */}
+        {isMobile && !embedded && !sidebarOpen && !inlineSidePanelShowing && !(activeSlot && (messages.length > 0 || slotRunning)) && (
           <div className="fixed top-[42px] left-2 z-10">
             <button className="p-2 rounded-lg text-muted hover:text-text bg-bg-elevated border border-border shadow-sm cursor-pointer" onClick={() => setMobileSessions(true)} aria-label={i18nT('pages.chatPage.toggle_sessions')}>
               {effectiveMode === 'orchestrator' ? <MessageSquareDot size={18} /> : <MessageSquare size={18} />}
@@ -6222,7 +6255,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                     {effectiveMode === 'orchestrator' ? <MessageSquareDot size={16} /> : <MessageSquare size={16} />}
                   </button>
                 )}
-                <div className="group/header flex items-stretch gap-0.5 pointer-events-auto">
+                <div className="group/header flex min-w-0 items-stretch gap-0.5 pointer-events-auto">
                 <div className="flex items-center rounded-l-md rounded-r-[2px] px-1.5 py-0.5 group-hover/header:bg-bg-hover transition-colors">
                 <ChatHeaderMenu
                   activeSlot={activeSlot}
@@ -6242,22 +6275,22 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                     else if (!sidebarPinned) setSidebarPinned(true)
                     dispatch(requestSlotReveal(activeSlot))
                   } : undefined}
-                  onRename={activeSlot ? () => { setEditingTitle(true); setTitleDraft(title) } : undefined}
+                  onRename={activeSlot ? () => { setEditingTitleSlot(activeSlot); setTitleDraft(title) } : undefined}
                   mode={effectiveMode}
                 />
                 </div>
               {editingTitle ? (
-                <div className="flex w-fit items-center gap-1 px-1.5 py-0.5 rounded-l-[2px] rounded-r-md bg-bg-hover">
+                <div className="flex min-w-0 flex-1 items-center gap-1 px-1.5 py-0.5 rounded-l-[2px] rounded-r-md bg-bg-hover">
                   {currentSlot?.memory_mode === 'incognito' && <span title={i18nT('pages.chatPage.incognito_memory_writes_disabled')}><EyeOff size={13} className="shrink-0 text-warn" /></span>}
                   {currentSlot?.memory_mode === 'temporary' && <span title={i18nT('pages.chatPage.temporary_no_memory_reads_or_writes')}><VenetianMask size={13} className="shrink-0 text-aim" /></span>}
-                  <Input className="session-header-title text-sm font-semibold text-muted font-body bg-transparent border-0 rounded-none p-0 m-0 flex-none outline-none max-w-[50vw] focus:!shadow-none" size={Math.min(Math.max(titleDraft.length + 2, 6), 80)} autoFocus value={titleDraft} onChange={e => setTitleDraft(e.target.value)} onBlur={() => { if (!cancelTitleRef.current && titleDraft.trim() && activeSlot && titleDraft !== title) { dispatch(sseSlotTitle({ key: activeSlot, title: titleDraft.trim() })); api.renameSlot(activeSlot, titleDraft.trim()).catch(() => {}) } cancelTitleRef.current = false; setEditingTitle(false) }} onCompositionStart={() => { composingRef.current = true }} onCompositionEnd={() => { composingRef.current = true; setTimeout(() => { composingRef.current = false }, 50) }} onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing && !composingRef.current) (e.target as HTMLInputElement).blur(); if (e.key === 'Escape') { cancelTitleRef.current = true; setEditingTitle(false) } }} />
+                  <Input className="session-header-title text-sm font-semibold text-muted font-body bg-transparent border-0 rounded-none p-0 m-0 min-w-0 flex-1 outline-none md:max-w-[50vw] focus:!shadow-none" size={Math.min(Math.max(titleDraft.length + 2, 6), 80)} autoFocus value={titleDraft} onChange={e => setTitleDraft(e.target.value)} onBlur={() => { if (!cancelTitleRef.current && titleDraft.trim() && activeSlot && titleDraft !== title) { dispatch(sseSlotTitle({ key: activeSlot, title: titleDraft.trim() })); api.renameSlot(activeSlot, titleDraft.trim()).catch(() => {}) } cancelTitleRef.current = false; setEditingTitleSlot(null) }} onCompositionStart={() => { composingRef.current = true }} onCompositionEnd={() => { composingRef.current = true; setTimeout(() => { composingRef.current = false }, 50) }} onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing && !composingRef.current) (e.target as HTMLInputElement).blur(); if (e.key === 'Escape') { cancelTitleRef.current = true; setEditingTitleSlot(null) } }} />
                 </div>
               ) : (
-                <div className="cursor-text flex items-center gap-1 px-1.5 py-0.5 rounded-l-[2px] rounded-r-md group-hover/header:bg-bg-hover transition-colors">
-                  <Clickable className="flex items-center gap-1" onClick={() => { if (activeSlot && generatingTitleSlots.has(activeSlot)) return; setEditingTitle(true); setTitleDraft(title) }}>
+                <div className="cursor-text flex min-w-0 items-center gap-1 px-1.5 py-0.5 rounded-l-[2px] rounded-r-md group-hover/header:bg-bg-hover transition-colors">
+                  <Clickable className="flex min-w-0 items-center gap-1" onClick={() => { if (activeSlot && generatingTitleSlots.has(activeSlot)) return; setEditingTitleSlot(activeSlot); setTitleDraft(title) }}>
                     {currentSlot?.memory_mode === 'incognito' && <span title={i18nT('pages.chatPage.incognito_memory_writes_disabled')}><EyeOff size={13} className="shrink-0 text-warn" /></span>}
                     {currentSlot?.memory_mode === 'temporary' && <span title={i18nT('pages.chatPage.temporary_no_memory_reads_or_writes')}><VenetianMask size={13} className="shrink-0 text-aim" /></span>}
-                    <TypewriterText text={title} className="session-header-title text-sm font-semibold text-muted font-body truncate max-w-[50vw]" />
+                    <TypewriterText text={title} className="session-header-title text-sm font-semibold text-muted font-body truncate min-w-0 md:max-w-[50vw]" />
                     <Pen size={13} className="shrink-0 text-muted opacity-0 group-hover/header:opacity-60 transition-opacity" />
                   </Clickable>
                   {activeSlot && (generatingTitleSlots.has(activeSlot) ? <Loader size={16} className="shrink-0 text-accent animate-spin" /> : <Btn aria-label={i18nT('pages.chatPage.regenerate_title_with_llm')} className="shrink-0 text-muted opacity-0 group-hover/header:opacity-40 hover:!opacity-100 hover:text-accent transition-all cursor-pointer bg-transparent border-none p-0" title={i18nT('pages.chatPage.regenerate_title_with_llm')} onClick={e => { e.stopPropagation(); if (!activeSlot || generatingTitleSlots.has(activeSlot)) return; const slot = activeSlot; setGeneratingTitleSlots(prev => new Set(prev).add(slot)); api.generateTitle(slot).then(r => { /* title is redacted server-side via redact_exfiltration_urls + redact_credentials */ if (r.title) dispatch(sseSlotTitle({ key: slot, title: r.title })) }).catch(e => {
@@ -6272,7 +6305,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               {/* Trailing controls grouped under a single ml-auto so multiple
                   right-aligned items don't each absorb free space (two ml-auto
                   siblings split the gap, parking the split icon mid-header). */}
-              <div className="ml-auto flex items-center gap-1.5 pointer-events-none">
+              <div className="ml-auto flex shrink-0 items-center gap-1.5 pointer-events-none">
               {/* Pop-out control, promoted to the title bar (menu items remain for
                   sidebar parity). Mirrors the split-view pattern to its left: a
                   dimmed icon to act, an accent chip when the state is active.
@@ -6297,16 +6330,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   below the mobile breakpoint the panel opens full width, at or
                   above it opens beside the chat. There is no width at which
                   the button does nothing. */}
-              {!embedMode && !popout && !activityOpen && (
-                <Clickable
-                  className={`flex items-center justify-center w-7 h-7 rounded-md transition-colors bg-transparent border-none shrink-0 pointer-events-auto cursor-pointer ${pinsPanelOpen ? 'text-accent bg-accent/10' : 'text-muted hover:text-text hover:bg-bg-hover'}`}
-                  onClick={togglePinsPanel}
-                  title={i18nT('pages.chat.pins.open_pinned_messages')}
-                  aria-label={i18nT('pages.chat.pins.open_pinned_messages')}
-                >
-                  <Pin size={15} />
-                </Clickable>
-              )}
               {!embedMode && !popout && !activityOpen && (
                 <Clickable
                   className="pi-morph flex items-center justify-center w-7 h-7 rounded-md transition-colors bg-transparent border-none shrink-0 pointer-events-auto text-muted hover:text-text hover:bg-bg-hover cursor-pointer"
@@ -6453,6 +6476,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               <div className="h-16" />
               {/* Top sentinel: drives upward window expansion via virtualizer's IO. */}
               <div ref={virt.topSentinelRef} aria-hidden style={{ height: 1 }} />
+              {/* top-16 matches the h-16 header spacer above, so the pinned spinner
+                  clears the overlay header instead of sitting under it.
+                  overflow-anchor:none so appearing/vanishing here cannot become the
+                  browser's scroll anchor and jump the list mid-fetch. */}
+              {loadingOlder && (
+                <div className="sticky top-16 z-[1] flex justify-center py-2" data-testid="older-messages-loading" role="status" aria-label={i18nT('pages.chatPage.loading_earlier_messages')} style={{ overflowAnchor: 'none', background: 'var(--bg)' }}>
+                  <Loader size={16} className="animate-spin text-muted" />
+                </div>
+              )}
               {/* Top spacer — reserves the height of all items above the mounted
                   window so the scrollbar stays accurate while only the window
                   renders real DOM (keeps fast scroll cheap — O(window) nodes).
@@ -6989,31 +7021,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         )}
       </div>
       )}
-      <AnimatePresence initial={false}>
-        {pinsPanelOpen && (
-          <motion.div
-            key="pins-panel"
-            initial={{ width: 0, opacity: 0 }}
-            animate={{ width: 300, opacity: 1 }}
-            exit={{ width: 0, opacity: 0 }}
-            transition={{ duration: 0.18, ease: [0.2, 0, 0, 1] }}
-            className="h-full overflow-hidden shrink-0 border-l border-border shadow-lg"
-          >
-            <div className="w-[300px] h-full">
-              <PinnedMessagesPanel
-                pins={chatPins}
-                loading={chatPinsLoading}
-                slotKey={activeSlot || ''}
-                slotTitle={activeSlotTitle}
-                mode={mode}
-                onClose={() => setPinsPanelOpen(false)}
-                onJumpToMessage={handleJumpToPinnedMessage}
-                onUnpin={handleUnpinById}
-              />
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
       {search.isOpen && (
           <DetailPanel
             key="search-panel"
@@ -7064,6 +7071,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               issues={panelIssues} selectedIssueUrl={selectedIssueUrl} onSelectIssue={selectIssueUrl} onReconcileIssue={reconcileIssueUrl}
               onAddSourceToChat={addSourceCommentToChat}
               onSubmitComments={submitComments} onFileSave={handleFileSave} onClose={toggleAct}
+              pins={chatPins} pinsLoading={chatPinsLoading} onJumpToPin={handleJumpToPinnedMessage} onUnpin={handleUnpinById}
+              slotTitle={activeSlotTitle} chatMode={mode}
               inlinePreviewPath={inlinePreviewPath} onInlinePreviewChange={setInlinePreviewPath}
               expanded={panelMaximized}
               fillWidth={panelFillWidth}
@@ -7101,6 +7110,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               issues={panelIssues} selectedIssueUrl={selectedIssueUrl} onSelectIssue={selectIssueUrl} onReconcileIssue={reconcileIssueUrl}
               onAddSourceToChat={addSourceCommentToChat}
                 onSubmitComments={submitComments} onFileSave={handleFileSave} onClose={toggleAct}
+                pins={chatPins} pinsLoading={chatPinsLoading} onJumpToPin={handleJumpToPinnedMessage} onUnpin={handleUnpinById}
+                slotTitle={activeSlotTitle} chatMode={mode}
                 inlinePreviewPath={inlinePreviewPath} onInlinePreviewChange={setInlinePreviewPath}
                 expanded={panelMaximized}
                 fillWidth={panelFillWidth}

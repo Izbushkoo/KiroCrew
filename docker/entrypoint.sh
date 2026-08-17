@@ -71,8 +71,11 @@ ENV_FILE="$ACTIVE_HOME/.env"
 # key added to one without the other fails CI. Replace-or-append line-wise so
 # operator-added lines and comments in .env survive; grep -v (not sed) avoids
 # escaping issues with arbitrary secret bytes.
-CRED_KEYS="SLACK_BOT_TOKEN SLACK_APP_TOKEN KIROCREW_OWNER_ID DISCORD_BOT_TOKEN TELEGRAM_BOT_TOKEN WECOM_BOT_ID WECOM_SECRET WEBEX_BOT_TOKEN MICROSOFT_APP_ID MICROSOFT_APP_PASSWORD MICROSOFT_APP_TENANT_ID WEIXIN_TOKEN KIRO_API_KEY"
-for KEY in $CRED_KEYS; do
+CRED_KEYS="SLACK_BOT_TOKEN SLACK_APP_TOKEN KIROCREW_OWNER_ID DISCORD_BOT_TOKEN TELEGRAM_BOT_TOKEN WECOM_BOT_ID WECOM_SECRET WEBEX_BOT_TOKEN MICROSOFT_APP_ID MICROSOFT_APP_PASSWORD MICROSOFT_APP_TENANT_ID WEIXIN_TOKEN JIRA_API_TOKEN KIRO_API_KEY"
+# Append any per-host Jira tokens (JIRA_TOKEN_<hex>) — dynamic keys not in the
+# static list above. Same persist-then-unset treatment in the single loop below.
+JIRA_DYNAMIC=$(env | grep -oE '^JIRA_TOKEN_[0-9A-Fa-f]+' 2>/dev/null || true)
+for KEY in $CRED_KEYS $JIRA_DYNAMIC; do
     VAL=$(eval "printf '%s' \"\${$KEY:-}\"")
     if [ -n "$VAL" ]; then
         mkdir -p "$ACTIVE_HOME"
@@ -104,7 +107,15 @@ for KEY in $CRED_KEYS; do
     fi
 done
 
-# ── 2. Sandbox posture (first run only) ──────────────────────────────────
+# Catch-all: unset any remaining JIRA_TOKEN_* vars that didn't match the
+# hex-suffix pattern above (e.g. mistyped or non-standard names). These are
+# NOT persisted to .env (their names aren't well-formed per-host tokens), but
+# they must not linger in /proc/<pid>/environ. Plain unset — no eval needed
+# since we only need to remove them, not read their values.
+for KEY in $(env | grep -o '^JIRA_TOKEN_[^=]*' 2>/dev/null || true); do
+    unset "$KEY"
+done
+
 # Signal to the gateway's load_credentials() that credentials were
 # deliberately scrubbed from the process environ and must NOT be
 # re-injected (which would leak into /proc/<pid>/environ).

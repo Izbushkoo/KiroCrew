@@ -67,6 +67,7 @@ from kiro_crew.providers.base import (
     EVENT_TOOL_RESULT,
     LLMEvent,
 )
+from kiro_crew.resource_status import cached_admission_check
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.session import SessionManager
@@ -88,6 +89,7 @@ from kiro_crew.subagent_persistence import (
     _agent_dir,
     _cleanup_session_files_sync,
     _subagents_dir,
+    agent_dir_for_display,
     clear_tombstone,
     create_agent_folder,
     list_orphans,
@@ -1539,7 +1541,7 @@ class SubagentManager:
         """
         task_preview = (state.get("task", "") or "")[:100]
         parent_session = state.get("parent_session", "")
-        result_path = str(_agent_dir(agent_id) / "result.txt")
+        result_path = str(agent_dir_for_display(agent_id) / "result.txt")
 
         if has_result:
             msg = (
@@ -2756,6 +2758,41 @@ class SubagentManager:
             )
             return self._announce_rejection(info)
 
+        # --- Admission gate: refuse NEW spawns while host memory posture is
+        # critical. Complements the absolute spawn_min_memory_gb floor above
+        # with the posture tier (resource_critical_gb) and shares its
+        # off-switch (agent.admission_gate) with the cron scheduler's deferral
+        # gate. This method is sync and runs on the gateway event loop, so it
+        # reads the CACHED off-thread verdict — never inline config/procfs
+        # I/O; bounded staleness is acceptable for pressure-shedding.
+        # In-flight subagents are untouched; direct user chat turns are
+        # not gated; fails open on an unknown posture. ---
+        admission = cached_admission_check()
+        if not admission.admitted:
+            logger.warning("Subagent spawn refused: %s", admission.reason)
+            sel().log_tool_invocation(
+                session_key=parent_session_key or "",
+                source="subagent",
+                tool_name="spawn_run",
+                outcome="refused_memory_critical",
+                metadata={
+                    "available_gb": admission.available_gb,
+                    "posture": admission.posture,
+                    "task": _redacted_task[:120],
+                },
+            )
+            info = SubagentInfo(
+                id=agent_id,
+                task=_redacted_task,
+                agent=agent,
+                parent_session_key=parent_session_key,
+                done=True,
+                error=f"spawn refused: {admission.reason}",
+                batch_id=batch_id,
+                batch_total=max(0, int(batch_total)),
+            )
+            return self._announce_rejection(info)
+
         # --- CWD validation: reject bad paths before consuming a slot ---
         resolved_cwd = ""
         if cwd:
@@ -3096,7 +3133,10 @@ class SubagentManager:
 
         Non-batch rejections skip the announce: the caller already receives
         the error synchronously in the returned info, and injecting a
-        completion turn for them would double-report.
+        completion turn for them would double-report. That holds for
+        queue-drained non-batch rejections too — ``_drain_queue`` announces
+        those itself off the returned info, so announcing here as well would
+        inject the completion twice.
         """
         if info.batch_id and self._on_done:
             try:
@@ -3333,7 +3373,7 @@ class SubagentManager:
             # (result.txt outlives the session under the tombstone TTL).
             result_hint = ""
             try:
-                _rp = _agent_dir(conv_id) / "result.txt"
+                _rp = agent_dir_for_display(conv_id) / "result.txt"
                 if _rp.exists():
                     result_hint = f" Prior result still readable at: {_rp}"
             except Exception:
@@ -4986,7 +5026,7 @@ class SubagentManager:
         except Exception:
             logger.debug("Failed to record session_id for %s", info.id, exc_info=True)
 
-        _rp = _agent_dir(info.id) / "result.txt"
+        _rp = agent_dir_for_display(info.id) / "result.txt"
         info.result_path = str(_rp)
         # Cache tool names by tool_call_id so PostToolUse can recover the tool name
         # when EVENT_TOOL_RESULT arrives (which only carries tool_call_id and output).
@@ -5139,6 +5179,24 @@ class SubagentManager:
                 if tool_result.action == TOOL_DENY:
                     await self._reject_and_log(
                         client, event.request_id, session_key, event, error="hook_deny"
+                    )
+                    continue
+                if event.child_low_fidelity:
+                    # Backend-internal child origin whose SECURITY context is
+                    # absent (structured params missing, or shell without a
+                    # recoverable command — AcpEvent.child_low_fidelity): any
+                    # APPROVE would rest on the LLM-authored title alone. This
+                    # consumer is headless — there is no card to downgrade to
+                    # — so fail closed before any approve branch (hook
+                    # auto-approve or parent_policy auto) can fire. A child
+                    # WITH cached bytes flows through the same pipeline as any
+                    # other tool (mode parity).
+                    await self._reject_and_log(
+                        client,
+                        event.request_id,
+                        session_key,
+                        event,
+                        error="child_origin_no_command_context",
                     )
                     continue
                 if tool_result.action == TOOL_AUTO_APPROVE:

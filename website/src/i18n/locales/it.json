@@ -45,6 +45,7 @@
     "k_search_for_anything": "⌘K — Cerca qualsiasi cosa…",
     "kiro_credit_usage_checking": "Utilizzo dei crediti Kiro — verifica in corso…",
     "kiro_credit_usage_checking_2": "Utilizzo dei crediti Kiro — verifica in corso",
+    "kiro_credit_usage_unavailable": "Utilizzo dei crediti Kiro — non disponibile",
     "kiro_discord_community": "Community Discord di Kiro",
     "main_navigation": "Navigazione principale",
     "manage_account": "Gestisci l'account",
@@ -1342,6 +1343,144 @@
         "page_label": "Dev Fleet"
       }
     },
+    "designTweak": {
+      "comments": {
+        "an_earlier_comment": "un commento precedente",
+        "element_count": "{{n}} elementi",
+        "follow_up_to": "↩ seguito di {{label}}",
+        "meta": "{{label}} · {{element}} · {{ago}}",
+        "open_in_preview": "Clicca per aprire questo commento nell'anteprima",
+        "remove_from_draft": "Rimuovi questo commento dalla bozza"
+      },
+      "devServer": {
+        "detect_hint": "Vedi l'anteprima di questo progetto dal suo server di sviluppo in esecuzione (mantiene attivo il ricaricamento in tempo reale)",
+        "dev_server": "Server di sviluppo",
+        "looking": "Ricerca in corso…",
+        "preview_from_disk_instead": "Vedi invece l'anteprima da disco",
+        "url_placeholder": "http://localhost:5173",
+        "use": "Usa"
+      },
+      "layout": {
+        "drag_to_resize": "Trascina per ridimensionare"
+      },
+      "modes": {
+        "edit": "Modifica",
+        "preview": "Anteprima"
+      },
+      "page": {
+        "tagline": "Indica, descrivi e guarda il codice adeguarsi.",
+        "title": "Design Tweak"
+      },
+      "preview": {
+        "backend_did_not_answer": "Il backend dell'app non ha risposto. Se l'hai appena modificato, disattiva e riattiva Design Tweak nella pagina App.",
+        "dev_server_not_reachable": "Server di sviluppo non raggiungibile",
+        "dim_desktop": "Desktop",
+        "dim_mobile": "Mobile",
+        "dim_tablet": "Tablet",
+        "dimensions": "Dimensioni",
+        "fallback_name": "anteprima",
+        "frame_title": "Anteprima dell’app",
+        "loading_name": "Caricamento di {{name}}…",
+        "needs_dev_server_title": "Questa è un'app web — richiede un server di sviluppo",
+        "no_dev_script_in_package_json": "Nessuno script dev trovato in package.json — avvialo tu, poi premi Server di sviluppo qui sotto.",
+        "no_html_entry": "Non c'è alcun punto di ingresso HTML da servire da disco, quindi deve essere compilata e servita dal suo server di sviluppo.",
+        "not_reachable": "Anteprima non raggiungibile",
+        "nothing_answered_at": "Nessuna risposta da {{url}}. Avvia il server di sviluppo per questo progetto, poi riprova — oppure cancella il suo URL per vedere l'anteprima dei file da disco.",
+        "refresh_preview": "Aggiorna l'anteprima",
+        "retry": "Riprova",
+        "runs_command_in_project": "Esegue {{command}} in {{name}}",
+        "start_dev_server": "Avvia il server di sviluppo",
+        "starting": "Avvio in corso…",
+        "timed_out": "tempo scaduto",
+        "unbundled_entry": "Il suo punto di ingresso è {{entry}} — TypeScript/JSX, che un browser non può eseguire. I file devono essere compilati mentre vengono serviti, quindi non c'è nulla di cui vedere l'anteprima da disco."
+      },
+      "projects": {
+        "add": "Aggiungi",
+        "browse_or_type_path": "Sfoglia per scegliere una cartella, oppure digita il suo percorso",
+        "click_again_to_disconnect": "Clicca di nuovo per disconnettere",
+        "connect": "Connetti",
+        "connected": "Connessa",
+        "dev_badge": "dev",
+        "load_new_app": "Carica una nuova app",
+        "loading": "Caricamento…",
+        "loading_your_apps": "Caricamento delle tue app…",
+        "looking_for_connected_apps": "Ricerca delle tue app connesse…",
+        "needs_dev_server": "Richiede un server di sviluppo ({{command}})",
+        "no_app_selected": "Nessuna app web selezionata. Scegline una nel menu a tendina — il passaggio è immediato.",
+        "no_dev_script": "nessuno script dev trovato",
+        "none_loaded": "Nessuna app web caricata finora.",
+        "path_placeholder": "/path/to/your/app",
+        "previewing_from": "Anteprima da {{url}}",
+        "remove_from_list": "Rimuovi dall'elenco",
+        "select_app": "Seleziona un'app web…"
+      },
+      "requests": {
+        "archive_to_history": "Archivia nella cronologia",
+        "chip_done": "{{n}} completati",
+        "chip_in_progress": "{{n}} in corso",
+        "chip_not_sent": "{{n}} non inviati",
+        "chip_queued": "{{n}} in coda",
+        "delete_confirm": "Eliminare la richiesta {{number}}? I suoi commenti vengono rimossi definitivamente — l'operazione non può essere annullata.",
+        "delete_request": "Elimina la richiesta",
+        "empty_for_app": "Nessuna richiesta di modifica per {{name}} finora. Imposta l'anteprima in modalità Modifica, fai clic destro su un elemento e descrivi la modifica. I commenti si raccolgono in una richiesta che invii in blocco.",
+        "empty_no_app": "Nessuna app web connessa. Scegline una nel menu a tendina qui sopra — ogni app mantiene le proprie richieste, la propria cronologia e la propria sessione di chat.",
+        "history": "Cronologia",
+        "more_actions": "Altre azioni per la richiesta {{number}}",
+        "no_comments": "Nessun commento finora.",
+        "open_in_chat": "Apri nella chat",
+        "request_number": "Richiesta {{number}}",
+        "sending": "Invio in corso…",
+        "send_request": "Invia come Richiesta {{number}}",
+        "send_missing_request": "Invia la richiesta {{number}}",
+        "this_app": "questa app"
+      },
+      "status": {
+        "add_failed": "Aggiunta non riuscita: {{error}}",
+        "added_comment": "Aggiunto {{label}} — {{n}} nella Richiesta {{number}}, non ancora inviata.",
+        "added_dev_previewing": "{{name}} aggiunta (server di sviluppo) — anteprima in corso.",
+        "added_found_dev_server": "{{name}} aggiunta — trovato il suo server di sviluppo su {{url}}.",
+        "added_many_dev_servers": "{{name}} aggiunta — {{n}} server di sviluppo corrispondono a questa cartella, quindi non ne è stato scelto nessuno. Impostane uno nel menu a tendina.",
+        "added_previewing": "{{name}} aggiunta — anteprima in corso.",
+        "already_registered": "Già registrata — passato a {{name}}.",
+        "already_sent": "La richiesta {{number}} è già stata inviata.",
+        "archive_failed": "Archiviazione non riuscita: {{error}}",
+        "capture_failed": "Acquisizione non riuscita: {{error}}",
+        "could_not_start_dev_server": "Non è stato possibile avviare il server di sviluppo.",
+        "delete_failed": "Eliminazione non riuscita: {{error}}",
+        "detect_failed": "Rilevamento non riuscito: {{error}}",
+        "dev_server_running": "Server di sviluppo in esecuzione su {{url}}.",
+        "dev_server_stopped": "Server di sviluppo arrestato — anteprima da disco.",
+        "failed": "Non riuscito: {{error}}",
+        "follow_up_added": "Seguito {{label}} aggiunto alla Richiesta {{number}} — non ancora inviata.",
+        "follow_up_failed": "Seguito non riuscito: {{error}}",
+        "follow_up_origin_missing": "Non è stato possibile trovare il commento a cui dare seguito.",
+        "looking_for_dev_server": "Ricerca di un server di sviluppo…",
+        "no_dev_server_found": "Nessun server di sviluppo trovato per questa cartella — avvialo, oppure digita l'URL.",
+        "opening_folder_picker": "Apertura del selettore di cartelle…",
+        "picker_unavailable": "Selettore non disponibile ({{error}}) — digita invece il percorso.",
+        "preview_refreshed": "Anteprima aggiornata — {{label}} completato",
+        "previewing_from_disk": "Anteprima di {{name}} da disco.",
+        "previewing_from_url": "Anteprima di {{name}} da {{url}}.",
+        "remove_failed": "Rimozione non riuscita: {{error}}",
+        "send_failed": "Invio non riuscito: {{error}}",
+        "dispatch_failed_unconfirmed": "La richiesta {{number}} è stata sigillata, ma non è stato possibile confermare la consegna ({{error}}). Controllo della sessione: l'elenco si aggiornerà.",
+        "sent_request_to_session": "Richiesta {{number}} ({{n}}) inviata → sessione {{label}}.",
+        "no_session_for_request": "La richiesta {{number}} è pronta, ma questa app non ha una cartella, quindi non c'è nessuna sessione a cui inviarla. Imposta la cartella dell'app e poi inviala dall'elenco.",
+        "servers_match_folder": "{{n}} server corrispondono a questa cartella ({{ports}}) — scegline uno.",
+        "set_dev_server_for": "Server di sviluppo impostato per {{name}}.",
+        "starting_command": "Avvio di {{command}}…",
+        "starting_dev_server": "Avvio del server di sviluppo…",
+        "stop_failed": "Arresto non riuscito: {{error}}",
+        "unknown": "sconosciuto",
+        "unknown_error": "errore sconosciuto",
+        "using_running_dev_server": "Utilizzo del server di sviluppo già in esecuzione su {{url}}."
+      },
+      "manifest": {
+        "display_name": "Design Tweak",
+        "description": "Seleziona visivamente gli elementi nell'anteprima live della tua app e trasformali in richieste di modifica mirate e collegate al codice sorgente per l'agente — come i commenti di Figma, ma per il codice.",
+        "page_label": "Design Tweak"
+      }
+    },
     "fileExplorer": {
       "fileExplorerPage": {
         "backend_not_reachable": "Backend non raggiungibile:",
@@ -1430,6 +1569,9 @@
           "regenerate_summary": "Rigenera il riepilogo",
           "retry": "Riprova"
         },
+        "detailOverflowMenu": {
+          "more_actions": "Altre azioni"
+        },
         "filterRow": {
           "sign_in_with_the_gh_cli_to_use_this_filter": "Accedi con la CLI gh per usare questo filtro"
         },
@@ -1463,10 +1605,8 @@
           "assignees": "Assegnatari",
           "by": "· di",
           "changed_the_title": "ha modificato il titolo",
-          "close": "Chiudi",
           "close_as_completed": "Chiudi come completata",
           "close_as_not_planned": "Chiudi come non pianificata",
-          "close_this_issue": "Chiudi questa issue",
           "closed": "Chiusa",
           "closed_as_not_planned": "Chiusa come non pianificata",
           "closed_this": "ha chiuso questa",
@@ -1474,7 +1614,6 @@
           "copy_link_to_this_issue": "Copia il link a questa issue",
           "couldn_t_load_activity": "Impossibile caricare l'attività:",
           "dates": "Date",
-          "dismiss_menu": "Chiudi il menu",
           "done": "Fatto",
           "edit": "Modifica",
           "finding_suggestions": "Ricerca di suggerimenti…",
@@ -1498,7 +1637,6 @@
           "opened": "aperta",
           "opened_2": "Aperta",
           "opened_this_issue": "ha aperto questa issue",
-          "re_fetch_issue_and_timeline_from": "Recupera di nuovo questa issue e la sua cronologia da {{provider}}",
           "read_only_connect_with_triage_push_access_to_app": "Sola lettura — collegati con accesso di triage/push per applicare.",
           "read_only_connect_with_triage_push_access_to_app_2": "Sola lettura — collegati con accesso di triage/push per applicare",
           "referenced_this_in": "ha fatto riferimento a questa in",
@@ -1507,7 +1645,6 @@
           "removed_the": "ha rimosso l'etichetta",
           "removed_this_from_the": "ha rimosso questo da",
           "reopen": "Riapri",
-          "reopen_this_issue": "Riapri questa issue",
           "reopened_this": "ha riaperto questa",
           "self_assigned_this": "si è assegnato questa",
           "suggested": "Suggerito",
@@ -1716,7 +1853,6 @@
           "opened": "aperta",
           "opened_2": "Aperta",
           "passed": "superato",
-          "re_fetch_this_and_its_timeline_from": "Recupera di nuovo questa {{subject}} e la sua cronologia da {{provider}}",
           "referenced_this_in": "ha fatto riferimento a questa in",
           "refresh_details": "Aggiorna i dettagli di {{subject}}",
           "removed_the": "ha rimosso l'etichetta",
@@ -2343,6 +2479,9 @@
         "view_folders": "Cartelle",
         "view_list": "Elenco semplice"
       },
+      "preview": {
+        "mermaidError": "Diagramma Mermaid non valido: viene mostrato il codice sorgente."
+      },
       "row": {
         "delete": "Elimina la nota",
         "deleteAction": "Elimina",
@@ -2383,6 +2522,7 @@
         "recording": "Registrazione…",
         "remove": "Rimuovi",
         "removeConfirm": "Rimuovere questo vault dall’app? I file restano intatti sul disco: viene dimenticata solo la connessione.",
+        "removeFailed": "Impossibile rimuovere il vault: {{message}}",
         "removeIt": "Rimuovilo",
         "reset": "Reimposta",
         "save": "Salva",
@@ -2394,9 +2534,11 @@
         "syncSection": "Sincronizzazione",
         "title": "Impostazioni",
         "tokenCleared": "Token cancellato.",
+        "tokenClearFailed": "Impossibile cancellare il token: {{message}}",
         "tokenPlaceholderEmpty": "github_pat_…",
         "tokenPlaceholderStored": "Sostituisci il token salvato…",
         "tokenSaved": "Token salvato.",
+        "tokenSaveFailed": "Impossibile salvare il token: {{message}}",
         "vaultsSection": "Vault"
       },
       "sort": {
@@ -2694,12 +2836,14 @@
         "copy_markdown": "Copia markdown",
         "dismiss": "Ignora",
         "edit_resend": "Modifica e reinvia",
+        "open_in_file_explorer": "Apri in Esplora file",
+        "open_in_finder": "Apri nel Finder",
         "pinned_files": "File fissati",
         "pins": "Fissati",
         "preview": "Anteprima",
         "remove_screenshot": "Rimuovi screenshot",
-        "reveal_in_finder": "Mostra nel gestore file",
         "screenshot": "Screenshot",
+        "show_in_file_manager": "Mostra nel gestore file",
         "watchlist": "Elenco di monitoraggio"
       },
       "clear": {
@@ -4258,6 +4402,20 @@
     "viewPr": "Pull request"
   },
   "components": {
+    "crewWakeSection": {
+      "active": "attivo",
+      "could_not_load_this_crew_s_schedules_so_what_wak": "Non è stato possibile caricare le pianificazioni di questo crew, quindi non si sa cosa lo attivi.",
+      "no_schedules_run_this_crew_automatically": "Nessuna pianificazione esegue questo crew automaticamente.",
+      "open_schedule": "Apri Pianificazione",
+      "pause_named": "Metti in pausa {{name}}",
+      "paused": "in pausa",
+      "resume_named": "Riprendi {{name}}",
+      "run_named_now": "Esegui {{name}} ora",
+      "running": "in esecuzione",
+      "schedule": "pianificazione",
+      "schedules_that_run_this_crew_without_you_asking": "Pianificazioni che eseguono questo crew senza che tu lo chieda. Diverso da Triggers sopra, che decide solo quando l'orchestratore seleziona questo crew.",
+      "what_wakes_this_crew": "Cosa attiva questo crew"
+    },
     "kiroAccountModal": {
       "account_details_unavailable": "I dettagli dell’account non sono disponibili",
       "checking_account": "Verifica dell’account…",
@@ -4601,6 +4759,7 @@
       "describe_what_you_want_the_agent_to_accomplish": "Descrivi cosa vuoi che l'agente realizzi…",
       "give_the_agent_a_goal_and_it_will_keep_working_t": "Imposta un obiettivo per l’agente. Kiro Crew invia all’agente un sollecito con quell’obiettivo all’intervallo indicato sotto finché l’obiettivo non sarà completato o non verrà raggiunto il limite di cicli.",
       "goal_active_cycle": "Obiettivo attivo (ciclo {{cycle}})",
+      "goal_interrupted_cycle": "Loop obiettivo armato (ciclo {{cycle}}) — l'ultimo turno è stato interrotto; riprendi la chat o attendi il prossimo ciclo",
       "goal_description": "Descrizione dell'obiettivo",
       "seconds_between_nudges": "Secondi tra i solleciti",
       "last_fire": "Ultima attivazione:",
@@ -4617,16 +4776,14 @@
       "focus_popout": "Metti a fuoco la finestra separata",
       "hide_terminal_panel": "Nascondi il pannello del terminale",
       "maximum_terminals": "Massimo {{n}} terminali",
-      "move_to_side_panel": "Sposta nel pannello laterale",
       "new_terminal": "Nuovo terminale",
-      "open_a_chat_page_to_move_this_terminal_there": "Apri una pagina di chat per spostare lì questo terminale",
       "pop_out_to_window": "Apri in una finestra",
       "resize_terminal_panel": "Ridimensiona il pannello del terminale",
       "terminal": "Terminale",
       "terminal_is_in_its_own_window": "Il terminale è in una finestra separata",
-      "move_panel_to_right": "Move panel to right",
-      "move_panel_to_bottom": "Move panel to bottom",
-      "more_actions": "More actions"
+      "move_panel_to_right": "Sposta pannello a destra",
+      "move_panel_to_bottom": "Sposta pannello in basso",
+      "more_actions": "Altre azioni"
     },
     "chatInput": {
       "add_files_options": "Aggiungi file e opzioni",
@@ -5178,11 +5335,15 @@
       "tunnel_error": "errore del tunnel",
       "tunnel_state": "Tunnel {{state}}.",
       "n_unread": "Non letti: {{n}}",
-      "switch_crew_active": "Cambia crew, attualmente {{name}}",
-      "switch_crew_active_unread": "Cambia crew, attualmente {{name}}, non letti altrove: {{n}}",
+      "switch_crew": "Cambia crew",
+      "switch_crew_unread": "Cambia crew, {{n}} non letti altrove",
       "stopped": "arrestato",
-      "show_all_crews": "Mostra tutti i crew",
-      "collapse_crews": "Comprimi crew"
+      "pin_crews": "Fissa crew…",
+      "pinned": "fissato",
+      "pinned_no_room": "fissato, nessuno spazio nell’intestazione",
+      "no_room": "nessuno spazio",
+      "pin_crew": "Fissa {{name}} nell’intestazione",
+      "unpin_crew": "Rimuovi {{name}} dall’intestazione"
     },
     "instancesViewport": {
       "connecting": "Connessione in corso…",
@@ -5236,8 +5397,11 @@
       "unknown_author": "Autore sconosciuto",
       "untitled": "Senza titolo",
       "updated_time": "aggiornata {{time}}",
-      "jira_open_in_browser": "Jira issue — open in browser to view details.",
-      "open_in_jira": "Open in Jira"
+      "open_in_jira": "Open in Jira",
+      "provider_github": "GitHub",
+      "provider_jira": "Jira",
+      "provider_gitlab": "GitLab",
+      "jira_no_credentials": "No Jira credentials configured for this host. Add a jira_auth entry to config.json and set JIRA_API_TOKEN (or JIRA_TOKEN_<hex-host> for multi-host) in your .env file."
     },
     "jobForm": {
       "a_short_label_for_this_job": "Una breve etichetta per questo job",
@@ -5443,6 +5607,8 @@
       "open_artifact": "Apri l’artefatto {{name}}",
       "open_as_artifact": "Apri come artefatto",
       "open_folder": "Apri cartella {{path}}",
+      "open_in_file_explorer": "Apri in Esplora file",
+      "open_in_finder": "Apri nel Finder",
       "open_with_default_app": "Apri con l’applicazione predefinita",
       "path_copied_to_clipboard_no_desktop_available": "Percorso copiato negli appunti (nessun desktop disponibile)",
       "preview": "Anteprima",
@@ -5474,8 +5640,12 @@
       "word_wrap": "Ritorno a capo automatico"
     },
     "markdownRenderer": {
+      "click_to_browse_shift_click_to_open_in_file_explorer": "Clicca per esplorare / Maiusc+clic per mostrare in Esplora file",
       "click_to_browse_shift_click_to_reveal_in_finder": "Clicca per esplorare / Maiusc+clic per mostrare nel Finder",
+      "click_to_browse_shift_click_to_show_in_file_manager": "Clicca per esplorare / Maiusc+clic per mostrare nel gestore file",
+      "click_to_open_shift_click_to_open_in_file_explorer": "Clicca per aprire / Maiusc+clic per mostrare in Esplora file",
       "click_to_open_shift_click_to_reveal_in_finder": "Clicca per aprire / Maiusc+clic per mostrare nel Finder",
+      "click_to_open_shift_click_to_show_in_file_manager": "Clicca per aprire / Maiusc+clic per mostrare nel gestore file",
       "close": "Chiudi",
       "download_d": "Scarica (d)",
       "download_image": "Scarica immagine",
@@ -5948,11 +6118,13 @@
       "include_recent_logs": "Includi i log recenti",
       "note_placeholder": "es. Dopo l'aggiornamento ogni messaggio va in errore con \"process exited (rc=None)\".",
       "open_github_issue": "Apri una issue su GitHub",
+      "open_in_file_explorer": "Apri in Esplora file",
+      "open_in_finder": "Apri nel Finder",
       "prefill_hint": "Aprendo la issue i dettagli vengono precompilati — poi trascinaci lo zip.",
       "redaction_notice": "I token Bearer, i cookie di sessione e le chiavi AWS vengono rimossi automaticamente prima di creare lo zip.",
       "report_a_problem": "Segnala un problema",
       "saved_to": "Salvato in",
-      "show_in_finder": "Mostra nel Finder",
+      "show_in_file_manager": "Mostra nel gestore file",
       "what_happened": "Cosa è successo?"
     },
     "resizeHandle": {
@@ -6336,8 +6508,13 @@
       "no_noun_match": "Nessun(a) {{noun}} corrispondente"
     },
     "updateModal": {
+      "back_to_dashboard": "Torna alla dashboard",
       "dismiss": "Ignora",
       "dismiss_update_dialog": "Chiudi la finestra di aggiornamento",
+      "install_failed": "Installazione dell'aggiornamento non riuscita",
+      "install_failed_body": "Impossibile applicare l'aggiornamento. Kiro Crew sta ripristinando il gateway locale — puoi continuare a usare questa versione e riprovare da Impostazioni > Informazioni.",
+      "installing_update": "Installazione dell'aggiornamento…",
+      "installing_update_body": "Kiro Crew sta arrestando il gateway locale e installando l'aggiornamento. Può richiedere un minuto — non chiudere l'app; si riavvierà da sola.",
       "is_downloaded_and_ready_to_install": "è stato scaricato ed è pronto per l'installazione.",
       "kirocrew": "Kiro Crew",
       "later": "Più tardi",
@@ -6588,6 +6765,14 @@
       "install_step_1": "Point your smartphone camera at the QR code and open the link.",
       "install_step_2": "In Chrome menu (3 dots), tap \"Add to Home screen\".",
       "install_step_3": "A KiroCrew app icon will appear on your home screen."
+    },
+    "skillsMultiSelect": {
+      "add_skill": "Add skill",
+      "remove_skill": "Remove {{name}}",
+      "filter_skills": "Filter skills...",
+      "no_matching_skills": "No matching skills",
+      "skills_hint": "Skills loaded when this hook matches — no command needed.",
+      "selected": "Selected"
     }
   },
   "hooks": {
@@ -6602,6 +6787,8 @@
     },
     "useCronActions": {
       "failed_to_cancel_job": "Impossibile annullare il job",
+      "failed_to_pause_job": "Impossibile mettere in pausa il job",
+      "failed_to_resume_job": "Impossibile riprendere il job",
       "failed_to_open_in_chat": "Impossibile aprire nella chat",
       "failed_to_run_job": "Impossibile eseguire il job"
     },
@@ -6648,7 +6835,8 @@
       "subagents": "Subagenti",
       "summary": "Riepilogo",
       "workflows": "Workflow",
-      "git": "Git"
+      "git": "Git",
+      "pins": "Fissati"
     },
     "useSceneInteraction": {
       "all_slots_are_occupied": "Tutti gli slot sono occupati",
@@ -7381,7 +7569,8 @@
       "ver": "Ver.",
       "widgets_files_and_snippets_live_tracked_with_ver": "Widget, file e snippet — tracciati in tempo reale con cronologia delle versioni",
       "your_artifacts": "I tuoi artefatti",
-      "local_preview": "Local preview"
+      "local_preview": "Local preview",
+      "more_actions": "Altre azioni"
     },
     "capabilitiesPage": {
       "agent_capabilities": "Capacità dell'agente",
@@ -7621,9 +7810,11 @@
       "folderPanel": {
         "empty_folder": "Cartella vuota",
         "loading": "Caricamento…",
+        "open_in_file_explorer": "Apri in Esplora file",
+        "open_in_finder": "Apri nel Finder",
         "parent_folder": "Cartella superiore",
         "refresh": "Aggiorna",
-        "reveal_in_finder": "Mostra nel Finder",
+        "show_in_file_manager": "Mostra nel gestore file",
         "unable_to_list_folder": "Impossibile elencare la cartella"
       },
       "knowledgePicker": {
@@ -7755,7 +7946,9 @@
         "this_app_render_is_no_longer_available": "Questo rendering dell'app non è più disponibile. Esegui di nuovo lo strumento per visualizzarlo.",
         "turn_diff": "Diff del turno",
         "menu_git": "Git",
-        "menu_git_desc": "Branch, modifiche e commit recenti"
+        "menu_git_desc": "Branch, modifiche e commit recenti",
+        "menu_pins": "Fissati",
+        "menu_pins_desc": "Messaggi che hai fissato in questa sessione"
       },
       "stopEventCard": {
         "stop_failed_session_reset": "Arresto non riuscito, sessione reimpostata",
@@ -7785,11 +7978,12 @@
         "expand_agent_list": "Espandi l’elenco dei subagenti",
         "more_running_normally": "altri in esecuzione normale…",
         "no_activity": "— nessuna attività",
+        "no_activity_for": "nessuna attività da {{secs}}s",
         "no_activity_possibly_stalled": "Nessuna attività — potrebbe essere in stallo",
         "open_in_subagents_sidebar": "Apri {{label}} nella barra laterale dei subagenti",
+        "possibly_stalled": "potrebbe essere in stallo",
         "retry_failed_count": "Riprova i non riusciti ({{count}})",
         "s": "s",
-        "stalled": "in stallo",
         "stop": "Arresta",
         "stop_all_running_subagents": "Arresta tutti i subagenti in esecuzione",
         "stop_running_subagent": "Arresta il subagente in esecuzione",
@@ -7851,6 +8045,7 @@
         "send": "Invia",
         "send_enter": "Invia (Invio)",
         "steered_into_the_running_turn": "Indirizzato nel turno in corso",
+        "message_unconfirmed": "Message not confirmed — may not have been delivered",
         "pin_message": "Fissa messaggio",
         "unpin_message": "Rimuovi fissaggio"
       },
@@ -7873,9 +8068,8 @@
       },
       "pins": {
         "pinned_messages": "Messaggi fissati",
-        "close_panel": "Chiudi pannello messaggi fissati",
         "loading": "Caricamento…",
-        "no_pinned_messages": "Nessun messaggio fissato. Fissa messaggi importanti dalla chat per trovarli rapidamente.",
+        "no_pinned_messages": "Nessun messaggio fissato. Passa il cursore su un messaggio nella chat e fai clic sull’icona della puntina per salvarlo qui.",
         "message_unavailable": "Questo messaggio fissato non è più disponibile nella cronologia caricata.",
         "pin_failed": "Impossibile fissare il messaggio. Riprova.",
         "unpin_failed": "Impossibile rimuovere il messaggio fissato. Riprova.",
@@ -7888,7 +8082,6 @@
         "copy_preview": "Copia testo",
         "copy_link": "Copia link al messaggio",
         "unpin": "Rimuovi",
-        "open_pinned_messages": "Apri messaggi fissati",
         "jump_to_message": "Vai al messaggio"
       },
       "sessionSummary": {
@@ -8015,7 +8208,8 @@
       "upload_failed_check_file_type_and_size_max_50_mb": "Caricamento non riuscito — controlla tipo e dimensione del file (max 50 MB)",
       "upload_failed_error": "Caricamento non riuscito: {{error}}",
       "what_can_i_do_for_you": "Cosa posso fare per te?",
-      "worktree_creation_returned_no_path": "La creazione del worktree non ha restituito alcun percorso"
+      "worktree_creation_returned_no_path": "La creazione del worktree non ha restituito alcun percorso",
+      "loading_earlier_messages": "Caricamento dei messaggi precedenti…"
     },
     "chatSidebar": {
       "1_skipped_currently_selected": "(1 saltata — attualmente selezionata)",
@@ -8094,6 +8288,7 @@
       "folders": "Cartelle",
       "goal_loop_cycle": "Ciclo obiettivo · iterazione {{count}} di {{total}}",
       "goal_loop_cycle_no_cap": "Ciclo obiettivo · iterazione {{count}} (senza limite)",
+      "goal_loop_interrupted_title": "Loop obiettivo armato — l'ultimo turno è stato interrotto; riprendi la chat o attendi il prossimo ciclo",
       "hidden": "nascosta",
       "hidden_because_parent_hidden": "{{name}} non è visibile perché una cartella superiore è nascosta",
       "hidden_folder": "cartella nascosta",
@@ -8103,7 +8298,6 @@
       "hide_from_flat_view": "Nascondi {{name}} dalla vista piatta",
       "hide_when_empty": "Nascondi quando è vuoto",
       "hours": "ore",
-      "in_folder": "Nella cartella: {{name}}",
       "include_untagged_sessions": "Includi le sessioni senza tag",
       "incognito_no_memory_writes": "Incognito — nessuna scrittura in memoria",
       "last_30_days": "Ultimi 30 giorni",
@@ -8111,6 +8305,7 @@
       "load_more": "Carica altro…",
       "loop": "Ciclo {{count}}/{{total}}",
       "loop_2": "Ciclo · {{count}}",
+      "loop_interrupted": "interrotto",
       "manage_tags": "Gestisci i tag…",
       "manage_tags_2": "Gestisci i tag",
       "match_mode": "Modalità di corrispondenza",
@@ -8172,6 +8367,7 @@
       "show_collapsed_folders": "Mostra le cartelle compresse:",
       "show_folder": "Mostra la cartella",
       "show_in_flat_view": "Mostra {{name}} nella vista piatta",
+      "show_only_sessions_tagged": "Mostra solo le sessioni con il tag {{name}}",
       "show_the_folder_list": "Mostra l'elenco delle cartelle",
       "skip": "Salta",
       "sort_and_filter_sessions": "Ordina e filtra le sessioni",
@@ -8185,6 +8381,7 @@
       "sort_oldest": "Più vecchie",
       "started_in_channel": "Questa conversazione è iniziata in {{channel}}.",
       "started_in_direct_message": "Questa conversazione è iniziata in un messaggio diretto.",
+      "stop_filtering_by_tag": "Non filtrare più per {{name}}",
       "streaming": "Streaming",
       "switch_all_sessions": "Cambia tutte le sessioni",
       "switch_all_to_model": "Passa tutte al modello…",
@@ -8194,6 +8391,7 @@
       "switch_to_folder_view": "Passa alla vista a cartelle",
       "switch_to_list_view": "Passa alla vista a elenco",
       "switching": "Passaggio…",
+      "tags": "Tag",
       "temporary_no_memory_reads_or_writes": "Temporaneo — nessuna lettura o scrittura in memoria",
       "thinking": "Riflessione…",
       "today": "Oggi",
@@ -8309,6 +8507,7 @@
       "build_pending": "build in attesa",
       "build_pending_restart_gateway_to_apply_kirocrew": "build in attesa — riavvia il gateway per applicare (kirocrew restart)",
       "building": "Build in corso…",
+      "build_finished_restarting_gateway": "Build completata — riavvio del gateway…",
       "built": "build pronta",
       "built_and_ready_spin_up_a_pod_from_the_row_menu": "Build pronta — avvia un pod dal menu della riga per fare QA su questo branch",
       "built_but_pods_cannot_run_on_this_host_preview_i": "Build pronta — ma su questo host i pod non possono girare; usa ./dev-backend.sh per l'anteprima",
@@ -8346,6 +8545,10 @@
       "filter_worktrees": "Filtra i worktree…",
       "filter_worktrees_2": "Filtra i worktree",
       "finished": "Completato",
+      "force_remove_confirm_desc": "{{count}} worktree hanno lavoro non unito o non committato. Rimuoverli elimina permanentemente tutte le modifiche locali. Operazione irreversibile.",
+      "force_remove_confirm_title": "Forzare la rimozione dei worktree?",
+      "force_remove_warning": "I worktree selezionati hanno lavoro non unito — la rimozione è permanente e irreversibile.",
+      "force_remove": "Forza rimozione di {{name}}",
       "gateway_did_not_come_back_within_60s_reload_the": "Il gateway non è tornato disponibile entro 60s — ricarica la pagina manualmente oppure controlla `kirocrew logs`.",
       "gateway_restarted_mid_sync_run_lost_check_git_st": "il gateway si è riavviato durante la sincronizzazione — esecuzione perduta; controlla lo stato di git e riesegui Pull+Build",
       "git_status_failed": "git status non riuscito",
@@ -8354,6 +8557,7 @@
       "hide_logs": "Nascondi i log",
       "issues": "Issue:",
       "just_now": "proprio ora",
+      "kept_force_hint": "Seleziona per forzare la rimozione — elimina il lavoro non unito.",
       "kept": "Mantenuto",
       "last_commit_activity": "Ultima attività di commit",
       "legacy_worktrees_hidden_show": "{{n}} worktree legacy nascosti · Mostra",
@@ -8403,6 +8607,7 @@
       "pr_merged_safe_to_remove_runs_git_worktree_remov": "PR unita — si può rimuovere senza rischi. Esegue `git worktree remove`. Operazione irreversibile.",
       "pr_merged_uncommitted_changes": "PR unita, modifiche non committate",
       "pr_open_or_unmerged_commits": "PR aperta o commit non uniti",
+      "protected_worktree": "Protetto — principale o attualmente live",
       "provision": "Esegui il provisioning",
       "provision_failed": "Provisioning non riuscito",
       "provision_failed_exit_code": "Provisioning non riuscito (uscita {{code}})",
@@ -8426,7 +8631,7 @@
       "pull_build_failed_to_start": "Avvio di Pull+Build non riuscito",
       "pull_build_main": "Pull + build di main",
       "pulls_main_and_rebuilds_6_min_does_not_restart": "Recupera main e ricompila (~6 min). NON riavvia.",
-      "pulls_main_rebuilds_then_restarts_automatically": "Pulls main, rebuilds (~6 min), then restarts the gateway automatically.",
+      "pulls_main_rebuilds_then_restarts_keep_page_open": "Scarica main, ricompila (~6 min) e riavvia il gateway automaticamente. Tieni questa pagina aperta fino al termine del build.",
       "purpose": "Scopo:",
       "qa_pod_is_running_but_failing_its_health_check": "Il pod QA è in esecuzione ma non supera il controllo di integrità",
       "qa_pod_is_running_click_open_to_use_it": "Il pod QA è in esecuzione — clicca Apri per usarlo",
@@ -8611,7 +8816,8 @@
       "timeout": "Timeout",
       "total": "Totale",
       "total_runs": "Esecuzioni totali",
-      "user": "utente"
+      "user": "utente",
+      "matcher_mode": "Matcher mode"
     },
     "kiroCrewAgentsPage": {
       "a_unique_identifier_for_this_workspace_agents_re": "Un identificatore univoco per questo workspace. Gli agenti fanno riferimento ai workspace tramite il nome.",
@@ -8729,7 +8935,6 @@
         "months_ago": "{{n}} mesi fa",
         "search_across_all_knowledge_filter_by_type_or_ex": "Cerca in tutte le conoscenze, filtra per tipo oppure esplora il grafo delle entità",
         "supported_formats": "Formati supportati: {{formats}}",
-        "supported_formats_list": "Markdown, testo semplice, file di codice (.py, .ts, .java, .go, .rs, ecc.), HTML, JSON, YAML, CSV, DOCX, Org Mode (.org), PDF",
         "weeks_ago": "{{n}} sett. fa",
         "welcome_to_the_knowledge_library": "Benvenuto nella libreria delle conoscenze",
         "your_centralized_knowledge_base_with_entity_extr": "La tua base di conoscenza centralizzata con estrazione delle entità, relazioni a grafo e ricerca full-text."
@@ -8751,6 +8956,7 @@
         "embedding_model_loading": "Caricamento del modello di embedding ({{name}})",
         "embeddings_initializing": "○ inizializzazione degli embedding",
         "embeddings_loading": "caricamento embedding",
+        "embeddings_count": "embedding ({{value}})",
         "entities": "entità",
         "esc": "Esc",
         "filter_by_namespace": "Filtra per namespace",
@@ -8849,9 +9055,10 @@
         "ignore_patterns": "Pattern da ignorare",
         "ignore_patterns_one_per_line_e_g_trash_templates": "Pattern da ignorare (uno per riga, ad es. .trash/*)\nTemplates/*",
         "include_subdirectories_recursive": "Includi le sottodirectory (ricorsivo)",
-        "indexing_uses_kiro_requests_each_source_costs_mo": "L’indicizzazione consuma richieste Kiro: ogni origine costa richieste in proporzione alle sue dimensioni e una cartella monitorata continua a consumarne man mano che arrivano nuovi file. Il costo si distribuisce nel tempo invece di essere addebitato tutto insieme.",
+        "indexing_uses_kiro_requests_each_source_costs_mo": "L’indicizzazione consuma richieste Kiro in proporzione alle dimensioni di ogni origine e una cartella monitorata continua a consumarne man mano che arrivano nuovi file — il costo si distribuisce nel tempo invece di essere addebitato tutto insieme.",
         "items": "elementi",
-        "kiro_requests_left": "~{{calls}} richieste Kiro rimaste",
+        "kiro_requests_left": "~{{calls}} richieste Kiro per completare",
+        "max_file_size": "Massimo 50 MB per file.",
         "local_file": "File locale",
         "local_folder": "Cartella locale",
         "manual": "○ manuale",
@@ -8874,6 +9081,7 @@
         "retry": "Riprova",
         "save_name": "Salva il nome",
         "scanning_this_many_files_will_take_several_minut": "La scansione di così tanti file richiederà diversi minuti e utilizzerà risorse considerevoli.",
+        "show_failed_files": "Mostra quali file non sono riusciti",
         "skip": "Salta",
         "source_name": "Nome dell'origine",
         "source_name_optional": "Nome dell'origine (facoltativo)",
@@ -8882,7 +9090,7 @@
         "supported_file_found_many": "{{count}} file supportati trovati",
         "supported_file_found_one": "{{count}} file supportato trovato",
         "supported_file_found_other": "{{count}} file supportati trovati",
-        "supports_markdown_plain_text_code_files_html_jso": "Supporta: Markdown, testo semplice, file di codice, HTML, JSON, YAML, CSV, DOCX, Org Mode, PDF. Massimo 50 MB per file.",
+        "supports_formats": "Supporta: {{formats}}.",
         "sync": "Sincronizza",
         "sync_source": "Sincronizza l'origine",
         "this_folder_will_be_watched_any_supported_files": "Questa cartella verrà monitorata. Tutti i file supportati aggiunti qui verranno acquisiti automaticamente al prossimo ciclo di scansione (~5 min).",
@@ -8976,6 +9184,36 @@
       "without_gateway_per_session_copies": "Senza gateway (copie per sessione)"
     },
     "mcpManagement": {
+      "assessment": {
+        "col_assessment": "Valutazione",
+        "col_evidence": "Prove",
+        "col_running_as": "In esecuzione come",
+        "connections_link": "Connections",
+        "how_measured": "Un server risulta non misurato finché Kiro Crew non lo sonda, cosa che avviene due alla volta quando si aggiorna l'elenco dei server MCP in {{link}}.",
+        "lede": "Ciò che Kiro Crew è riuscito a osservare su ciascun server e come ciò si concilia con la modalità di esecuzione attuale del server. Nulla in questa vista cambia qualcosa — gli interruttori si trovano in Server.",
+        "legend": "Per consigliare un backend condiviso è necessario che il server dichiari di saper distinguere i propri chiamanti, e pochi server lo dichiarano — perciò la maggior parte dei server integri resta su nessuna obiezione riscontrata. È la risposta prudente, non una risposta mancante, e la condivisione resta una tua scelta.",
+        "open_servers": "Apri Servers",
+        "reason_all_tools_read_only": "Ogni strumento si dichiara di sola lettura",
+        "reason_caller_sensitive": "Ha risposto all’handshake in modo diverso per due chiamanti differenti",
+        "reason_declares_caller_identity": "Dichiara di saper distinguere i propri chiamanti",
+        "reason_first_party": "Un server Kiro Crew, legato a una singola sessione per progettazione",
+        "reason_no_objection_found": "Non è stato riscontrato nulla di squalificante, il che è più debole della prova che la condivisione sia sicura",
+        "reason_no_tool_annotations": "Nessuno strumento ha dichiarato se si limita a leggere",
+        "reason_no_tools_listed": "Non ha offerto strumenti da ispezionare",
+        "reason_not_probed": "Mai misurato, quindi non si afferma nulla in un senso o nell’altro",
+        "reason_not_stdio": "Non è un server stdio, quindi non c’è alcuna pipe davanti a cui mettere uno stub",
+        "reason_observed_hazard": "Già osservato comportarsi in modo diverso a seconda del chiamante mentre era condiviso",
+        "reason_per_client_capability": "Pubblicizza una funzionalità che appartiene a un solo client",
+        "reason_preflight_not_run": "Lo dichiara, ma non è ancora stato misurato",
+        "reason_preflight_passed": "Misurato con due chiamanti differenti e ha risposto nello stesso modo",
+        "reason_rotating_secret_env": "Legge una credenziale il cui valore varia a seconda della sessione",
+        "shared_without_support": "La condivisione del backend è già attiva per server le cui prove la sconsigliano. Server interessati: {{count}}",
+        "strength_declared": "creato per la condivisione",
+        "strength_disqualified": "non adatto alla condivisione",
+        "strength_no_objection": "nessuna obiezione riscontrata",
+        "strength_refuted": "non sicuro se condiviso",
+        "strength_unknown": "non misurato"
+      },
       "cancel": "Annulla",
       "col_server": "Server",
       "col_state": "Stato",
@@ -8987,6 +9225,7 @@
       "confirm_stateful": "Un server che conserva stato per sessione dovrebbe restare solo con lo stub, o aspettarsi coinquilini.",
       "confirm_title": "Condividere i backend tra le sessioni?",
       "confirm_turn_on": "Attiva la condivisione",
+      "confirm_unsupported": "Di questi, {{count}} hanno prove che sconsigliano la condivisione.",
       "learn_more": "Scopri di più",
       "learn_more_docs": "Scopri di più nella documentazione",
       "lede": "Kiro Crew può mettere il proprio stub davanti a un server MCP invece di lasciare che ogni sessione avvii quel server per conto suo. Lo stub è ciò che permette al server di disegnare la propria interfaccia (MCP Apps) e l'unica cosa verso cui un backend condiviso può essere instradato, quindi si attiva server per server. {{link}}",
@@ -9008,7 +9247,10 @@
       "stub_failed": "Non è stato possibile applicare la modifica. Potrebbe essere già salvata senza essere attiva: gli interruttori qui sotto mostrano ora lo stato salvato.",
       "stub_not_live": "Salvato, ma non ancora attivo: il gateway non è riuscito ad avviarsi. L'interruttore mostra ciò che è salvato, non ciò che è in esecuzione.",
       "stubbed_of_total": "{{stubbed}} su {{total}} con stub",
-      "unsupported_platform": "La condivisione dei backend richiede socket di dominio Unix e non è disponibile su questa piattaforma."
+      "unsupported_platform": "La condivisione dei backend richiede socket di dominio Unix e non è disponibile su questa piattaforma.",
+      "view_assessment": "Valutazione della condivisione",
+      "view_servers": "Server",
+      "views_aria": "Viste di gestione MCP"
     },
     "migrationPage": {
       "app_migration": "Migrazione dell'app",
@@ -9420,7 +9662,8 @@
         "version_range": "(v{{from}} → v{{to}})",
         "workspace": "workspace",
         "auto_create_hint": "Kiro Crew può anche redigere competenze dalle sessioni completate automaticamente — disattivato per impostazione predefinita, controllato da <settingRef/>.",
-        "approval_required_hint": "I candidati attendono qui fino alla tua approvazione — richiesto da <settingRef/>."
+        "approval_required_hint": "I candidati attendono qui la tua approvazione. Le skill di sola prosa possono essere pubblicate automaticamente quando <settingRef/> è disattivato — le skill che includono script richiedono sempre una revisione.",
+        "scripts_always_require_review": "Gli script inclusi richiedono sempre una revisione manuale, anche quando l'approvazione delle skill è disattivata."
       },
       "steeringTab": {
         "always_on_markdown_conventions_injected_into_eve": "Convenzioni Markdown sempre attive, inserite in ogni sessione. I file globali si trovano in ~/.kiro/steering e si applicano a tutto; i file di workspace si trovano in <project>/.kiro/steering e si applicano solo a quel progetto.",
@@ -9905,7 +10148,11 @@
       "view_last_result": "Visualizza l'ultimo risultato",
       "writes_badge_tooltip": "Il job di questo modello pubblica branch, apre PR o modifica issue. Le sue protezioni sono istruzioni per l’agente, non una policy applicata dal sistema.",
       "writes_notice": "Il job di questo modello pubblica branch, apre PR o modifica issue nei tuoi repository. I limiti indicati nel prompt (per esempio “non pubblicare mai sul branch predefinito”) sono istruzioni per l’agente, non una policy applicata dal sistema — rivedi il prompt prima di salvare.",
-      "writes_to_your_repos": "Scrive nei tuoi repository"
+      "writes_to_your_repos": "Scrive nei tuoi repository",
+      "script_source": "Codice sorgente dello script",
+      "script_source_download": "Scarica script",
+      "script_source_failed": "Impossibile caricare il codice sorgente dello script.",
+      "script_source_truncated": "Troncato — lo script supera il limite di anteprima."
     },
     "servicesTab": {
       "connected": "Connesso",
@@ -10168,6 +10415,9 @@
         "session_folder_name_desc": "Viene creata quando salvi queste impostazioni, se non esiste ancora."
       },
       "browserPanel": {
+        "use_builtin_label": "Usa il browser integrato",
+        "use_builtin_desc": "Apre le pagine nel pannello integrato di Kiro Crew. Disattiva per navigare con playwright-cli.",
+        "use_builtin_desktop_only": "Funziona solo nell'app desktop. In un browser o su un gateway remoto l'agente usa playwright-cli.",
         "browsing": "Navigazione",
         "cannot_load": "Impossibile caricare lo stato del browser. Il gateway è in esecuzione?",
         "available": "L'agente può navigare le pagine web.",

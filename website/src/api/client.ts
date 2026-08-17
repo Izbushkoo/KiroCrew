@@ -47,6 +47,34 @@ function themeConsentSha(colorTheme?: string): string | null {
   return stored
 }
 
+/** One machine-readable ground for a sharing verdict.
+ *
+ *  `code` is stable and is what the UI translates. `detail` is verbatim data
+ *  from the server or the config (an env name, a capability path, a protocol
+ *  version) and is deliberately NOT translated.
+ */
+export type McpShareReason = {
+  code: string
+  detail: string
+}
+
+/** The gateway's advisory reading of whether a server's backend can be shared.
+ *
+ *  `strength` is the evidence tier, weakest first: `unknown`, `no_objection`,
+ *  `declared`, `disqualified`, `refuted`. Only `declared` sets `recommendShare`,
+ *  because finding nothing disqualifying is an absence of evidence rather than
+ *  evidence of absence.
+ *
+ *  The wire object also carries a separate stub recommendation, which is not
+ *  declared here: a TS type is structural, so the field costs a reader something
+ *  and buys nothing until a component actually renders it.
+ */
+export type McpShareRecommendation = {
+  strength: string
+  recommendShare: boolean
+  reasons: McpShareReason[]
+}
+
 export type McpManagedServer = {
   name: string
   stub: boolean            // effective: can_stub AND in_allowlist
@@ -56,6 +84,11 @@ export type McpManagedServer = {
   agents: string[]         // agent configs that declare this server
   transport: string        // "stdio" (stubbable) or "http" (no stdio pipe to interpose on)
   denylisted: boolean      // in UNPOOLABLE_SERVERS — can never be pooled
+  // Optional because the field is only as old as the shareability detector: a
+  // dashboard served from this build can be pointed at an older gateway (Make
+  // Live to an earlier worktree), and a row with no verdict must read as "not
+  // measured" rather than crash the table.
+  recommendation?: McpShareRecommendation
 }
 
 export const SEARCH_MIN_CHARS = 2  // backend session search threshold (must match kiro_crew.history.SEARCH_MIN_CHARS)
@@ -1724,6 +1757,7 @@ export const api = {
     return fetch('/api/crons/' + jobId + '/history' + (qs ? '?' + qs : ''), { headers: { ..._sk } }).then(j)
   },
   cronRunDetail: (jobId: string, runId: string) => fetch('/api/crons/' + jobId + '/history/' + encodeURIComponent(runId), { headers: { ..._sk } }).then(j),
+  cronScript: (jobId: string) => fetch('/api/crons/' + jobId + '/script').then(j),
   ackCron: (id: string, summary: string, ts?: string) => post('/api/crons/' + id + '/ack', { summary, ts }).then(j),
   cronHistoryAll: (opts?: { offset?: number; limit?: number; jobId?: string }) => {
     const p = new URLSearchParams()
@@ -2059,6 +2093,10 @@ export const api = {
   // Sessions (history)
   sessions: (limit = 30, offset = 0, preview = false) => fetch('/api/sessions?limit=' + limit + '&offset=' + offset + (preview ? '&preview=1' : '')).then(j),
   sessionsSearch: (q: string, limit = 50) => fetch('/api/sessions/search?q=' + encodeURIComponent(q) + '&limit=' + limit).then(j),
+  // Federated session search across the local gateway + every CONNECTED remote
+  // instance (backend rank-interleaves; remote rows carry instance_id/_name).
+  // 403 = instances feature disabled — callers fall back to sessionsSearch.
+  instancesSearchSessions: (q: string, limit = 50) => fetch('/api/instances/search-sessions?q=' + encodeURIComponent(q) + '&limit=' + limit).then(j),
   sessionDetail: (key: string) => fetch('/api/sessions/' + encodeURIComponent(key)).then(j),
   deleteSession: (key: string) => del('/api/sessions/' + encodeURIComponent(key)).then(j),
   clearSessions: () => del('/api/sessions').then(j),
