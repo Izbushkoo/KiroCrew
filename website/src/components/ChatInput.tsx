@@ -296,8 +296,7 @@ interface ChatInputProps {
 
   /** Cancel (discard) an in-progress dictation without transcribing — Esc. */
   onVoiceCancel?: () => void
-  /** Pre-warm the mic on pointer-down so recording starts instantly on click. */
-  onVoicePrewarm?: () => void
+
   /** Mic error (null = none), live input level [0,1], active device label, and error-dismiss. */
   voiceError?: string | null
   voiceLevel?: number
@@ -620,7 +619,6 @@ function ChatInput({
   onVoiceToggle,
 
   onVoiceCancel,
-  onVoicePrewarm,
   voiceError = null,
   voiceLevel = 0,
   voiceDeviceLabel = '',
