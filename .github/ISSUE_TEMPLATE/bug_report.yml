@@ -53,8 +53,6 @@ body:
       label: How is it installed?
       options:
         - Desktop app
-        - Desktop app (deb)
-        - Desktop app (rpm)
         - pip / pipx
         - Docker
         - From source
