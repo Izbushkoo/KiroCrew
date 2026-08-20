@@ -8,7 +8,6 @@ import { api } from '../api/client'
 import { Card, CardTitle, StatCard } from '../components/ui'
 import { TunnelStatus } from '../components/TunnelStatus'
 import ErrorBoundary from '../components/ErrorBoundary'
-import MobileSyncModal from '../components/MobileSyncModal'
 import { getOverviewStatCards } from './overviewStatCards'
 import { MemoryTab, UsageTab } from './overview'
 import { useProvider } from '../providers'
@@ -221,12 +220,6 @@ export default function OverviewPage() {
         <UsageSummaryCard onOpen={() => setView('usage')} />
         <MemorySummaryCard onOpen={() => setView('memory')} />
       </div>
-
-      {mobileSyncOpen && (
-        <MobileSyncModal
-          onClose={() => setMobileSyncOpen(false)}
-        />
-      )}
     </>
   )
 }
