@@ -11,8 +11,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from windows_sim import replace_sharing_violation
 
 from kiro_crew import agent_state
+from kiro_crew import atomic_write as aw
 from kiro_crew.agent import install_agent, migrate_agent_specs
 
 
@@ -475,6 +477,52 @@ class TestAtomicJsonWrite:
 
         assert stat.S_IMODE(target.stat().st_mode) == 0o644
         assert json.loads(target.read_text(encoding="utf-8")) == {"new": True}
+
+    def test_a_contended_rename_is_retried_on_windows(self, tmp_path: Path, monkeypatch):
+        """The rename this writer ends on is the one Windows can refuse.
+
+        The docstring reasons about Linux, where `rename()` is atomic and a
+        reader holding the destination cannot block it. On Windows `os.replace`
+        raises `PermissionError` (`WinError 32`) while ANY other handle is open
+        on either path, and a freshly written temp file is exactly what an
+        indexer or AV scanner touches. `replace_with_retry` exists for that
+        window and every other tmp-plus-rename writer in the tree goes through
+        it; this one hand-rolled the rename and did not.
+
+        It matters here more than most: these are the agent configs kiro-cli
+        reads at spawn, so a refused rename surfaces as a failed spawn.
+        """
+        from kiro_crew import platform_compat
+        from kiro_crew.agent import _atomic_json_write
+
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(aw, "_REPLACE_BACKOFF_SECONDS", 0)
+        target = tmp_path / "agent.json"
+        target.write_text("{}", encoding="utf-8")
+
+        with replace_sharing_violation(match="agent.json", times=1) as state:
+            _atomic_json_write(target, {"key": "value"})
+
+        assert state["n"] == 2, "one refused rename, then one that succeeded"
+        assert json.loads(target.read_text(encoding="utf-8")) == {"key": "value"}
+
+    def test_a_posix_permission_error_still_propagates(self, tmp_path: Path, monkeypatch):
+        """POSIX permits replacing an open file, so a PermissionError there is a
+        real access fault — retrying would only delay an honest failure, and
+        the temp file must still be cleaned up."""
+        from kiro_crew import platform_compat
+        from kiro_crew.agent import _atomic_json_write
+
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
+        target = tmp_path / "agent.json"
+        target.write_text("{}", encoding="utf-8")
+
+        with replace_sharing_violation(match="agent.json", times=1):
+            with pytest.raises(PermissionError):
+                _atomic_json_write(target, {"key": "value"})
+
+        assert list(tmp_path.glob("*.tmp")) == [], "the temp file must not be left behind"
+        assert target.read_text(encoding="utf-8") == "{}", "the target is unchanged"
 
     def test_no_temp_file_left_on_success(self, tmp_path: Path):
         from kiro_crew.agent import _atomic_json_write
@@ -1035,6 +1083,112 @@ class TestResolveKirocrewBin:
             agent_mod._KIROCREW_BIN = old_val
 
 
+class TestKirocrewBinSubpath:
+    """Tests for the per-OS console-script subpath (#4439).
+
+    On Windows the resolver must prefer the relocatable ``bin\\kirocrew.cmd``
+    shim over the pip-generated ``Scripts\\kirocrew.exe``: inside the shipped
+    desktop bundle the ``.exe`` embeds the ABSOLUTE interpreter path of the
+    build agent and can never run on the user's machine, while the ``.cmd``
+    resolves its interpreter via ``%~dp0``. Mirrors the ranking in
+    ``website/electron/find-bin.js``.
+    """
+
+    def test_posix_returns_bin_kirocrew(self, tmp_path: Path, monkeypatch):
+        from kiro_crew import platform_compat
+        from kiro_crew.agent import _kirocrew_bin_subpath
+
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
+        # Even with a stray kirocrew.cmd present, POSIX resolution is unchanged.
+        (tmp_path / "bin").mkdir()
+        (tmp_path / "bin" / "kirocrew.cmd").write_text("@echo off\n")
+        assert _kirocrew_bin_subpath(tmp_path) == tmp_path / "bin" / "kirocrew"
+
+    def test_windows_prefers_relocatable_cmd_shim(self, tmp_path: Path, monkeypatch):
+        """Bundle layout: BOTH launchers exist -> the .cmd shim wins."""
+        from kiro_crew import platform_compat
+        from kiro_crew.agent import _kirocrew_bin_subpath
+
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        (tmp_path / "bin").mkdir()
+        cmd_shim = tmp_path / "bin" / "kirocrew.cmd"
+        cmd_shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -s -m kiro_crew %*\r\n')
+        (tmp_path / "Scripts").mkdir()
+        (tmp_path / "Scripts" / "kirocrew.exe").write_bytes(b"MZ")
+        assert _kirocrew_bin_subpath(tmp_path) == cmd_shim
+
+    def test_windows_falls_back_to_scripts_exe_without_cmd(self, tmp_path: Path, monkeypatch):
+        """Plain pip install: no .cmd shim -> Scripts/kirocrew.exe as before."""
+        from kiro_crew import platform_compat
+        from kiro_crew.agent import _kirocrew_bin_subpath
+
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        (tmp_path / "Scripts").mkdir()
+        (tmp_path / "Scripts" / "kirocrew.exe").write_bytes(b"MZ")
+        expected = tmp_path / "Scripts" / "kirocrew.exe"
+        assert _kirocrew_bin_subpath(tmp_path) == expected
+
+    def test_windows_cmd_must_be_a_file(self, tmp_path: Path, monkeypatch):
+        """A directory named kirocrew.cmd does not shadow the .exe fallback."""
+        from kiro_crew import platform_compat
+        from kiro_crew.agent import _kirocrew_bin_subpath
+
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        (tmp_path / "bin" / "kirocrew.cmd").mkdir(parents=True)
+        expected = tmp_path / "Scripts" / "kirocrew.exe"
+        assert _kirocrew_bin_subpath(tmp_path) == expected
+
+    def test_bin_is_usable_accepts_cmd_batch_shim(self, tmp_path: Path):
+        """A `.cmd` starts with `@`, not `#!` -> no shebang to validate, usable."""
+        from kiro_crew.agent import _bin_is_usable
+
+        shim = tmp_path / "kirocrew.cmd"
+        shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -s -m kiro_crew %*\r\n')
+        assert _bin_is_usable(shim) is True
+
+    def test_resolver_walk_finds_cmd_shim_in_bundle_layout(self, tmp_path: Path, monkeypatch):
+        """End-to-end: the parent walk PREFERS the bundle's .cmd on Windows.
+
+        Pins the issue's failure mode: the bundle ships BOTH launchers, and
+        resolving the co-present ``Scripts\\kirocrew.exe`` instead of the
+        ``.cmd`` shim is exactly the #4439 defect.
+        """
+        import kiro_crew.agent as agent_mod
+        from kiro_crew import platform_compat
+        from kiro_crew.agent import _resolve_kirocrew_bin
+
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+
+        # Bundle layout (packaging/build-desktop.sh build_backend_windows):
+        # <root>/Lib/site-packages/kiro_crew + <root>/bin/kirocrew.cmd
+        # + the pip-dropped <root>/Scripts/kirocrew.exe (non-relocatable).
+        root = tmp_path / "kirocrew-backend"
+        pkg_dir = root / "Lib" / "site-packages" / "kiro_crew"
+        pkg_dir.mkdir(parents=True)
+        (pkg_dir / "__init__.py").write_text("")
+        (root / "bin").mkdir()
+        cmd_shim = root / "bin" / "kirocrew.cmd"
+        cmd_shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -s -m kiro_crew %*\r\n')
+        # The test host is POSIX, where the resolver's X_OK gate is real.
+        cmd_shim.chmod(0o755)
+        (root / "Scripts").mkdir()
+        dead_exe = root / "Scripts" / "kirocrew.exe"
+        dead_exe.write_bytes(b"MZ")
+        dead_exe.chmod(0o755)
+
+        mock_mc = unittest.mock.MagicMock()
+        mock_mc.__file__ = str(pkg_dir / "__init__.py")
+
+        old_val = agent_mod._KIROCREW_BIN
+        try:
+            agent_mod._KIROCREW_BIN = None
+            with patch.dict("sys.modules", {"kiro_crew": mock_mc}):
+                result = _resolve_kirocrew_bin()
+            assert result == str(cmd_shim)
+        finally:
+            agent_mod._KIROCREW_BIN = old_val
+
+
 class TestKirocrewMcpInvocation:
     """Tests for built-in MCP server invocation resolution.
 
@@ -1059,6 +1213,44 @@ class TestKirocrewMcpInvocation:
 
         # Bare "kirocrew" is the unresolved sentinel from _resolve_kirocrew_bin.
         with patch("kiro_crew.agent._resolve_kirocrew_bin", return_value="kirocrew"):
+            cmd, args = _kirocrew_mcp_invocation("mcp-core")
+        assert cmd == sys.executable
+        assert args == ["-m", "kiro_crew", "mcp-core"]
+
+    def test_unwraps_cmd_shim_to_sibling_interpreter(self, tmp_path: Path):
+        """A resolved bin/kirocrew.cmd is never emitted verbatim (#4439).
+
+        Mirrors website/electron/main.js: the shim is unwrapped to
+        ``<root>/python.exe -s -m kiro_crew <sub>`` so kiro-cli spawns the
+        interpreter, not a batch file.
+        """
+        from kiro_crew.agent import _kirocrew_mcp_invocation
+
+        root = tmp_path / "kirocrew-backend"
+        (root / "bin").mkdir(parents=True)
+        shim = root / "bin" / "kirocrew.cmd"
+        shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -s -m kiro_crew %*\r\n')
+        interpreter = root / "python.exe"
+        interpreter.write_bytes(b"MZ")
+        interpreter.chmod(0o755)  # X_OK is real on the POSIX test host
+
+        with patch("kiro_crew.agent._resolve_kirocrew_bin", return_value=str(shim)):
+            cmd, args = _kirocrew_mcp_invocation("mcp-cron")
+        assert cmd == str(interpreter)
+        # -P keeps the spawn CWD off sys.path (the bundle interpreter is
+        # pinned 3.12, so the 3.11+ flag is safe); -s drops user site-packages.
+        assert args == ["-P", "-s", "-m", "kiro_crew", "mcp-cron"]
+
+    def test_cmd_shim_without_interpreter_falls_back_to_sys_executable(self, tmp_path: Path):
+        """Corrupted bundle: shim present but python.exe missing -> sys.executable."""
+        from kiro_crew.agent import _kirocrew_mcp_invocation
+
+        root = tmp_path / "kirocrew-backend"
+        (root / "bin").mkdir(parents=True)
+        shim = root / "bin" / "kirocrew.cmd"
+        shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -s -m kiro_crew %*\r\n')
+
+        with patch("kiro_crew.agent._resolve_kirocrew_bin", return_value=str(shim)):
             cmd, args = _kirocrew_mcp_invocation("mcp-core")
         assert cmd == sys.executable
         assert args == ["-m", "kiro_crew", "mcp-core"]

@@ -770,6 +770,21 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "shared tag-creation path. Names are passed through redact_credentials "
         "and redact_exfiltration_urls before resolution or persistence.",
     ),
+    (
+        "Session-pulse survey feedback (Aperture egress)",
+        "dashboard/handlers/feedback.py",
+        "The free-text `feedback` field submitted via POST /api/feedback/submit is "
+        "forwarded to Aperture, a third-party AWS service, so it is a genuine "
+        "external egress boundary — a user typing a credential or exfiltration URL "
+        "while describing their experience would otherwise leave the host "
+        "unredacted. `_customer_responses` runs it through redact_exfiltration_urls "
+        "then redact_credentials before it is included in the outbound payload. "
+        "`email` is run through that SAME pass (redact_exfiltration_urls then "
+        "redact_credentials) because a user could paste a credential into it; its "
+        "`pii: True` marker is a separate Aperture disclosure flag, not a "
+        "substitute for redaction. `rating` (a fixed frontend enum) is not run "
+        "through this pass.",
+    ),
 )
 
 # Modules that call a redactor but are NOT an output egress boundary, so they do
@@ -786,6 +801,12 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # goes out to a human.
         "context.py",
         "agent.py",
+        # Gate-side log hygiene: the update provider redacts an update command's
+        # stderr before writing it to the gateway log. It is a boot-time
+        # operational log line, not an output boundary bound for a human or a
+        # third party — the redaction is defensive so a credential-bearing
+        # installer error cannot leak into the log ring / /api/logs stream.
+        "platform/update_provider.py",
         # The shared recursive redactor helper itself — a pure scrubber, not an
         # egress boundary; the modules that CALL it (mochi routes/hooks) are the
         # registered sinks.
@@ -842,6 +863,14 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # rather than an egress boundary — the slot title's user-visible surface
         # is already covered by the registered dashboard sinks.
         "apps/builtins/issue_radar/backend/crew_runtime.py",
+        # Log/audit hygiene, not an egress boundary: strips ``user:password@`` from
+        # an external registry's clone URL before it reaches the SEL credential-grant
+        # record and the warning logs. The URL is index-supplied, so it can carry a
+        # token; scrubbing it keeps the secret out of a persisted audit trail. It is
+        # not an output bound for a human or a third party, and the value that DOES
+        # reach a dashboard client (``GET /api/apps/registries``) is protected by
+        # refusing a credential-bearing repo outright rather than by redacting it.
+        "apps/registry.py",
         # Internal persistence / indexing (the on-disk or in-memory copy), whose
         # user-visible surface is already covered by a registered sink.
         "dashboard/chat_folders.py",
@@ -1020,12 +1049,15 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # are the app's own surface, same classification as its siblings above.
         "apps/builtins/code_review_sage/sage_lib/store.py",
         "apps/builtins/code_review_sage/sage_lib/discovery.py",
-        # `chat_session` scrubs every turn of a post-review conversation at its
-        # serialization boundary: the reviewer can repeat a credential it read in
-        # the diff, and a tool title carries the arguments it was called with. Same
-        # classification as its siblings — the app's own surface, rendered by this
-        # app's panel, not a core egress path.
-        "apps/builtins/code_review_sage/sage_lib/chat_session.py",
+        # `followup` scrubs every turn of a review's stored question history at
+        # its read boundary: the reviewer can repeat a credential it read in the
+        # diff, a tool title carries the arguments it was called with, and it can
+        # write that file itself. `backend/routes` scrubs the reviewed pull
+        # request's title before it becomes a chat session's name. Same
+        # classification as their siblings — the app's own surface, rendered by
+        # this app's panel, not a core egress path.
+        "apps/builtins/code_review_sage/sage_lib/followup.py",
+        "apps/builtins/code_review_sage/backend/routes.py",
         "apps/builtins/dev_fleet/server.py",
         "apps/builtins/issue_radar/backend/routes.py",
         "apps/builtins/meetings/backend/domain/session.py",

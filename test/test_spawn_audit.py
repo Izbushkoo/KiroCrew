@@ -87,7 +87,7 @@ _SPAWN_BASES = {"subprocess", "asyncio"}
 # Spawn helpers called as a BARE NAME rather than ``module.attr`` -- they are
 # imported directly, so the receiver check above cannot see them. Without this
 # the audit goes blind the moment a call site moves to the wrapper.
-_SPAWN_NAMES = {"create_subprocess_limited"}
+_SPAWN_NAMES = {"create_subprocess_limited", "run_limited", "popen_limited"}
 
 # Tokens whose presence anywhere in the enclosing function marks the spawn as
 # routed through the sandbox chokepoint. ``_prepare_sandboxed_spawn`` is the
@@ -110,14 +110,20 @@ _ROUTED_TOKENS = (
 # ``create_subprocess_limited`` (async) and ``run_limited`` / ``popen_limited``
 # (sync) are the preferred forms: they deliver the same limits AFTER exec via the
 # spawn shim instead of in a fork child of this threaded gateway. The two
-# ``*_preexec`` names remain valid only for the spawns that have not moved yet --
-# the builtin app backends and the standalone deploy scripts.
+# ``*_preexec`` names remain valid for the wrappers' own no-shim fallbacks and
+# the terminal's pre-resolved ioctl callback.
+#
+# Every token is matched as a CALL (trailing paren) rather than a bare name: the
+# check scans the enclosing function's raw source, docstrings and comments
+# included, so a bare-name match lets prose like "routed through run_limited"
+# satisfy the gate while the actual spawn silently reverts to a bare
+# ``subprocess.run`` (verified by mutation before the parens were added).
 _PREEXEC_TOKENS = (
-    "create_subprocess_limited",
-    "run_limited",
-    "popen_limited",
-    "resource_limit_preexec",
-    "session_host_preexec",
+    "create_subprocess_limited(",
+    "run_limited(",
+    "popen_limited(",
+    "resource_limit_preexec()",
+    "session_host_preexec(",
 )
 
 # Routed functions exempt from the resource-limit requirement: the enclosing
@@ -142,6 +148,14 @@ PREEXEC_EXEMPT: frozenset[str] = frozenset(
         # futex, never exec'd, never exited, and pinned every fd it inherited --
         # including gateway.lock and the dashboard listener.
         "kiro_prerequisite.py::_run_process",
+        # Spawns NOTHING. It PATCHES `sandboxed_spawn_argv` and raises from the
+        # replacement, so the argv is captured at the boundary and no child is ever
+        # created -- but the name appears in the function body, which is what this scan
+        # matches on. A resource ceiling has nothing to apply to. Deliberately NOT in
+        # BENIGN_SPAWNS: that set is for an UNROUTED spawn, and the staleness check
+        # correctly rejects this key there.
+        "apps/builtins/ops_mission_control/tests/test_ledger_sync_git.py"
+        "::test_every_git_invocation_carries_the_identity",
     }
 )
 
@@ -233,7 +247,14 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # ``capabilities.tailnet_origin`` ceiling at the enforcement call, and
         # never reached from a tool dispatch path.
         "dashboard/tailnet_serve.py::_run",
-        "apps/backend.py::_proc_start_time",
+        # PID-reuse guard for the app-backend reap, moved out of
+        # ``apps/backend.py::_proc_start_time`` so Windows gets a real answer
+        # instead of a blanket None. Only the macOS/other-POSIX arm spawns, and
+        # it is the same fixed ``ps -o lstart= -p <pid>`` argv the backend used
+        # before: no shell, the binary comes from ``trusted_system_bin`` rather
+        # than PATH, and the sole interpolated value is a pid the gateway itself
+        # recorded, rendered through ``str()``. Nothing here is agent-influenced.
+        "platform_compat.py::process_start_time",
         "apps/backend.py::_resolve_nvm_path",
         "apps/backend.py::stop_app_backend",
         # py-spy attach for `kirocrew perf sample --pid`: fixed list-argv (no
@@ -483,6 +504,11 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # Same classification as the other ``asyncio.run`` sites in this list
         # (cli_doctor.py::_doctor, cli_commands.py::_cleanup_app_crons_from_scheduler).
         "apps/builtins/issue_radar/tests/test_pr_actions.py::_await",
+        # Same construct, same classification, for the assignee-route tests: an
+        # ``asyncio.run`` that drives one in-process aiohttp handler coroutine to
+        # completion. No child process, and every payload is a literal in the test
+        # file.
+        "apps/builtins/issue_radar/tests/test_assignees.py::_await",
         # md-notebook shells out to the real git binary rather than a pure-Python
         # implementation, because a server refuses a push from the shallow clone
         # isomorphic-git produces. The command is the literal "git"; the remote
@@ -555,6 +581,24 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # git rev-parse at startup, no agent input, no sandbox needed).
         "apps/builtins/dev_fleet/server.py::_resolve_primary_checkout",
         "apps/builtins/dev_fleet/server.py::worker",
+        # dep_sync stands in for `pip install -e .` on a checkout whose console
+        # script is locked, and it spawns the same shapes that step did:
+        # `<target python> -c <fixed metadata/version probe>` and `<target python>
+        # -m pip install <requirements the merged revision declares>`. It spawns no
+        # git at all -- it runs after the merge, so it reads the declarations
+        # straight from the working tree. The interpreter is the target repo's own
+        # venv python (handed down, never resolved from PATH here); the repo comes
+        # from the operator-configured checkout, and the requirement specs are read
+        # from that checkout's own declarations -- the same ones `pip install -e .`
+        # would have read, so this adds no surface the step it replaces did not
+        # already have. Routing here would also NEST sandboxes: dep_sync runs as a
+        # sync step, which server.py::worker already wrapped through
+        # sandboxed_spawn_argv, and a filesystem-scoped wrapper around pip would
+        # block the venv writes that are the point of the step.
+        "apps/builtins/dev_fleet/dep_sync.py::interpreter_version",
+        "apps/builtins/dev_fleet/dep_sync.py::installed_console_script_target",
+        "apps/builtins/dev_fleet/dep_sync.py::installed_package_origin",
+        "apps/builtins/dev_fleet/dep_sync.py::main",
         # Foreground last-resort restart (Make Live on hosts with no drivable
         # service manager): a detached `kirocrew restart --port <marker port>`,
         # fixed argv whose binary is validated (basenamed kirocrew, absolute,
@@ -614,6 +658,18 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "cli_commands.py::_register_app_crons_to_scheduler",
         "cli_doctor.py::_doctor",
         "cli_doctor.py::_doctor_mcp_tools",
+        # Read-only diagnostic for the Source Checkout section: ``git -C <repo>
+        # rev-parse/rev-list`` with a hardcoded argv whose only variable is the
+        # install's own source directory (derived from the package's module
+        # path, never agent-supplied). The binary itself is pinned via
+        # ``platform_compat.trusted_system_bin("git")`` with a Windows-only
+        # fallback to the fixed Git for Windows install roots under Program
+        # Files (literal paths, never ``%ProgramFiles%`` — the environment is
+        # exactly what the pin declines to trust); a miss on both means no
+        # spawn at all. Operator-invoked doctor, 10s-capped, queries only — no
+        # fetch, no mutation. Same classification as the other fixed-argv
+        # doctor probes (``_detect_userspace_oom_killer``, ``_detect_linger``).
+        "cli_doctor.py::_git_line",
         # NOT a subprocess spawn here: the AST heuristic matches ``asyncio.run``
         # (attr ``run`` on base ``asyncio``), used only to drive the async KAS
         # token probe from the synchronous doctor. The actual child process is
@@ -845,6 +901,21 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "session_pid.py::find_orphan_mcp_candidates",
         "session_pid.py::kill_orphan_mcps",
         "slack/gateway.py::_auto_apply_update",
+        # Wheel/cli.sh auto-update: runs the signed installer command
+        # (composed locally from a validated channel name and https-pinned
+        # artifact base, never from feed data). The child is the cli.sh
+        # installer, which performs its own RSA-SHA256 signature verification.
+        # NOT sandbox-routed because the installer must write to the managed
+        # venv and symlink ~/.local/bin/kirocrew.
+        "slack/gateway.py::_auto_apply_wheel_update",
+        # Pluggable update provider: CommandProvider runs operator-configured
+        # shell commands from security_policy.json or config.json (sensitive
+        # home dirs the agent cannot write). The check command probes for a
+        # newer version; the apply command performs the update. Both are
+        # operator-authored, not agent-influenced. NOT sandbox-routed because
+        # the command must reach the host's package manager / registry.
+        "platform/update_provider.py::check",
+        "platform/update_provider.py::apply",
         "slack/gateway.py::_check_missing_deps",
         # The kiro-cli version probe, extracted from _init_services (issue
         # #3051). Fixed argv ("kiro-cli --version"), no agent-influenced

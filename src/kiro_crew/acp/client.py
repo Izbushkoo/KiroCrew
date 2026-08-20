@@ -42,7 +42,12 @@ from kiro_crew.acp._dispatch import (
     parse_session_modes,
     parse_usage_update,
 )
-from kiro_crew.acp.liveness import VERDICT_UNKNOWN, VERDICT_WORKING, LivenessOracle
+from kiro_crew.acp.liveness import (
+    VERDICT_WORKING,
+    LivenessOracle,
+    _consume_future_exception,
+    consult_offloaded,
+)
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
@@ -121,6 +126,7 @@ from kiro_crew.mcp_gateway.session_servers import pooled_session_servers
 from kiro_crew.resource_status import inject_xdist_auto_cap
 from kiro_crew.sandbox import (
     RLIMIT_PROFILE_SESSION_HOST,
+    apply_windows_resource_ceiling,
     cgroup_scope_argv,
     create_subprocess_limited,
     scrub_agent_denied_env,
@@ -834,18 +840,6 @@ _SEL_AUDIT_TIMEOUT_SECONDS = 5.0
 _JSONRPC_METHOD_NOT_FOUND = -32601
 
 
-def _consume_future_exception(future: asyncio.Future[tuple[str, str]]) -> None:
-    """Retrieve a liveness consult's exception so asyncio does not report it.
-
-    The /proc walk keeps running after its awaiter goes away, so it can finish
-    with an exception nobody reads. ``Future.__del__`` reports that through the
-    loop exception handler, which the gateway records as an unhandled-asyncio
-    crash for what is an ordinary probe failure.
-    """
-    if not future.cancelled():
-        future.exception()
-
-
 # Legacy kiro permission options omit the spec-mandated `kind` field. Only
 # synthesize a kind for these well-known literals — unknown ids stay empty
 # so we don't fabricate intent the agent didn't express.
@@ -1046,16 +1040,33 @@ _RE_SESSION_EXPIRED = re.compile(
     r"|re-?authenticate|login\s+required|auth(?:entication)?\s+required)\b",
     re.IGNORECASE,
 )
+# Credential REJECTED rather than expired. Switching the active Kiro account
+# invalidates the credential a long-lived kiro-cli child still holds, and the
+# upstream rejection reports only that the bearer token is invalid: it carries
+# no status code and never uses expiry wording, so neither _RE_AUTH_STATUS nor
+# _RE_SESSION_EXPIRED matches it and the failure reaches the user as the raw
+# upstream string with no sign-in affordance. Grouped with session expiry
+# because the remedy is identical — sign in again; no retry can make a rejected
+# credential valid. The gap between the two words is fenced to one sentence and
+# one line so the pattern cannot span unrelated errors in a combined haystack.
+_RE_INVALID_BEARER = re.compile(
+    r"\b(?:bearer\s+token\b[^.\n]{0,80}?\binvalid|invalid\s+bearer\s+token)\b",
+    re.IGNORECASE,
+)
 
 
 def _is_session_expired(haystack: str) -> bool:
-    """True when the failure is an expired session rather than a backend fault.
+    """True when the session credential is expired or rejected, not a backend fault.
 
-    Both signals are terminal: retrying cannot refresh a login. Checked before
-    the 5xx family so an aborted request's transport error does not shadow the
-    real cause.
+    All three signals are terminal: retrying can neither refresh a login nor
+    revive a credential the upstream has rejected. Checked before the 5xx family
+    so an aborted request's transport error does not shadow the real cause.
     """
-    return bool(_RE_AUTH_STATUS.search(haystack) or _RE_SESSION_EXPIRED.search(haystack))
+    return bool(
+        _RE_AUTH_STATUS.search(haystack)
+        or _RE_SESSION_EXPIRED.search(haystack)
+        or _RE_INVALID_BEARER.search(haystack)
+    )
 
 
 # Account/plan capacity is EXHAUSTED — terminal. Distinct from a throttle: a
@@ -1729,6 +1740,92 @@ def _get_start_time(pid: int) -> int | None:
         return None
 
 
+def finish_suspended_spawn(process: asyncio.subprocess.Process, pid: int, *, label: str) -> None:
+    """Apply the Windows resource ceiling to a just-spawned child, then resume it.
+
+    **Call this from an executor, never inline on the event loop.** On Windows it
+    reads the config file (through ``apply_windows_resource_ceiling``) and walks
+    two Toolhelp snapshots — the process table for the ownership check and the
+    system-wide THREAD table to resume — so a slow config store or a loaded
+    machine would otherwise stall every other session on that loop. Both ACP
+    spawn sites wrap it in ``run_in_executor(subprocess_executor(), ...)``. It
+    stays synchronous rather than becoming a coroutine because every step is
+    blocking ctypes work with no await point to offer.
+
+    Both ACP spawn sites (:meth:`AcpClient._spawn` and ``AcpRuntime._spawn``)
+    create the session host with ``creationflags |=
+    platform_compat.CREATE_SUSPENDED`` and call this immediately afterwards. On
+    POSIX every step is a no-op — ``CREATE_SUSPENDED`` is 0 there, so the child
+    was never suspended — which keeps one code path for both platforms.
+
+    Why suspended: ``cgroup_scope_argv`` is a no-op on Windows (no systemd), so
+    without this the agent and every MCP server it spawns would run with NO
+    fork-bomb and NO memory-DoS ceiling. A Job object cannot be an argv prefix,
+    so it must be attached to a live pid — and job membership covers a member's
+    FUTURE descendants only. Attaching to an already-running kiro-cli would
+    therefore leave a window in which it could spawn an MCP server that escapes
+    the ceiling. ``CREATE_SUSPENDED`` closes that window by construction: the
+    child has not executed a single instruction, so it provably has no
+    descendants. Assign the job, then resume.
+
+    A resume failure is FATAL, but only when the child is actually there: a
+    process that exists yet cannot be resumed is alive-but-frozen, and letting it
+    masquerade as a running agent would hang the session on the ACP handshake
+    with no diagnosis. Kill it and raise instead. If the pid is already gone
+    there is nothing frozen to worry about — it exited on its own — so note it
+    and let the handshake surface the real error.
+
+    The ceiling itself fails SOFT (``apply_windows_resource_ceiling`` logs a
+    SECURITY warning and returns False): a missing ceiling must not break the
+    gateway. Only the resume may abort the spawn, which is why it runs from a
+    ``finally`` — a raising ceiling must still leave the child resumed or killed,
+    never frozen.
+
+    The two DESTRUCTIVE steps are gated on confirmed ownership: the pid's parent
+    must be this process. A Job object would impose a process and memory ceiling
+    on a stranger, and the unresumable branch KILLS what it is holding, so
+    neither may ever act on a pid we did not create. The resume itself is NOT
+    gated, because ``ResumeThread`` on a thread that is not suspended is a
+    documented no-op (its suspend count is already 0) — and leaving our own child
+    frozen would hang the session forever on the handshake with no diagnosis.
+    That asymmetry is deliberate: an unconfirmed pid loses only its ceiling,
+    which already fails soft by contract, while nothing can wedge or die by
+    mistake.
+    """
+    owned = not platform_compat.IS_WINDOWS or platform_compat.get_ppid(pid) == os.getpid()
+    try:
+        if owned:
+            apply_windows_resource_ceiling(pid)
+        else:
+            logger.debug(
+                "PID %d is not a confirmed child of this process; skipping the Windows "
+                "resource ceiling rather than bounding a foreign process",
+                pid,
+            )
+    finally:
+        if platform_compat.IS_WINDOWS and not platform_compat.resume_process_main_thread(pid):
+            if owned and platform_compat.pid_exists(pid):
+                logger.error(
+                    "Could not resume suspended %s (PID %d); killing it rather than "
+                    "leaving a frozen process that looks like a live agent",
+                    label,
+                    pid,
+                )
+                try:
+                    process.kill()
+                except Exception:
+                    logger.debug("kill of unresumable child failed", exc_info=True)
+                raise AcpError(
+                    f"failed to resume {label} (PID {pid}) after applying Windows "
+                    f"Job object resource limits"
+                )
+            logger.debug(
+                "Nothing to resume for PID %d — it is gone, or not ours to kill; the "
+                "handshake will report the real failure",
+                pid,
+            )
+
+
 def _read_basename(pid: int) -> bytes | None:
     """Read the executable basename for a PID (platform-aware).
 
@@ -1863,34 +1960,49 @@ def _make_unified_diff(old: str, new: str, path: str, max_len: int = 6000) -> st
     return "".join(udiff).rstrip()[:max_len]
 
 
-def _select_tool_title(title: object, raw_input: object, kind: object = None) -> str | None:
+def _select_tool_title(
+    title: object,
+    raw_input: object,
+    kind: object = None,
+    *,
+    is_shell: bool | None = None,
+) -> str | None:
     """Pick the pill label, preferring a human-readable `description` when present.
 
     Some backends' Bash tool emits a `description` field alongside `command`
     (e.g. "List KiroCrew ACP module files" rather than `ls /workplace/...`).
-    We surface it on the pill when supplied; otherwise we fall back to the
-    SDK-provided `title` (the literal tool invocation). Used by both
+    We surface it on the pill when supplied, then the literal shell command for
+    a shell tool, and only then the SDK-provided `title`. Used by both
     `_extract_tool_event` (initial tool_call) and
     `_extract_tool_call_refinement` (the second-phase tool_call_update from
     claude-agent-acp) so the title rule stays consistent across both events.
+
+    The command outranks `title` because backends disagree on what `title`
+    holds for a shell call: some send the invocation itself, others a generic
+    kind label ("Run Command") that names no command at all. A genuinely
+    human-readable label arrives as `description`, which still wins.
+
+    `is_shell` overrides the kind-derived classification for a caller holding a
+    RESOLVED signal — a tool_call_update may omit `kind` entirely, and reading
+    that absence as non-shell would put the generic title back on a pill the
+    initial tool_call had already labelled with its command.
     """
     if isinstance(raw_input, dict):
         desc = raw_input.get("description")
         if isinstance(desc, str) and desc.strip():
             return desc
+    kind_str = kind if isinstance(kind, str) else None
+    shell = _is_shell_kind(kind_str) if is_shell is None else is_shell
+    # Shell kinds only, so an fs tool's operation name ("strReplace") is never
+    # mistaken for a command.
+    if shell and isinstance(raw_input, dict):
+        cmd = raw_input.get("command")
+        if isinstance(cmd, str) and cmd.strip():
+            return cmd
     # The flat title field defaults to an "unknown" sentinel when a backend
     # omits it; treat that (and blanks) as absent rather than surfacing it.
     if isinstance(title, str) and title and title != "unknown":
         return title
-    # Some backends omit the SDK title for a shell/exec tool and carry only the
-    # command in rawInput. Surface it for shell kinds only (so an fs tool's
-    # operation name is never mistaken for a command) instead of a bare kind
-    # label like "Run Command".
-    kind_str = kind if isinstance(kind, str) else None
-    if _is_shell_kind(kind_str) and isinstance(raw_input, dict):
-        cmd = raw_input.get("command")
-        if isinstance(cmd, str) and cmd.strip():
-            return cmd
     return None
 
 
@@ -2690,15 +2802,28 @@ class AcpClient:
             creationflags=(
                 platform_compat.CREATE_NEW_PROCESS_GROUP
                 | platform_compat._SUBPROCESS_NO_WINDOW
+                | platform_compat.CREATE_SUSPENDED
             ),
             profile=RLIMIT_PROFILE_SESSION_HOST,
         )
         self._pid = self._process.pid
-        self._start_time = await asyncio.get_running_loop().run_in_executor(
-            subprocess_executor(), _get_start_time, self._pid
-        )
         _spawn_label = (
             "claude-agent-acp" if self._is_claude else f"{KIRO_CLI_BIN} {KIRO_CLI_SUBCMD}"
+        )
+        # Windows resource ceiling, applied while the child is still SUSPENDED,
+        # then resumed. No-op on POSIX (CREATE_SUSPENDED is 0 there). OFFLOADED
+        # because the Windows path reads the config file and walks the process
+        # and thread tables (see the note on finish_suspended_spawn); the child
+        # is frozen until it returns, so this is the one await the spawn cannot
+        # skip.
+        await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(),
+            functools.partial(
+                finish_suspended_spawn, self._process, self._pid, label=_spawn_label
+            ),
+        )
+        self._start_time = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), _get_start_time, self._pid
         )
         logger.info("Spawned %s (PID %d)", _spawn_label, self._pid)
         # Track root PID and do an early descendant scan.  kiro-cli forks
@@ -3936,45 +4061,21 @@ class AcpClient:
           path has it too); tighter per-branch attribution belongs in
           ``liveness.py``, shared by both callers, not here.
 
-        A timed-out await does not stop its executor thread. Keep that future
-        until the /proc walk finishes and return UNKNOWN on intervening polls,
-        bounding this client to one outstanding consult job per turn.
-        ``_prompt_loop`` retires it at turn start under ``_turn_lock``, so a walk
-        abandoned by one turn never gates the next (at the cost of one abandoned
-        worker per turn, versus one per silent read before this guard existed).
+        A timed-out await does not stop its executor thread. The one-outstanding-
+        walk bound, the refused-submission-reads-UNKNOWN contract, and exception
+        retrieval all live in the shared :func:`consult_offloaded` guard.
+        ``_prompt_loop`` retires the tracked future at turn start under
+        ``_turn_lock``, so a walk abandoned by one turn never gates the next (at
+        the cost of one abandoned worker per turn, versus one per silent read
+        before this guard existed).
         """
-        prior = self._consult_future
-        if prior is not None:
-            if not prior.done():
-                return VERDICT_UNKNOWN, "prior consult still in flight"
-            # wait_for cancels shield's outer future, and shield detaches its
-            # inner-done callback in exactly that case. The submission-time
-            # callback below handles that normal path; this consume additionally
-            # covers an already-completed future that never went through it.
-            _consume_future_exception(prior)
-
-        try:
-            # Submission stays inside the guard: the caller is a silent-read poll
-            # in _prompt_loop, so a refused executor job (shut down during
-            # teardown, thread creation refused under load) must read as UNKNOWN
-            # rather than abort the live turn.
-            loop = asyncio.get_running_loop()
-            future = loop.run_in_executor(
-                subprocess_executor(),
-                self._liveness_oracle.check_model_wait,
-                getattr(self, "_pid", None),
-            )
-            # Attach at SUBMISSION, not only where a later poll or _reset_state
-            # observes it: a turn that reaches the stale cutoff returns with this
-            # walk still running, and an idle client may never look again.
-            # Retrieval is not destructive, so the await below still sees the
-            # result.
-            future.add_done_callback(_consume_future_exception)
-            self._consult_future = future
-            return await asyncio.wait_for(asyncio.shield(future), timeout=10.0)
-        except Exception:
-            logger.debug("liveness consult failed/timed out", exc_info=True)
-            return VERDICT_UNKNOWN, "oracle offload error"
+        return await consult_offloaded(
+            self,
+            self._liveness_oracle.check_model_wait,
+            (getattr(self, "_pid", None),),
+            executor_factory=subprocess_executor,
+            log_label="liveness consult",
+        )
 
     # ── Public API ──
 
@@ -5140,7 +5241,7 @@ class AcpClient:
                 # Cache the trusted tool name too, so the permission event can
                 # rebuild mcp__<server>__<tool> for per-tool governance.
                 self._tool_call_tool_name[tool_call_id] = _kiro_tool_name(update)
-            title = _select_tool_title(title, raw_input, kind) or ""
+            title = _select_tool_title(title, raw_input, kind, is_shell=is_shell) or ""
             if title:
                 title, _ = redact_exfiltration_urls(title)
                 title, _ = redact_credentials(title)
@@ -5294,10 +5395,26 @@ class AcpClient:
             input_str, _ = redact_exfiltration_urls(input_str)
             input_str, _ = redact_credentials(input_str)
             self._tool_call_inputs[tool_use_id] = input_str
+        # Refresh the cached shell signal only when this refinement carries a
+        # kind. A refinement that omits kind must NOT clobber a True cached by
+        # the initial tool_call notification (kind is optional on updates).
+        # Cache off the RAW kind, not the redacted kind_str. Resolved BEFORE the
+        # title so the label rule sees the real classification rather than a
+        # missing kind.
+        if isinstance(kind, str) and kind:
+            self._tool_call_is_shell[tool_use_id] = _is_shell_kind(kind)
+        is_shell = self._tool_call_is_shell.get(tool_use_id, False)
         # Prefer rawInput.description over the SDK-supplied title (e.g.
         # Bash's "List KiroCrew ACP module files" rather than `ls /workplace/...`).
         # Same helper as `_extract_tool_event` so the rule is consistent.
-        title_source = _select_tool_title(title, raw_input, kind)
+        # A refinement carrying a title but no rawInput still overwrites the
+        # pill, so the command has to be recoverable from the params the initial
+        # tool_call cached — otherwise a backend that sends a generic title on
+        # both events lands that label on a pill the first event got right.
+        _title_params: object = raw_input
+        if not (isinstance(raw_input, dict) and raw_input):
+            _title_params = self._tool_call_params.get(tool_use_id)
+        title_source = _select_tool_title(title, _title_params, kind, is_shell=is_shell)
         title_str = ""
         if title_source:
             title_str, _ = redact_exfiltration_urls(title_source)
@@ -5316,13 +5433,6 @@ class AcpClient:
         if purpose:
             purpose, _ = redact_exfiltration_urls(purpose)
             purpose, _ = redact_credentials(purpose)
-        # Refresh the cached shell signal only when this refinement carries a
-        # kind. A refinement that omits kind must NOT clobber a True cached by
-        # the initial tool_call notification (kind is optional on updates).
-        # Cache off the RAW kind, not the redacted kind_str.
-        if isinstance(kind, str) and kind:
-            self._tool_call_is_shell[tool_use_id] = _is_shell_kind(kind)
-        is_shell = self._tool_call_is_shell.get(tool_use_id, False)
         return AcpEvent(
             kind=EVENT_TOOL_CALL_UPDATE,
             title=title_str,

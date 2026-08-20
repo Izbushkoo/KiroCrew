@@ -1,6 +1,7 @@
 import { copyToClipboard } from '../utils/clipboard'
 import { resizeImageForModel, type ResizeInfo } from '../utils/resizeImage'
 import type {
+  ChatSlot,
   IssueSource,
   McpApplyChange,
   PullRequestCheck,
@@ -10,6 +11,7 @@ import type {
   SessionDoc,
   SessionInventoryDetail,
   SessionInventoryList,
+  SessionLaneKey,
   SessionStorageCleanup,
   SessionStorageReport,
   SessionTrashResult,
@@ -22,6 +24,7 @@ import { queryClient } from './queryClient'
 import { getStoredConsent } from '../utils/themeConsent'
 import { recordError, parseErrorCode, requestPath } from '../utils/errorReport'
 import { i18nT } from '../i18n/t'
+import { normalizeInstalledApp, normalizeInstalledApps } from '../components/appstore/types'
 import { TAB_ID } from './tabId'
 
 /**
@@ -71,8 +74,33 @@ export type McpShareReason = {
  */
 export type McpShareRecommendation = {
   strength: string
+  // Two axes, not one verdict. `recommendStub` is the safe half — Kiro Crew's
+  // stub in the path, backend still 1:1 with the session — while
+  // `recommendShare` is the one that introduces co-tenancy. A bulk action has to
+  // consult whichever one the global sharing switch makes true of a click.
+  recommendStub: boolean
   recommendShare: boolean
   reasons: McpShareReason[]
+}
+
+/**
+ * Where an operator-requested measurement pass got to.
+ *
+ * ``running`` is the only field a caller may branch on to decide whether to keep
+ * polling: ``done`` and ``total`` are a readout, and both are 0 both before a
+ * pass starts and when a pass found nothing to measure. ``error`` names the
+ * exception class of a pass that stopped early, because a pass that dies
+ * silently is indistinguishable from one that finished with nothing to do.
+ */
+export type McpMeasureProgress = {
+  running: boolean
+  // Servers attempted, which is what the progress line advances on.
+  done: number
+  // How many of those produced a verdict. Lower than `done` whenever a pre-flight
+  // could not run, so any claim about the outcome is built from this one.
+  measured: number
+  total: number
+  error?: string
 }
 
 export type McpManagedServer = {
@@ -84,6 +112,12 @@ export type McpManagedServer = {
   agents: string[]         // agent configs that declare this server
   transport: string        // "stdio" (stubbable) or "http" (no stdio pipe to interpose on)
   denylisted: boolean      // in UNPOOLABLE_SERVERS — can never be pooled
+  // True when stubbing this server cannot produce a SHARED backend anyway: the
+  // rewriter leaves an env-declaring entry unwrapped rather than spawn a pooled
+  // backend without a declared key. Optional for the same reason as
+  // `recommendation` — an older gateway does not send it, and its absence must
+  // read as "no obstacle known", not as an obstacle.
+  pooling_blocked_by_env?: boolean
   // Optional because the field is only as old as the shareability detector: a
   // dashboard served from this build can be pointed at an older gateway (Make
   // Live to an earlier worktree), and a row with no verdict must read as "not
@@ -548,6 +582,10 @@ export interface GovernancePolicyData {
    *  Rendered so a reader can see that a host row's "disabled" is one surface's
    *  posture, not the whole install's. */
   other_bound_surfaces?: string[]
+  /** True when the resolved profile is a deny-all fallback because the file
+   *  could not be read or parsed — enforcement is correct (fail-closed) but the
+   *  operator should know the ceiling is synthetic, not intentional. */
+  fallback_profiles?: string[]
   /** True when governance resolution failed — the viewer shows a soft notice. */
   unavailable: boolean
   scopes: GovernanceScope[]
@@ -953,8 +991,14 @@ function trackArtifactWrite(url: string, res: Promise<Response>): Promise<Respon
   return res.finally(() => endArtifactWrite(slug))
 }
 
+/** Precondition header for a steering workspace write. Omitted when the caller
+ *  has no project key, which the server treats as fail-closed for `workspace/`
+ *  keys — an absent view is not an agreeing one. */
+const projectHeader = (projectKey?: string): HeadersInit | undefined =>
+  projectKey ? { 'X-Steering-Project': projectKey } : undefined
+
 const get = (url: string) => fetch(url, { headers: { ..._sk } })
-const post = (url: string, body?: object, sessionKey?: string) =>
+const post = (url: string, body?: object, sessionKey?: string, extra?: HeadersInit) =>
   trackArtifactWrite(url, fetch(url, {
     method: 'POST',
     // sessionKey overrides the shared `dashboard:ui` placeholder with the REAL
@@ -962,13 +1006,15 @@ const post = (url: string, body?: object, sessionKey?: string) =>
     // actual session, so a restricted (incognito) slot was never recognised as
     // restricted and its writes were allowed through. Callers acting on behalf
     // of a specific chat slot must pass it.
-    headers: { 'Content-Type': 'application/json', ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk) },
+    // `extra` carries a per-call precondition header (a view the server must
+    // still agree with) without every caller re-implementing the header merge.
+    headers: { 'Content-Type': 'application/json', ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk), ...extra },
     body: body ? JSON.stringify(body) : undefined,
   }))
-const put = (url: string, body: object) =>
-  trackArtifactWrite(url, fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify(body) }))
-const del = (url: string, body?: object) =>
-  trackArtifactWrite(url, fetch(url, { method: 'DELETE', headers: body ? { 'Content-Type': 'application/json', ..._sk } : _sk, body: body ? JSON.stringify(body) : undefined }))
+const put = (url: string, body: object, sessionKey?: string, extra?: HeadersInit) =>
+  trackArtifactWrite(url, fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json', ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk), ...extra }, body: JSON.stringify(body) }))
+const del = (url: string, body?: object, sessionKey?: string, extra?: HeadersInit) =>
+  trackArtifactWrite(url, fetch(url, { method: 'DELETE', headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk), ...extra }, body: body ? JSON.stringify(body) : undefined }))
 const patch = (url: string, body: object, sessionKey?: string) =>
   trackArtifactWrite(url, fetch(url, {
     method: 'PATCH',
@@ -1661,6 +1707,7 @@ export const api = {
     tasks: {
       id: string; task: string; agent: string; parent: string
       rss_mb: number; peak_rss_mb: number; cpu_cores: number
+      procs: number | null; mcp: number | null
       started_at: number; shared: boolean; pid: number | null; sampled: boolean
     }[]
     totals: {
@@ -1713,6 +1760,10 @@ export const api = {
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/reasoning-effort', { reasoning_effort }).then(j),
   chatSlotWorkspace: (slot: string, workspace: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/workspace', { workspace }).then(j),
+  // Relaunch the slot's agent process in place (fresh agent spec, env, and MCP
+  // servers; conversation preserved). 409 while a turn is in flight.
+  chatSlotReload: (slot: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/reload', {}).then(j) as Promise<{ ok?: boolean; error?: string }>,
   chatSlotProject: (slot: string, project: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/project', { project }).then(j),
   // Follow-up card: create a sibling git worktree of `repo` on a new `branch`.
@@ -1732,6 +1783,7 @@ export const api = {
   projectGit: (path: string) => fetch('/api/project/git?path=' + encodeURIComponent(path)).then(j) as Promise<{ path: string; repo: boolean; repoRoot?: string; branch?: string; detached?: boolean; head?: string }>,
   projectGitStatus: (path: string) => fetch('/api/project/git/status?path=' + encodeURIComponent(path)).then(j) as Promise<{ repo: boolean; repoRoot?: string; branch?: string; ahead?: number; behind?: number; files: { path: string; status: string; staged: boolean; additions?: number; deletions?: number }[] }>,
   projectGitLog: (path: string, limit = 20) => fetch('/api/project/git/log?path=' + encodeURIComponent(path) + '&limit=' + limit).then(j) as Promise<{ repo: boolean; commits: { sha: string; message: string; author: string; date: string; isHead: boolean }[] }>,
+  projectTree: (path: string) => fetch('/api/project/tree?path=' + encodeURIComponent(path)).then(j) as Promise<{ root: string; paths: string[]; repo: boolean; truncated?: boolean }>,
   workspaces: () => fetch('/api/workspaces').then(j),
   createWorkspace: (body: object) => post('/api/workspaces', body).then(j),
   updateWorkspace: (name: string, body: object) =>
@@ -1816,13 +1868,29 @@ export const api = {
   deleteSkill: (name: string) => del('/api/skills/' + name.split('/').map(encodeURIComponent).join('/')).then(j),
 
   // Steering (Kiro steering files — ~/.kiro/steering + <project>/.kiro/steering)
-  steeringFiles: () => fetch('/api/steering').then(j),
-  steeringFile: (key: string) => fetch('/api/steering/' + key.split('/').map(encodeURIComponent).join('/')).then(j),
-  createSteering: (name: string, content: string, source?: string) =>
-    post('/api/steering', { name, content, source }).then(j),
-  updateSteering: (key: string, content: string) =>
-    put('/api/steering/' + key.split('/').map(encodeURIComponent).join('/'), { content }).then(j),
-  deleteSteering: (key: string) => del('/api/steering/' + key.split('/').map(encodeURIComponent).join('/')).then(j),
+  // sessionKey names the CHAT SLOT whose project `workspace/` keys resolve
+  // against, exactly as it does for kirocrewAgents. Without it the server can
+  // only fall back to "the single project every slot shares" and fails closed
+  // with two chats on different projects, so project steering silently
+  // disappears from a tab that has no way to say why. All five verbs take it:
+  // a key created under one project must stay readable, editable and deletable
+  // from the same page load.
+  steeringFiles: (sessionKey?: string) =>
+    fetch('/api/steering', { headers: sessionKey ? { 'X-Session-Key': sessionKey } : { ..._sk } }).then(j),
+  steeringFile: (key: string, sessionKey?: string) =>
+    fetch('/api/steering/' + key.split('/').map(encodeURIComponent).join('/'), {
+      headers: sessionKey ? { 'X-Session-Key': sessionKey } : { ..._sk },
+    }).then(j),
+  // projectKey is the `project_key` the listing returned: a workspace write
+  // echoes it so the server can refuse (409) when the chat slot has since been
+  // re-pointed at a different project. The session key names the slot, and the
+  // slot is precisely what can move, so it cannot close this on its own.
+  createSteering: (name: string, content: string, source?: string, sessionKey?: string, projectKey?: string) =>
+    post('/api/steering', { name, content, source }, sessionKey, projectHeader(projectKey)).then(j),
+  updateSteering: (key: string, content: string, sessionKey?: string, projectKey?: string) =>
+    put('/api/steering/' + key.split('/').map(encodeURIComponent).join('/'), { content }, sessionKey, projectHeader(projectKey)).then(j),
+  deleteSteering: (key: string, sessionKey?: string, projectKey?: string) =>
+    del('/api/steering/' + key.split('/').map(encodeURIComponent).join('/'), undefined, sessionKey, projectHeader(projectKey)).then(j),
 
   // Auto-skill pending queue + lifecycle pin
   skillsPending: () => fetch('/api/skills/-/pending').then(j),
@@ -1891,10 +1959,21 @@ export const api = {
   mcpGatewayEnable: (enabled: boolean) => post('/api/mcp-gateway/enable', { enabled }).then(j) as Promise<{ ok: boolean; enabled: boolean; running: boolean; ping_ok: boolean }>,
   mcpGatewayMetrics: () => fetch('/api/mcp-gateway/metrics').then(j) as Promise<{ running: boolean; size?: number; max_backends?: number; backends: { server: string; agent: string; pid: number | null; sessions: number; idle_s: number; rss_kb: number }[]; warm_pool_hits?: number; warm_pool_misses?: number; warm_pool_hit_rate_pct?: number }>,
   mcpGatewayServers: () => fetch('/api/mcp-gateway/servers').then(j) as Promise<{ servers: McpManagedServer[] }>,
-  mcpGatewaySetStub: (name: string, stub: boolean) => post('/api/mcp-gateway/servers/stub', { name, stub }).then(j) as Promise<{ ok: boolean; name: string; stub: boolean; enabled?: boolean; applied?: boolean; stub_servers?: string[] }>,
-  // Batch form of the above — one config write + one pool re-apply for the whole
-  // set, so "toggle all" can't land the allowlist half-flipped.
-  mcpGatewaySetStubMany: (names: string[], stub: boolean) => post('/api/mcp-gateway/servers/stub', { names, stub }).then(j) as Promise<{ ok: boolean; names: string[]; stub: boolean; enabled?: boolean; applied?: boolean; stub_servers?: string[] }>,
+  mcpGatewaySetStub: (name: string, stub: boolean) => post('/api/mcp-gateway/servers/stub', { name, stub }).then(j) as Promise<{ ok: boolean; name: string; stub: boolean; enabled?: boolean; applied?: boolean; restart_required?: boolean; stub_servers?: string[] }>,
+  mcpResolveRefresh: () => post('/api/mcp-gateway/resolve-refresh', {}).then(j) as Promise<{ ok: boolean; reason?: string; resolved: Record<string, 'ready' | 'unresolved' | 'error'>; ready?: string[] }>,
+  // Starting a measurement pass returns immediately: it spawns two processes per
+  // unmeasured server, so the answer arrives through the progress read, not here.
+  mcpMeasureStart: () => post('/api/mcp/measure', {}).then(j) as Promise<McpMeasureProgress>,
+  mcpMeasureProgress: () => fetch('/api/mcp/measure').then(j) as Promise<McpMeasureProgress>,
+  // Batch form of the above -- one config write for the whole set, so "toggle
+  // all" can't land the allowlist half-flipped. Like the single form it records
+  // rather than applies, and answers `restart_required`.
+  //
+  // `resolveEligibility` hands the decision to the server: it re-reads the sharing
+  // switch and each server's verdict inside the same lock hold that writes them, so
+  // the policy and the write cannot disagree. The response then reports `stubbed`
+  // and `skipped` rather than echoing the request, because the two differ by design.
+  mcpGatewaySetStubMany: (names: string[], stub: boolean, resolveEligibility?: boolean) => post('/api/mcp-gateway/servers/stub', resolveEligibility ? { names, stub, resolve_eligibility: true } : { names, stub }).then(j) as Promise<{ ok: boolean; names: string[]; stub: boolean; stubbed?: string[]; skipped?: Array<{ name: string; reason: string }>; sharing_on?: boolean; applied?: boolean; restart_required?: boolean; stub_servers?: string[] }>,
   // Agent config
   agentConfig: () => fetch('/api/agent/config').then(j),
   saveAgentConfig: (config: object) => put('/api/agent/config', { config }).then(j),
@@ -1964,17 +2043,23 @@ export const api = {
    *  the auto-nudge feature flag is off, so callers need no flag check. */
   autonudgeList: (): Promise<{ enabled: boolean; loops: { slot_key: string; active?: boolean; cycle_count?: number; max_cycles?: number }[] }> =>
     fetch('/api/autonudge').then(j),
-  chatSlotDetail: (slot: string, limit?: number, before?: number) => {
+  /** Every pull request / issue link a session carries — the unbudgeted read
+   *  behind the sidebar's expandable "+N" overflow chip. The slots payload caps
+   *  chips per kind, so the links behind that chip are not on the client until
+   *  this is called. */
+  chatSlotSourceLinks: (slot: string): Promise<{ links: NonNullable<ChatSlot['source_links']>; total: number }> =>
+    fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/source-links').then(j),
+  chatSlotDetail: (slot: string, limit?: number, before?: number, signal?: AbortSignal) => {
     const p = new URLSearchParams()
     if (limit) p.set('limit', String(limit))
     if (before !== undefined) p.set('before', String(before))
-    return fetch('/api/chat/slots/' + encodeURIComponent(slot) + '?' + p).then(j)
+    return fetch('/api/chat/slots/' + encodeURIComponent(slot) + '?' + p, { signal }).then(j)
   },
   createChatSlot: (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, clean_mode?: boolean, artifact?: string, folder_id?: string) => post('/api/chat/slots', { ...(name ? { name } : {}), ...(agent ? { agent } : {}), ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(memory_mode ? { memory_mode } : {}), ...(title ? { title } : {}), ...(clean_mode !== undefined ? { clean_mode } : {}), ...(artifact ? { artifact } : {}), ...(folder_id ? { folder_id } : {}) }).then(j),
   /** Inject silent background context into a slot — consumed on the next user
    * message. Used by the artifact companion chat to name the bound artifact so
    * the user's first message needs no slug boilerplate. */
-  chatSlotContext: (slot: string, content: string, opts?: { source?: string; ephemeral?: boolean }) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/context', { content, ...(opts?.source ? { source: opts.source } : {}), ...(opts?.ephemeral !== undefined ? { ephemeral: opts.ephemeral } : {}) }).then(j),
+  chatSlotContext: (slot: string, content: string, opts?: { source?: string; ephemeral?: boolean; maxAge?: number }) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/context', { content, ...(opts?.source ? { source: opts.source } : {}), ...(opts?.ephemeral !== undefined ? { ephemeral: opts.ephemeral } : {}), ...(opts?.maxAge !== undefined ? { maxAge: opts.maxAge } : {}) }).then(j),
   deleteChatSlot: (slot: string) => del('/api/chat/slots/' + encodeURIComponent(slot)).then(j),
   cleanupSessions: (maxInactiveDays: number, activeSlot?: string, dryRun?: boolean) => post('/api/chat/slots/cleanup', { max_inactive_days: maxInactiveDays, active_slot: activeSlot || '', dry_run: !!dryRun }).then(j) as Promise<{ ok: boolean; archived: number; keys: string[]; failed: string[]; dry_run?: boolean; count?: number; active_is_stale?: boolean }>,
   stopChatSlot: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/stop').then(j),
@@ -2035,6 +2120,13 @@ export const api = {
   deleteChatFolder: (id: string) => del('/api/chat/folders/' + encodeURIComponent(id)).then(j),
   setSlotFolder: (slot: string, folderId: string | null) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/folder', { folder_id: folderId || '' }).then(j),
   setSlotColor: (slot: string, colorIndex: number | null) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/color', { color_index: colorIndex }).then(j),
+  /** Set a custom per-session color (#rrggbb). The backend clears color_index
+   *  when a hex is set and vice versa (mutual exclusion), so callers send one
+   *  or the other, never both. */
+  setSlotColorHex: (slot: string, colorHex: string | null) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/color', { color_hex: colorHex }).then(j),
+  /** Clear BOTH color fields in one PATCH. The endpoint is in-body-gated, so
+   *  an index-only null would leave a custom hex behind. */
+  clearSlotColor: (slot: string) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/color', { color_index: null, color_hex: null }).then(j),
   setSlotPin: (slot: string, pinned: boolean) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/pin', { pinned }).then(j),
   setSlotMode: (slot: string, mode: string) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/mode', { mode }).then(j),
   // Tags
@@ -2045,7 +2137,7 @@ export const api = {
   setSlotTags: (slot: string, tags: string[]) => fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/tags', { method: 'PUT', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify({ tags }) }).then(j),
   dropSlotToColumn: (slot: string, columnId: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/drop', { column_id: columnId }).then(j),
   tagColumns: () => fetch('/api/chat/tag-columns', { headers: { ..._sk } }).then(j),
-  createTagColumn: (body: { name?: string; tag_ids?: string[]; mode?: 'any' | 'all' | 'none'; include_untagged?: boolean }) => post('/api/chat/tag-columns', body).then(j),
+  createTagColumn: (body: { name?: string; tag_ids?: string[]; mode?: 'any' | 'all' | 'none'; include_untagged?: boolean; source?: 'tags' | 'state'; state_key?: SessionLaneKey }) => post('/api/chat/tag-columns', body).then(j),
   updateTagColumn: (id: string, body: { name?: string; tag_ids?: string[]; mode?: 'any' | 'all' | 'none'; order?: number; include_untagged?: boolean }) => patch('/api/chat/tag-columns/' + encodeURIComponent(id), body).then(j),
   deleteTagColumn: (id: string) => del('/api/chat/tag-columns/' + encodeURIComponent(id)).then(j),
   reorderTagColumns: (ids: string[]) => fetch('/api/chat/tag-columns/order', { method: 'PUT', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify({ ids }) }).then(j),
@@ -2091,7 +2183,10 @@ export const api = {
   handoffChannels: () => fetch('/api/handoff-channels').then(j) as Promise<Record<string, string> | null>,
   handoffSlot: (slot: string, channel?: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/handoff', channel ? { channel } : undefined).then(j),
   // Sessions (history)
-  sessions: (limit = 30, offset = 0, preview = false) => fetch('/api/sessions?limit=' + limit + '&offset=' + offset + (preview ? '&preview=1' : '')).then(j),
+  // `excludeOpen` drops sessions already open as a tab — for the sidebar's
+  // Older-sessions pane, which is the complement of the tab list above it.
+  // Off by default: every other caller wants the full inventory.
+  sessions: (limit = 30, offset = 0, preview = false, excludeOpen = false) => fetch('/api/sessions?limit=' + limit + '&offset=' + offset + (preview ? '&preview=1' : '') + (excludeOpen ? '&exclude_open=1' : '')).then(j),
   sessionsSearch: (q: string, limit = 50) => fetch('/api/sessions/search?q=' + encodeURIComponent(q) + '&limit=' + limit).then(j),
   // Federated session search across the local gateway + every CONNECTED remote
   // instance (backend rank-interleaves; remote rows carry instance_id/_name).
@@ -2220,10 +2315,15 @@ export const api = {
   simulateUpdate: (opts?: { delay?: number; fail_at?: string }) => post('/api/update/simulate', opts || {}).then(j),
   pickFiles: () => post('/api/upload').then(j) as Promise<{ paths: string[] }>,
   fileDiff: (path: string) => fetch('/api/file-diff?path=' + encodeURIComponent(path)).then(j) as Promise<{ diff: string; original: string; status?: 'clean' | 'modified' | 'untracked' | 'not_git' }>,
-  /** Fuzzy file search for @-mention picker. `kind` distinguishes folder hits from files. */
-  fileSearch: (q: string, project?: string, signal?: AbortSignal) => {
+  /** Fuzzy file search for @-mention picker. `kind` distinguishes folder hits from files.
+   *  `kinds` narrows the result set server-side — 'files' or 'dirs'; omitted returns both.
+   *  Filtering server-side rather than dropping unwanted hits here matters because the
+   *  backend caps results BEFORE the response, so a client-side filter would silently
+   *  shrink an already-capped list. */
+  fileSearch: (q: string, project?: string, signal?: AbortSignal, kinds?: 'files' | 'dirs') => {
     const p = new URLSearchParams({ q })
     if (project) p.set('project', project)
+    if (kinds) p.set('kinds', kinds)
     return fetch(`/api/file-search?${p}`, signal ? { signal } : undefined).then(j) as Promise<{ results: Array<{ path: string; name: string; size: number; mtime: number; kind?: 'file' | 'dir' }>; root: string }>
   },
   /** Upload files via browser File API (cross-platform) */
@@ -2295,8 +2395,13 @@ export const api = {
   channelClearContext: (id: string, scope: 'all' | 'agent', agentId?: string) => post('/api/channels/' + encodeURIComponent(id) + '/clear-context', scope === 'agent' ? { scope, agent_id: agentId } : { scope }).then(j),
 
   // --- Apps ---
-  listApps: () => fetch('/api/apps').then(j),
-  getApp: (name: string) => fetch('/api/apps/' + encodeURIComponent(name)).then(j),
+  // Installed-app payloads are normalized HERE rather than in a queryFn. The
+  // registry feed has one consumer, so `AppsPage` can narrow it at its own
+  // `useQuery`; `/api/apps` has four (the Apps page, the left rail, the command
+  // palette, the migration check), and normalizing per consumer is how the
+  // fourth one gets forgotten. This is the boundary all four share.
+  listApps: () => fetch('/api/apps').then(j).then(normalizeInstalledApps),
+  getApp: (name: string) => fetch('/api/apps/' + encodeURIComponent(name)).then(j).then(normalizeInstalledApp),
   getAppManifest: (name: string) => fetch('/api/apps/' + encodeURIComponent(name) + '/manifest').then(j),
   installApp: (source: string) => post('/api/apps/install', { source }).then(j),
   enableApp: (name: string) => post('/api/apps/' + encodeURIComponent(name) + '/enable').then(j),
@@ -2325,8 +2430,8 @@ export const api = {
   // unknown[] here would break those structural assignments across files.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   listRegistry: () => fetch('/api/apps/registry').then(j) as Promise<{ apps: any[]; serverPlatform: { os: string; arch: string }; categoryOrder?: string[]; editorialSections?: unknown[] }>,
-  listRegistries: () => fetch('/api/apps/registries').then(j) as Promise<{ registries: { name: string; repo: string; branch: string }[] }>,
-  updateRegistries: (registries: { name: string; repo: string; branch: string }[]) => put('/api/apps/registries', { registries }).then(j) as Promise<{ ok: boolean; registries: { name: string; repo: string; branch: string }[]; newlyTrustedHosts: string[] }>,
+  listRegistries: () => fetch('/api/apps/registries').then(j) as Promise<{ registries: { name: string; repo: string; branch: string; trust?: string }[]; pinned?: { name: string; repo: string; branch: string; trust?: string }[] }>,
+  updateRegistries: (registries: { name: string; repo: string; branch: string; trust?: string }[]) => put('/api/apps/registries', { registries }).then(j) as Promise<{ ok: boolean; registries: { name: string; repo: string; branch: string; trust?: string }[]; newlyTrustedHosts: string[] }>,
   refreshRegistries: (repo?: string) => post('/api/apps/registries/refresh', repo ? { repo } : {}).then(j) as Promise<{ ok: boolean; refreshed: string[]; failed: string[]; results: { name: string; ok: boolean }[]; apps: number; lastSyncedAt: string }>,
   installFromRegistry: (name: string) => post('/api/apps/registry/install', { name }).then(j),
   /**

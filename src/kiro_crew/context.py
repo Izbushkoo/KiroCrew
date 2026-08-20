@@ -1244,8 +1244,10 @@ async def compress_thread_history(
     *exclude_last_n* is forwarded to ``conversation_log.recent`` to drop
     the just-flushed current-turn user message from history.
     """
-    from kiro_crew.llm_helpers import stream_and_collect  # circular import
-    from kiro_crew.session import BACKGROUND_KEY  # circular import
+    from kiro_crew.llm_helpers import (  # circular import
+        background_turn,
+        stream_and_collect,
+    )
 
     compressed_cap = _resolve_caps(model_window).compressed_history
 
@@ -1283,33 +1285,27 @@ async def compress_thread_history(
         + transcript
     )
 
-    acquired = False
     try:
-        client, _is_new, _resumed = await sessions.get_or_create(
-            BACKGROUND_KEY, agent="kirocrew-lite"
-        )
-        acquired = True
-        result = await stream_and_collect(client, prompt)
-        if not result:
-            return None
+        async with background_turn(
+            sessions, task="thread_compress", agent="kirocrew-lite"
+        ) as client:
+            result = await stream_and_collect(client, prompt)
+            if not result:
+                return None
 
-        parts: list[str] = []
-        if head_lines:
-            parts.append("## Thread start (verbatim)\n" + "\n".join(head_lines))
-        parts.append("## Compressed history\n" + result[:compressed_cap])
-        if tail_lines:
-            parts.append("## Recent exchanges (verbatim)\n" + "\n".join(tail_lines))
-        final = "\n\n".join(parts)
-        final, _ = redact_exfiltration_urls(final)
-        final, _ = redact_credentials(final)
-        return final.translate(_MULTIBYTE_TABLE)
+            parts: list[str] = []
+            if head_lines:
+                parts.append("## Thread start (verbatim)\n" + "\n".join(head_lines))
+            parts.append("## Compressed history\n" + result[:compressed_cap])
+            if tail_lines:
+                parts.append("## Recent exchanges (verbatim)\n" + "\n".join(tail_lines))
+            final = "\n\n".join(parts)
+            final, _ = redact_exfiltration_urls(final)
+            final, _ = redact_credentials(final)
+            return final.translate(_MULTIBYTE_TABLE)
     except Exception:
         logger.warning("Thread history compression failed", exc_info=True)
         return None
-    finally:
-        if acquired:
-            sessions.release(BACKGROUND_KEY)
-            await sessions.recycle_background()
 
 
 # ── Provider-Agnostic Session Replay ──
@@ -1711,6 +1707,7 @@ class ContextBuilder:
         model_window: int | None = None,
         context_groups: frozenset[str] | None = None,
         query_text: str = "",
+        project: str | None = None,
     ) -> str:
         """Build context for a new session (memory + skills + history).
 
@@ -2046,6 +2043,7 @@ class ContextBuilder:
             skills_ctx = self.skills.get_context(
                 budget=caps.skills if lazy_skills else None,
                 only=skill_globs or None,
+                project_dir=project,
             )
             if skills_ctx:
                 if lazy_skills and len(skills_ctx) > caps.skills:
@@ -2280,6 +2278,7 @@ class ContextBuilder:
                 model_window=model_window,
                 context_groups=context_groups,
                 query_text=text,
+                project=project,
             )
             if session_ctx:
                 # Scrub forgeable boundary markers from the UNTRUSTED content in
@@ -2348,6 +2347,7 @@ class ContextBuilder:
                 skills_ctx = self.skills.get_context(
                     budget=caps.skills if lazy_skills else None,
                     only=_globs or None,
+                    project_dir=project,
                 )
                 if skills_ctx:
                     if lazy_skills and len(skills_ctx) > caps.skills:
@@ -2563,7 +2563,7 @@ class ContextBuilder:
         # context, and ACP replays native history so a body already sent earlier
         # in the conversation is still in the window.
         if not is_custom and not minimal_context:
-            triggered = self.skills.get_triggered_skills(text)
+            triggered = self.skills.get_triggered_skills(text, project_dir=project)
             if triggered:
                 enforced, pointer_only = self.skills.split_triggered(triggered)
                 # Log the split, not just the match: a pointed-at skill the

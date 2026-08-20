@@ -14,7 +14,7 @@
  * reordering a column does not break them.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, within, act } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
@@ -306,6 +306,46 @@ describe('crew roster — filtering', () => {
     expect(screen.getByTestId('empty-state-title')).not.toHaveTextContent('match your filter')
     expect(screen.queryAllByTestId('crew-card')).toHaveLength(0)
   })
+
+  it('does not flash the empty state while an invalidateQueries-driven refetch is in flight', async () => {
+    // After retiring the refreshTrigger-in-queryKey pattern (#4179), the
+    // roster query key is stable (`['kirocrew-agents']`) and refetches are
+    // triggered by `queryClient.invalidateQueries` from the WS handler.
+    // `invalidateQueries` keeps the cached data visible during the refetch,
+    // so the roster must never collapse to the empty state.
+    let resolveSecond: (v: unknown) => void = () => {}
+    mockApi.kirocrewAgents
+      .mockResolvedValueOnce(AGENTS_RESPONSE)
+      .mockImplementationOnce(() => new Promise(res => { resolveSecond = res }))
+
+    const store = createTestStore()
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={qc}>
+        <Provider store={store}>
+          <MemoryRouter>
+            <KiroCrewAgentsPage />
+          </MemoryRouter>
+        </Provider>
+      </QueryClientProvider>,
+    )
+    await waitFor(() => expect(screen.getAllByTestId('crew-card')).toHaveLength(2))
+
+    // Simulate the WS handler: invalidate the query in-place (no key change).
+    act(() => { qc.invalidateQueries({ queryKey: ['kirocrew-agents'] }) })
+
+    // The prior roster must remain on screen throughout the pending refetch —
+    // no empty state, cards intact.
+    await waitFor(() => expect(mockApi.kirocrewAgents).toHaveBeenCalledTimes(2))
+    expect(screen.queryByTestId('empty-state-title')).not.toBeInTheDocument()
+    expect(screen.getAllByTestId('crew-card')).toHaveLength(2)
+
+    // And once the refetch resolves the roster is still there (now from fresh
+    // data), never having blanked in between.
+    resolveSecond(AGENTS_RESPONSE)
+    await waitFor(() => expect(screen.getAllByTestId('crew-card')).toHaveLength(2))
+    expect(screen.queryByTestId('empty-state-title')).not.toBeInTheDocument()
+  })
 })
 
 describe('crew roster — description', () => {
@@ -470,6 +510,10 @@ describe('crew editor — opening', () => {
     // Create mode has no crew to edit yet, so the bindings start on the defaults.
     expect(within(sheet).getByRole('combobox', { name: 'Workspace' })).toHaveTextContent('default')
     expect(within(sheet).getByRole('combobox', { name: 'Memory Store' })).toHaveTextContent('default')
+    // The Agent Template is the exception: it has NO safe default, because
+    // pre-filling the built-in made a new crew an alias for the default agent.
+    expect(within(sheet).getByRole('combobox', { name: 'Agent Template' }))
+      .toHaveTextContent('Select an agent template…')
   })
 })
 
@@ -486,7 +530,7 @@ describe('crew editor — create', () => {
     expect(screen.getByRole('dialog', { name: 'Create a new crew' })).toBeInTheDocument()
   })
 
-  it('creates the crew with the chosen bindings', async () => {
+  it('refuses a crew with no Agent Template chosen, without calling the api', async () => {
     await renderRoster()
     const sheet = await openCreate()
 
@@ -494,10 +538,32 @@ describe('crew editor — create', () => {
     await user.type(within(sheet).getByPlaceholderText('e.g. oncall'), 'staging')
     fireEvent.click(within(sheet).getByRole('button', { name: 'Create' }))
 
+    // The template used to be pre-filled with 'kirocrew', so a crew created
+    // this way became an alias for the DEFAULT agent and the chat picker
+    // appeared to "fall back to default" (#1684). It is now an explicit choice.
+    expect(await within(sheet).findByText('Agent Template is required')).toBeInTheDocument()
+    expect(mockApi.createKirocrewAgent).not.toHaveBeenCalled()
+  })
+
+  it('creates the crew with the chosen bindings', async () => {
+    await renderRoster()
+    const sheet = await openCreate()
+
+    const user = userEvent.setup()
+    await user.type(within(sheet).getByPlaceholderText('e.g. oncall'), 'staging')
+    // The template must be picked deliberately — nothing pre-fills it.
+    // Keyboard-driven: a POINTER click on the Radix select inside this dialog
+    // recurses in happy-dom's blur handling (RangeError: Maximum call stack size
+    // exceeded), which then wedges React's act queue for every later test here.
+    const template = within(sheet).getByRole('combobox', { name: 'Agent Template' })
+    fireEvent.keyDown(template, { key: 'ArrowDown' })
+    fireEvent.click(await screen.findByRole('option', { name: 'oncall-agent' }))
+    fireEvent.click(within(sheet).getByRole('button', { name: 'Create' }))
+
     await waitFor(() =>
       expect(mockApi.createKirocrewAgent).toHaveBeenCalledWith({
         name: 'staging',
-        kiro_agent: 'kirocrew',
+        kiro_agent: 'oncall-agent',
         workspace: 'default',
         memory_store: 'default',
         triggers: '',

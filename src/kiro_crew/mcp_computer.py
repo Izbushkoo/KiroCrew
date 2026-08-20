@@ -99,6 +99,8 @@ from kiro_crew.mcp_core import (
     _api_base,
     _http_error_body,
     _internal_secret,
+    _invalidate_api_base,
+    _resolve_api_port,
     _resolve_session_key_strict,
     _session_key_header_error,
 )
@@ -346,11 +348,14 @@ def _tool_definitions() -> list[dict[str, Any]]:
                             "presses the control and requires element_index. "
                             f"'{CLICK_METHOD_APP_POST}' sends a click at x/y to the "
                             "target app WITHOUT moving the pointer — correct for a "
-                            f"background window. '{CLICK_METHOD_GLOBAL}' MOVES THE "
-                            "USER'S REAL MOUSE POINTER and clicks there; it is off "
-                            "by default and refused unless the user enabled it and "
-                            "policy permits it, so only ask for it when a click "
-                            "must be physically real."
+                            "background window, and macOS-only: WINDOWS HAS NO "
+                            "PER-PROCESS MOUSE ROUTE, so it is refused there (as is "
+                            f"'{CLICK_METHOD_AUTO}' with x/y). On Windows, pass an "
+                            "element_index for a pointer-free click, or name "
+                            f"'{CLICK_METHOD_GLOBAL}' to accept the cursor move. "
+                            f"'{CLICK_METHOD_GLOBAL}' MOVES THE USER'S REAL MOUSE "
+                            "POINTER and clicks there, so only ask for it when a "
+                            "click must be physically real."
                         ),
                     },
                 },
@@ -363,8 +368,12 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "Drag from one screen point to another inside an application — for "
                 "canvas strokes, sliders, range selections and reordering. "
                 "Coordinate-only: there is no element form, because a drag's "
-                "meaning is the path between the two points. The pointer is not "
-                f"moved unless you ask for click_method '{CLICK_METHOD_GLOBAL}'."
+                "meaning is the path between the two points. On macOS the pointer "
+                "is not moved unless you ask for click_method "
+                f"'{CLICK_METHOD_GLOBAL}'. ON WINDOWS EVERY DRAG MOVES THE USER'S "
+                f"REAL CURSOR, so click_method '{CLICK_METHOD_GLOBAL}' must be "
+                "passed EXPLICITLY there and the default is refused — the refusal "
+                "is what keeps 'the pointer was not moved' a true statement."
             ),
             "inputSchema": {
                 "type": "object",
@@ -381,11 +390,14 @@ def _tool_definitions() -> list[dict[str, Any]]:
                         "description": (
                             f"'{CLICK_METHOD_AUTO}' (default) and "
                             f"'{CLICK_METHOD_APP_POST}' send the drag to the target "
-                            "app without moving the pointer. "
-                            f"'{CLICK_METHOD_GLOBAL}' MOVES THE USER'S REAL MOUSE "
-                            "POINTER along the path and needs their opt-in. "
+                            "app without moving the pointer — macOS only. On "
+                            f"WINDOWS both are refused and '{CLICK_METHOD_GLOBAL}' "
+                            "is the only method, because there is no per-process "
+                            "mouse route: name it explicitly to accept the cursor "
+                            f"move. '{CLICK_METHOD_GLOBAL}' MOVES THE USER'S REAL "
+                            "MOUSE POINTER along the path. "
                             f"'{CLICK_METHOD_ACCESSIBILITY}' cannot express a drag "
-                            "and is refused."
+                            "and is refused everywhere."
                         ),
                     },
                 },
@@ -642,25 +654,51 @@ def _invoke(session_key: str, name: str, args: dict[str, Any]) -> dict[str, Any]
     body = json.dumps(
         {"tool": name, "args": args, "session_key": session_key, "agent": "", "app": ""}
     ).encode()
-    request = urllib.request.Request(
-        f"{_api_base()}{INVOKE_PATH}",
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "X-Internal-Secret": _internal_secret(),
-            "X-Session-Key": session_key,
-        },
-        method="POST",
-    )
-    try:
-        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- URL is the loopback gateway (_api_base() from config/run-marker) + a fixed internal path; never agent-controlled  # noqa: E501
+    headers = {
+        "Content-Type": "application/json",
+        "X-Internal-Secret": _internal_secret(),
+        "X-Session-Key": session_key,
+    }
+
+    def _send_once(base: str):
+        request = urllib.request.Request(
+            f"{base}{INVOKE_PATH}", data=body, headers=headers, method="POST"
+        )
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- URL is the loopback gateway (_api_base(): 127.0.0.1 plus a port from config/env or a run-marker whose ownership is re-verified per request) + a fixed internal path; never agent-controlled  # noqa: E501
         with loopback_urlopen(request, timeout=INVOKE_TIMEOUT_SECS) as response:
-            decoded = json.loads(response.read())
+            return json.loads(response.read())
+
+    api_base = _api_base()
+    try:
+        decoded = _send_once(api_base)
     except urllib.error.HTTPError as exc:
         return _http_error_body(exc)
     except urllib.error.URLError as exc:
         detail = str(exc.reason) if isinstance(exc.reason, OSError) else str(exc)
-        return {"error": ERR_GATEWAY_UNREACHABLE.format(detail=detail)}
+        # The resolved base can predate the gateway: its port is recorded only in
+        # the run marker, so a refusal is worth one re-resolution before giving up.
+        if isinstance(exc.reason, (ConnectionRefusedError, socket.gaierror)):
+            _invalidate_api_base()
+            retry_port, retry_source = _resolve_api_port()
+            # A default-source fall-through carries NO evidence: a listener on
+            # the default port could be any local process, and replaying would
+            # hand it the internal secret. Replay only chases positive
+            # evidence of a moved gateway. Same rule as mcp_core._send.
+            retry_base = f"http://127.0.0.1:{retry_port}"
+            if retry_source != "default" and retry_base != api_base:
+                try:
+                    decoded = _send_once(retry_base)
+                except urllib.error.HTTPError as retry_exc:
+                    # The replay REACHED the (moved) gateway and it answered with
+                    # a normal HTTP error — surface the structured body exactly
+                    # like a first-attempt HTTPError, not a stale "unreachable".
+                    return _http_error_body(retry_exc)
+                except Exception:
+                    return {"error": ERR_GATEWAY_UNREACHABLE.format(detail=detail)}
+            else:
+                return {"error": ERR_GATEWAY_UNREACHABLE.format(detail=detail)}
+        else:
+            return {"error": ERR_GATEWAY_UNREACHABLE.format(detail=detail)}
     except (TimeoutError, socket.timeout) as exc:
         return {"error": ERR_GATEWAY_UNREACHABLE.format(detail=f"timed out ({exc})")}
     except Exception as exc:

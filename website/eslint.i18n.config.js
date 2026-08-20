@@ -60,6 +60,33 @@ export default [
       // the module may contain ONLY paint data, so the filename IS the
       // boundary and its consumer (FolderGlyph.tsx) stays fully covered.
       'src/components/folderColorPaint.ts',
+      // Pierre's shared render configuration: injected stylesheet text
+      // (`unsafeCSS` templates of selectors, lengths and `var(--…)` references),
+      // theme ids the library matches on, and an extension→grammar map. None of
+      // it is read as words. Same named-boundary idiom as `folderColorPaint.ts`
+      // above — the module may contain ONLY render config, and every Pierre
+      // surface that shows copy (DiffBlock, MarkdownPanel, FileBrowserRail)
+      // stays fully covered.
+      //
+      // Stated as a false-negative class, per this file's convention: user-visible
+      // copy added here will not be reported. Verified copy-free rather than
+      // assumed — it imports neither `i18nT` nor `useTranslation`.
+      'src/pierre/config.ts',
+      // Injected stylesheet text for the chat file-change chips: selectors,
+      // lengths and keyframes handed to the CSS parser, with the two layout
+      // numbers and the animation duration the rules interpolate. Extracted from
+      // `FileChangeChips.tsx` precisely so the component -- which does carry
+      // user-visible copy -- stays fully covered here.
+      //
+      // Stated as a false-negative class, per this file's convention: copy added
+      // to this module will not be reported. Keep it stylesheet-only; anything a
+      // person reads belongs in the component with `i18nT`.
+      'src/components/fileChangeChipsCss.ts',
+      // Synthesizes the `diff --git` / `---` / `+++` headers Pierre needs to
+      // identify a file in a bare patch body: git wire format handed to Pierre's
+      // parser, never read as words. Extracted from `PullRequestPanel.tsx` so that
+      // panel -- which does carry copy -- stays fully covered.
+      'src/components/unifiedPatchHeaders.ts',
       // Per-shell env-var export command builders for SettingRef's env popover:
       // every string is CLI syntax handed to a terminal (`export`, `$env:`,
       // `set`, `=1`), never user-visible copy — translating a fragment would
@@ -329,6 +356,11 @@ export default [
               // a trailing `=`, so this still reports real copy.
               String.raw`^[?&][a-z_]+=$`,
 
+              // The same server contract with a FIXED flag value baked in, e.g.
+              // `&resolve=1`. The value class is a single digit or lowercase word
+              // (`=1`, `=true`) — never a sentence — so prose still cannot match.
+              String.raw`^[?&][a-z_]+=[a-z0-9]+$`,
+
               // A catalog KEY assembled at runtime, e.g.
               // `apps.crewCompanion.state.${slot}`. Translating a key would break the
               // lookup it performs — the value it resolves to is what gets translated.
@@ -396,6 +428,58 @@ export default [
               // merely containing such a token alongside a plain word still
               // fails, because every token must match end to end.
               String.raw`^\[@(?:media|supports)\([^)\s]*\)\]:[^\s]+(?:\s+\[@(?:media|supports)\([^)\s]*\)\]:[^\s]+)*$`,
+              // Tailwind ARBITRARY-VALUE clusters whose bracketed value carries a
+              // comma or underscore, e.g. the notification glass surfaces in
+              // components/notifications/NotificationFeed.tsx:
+              // `bg-[color-mix(in_srgb,var(--card)_72%,transparent)] backdrop-blur-2xl`
+              // or `shadow-[0_8px_24px_rgba(0,0,0,.10),0_1px_3px_rgba(0,0,0,.06)]`.
+              // The general class shape above cannot cover these: its char class
+              // forbids `,` and `_`, which are exactly what Tailwind's arbitrary-value
+              // syntax uses to encode CSS commas and spaces inside `[...]`. Such
+              // strings sit in plain `const` ternaries (not JSX attributes), so the
+              // attribute exemption does not reach them either.
+              //
+              // Deliberately NARROWER than "allow , and _ anywhere", on two axes:
+              // (a) the first lookahead rejects any two ADJACENT bare lowercase
+              // words — the prose shape (`connection lost [retry_pending]`)
+              // that would otherwise ride in on a single bracketed token; a
+              // class cluster never has two adjacent bare words, every
+              // utility next to a bare `border`/`isolate` carries a hyphen,
+              // digit, colon or bracket. (b) the second lookahead requires at
+              // least one space-free `[...]` token containing a `,` or `_` —
+              // and `,`/`_` are admitted ONLY inside brackets; outside them
+              // the char class is the general class shape's. A sentence
+              // merely containing a bracket still fails, because its commas
+              // live outside the brackets.
+              //
+              // Known false negative, stated: a SINGLE bare word plus
+              // bracketed-value tokens (`saved bg-[color-mix(a,b)]`) would be
+              // missed — the same single-word residue the general class shape
+              // already accepts, caught by the en-XA render gate instead.
+              String.raw`^(?!.*(?:^|\s)[a-z]+\s+[a-z]+(?:\s|$))(?=[^\[]*\[[^\]\s]*[,_][^\]\s]*\])(?:[\s\-a-z0-9:/().%#]|\[[\-a-z0-9:/().%#,_]*\])+$`,
+              // A GATEWAY WIRE MARKER whose tag is bracketed ALL-CAPS, e.g.
+              // `[SYSTEM] Sub-agent synthesis:`. These are matched byte-for-byte
+              // with `startsWith` against Python constants in
+              // src/kiro_crew/dashboard/state.py and the matched prefix is then
+              // SLICED OFF, so no character reaches the screen — translating one
+              // silently stops its card from rendering in that locale. Real site:
+              // the `PREFIXES` table in pages/chat/RecoveryCard.tsx, an ALL-CAPS
+              // module constant, so `i18n-strict` looks inside it.
+              //
+              // Deliberately narrow: the string must OPEN with `[`, the tag must be
+              // ALL-CAPS (`[A-Z]+`), no second `[` may follow, AND it must END in a
+              // colon — the shape a wire marker whose instruction continues on the
+              // same line takes. The trailing colon is what keeps real copy out:
+              // without it `[BETA] Experimental — expect changes` and `[ERROR] Unable
+              // to load session` would both be exempt, which two reviewers flagged.
+              // Known false negative, stated: copy that opens with a bracketed
+              // all-caps tag AND ends in a colon is exempt. The wholly-bracketed
+              // mixed-case siblings in that same table do not need this pattern —
+              // measured: an existing shape already covers a string that is
+              // entirely one bracketed token. This entry exists for the marker
+              // that carries text AFTER the closing bracket, which that shape
+              // cannot admit.
+              String.raw`^\[[A-Z]+\][^\[\]]*:$`,
               // CSS SELECTOR LISTS, e.g. `[role="dialog"],[data-x]` or
               // `a,button,[tabindex]` — a comma-joined list of type selectors and
               // bracketed attribute selectors, as passed to querySelector. The
@@ -564,6 +648,11 @@ export default [
               // gate. Adding a marker here is a deliberate one-line act, which is
               // the right cost for adding one to the wire protocol.
               '^\\[(Subagent|Subagent batch|Workflow) completion event\\]$',
+              // The Stop-hook nudge-cap backstop marker (no em dash), enumerated
+              // for the same closed-set reason as the completion-event markers
+              // above. Matched with `startsWith` and sliced off before render;
+              // byte-identical to HOOK_HALTED_RECOVERY_PREFIX in state.py.
+              '^\\[Stop-hook nudge cap reached\\]$',
               // NOTE ON SHAPE: the plugin wraps every pattern as `^<pattern>$`
               // (`generateFullMatchRegExp`), so a pattern must describe the WHOLE
               // string. A prefix-only pattern like `^data:` becomes `^^data:$` and can
@@ -718,7 +807,10 @@ export default [
               // artifact of the sink, not a statement about the text.
               '\\berrors\\.push$',
               // Style and test helpers.
-              '^(css|cx|clsx|twMerge|cva)$',
+              // `cn` is this repo's own `twMerge(clsx(...))` wrapper (src/lib/utils.ts)
+              // and takes `ClassValue[]` -- the same category as the two helpers it
+              // composes, both already listed here. Copy cannot legitimately reach it.
+              '^(css|cx|clsx|twMerge|cva|cn)$',
               // Storage, telemetry and routing take machine keys.
               '(local|session)Storage\\.\\w+', 'navigate', 'track', 'emit',
               // KiroCrew's own telemetry shim (`src/rum.ts`). Its first argument is
@@ -1026,6 +1118,20 @@ export default [
   // any copy later added here belongs in the catalog, not behind this exemption.
   {
     files: ['src/components/Strands.tsx'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // PROTOCOL VALUES ONLY, same category as `wireValues.ts` above: the two
+  // Aperture-registered literals for the session-pulse survey (a radio
+  // question's response values, and the question text itself). Both are
+  // compared/sent by value against Aperture's registered form template
+  // (category=KiroCrew, name=SessionFeedback, version=1.0.1) — ingestion  // brand-ok: registered category id
+  // 400s on any text/type mismatch, so translating either would break the
+  // submission rather than localize it. See the module's own header.
+  {
+    files: ['src/components/sessionPulseWireValues.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },

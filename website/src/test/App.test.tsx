@@ -9,14 +9,15 @@ import { openActivityPanel, sseSubagentQueued } from '../store/chatSlice'
 import SegmentedControl from '../components/SegmentedControl'
 import { ApiError } from '../api/client'
 import { safeSetItem } from '../utils/safeStorage'
+import { FEATURE_REQUEST_PROMPT_FALLBACK } from '../prompts/featureRequest'
 
 /** A failure `POST /api/chat/slots/{slot}/agent` really can return today. */
 const REAL_FAILURE = 'invalid agent name'
 
-/** Chrome the side tracks never get: the header's own `pl-3 pr-3` (24px) plus the
+/** Chrome the side tracks never get: the header's own `pl-2 pr-3` (20px) plus the
  *  two 12px track gaps. Subtracted before reasoning about a group's width —
  *  leaving the padding out is what first put the width factor 2vw too high. */
-const TOPBAR_GAPS = 48
+const TOPBAR_GAPS = 44
 
 /** `clamp(240px, 22vw, 480px)` evaluated in JS. One definition, because three
  *  assertions below reason about it and three copies would drift apart. The
@@ -97,6 +98,9 @@ vi.mock('../api/client', () => ({
       env_var: 'KIROCREW_TELEMETRY_DISABLED',
     }),
     patchConfig: vi.fn().mockResolvedValue({}),
+    createChatSlot: vi.fn().mockResolvedValue({ key: 'feature-slot', title: 'feature-slot', messages: 0, running: false }),
+    chatSlotContext: vi.fn().mockResolvedValue({ ok: true }),
+    sendChat: vi.fn().mockResolvedValue({ ok: true }),
   },
   // Default to "no auth banner showing" so existing App tests render the
   // normal connected/offline pill paths. The dedicated auth-banner
@@ -665,9 +669,15 @@ describe('App routing', () => {
   it('keeps the sub-agent bot and count in the expanded Sessions rail item', async () => {
     localStorage.removeItem('mc-nav')
     const store = createTestStore()
-    store.dispatch(sseSubagentQueued({ slot: 'background', queued: 2 }))
 
     renderWithProviders(<App />, { route: '/chat', store })
+
+    // Seed AFTER the mount fetch settles. `fetchSlots.fulfilled` is an
+    // authoritative slot-list writer, so queued-subagent state for a slot the
+    // fetched list does not name is residue and is evicted — seeding before the
+    // fetch would have this test depend on that eviction not happening.
+    expect(await screen.findByLabelText('Sessions')).toBeInTheDocument()
+    act(() => { store.dispatch(sseSubagentQueued({ slot: 'background', queued: 2 })) })
 
     expect(await screen.findByLabelText('2 subagents in flight')).toBeInTheDocument()
   })
@@ -958,42 +968,42 @@ describe('App routing', () => {
     localStorage.removeItem('mc-nav')
   })
 
-  it('lets the brand toggle expand the rail while preview focus mode is active', () => {
+  it('lets the brand toggle expand the rail while preview expand mode is active', () => {
     localStorage.removeItem('mc-nav')
     renderWithProviders(<App />, { route: '/chat' })
     const nav = screen.getByRole('navigation', { name: 'Main navigation' })
 
     // Entering the Web Preview's expand mode collapses the rail.
     act(() => {
-      window.dispatchEvent(new CustomEvent('kirocrew-preview-focus', { detail: { focused: true } }))
+      window.dispatchEvent(new CustomEvent('kirocrew-preview-expand', { detail: { expanded: true } }))
     })
     expect(within(nav).getByRole('button', { name: 'Expand sidebar' })).toBeInTheDocument()
 
-    // The logo keeps its standard behavior inside focus mode: it expands.
+    // The logo keeps its standard behavior inside expand mode: it expands.
     fireEvent.click(within(nav).getByRole('button', { name: 'Expand sidebar' }))
     expect(within(nav).getByRole('button', { name: 'Collapse sidebar' })).toBeInTheDocument()
 
-    // Leaving focus mode must not undo that explicit choice.
+    // Leaving expand mode must not undo that explicit choice.
     act(() => {
-      window.dispatchEvent(new CustomEvent('kirocrew-preview-focus', { detail: { focused: false } }))
+      window.dispatchEvent(new CustomEvent('kirocrew-preview-expand', { detail: { expanded: false } }))
     })
     expect(within(nav).getByRole('button', { name: 'Collapse sidebar' })).toBeInTheDocument()
     localStorage.removeItem('mc-nav')
   })
 
-  it('restores the pre-focus rail state when preview focus mode ends untouched', () => {
+  it('restores the pre-expand rail state when preview expand mode ends untouched', () => {
     localStorage.removeItem('mc-nav') // start expanded
     renderWithProviders(<App />, { route: '/chat' })
     const nav = screen.getByRole('navigation', { name: 'Main navigation' })
     expect(within(nav).getByRole('button', { name: 'Collapse sidebar' })).toBeInTheDocument()
 
     act(() => {
-      window.dispatchEvent(new CustomEvent('kirocrew-preview-focus', { detail: { focused: true } }))
+      window.dispatchEvent(new CustomEvent('kirocrew-preview-expand', { detail: { expanded: true } }))
     })
     expect(within(nav).getByRole('button', { name: 'Expand sidebar' })).toBeInTheDocument()
 
     act(() => {
-      window.dispatchEvent(new CustomEvent('kirocrew-preview-focus', { detail: { focused: false } }))
+      window.dispatchEvent(new CustomEvent('kirocrew-preview-expand', { detail: { expanded: false } }))
     })
     expect(within(nav).getByRole('button', { name: 'Collapse sidebar' })).toBeInTheDocument()
     // The auto-collapse is transient: it never writes the persisted preference.
@@ -1029,6 +1039,36 @@ describe('App routing', () => {
     expect(screen.getByRole('button', { name: 'Request a Feature' })).toBeInTheDocument()
     expect(localStorage.getItem('mc-nav')).toBe('0')
     localStorage.removeItem('mc-nav')
+  })
+
+  it('keeps feature-request instructions hidden from the persisted user message', async () => {
+    const { api } = await import('../api/client')
+    vi.mocked(api.createChatSlot).mockClear()
+    vi.mocked(api.chatSlotContext).mockClear()
+    vi.mocked(api.sendChat).mockClear()
+    renderWithProviders(<App />, { route: '/chat' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Request a Feature' }))
+
+    await waitFor(() => {
+      expect(api.chatSlotContext).toHaveBeenCalledWith(
+        'feature-slot',
+        FEATURE_REQUEST_PROMPT_FALLBACK,
+        // maxAge bounds the hidden seed's lifetime so a failed visible send
+        // cannot leave it queued for a later, unrelated message.
+        { source: 'feature-request', maxAge: 60 },
+      )
+      expect(api.sendChat).toHaveBeenCalledWith(
+        'I’d like to request a feature!',
+        'feature-slot',
+        expect.any(String),
+      )
+    })
+    expect(api.sendChat).not.toHaveBeenCalledWith(
+      FEATURE_REQUEST_PROMPT_FALLBACK,
+      expect.anything(),
+      expect.anything(),
+    )
   })
 
   it('renders connection status', () => {
@@ -1122,6 +1162,55 @@ describe('TopbarMetrics widget', () => {
     localStorage.setItem('mc-topbar-metrics', '1')
     renderWithProviders(<App />, { route: '/chat' })
     expect(await screen.findByText(/MEM —/)).toBeInTheDocument()
+    expect(screen.getByText(/DSK —/)).toBeInTheDocument()
+    sysMock.mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
+    localStorage.removeItem('mc-topbar-metrics')
+  })
+
+  it('renders "MEM —" instead of crashing when mem_used_gb is missing but mem_total_gb is present', async () => {
+    const { api } = await import('../api/client')
+    const sysMock = vi.mocked(api.system)
+    // The shape that crashed the root app-shell boundary with
+    // "Cannot read properties of undefined (reading 'toFixed')":
+    // `_collect_system_metrics` seeds the frame from the CACHED static system
+    // info (which carries mem_total_gb) and then computes mem_used_gb/
+    // mem_free_gb under `try/except: pass`, so a failed memory probe yields a
+    // total with no used. A `memTotal > 0` gate admits that frame and then
+    // formats `undefined.toFixed(1)`.
+    sysMock.mockResolvedValueOnce({ mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
+    localStorage.setItem('mc-topbar-metrics', '1')
+    renderWithProviders(<App />, { route: '/chat' })
+    expect(await screen.findByText(/MEM —/)).toBeInTheDocument()
+    // The rest of the same frame still renders — one absent probe must not
+    // blank the whole capsule, let alone unmount the app.
+    expect(screen.getByText(/CPU 25%/)).toBeInTheDocument()
+    expect(screen.getByText(/DSK 40%/)).toBeInTheDocument()
+    sysMock.mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
+    localStorage.removeItem('mc-topbar-metrics')
+  })
+
+  it('renders "DSK —" instead of NaN when disk_free_gb is missing but disk_total_gb is present', async () => {
+    const { api } = await import('../api/client')
+    const sysMock = vi.mocked(api.system)
+    sysMock.mockResolvedValueOnce({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0 } as never)
+    localStorage.setItem('mc-topbar-metrics', '1')
+    renderWithProviders(<App />, { route: '/chat' })
+    expect(await screen.findByText(/DSK —/)).toBeInTheDocument()
+    expect(screen.getByText(/MEM 25%/)).toBeInTheDocument()
+    sysMock.mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
+    localStorage.removeItem('mc-topbar-metrics')
+  })
+
+  it('renders every readout as "—" instead of crashing when the frame carries non-finite numbers', async () => {
+    const { api } = await import('../api/client')
+    const sysMock = vi.mocked(api.system)
+    // NaN/Infinity reach the frame when a probe divides by an unmeasured total;
+    // they must take the placeholder path, not render "NaN%".
+    sysMock.mockResolvedValueOnce({ mem_used_gb: NaN, mem_total_gb: 16.0, cpu_pct: NaN, disk_total_gb: Infinity, disk_free_gb: 60.0 } as never)
+    localStorage.setItem('mc-topbar-metrics', '1')
+    renderWithProviders(<App />, { route: '/chat' })
+    expect(await screen.findByText(/CPU —/)).toBeInTheDocument()
+    expect(screen.getByText(/MEM —/)).toBeInTheDocument()
     expect(screen.getByText(/DSK —/)).toBeInTheDocument()
     sysMock.mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
     localStorage.removeItem('mc-topbar-metrics')

@@ -18,6 +18,7 @@ from pathlib import Path
 
 from kiro_crew import __version__ as _mc_version
 from kiro_crew import diagnostics, platform_compat, sandbox
+from kiro_crew._bootstrap import _source_checkout_root
 from kiro_crew.acp import kas_assets, kas_auth
 from kiro_crew.acp.client import KIRO_CLI_BIN
 from kiro_crew.acp.types import ACP_BACKEND_KAS
@@ -73,7 +74,7 @@ from kiro_crew.service import common as common_service
 from kiro_crew.service import controller as service_controller
 from kiro_crew.service import linux as service_linux
 from kiro_crew.session_pid_sig import signing_health
-from kiro_crew.transcribe import _find_whisper, ensure_ffmpeg_in_path
+from kiro_crew.transcribe import _find_parakeet_mlx, _find_whisper, ensure_ffmpeg_in_path
 
 logger = logging.getLogger(__name__)
 
@@ -506,6 +507,44 @@ def _doctor_data_home() -> None:
             )
 
 
+def _doctor_path_launcher() -> None:
+    """Report which install the ``kirocrew`` command on PATH actually belongs to.
+
+    A gateway never takes the name from another install's working launcher (see
+    ``agent.ensure_kirocrew_on_path``), which is the right call — but it leaves a
+    gap the user cannot see from anywhere else. The documented Linux pairing puts
+    a cli.sh wheel and a deb/rpm desktop install on ONE machine, so typing
+    ``kirocrew`` can run a different install, at a different version or channel,
+    than the app that is running. The desktop app has no terminal, so the decline
+    is logged where nobody reads it; this is the surface someone checks when a
+    version looks wrong.
+
+    Read-only: it resolves and compares paths, and never writes or relinks.
+    """
+    from kiro_crew.agent import _resolve_kirocrew_bin
+
+    on_path = shutil.which("kirocrew")
+    if not on_path:
+        # Not an error on its own: the desktop app runs its bundled backend
+        # directly, and a user who never wanted a terminal command is fine.
+        print("  kirocrew CLI: ⏹ not on PATH (run `kirocrew setup` to link it)")
+        return
+    running = _resolve_kirocrew_bin()
+    if not os.path.isabs(running) or os.path.realpath(on_path) == os.path.realpath(running):
+        print(f"  kirocrew CLI: ✅ {on_path}")
+        return
+    print("  ⚠ kirocrew CLI on PATH belongs to a different install than this one.")
+    # Paths are printed UNWRAPPED, one per line: a wrapped path cannot be copied
+    # or pasted into a command, which is the first thing someone does with it.
+    print(f"{_INDENT}on PATH:      {os.path.realpath(on_path)}")
+    print(f"{_INDENT}this install: {os.path.realpath(running)}")
+    _print_wrapped(
+        "Both can coexist — the wheel keeps its own updates — but `kirocrew` in a "
+        "terminal runs the one on PATH, which may be a different version or "
+        "channel. Run `kirocrew setup` from the install you want to own the name."
+    )
+
+
 def _doctor_trust_root() -> None:
     """Report whether session identities can be signed, and from which file.
 
@@ -744,6 +783,145 @@ def _linger_enabled(user: str) -> bool | None:
     if val in ("no", "false", "0"):
         return False
     return None
+
+
+# Git for Windows never lives in the system directories the trusted resolver
+# pins Windows lookups to — it installs under Program Files. Fixed literal
+# roots, not ``%ProgramFiles%``: doctor runs with operator privileges, and
+# reading the environment would let a poisoned variable redirect the lookup to
+# an agent-writable directory — the exact hole the pin exists to close.
+_WINDOWS_GIT_DIRS = (
+    r"C:\Program Files\Git\cmd",
+    r"C:\Program Files (x86)\Git\cmd",
+)
+
+
+def _windows_git_bin() -> str | None:
+    """``git.exe`` from the fixed Git for Windows install roots, else ``None``.
+
+    Without this, every supported Windows source install reported "could not
+    check" — :func:`platform_compat.trusted_system_bin` only probes the system
+    directories, where git never is. A non-default-drive install still misses
+    and degrades to "could not check", which is honest: this fallback widens
+    the pin only to paths an unprivileged attacker cannot write.
+    """
+    for directory in _WINDOWS_GIT_DIRS:
+        candidate = os.path.join(directory, "git.exe")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _git_line(repo: Path, *args: str) -> str | None:
+    """First stdout line of ``git -C repo *args``, ``None`` on any failure.
+
+    A module-level seam (not inlined) so tests can drive the checkout probe
+    without a real repository. Failures are expected states here — a tarball
+    install has no ``.git``, a fresh clone may lack ``origin/HEAD`` — so every
+    error collapses to ``None`` and the caller renders "could not check".
+
+    ``git`` is resolved through :func:`platform_compat.trusted_system_bin`
+    rather than a bare ``PATH`` lookup: doctor runs with operator privileges,
+    and an agent-writable directory leading ``PATH`` could plant a ``git``
+    shim. On Windows a resolver miss falls back to the fixed Git for Windows
+    install roots (:func:`_windows_git_bin`); any remaining miss collapses to
+    ``None`` like every other failure here — no spawn at all.
+    """
+    git = platform_compat.trusted_system_bin("git")
+    if git is None and platform_compat.IS_WINDOWS:
+        git = _windows_git_bin()
+    if git is None:
+        return None
+    try:
+        res = subprocess.run(
+            [git, "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    return res.stdout.strip().splitlines()[0].strip() if res.stdout.strip() else None
+
+
+def _doctor_source_checkout(repo: Path) -> None:
+    """Report whether an editable install's source tree is current.
+
+    An editable install (``pip install -e``) runs whatever the source checkout
+    happens to be at process start. A checkout parked on a stale feature branch
+    is invisible at runtime: the gateway starts fine, serves traffic, and every
+    fix merged upstream since the branch diverged — security gates included —
+    is silently absent. Nothing else surfaces this (a real incident ran a
+    9-day-stale branch through a restart while doctor reported healthy), so
+    doctor names the branch and how far behind the default branch it is.
+
+    Advisory only (never appended to ``issues``, matching the linger and
+    model-url probes): running a feature branch is a legitimate developer
+    state, so doctor's job is to make it visible, not to block on it.
+
+    Offline by design: no ``git fetch`` — doctor must not touch the network or
+    mutate the repo. "behind" therefore means behind the LAST-FETCHED default
+    branch; a checkout that never fetches reports current. That bound is
+    acceptable because the failure mode being caught is a checkout parked on
+    an old branch while fetches happen around it (e.g. by update checks), not
+    a host that never talks to the remote.
+    """
+    print("\nSource Checkout")
+    if not (repo / ".git").exists():
+        print(f"  source:      ⏹ not a git checkout ({repo})")
+        return
+
+    branch = _git_line(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    if branch is None:
+        print("  branch:      ⚠️  could not check (git failed)")
+        return
+
+    # Default branch as recorded at clone time (refs/remotes/origin/HEAD).
+    # `git remote show` would be authoritative but hits the network.
+    default_ref = _git_line(repo, "rev-parse", "--abbrev-ref", "origin/HEAD")
+    default_branch = default_ref.split("/", 1)[1] if default_ref and "/" in default_ref else None
+
+    if default_branch is None:
+        # Fresh clones always have origin/HEAD; only manual remote surgery
+        # loses it. Report the branch we ARE on and stop — guessing "main"
+        # could mislabel a repo whose default genuinely differs.
+        print(f"  branch:      ⚠️  {branch} (could not determine default branch)")
+        return
+
+    if branch == default_branch:
+        behind = _git_line(repo, "rev-list", "--count", f"HEAD..origin/{default_branch}")
+        if behind is None or not behind.isdigit():
+            # A failed count must not masquerade as a verified-fresh checkout:
+            # "up to date" is a claim this probe could not actually establish.
+            print(f"  branch:      ⚠️  {default_branch} (could not count commits behind origin)")
+            return
+        if int(behind) > 0:
+            print(f"  branch:      ⚠️  {default_branch}, {behind} commit(s) behind origin (as of last fetch)")
+            print("               The running gateway predates those commits until an")
+            print("               update + restart.")
+        else:
+            print(f"  branch:      ✅ {default_branch} (up to date as of last fetch)")
+        return
+
+    behind = _git_line(repo, "rev-list", "--count", f"HEAD..origin/{default_branch}")
+    detail = (
+        f", {behind} commit(s) behind origin/{default_branch}"
+        if behind and behind.isdigit() and int(behind) > 0
+        else ""
+    )
+    print(f"  branch:      ⚠️  on '{branch}' — not the default branch{detail}")
+    print("               The gateway runs this checkout as-is: fixes merged to")
+    print(f"               {default_branch} since divergence are NOT active, and update")
+    print(f"               pulls this branch, not {default_branch}.")
+    # Remediation stays prose, never a rendered command: branch and path come
+    # from the repository (agent-writable), and a ref named e.g.
+    # ``$(touch${IFS}/tmp/pwn)`` pasted from a suggested command line would
+    # execute in the operator's shell.
+    print("               Fix: check out the default branch in the source checkout,")
+    print("               then update + restart.")
 
 
 def _doctor_pod_session_bus(issues: list[str]) -> None:
@@ -1298,6 +1476,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
 
     # ── Data Home (+ leftover migration archive) ──
     _doctor_data_home()
+    _doctor_path_launcher()
     _doctor_trust_root()
 
     # ── KAS backend (only when selected) ──
@@ -1376,6 +1555,17 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             issues.append("sqlite fts5")
     except Exception as exc:  # pragma: no cover - defensive
         print(f"  sqlite fts5: ⚠️  could not check ({exc})")
+
+    # ── Source Checkout (source/editable installs only) ──
+    # Gated on the checkout markers themselves (setup.cfg + src/kiro_crew, via
+    # _bootstrap), not on ./.venv existing: an editable install driven by an
+    # external virtualenv or a documented ``PYTHONPATH=src`` invocation runs
+    # stale source exactly the same way and was silently skipped by the venv
+    # gate. A wheel install resolves inside site-packages, has no markers two
+    # levels up, and correctly gets no section.
+    source_root = _source_checkout_root()
+    if source_root is not None:
+        _doctor_source_checkout(source_root)
 
     # ── Vector Memory (in-process embeddings) ──
     print("\nVector Memory (in-process embeddings)")
@@ -1536,6 +1726,19 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
         except ImportError:
             print("  boto3:       ⏹ optional AWS SDK not installed")
             print("               Install: pip install 'kirocrew[voice]'")
+
+    # Parakeet (NVIDIA Parakeet via parakeet-mlx) is Apple-Silicon-only and, like
+    # mlx_whisper, installed out-of-band — so report its CLI the same way.
+    if stt_active and cfg.stt.provider == "parakeet":
+        parakeet_bin = _find_parakeet_mlx()
+        if parakeet_bin:
+            print(f"  parakeet:    ✅ {parakeet_bin}")
+        else:
+            mark = "❌" if stt_fatal else "⚠️ "
+            print(f"  parakeet:    {mark} parakeet-mlx not found")
+            print("               Fix: pipx install parakeet-mlx  (Apple Silicon only)")
+            if stt_fatal:
+                issues.append("parakeet-mlx")
 
     # ── Slack (optional) ──
     print("\nSlack Integration")

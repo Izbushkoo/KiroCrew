@@ -593,13 +593,37 @@ def oauth_endpoints_path() -> Path:
     return config_dir() / "oauth_endpoints.json"
 
 
-def read_local_secret() -> str:
-    """Read ``<config_dir>/.local_secret`` (the gateway IPC secret), or ``""``.
+def read_local_secret(port: int) -> str:
+    """Read the internal-API credential for the gateway on *port*.
 
-    Single home for the secret-file read that callers (cron scripts, MCP tool
-    bridges, CLI) need to authenticate to the gateway's internal API. Returns
-    empty string if the file is absent/unreadable.
+    Single home for the secret read that callers (cron scripts, MCP tool bridges,
+    CLI) need to authenticate to the gateway's internal API. Returns empty string
+    when no credential can be read.
+
+    Resolution is per LISTENER first: ``run/gateway-<port>.secret``, then the
+    shared ``.local_secret``. That order is the invariant, and it lives here rather
+    than in each reader because the credential identifies ONE gateway generation
+    while the shared file has one slot per data home, last-writer-wins. A caller
+    that reads the shared file while a different generation owns the port it dials
+    gets 403 on every internal call.
+
+    *port* is REQUIRED, and deliberately so: the credential is a function of the
+    dial target, so inferring the target here would let a caller dial one gateway
+    while authenticating for another -- the exact desync this helper exists to
+    close, reintroduced one call site at a time and invisible at the call site. A
+    caller with no port must resolve one explicitly and pass it, where the choice
+    is reviewable.
     """
+    # Function-local: port_resolution imports this module, so a module-level
+    # import would be circular.
+    from kiro_crew.instances import run_marker
+
+    try:
+        per_port = run_marker.read_secret(int(port))
+    except Exception:
+        per_port = ""
+    if per_port:
+        return per_port
     try:
         return (config_dir() / ".local_secret").read_text().strip()
     except OSError:
@@ -1430,6 +1454,16 @@ class AgentConfig:
             "(see dynamic-subagent-sizing docs). Default; set a fixed cap by "
             "pinning an integer >= 3 (values of 1 or 2 are raised to 3 — a pin "
             "below 3 would disable auto-sizing and run under the default).",
+        ),
+    )
+    max_stop_hook_nudges: int = field(
+        default=100,
+        metadata=_meta(
+            "Max Stop-hook nudges",
+            "Maximum consecutive Stop-hook block continuations before the run "
+            "halts and surfaces a halt card instead of dispatching another turn. "
+            "Bounds a buggy always-block hook in an unattended session. 0 = "
+            "uncapped (opt-in for genuinely unbounded feedback loops).",
         ),
     )
     spawn_min_memory_gb: float = field(
@@ -3093,6 +3127,22 @@ class ExternalRegistryConfig:
         default="main",
         metadata=_meta("Branch", "Git branch to read from."),
     )
+    trust: str = field(
+        default="index",
+        metadata=_meta(
+            "Trust",
+            "How much a registry's INDEX is trusted, which selects the credential "
+            "posture for cloning the apps it lists. 'index' (the default) treats the "
+            "index as untrusted content: every app it lists is cloned credential-free "
+            "so a hostile entry cannot read a private sibling repo with this machine's "
+            "git identity. 'owner' means the index is under change control the build "
+            "owns, so its apps may clone with this machine's credentials. Setting it "
+            "HERE has no effect: the trusted tier is honoured only for registries the "
+            "build supplies, because this file is agent-writable and a tier read from "
+            "it would not be your assertion. A value other than 'index' on a "
+            "configured registry is read as 'index'.",
+        ),
+    )
 
 
 @dataclass
@@ -3134,10 +3184,11 @@ class SkillsConfig:
         metadata=_meta(
             "Auto-Create Skills",
             "When true, analyze each session after completion and synthesize a reusable "
-            "SKILL.md when a non-trivial multi-step procedure is detected. Candidates are "
-            "staged for review (see approval_required) rather than going live, and live "
-            "under skills/auto/ so they never collide with hand-authored skills. Disabled "
-            "by default; enable in Settings → Skills.",
+            "SKILL.md when the session demonstrates a recurring procedure — one a future "
+            "session, working on a different target, would run again. Candidates are staged "
+            "for review (see approval_required) rather than going live, and live under "
+            "skills/auto/ so they never collide with hand-authored skills. Disabled by "
+            "default; enable in Settings → Skills.",
         ),
     )
     auto_refine_on_deviation: bool = field(
@@ -3869,7 +3920,7 @@ class ChannelConfig:
         )
 
 
-_VALID_STT_PROVIDERS = ("whisper", "mlx", "apple", "transcribe", "openai")
+_VALID_STT_PROVIDERS = ("whisper", "mlx", "apple", "parakeet", "transcribe", "openai")
 _VALID_CHANNEL_PREFIXES = ("C", "D", "G")
 
 
@@ -4150,6 +4201,13 @@ class SttConfig:
             "Hugging Face repo for the mlx_whisper model (mlx provider only).",
         ),
     )
+    parakeet_model: str = field(
+        default="mlx-community/parakeet-tdt-0.6b-v3",
+        metadata=_meta(
+            "Parakeet Model",
+            "Hugging Face repo for the parakeet-mlx model (parakeet provider only).",
+        ),
+    )
     device: str = field(
         default="cpu",
         metadata=_meta("Device", "Computation device.", enum=["cpu", "cuda"]),
@@ -4314,13 +4372,16 @@ class McpGatewayConfig:
         ),
     )
     forward_declared_env: bool = field(
-        default=False,
+        default=True,
         metadata=_meta(
             "Forward Declared Env",
             "Apply a pooled server's declared env (mcpServers.<name>.env) to the "
             "shared backend. Only non-secret keys are forwarded — rotating-secret "
-            "and credential-prefixed keys are never applied to a shared backend. "
-            "Default False — opt-in.",
+            "and credential-prefixed keys are never applied to a shared backend, "
+            "and gatewayd re-hashes the sidecar at spawn and forwards nothing on "
+            "mismatch, so every forwarded key is one all co-tenants of that "
+            "backend declared identically. Turn it OFF to make an env-declaring "
+            "server run unwrapped (no stub, no pooling) instead.",
         ),
     )
     socket_path: str = field(
@@ -4345,6 +4406,21 @@ class McpGatewayConfig:
     idle_timeout_secs: int = field(
         default=300,
         metadata=_meta("Idle Timeout", "Seconds a refcount=0 MCP backend is kept before drain."),
+    )
+    resolve_once_refresh_hours: int = field(
+        default=24,
+        metadata=_meta(
+            "Pre-resolve Refresh",
+            "Hours before an UNPINNED npm-launcher MCP server (an npx spec at "
+            "@latest, a range, or no version) is re-resolved from the registry. "
+            "Pre-resolving lets a launch exec the installed tree directly, so "
+            "session start does no dependency resolution and needs no network; "
+            "this is how often that resolution is refreshed so such a spec still "
+            "tracks upstream. A spec pinned to an exact version ignores this -- "
+            "re-asking about an exact version cannot change the answer. 0 "
+            "re-resolves on every prefetch pass; a server with no resolution yet "
+            "simply launches the way it does today.",
+        ),
     )
     max_backends: int = field(
         default=64,
@@ -4418,6 +4494,19 @@ class McpGatewayConfig:
             "Env override: KIROCREW_MCP_SPILL_THRESHOLD.",
         ),
     )
+
+
+# The forwarding default assumed when config omits
+# ``mcp_gateway.forward_declared_env``. Read from the dataclass default so the
+# field and every parse-site fallback cannot drift apart: this default is read
+# in three places (the field, the loader's ``_safe_bool`` fallback, and the
+# dashboard stub-batch reader), and a reader disagreeing with the field makes the
+# batch skip servers the rewrite pools perfectly well.
+FORWARD_DECLARED_ENV_DEFAULT = bool(
+    McpGatewayConfig.__dataclass_fields__[  # type: ignore[arg-type]
+        "forward_declared_env"
+    ].default
+)
 
 
 @dataclass
@@ -5312,6 +5401,22 @@ class DiscordConfig:
             tags=["discord"],
         ),
     )
+    allowed_channel_ids: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Allowed Channel IDs",
+            "Discord server channels where approved users may start a new agent thread.",
+            tags=["discord"],
+        ),
+    )
+    auto_thread: bool = field(
+        default=True,
+        metadata=_meta(
+            "Auto-create Threads",
+            "Create one Discord thread per approved message in an allowed channel.",
+            tags=["discord"],
+        ),
+    )
     soft_threshold_pct: int = field(
         default=80,
         metadata=_meta(
@@ -6024,7 +6129,12 @@ class KiroCrewConfig:
                     agent_data.get("tool_search_min_tokens", 50000), 50000
                 ),
                 session_sharing=bool(agent_data.get("session_sharing", True)),
-                max_subagents=agent_data.get("max_subagents", 0),
+                max_subagents=_safe_int(
+                    agent_data.get("max_subagents", 0), 0, 0, SUBAGENT_AUTO_MAX_CEILING
+                ),
+                max_stop_hook_nudges=_safe_int(
+                    agent_data.get("max_stop_hook_nudges", 100), 100, 0
+                ),
                 subagent_mem_buffer_pct=_safe_int(
                     agent_data.get("subagent_mem_buffer_pct", 20), 20
                 ),
@@ -6050,7 +6160,9 @@ class KiroCrewConfig:
                 subagent_cpu_cost_cores=_safe_float(
                     agent_data.get("subagent_cpu_cost_cores", 1.0), 1.0
                 ),
-                subagent_auto_max=_safe_int(agent_data.get("subagent_auto_max", 32), 32),
+                subagent_auto_max=_safe_int(
+                    agent_data.get("subagent_auto_max", 32), 32, 3, SUBAGENT_AUTO_MAX_CEILING
+                ),
                 subagent_spawn_stagger_secs=_safe_float(
                     agent_data.get("subagent_spawn_stagger_secs", 2.0), 2.0
                 ),
@@ -6058,7 +6170,9 @@ class KiroCrewConfig:
                 resource_pressure_gb=_safe_float(agent_data.get("resource_pressure_gb", 4.0), 4.0),
                 resource_critical_gb=_safe_float(agent_data.get("resource_critical_gb", 2.0), 2.0),
                 admission_gate=_safe_bool(agent_data.get("admission_gate"), True),
-                subagent_max_turns=agent_data.get("subagent_max_turns", 100),
+                subagent_max_turns=_safe_int(
+                    agent_data.get("subagent_max_turns", 100), 100, 1, SUBAGENT_MAX_TURNS_CEILING
+                ),
                 subagent_timeout_secs=agent_data.get("subagent_timeout_secs", 1800),
                 subagent_stall_idle_secs=_safe_int(
                     agent_data.get("subagent_stall_idle_secs", 120), 120
@@ -6098,7 +6212,7 @@ class KiroCrewConfig:
                     session_data.get("empty_response_auto_continue", True)
                 ),
                 autocompact_pct=_safe_float(session_data.get("autocompact_pct", 90.0), 90.0),
-                pool_size=_safe_int(session_data.get("pool_size", 2), 2),
+                pool_size=_safe_int(session_data.get("pool_size", 2), 2, 0, POOL_SIZE_MAX),
                 pool_agent=str(session_data.get("pool_agent", "")),
                 pool_ttl_secs=_safe_int(session_data.get("pool_ttl_secs", 1800), 1800),
                 eager_spawn=bool(session_data.get("eager_spawn", True)),
@@ -6287,6 +6401,8 @@ class KiroCrewConfig:
                 # transport's string comparison).
                 allowed_user_ids=_coerce_str_ids(discord_data.get("allowed_user_ids")),
                 allowed_thread_ids=_coerce_str_ids(discord_data.get("allowed_thread_ids")),
+                allowed_channel_ids=_coerce_str_ids(discord_data.get("allowed_channel_ids")),
+                auto_thread=bool(discord_data.get("auto_thread", True)),
                 soft_threshold_pct=max(
                     1, min(100, _coerce_int(discord_data.get("soft_threshold_pct"), 80))
                 ),
@@ -6486,6 +6602,9 @@ class KiroCrewConfig:
                 # (809M vs 74M, but much better latency).
                 model=stt_data.get("model", "turbo"),
                 mlx_model=stt_data.get("mlx_model", "mlx-community/whisper-large-v3-turbo"),
+                parakeet_model=stt_data.get(
+                    "parakeet_model", "mlx-community/parakeet-tdt-0.6b-v3"
+                ),
                 device=stt_data.get("device", "cpu"),
                 timeout_secs=stt_data.get("timeout_secs", 300),
                 transcribe_region=stt_data.get("transcribe_region", "us-east-1"),
@@ -6580,6 +6699,13 @@ class KiroCrewConfig:
                     # retargeting it to ``main`` on upgrade would break any
                     # registry whose content still lives on ``mainline``.
                     branch=str(r.get("branch", "mainline")),
+                    # A credential-posture decision, so it is read back verbatim
+                    # and validated downstream rather than here: an unrecognised
+                    # value must resolve to the restrictive tier, which
+                    # ``registry._registry_trust_tier`` does. Absent -> "index",
+                    # so a config written before the field existed keeps the
+                    # credential-free posture it had.
+                    trust=str(r.get("trust", "index")),
                 )
                 for r in (data.get("registries") or [])
                 if isinstance(r, dict) and r.get("repo")
@@ -6597,17 +6723,34 @@ class KiroCrewConfig:
                 # ``bool("false")`` is True. The write path is where an opt-out is
                 # actually enforced: the endpoint rejects any non-boolean body.
                 apps_enabled=_safe_bool(mcp_gateway_data.get("apps_enabled", True), True),
-                # Default False AND type-checked: ``bool("false")`` is True, so a
-                # hand-edited string would silently ENABLE forwarding. A
-                # malformed value must mean "do not apply declared env to a
-                # shared backend", never the reverse.
+                # ON by default. The forwarded set is a strict subset of the
+                # hashed set and gatewayd re-hashes the sidecar at spawn,
+                # forwarding nothing on mismatch, so a forwarded key is one every
+                # co-tenant of that backend declared identically. With it off, one
+                # ordinary declared key costs the whole server its pooling.
+                #
+                # Both arguments are True on purpose. A malformed value never
+                # reaches this call: ``config.validation`` type-checks first and
+                # ``_apply_field_default`` strips a non-boolean so the dataclass
+                # default applies, which is why the log says "using default". The
+                # fallback here is defence in depth for a bypassed validator, and
+                # giving it a different answer than the schema would only put two
+                # disagreeing defaults in the file.
                 forward_declared_env=_safe_bool(
-                    mcp_gateway_data.get("forward_declared_env", False), False
+                    mcp_gateway_data.get(
+                        "forward_declared_env", FORWARD_DECLARED_ENV_DEFAULT
+                    ),
+                    FORWARD_DECLARED_ENV_DEFAULT,
                 ),
                 socket_path=str(mcp_gateway_data.get("socket_path", "")),
                 overlay_dir=str(mcp_gateway_data.get("overlay_dir", "")),
                 idle_timeout_secs=max(
                     10, _safe_int(mcp_gateway_data.get("idle_timeout_secs", 300), 300)
+                ),
+                # 0 is meaningful (re-resolve every pass), so the floor is 0 and
+                # not the usual "at least something" clamp.
+                resolve_once_refresh_hours=max(
+                    0, _safe_int(mcp_gateway_data.get("resolve_once_refresh_hours", 24), 24)
                 ),
                 max_backends=max(1, _safe_int(mcp_gateway_data.get("max_backends", 64), 64)),
                 poolable_servers=[

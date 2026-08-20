@@ -1,10 +1,11 @@
 import { memo, useState, useRef, useEffect, useCallback } from 'react'
 import { motion } from 'framer-motion'
-import { Pencil, Send, Copy, Check, Link2, Target, Pin, PinOff, AlertCircle } from 'lucide-react'
+import { Pencil, Send, Copy, Check, Link2, Target, Pin, PinOff } from 'lucide-react'
 import { copyToClipboard } from '../../utils/clipboard'
 import { copySessionLink } from '../../utils/shareUrl'
 import { HOVER_NONE_ACTIONS_ROW_CLS } from '../../utils/touchActions'
 import { useSearchHighlight, useCurrentOcc } from '../../hooks/SearchHighlightContext'
+import { useImeGuard } from '../../hooks/useImeGuard'
 import { applySearchHighlights } from '../../utils/domHighlight'
 import { scrollCurrentMatchIntoView } from '../../utils/searchScroll'
 import { type PasteBlock, expandAll as expandPasteTokens } from '../../utils/pasteTokens'
@@ -35,6 +36,7 @@ interface UserMessageProps {
 
 const UserMessage = memo(function UserMessage({ content, meta, timestamp, timestampTitle, renderContent, canEdit, messageIndex, messageTs, onEditResend, slotKey, slotTitle, mode, pinned, onTogglePin }: UserMessageProps) {
   const [editing, setEditing] = useState(false)
+  const ime = useImeGuard()
   const [draft, setDraft] = useState(content)
   const [copied, setCopied] = useState(false)
   const [linkCopied, setLinkCopied] = useState(false)
@@ -134,13 +136,14 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
 
   if (editing) {
     return (
-      <div data-role="user" className="group/msg flex flex-col items-end">
+      <div data-role="user" className="group/msg flex flex-col items-end max-w-full">
         {/* `edit-grow` is a CSS grid auto-sizer: a hidden ::after mirror (fed by
             data-replicated-value) drives the grid track so the textarea grows
             with its own content — width AND height — exactly like the read-only
-            bubble it replaces, capped by max-w-[550px]. No JS measurement. */}
+            bubble it replaces, capped at 550px or the column, whichever is
+            smaller. No JS measurement. */}
         <div
-          className="edit-grow px-4 py-1.5 text-sm leading-relaxed rounded-xl bg-card text-card-fg overflow-hidden min-w-0 max-w-[550px] outline outline-2 -outline-offset-2 outline-accent/60"
+          className="edit-grow px-4 py-2 text-sm leading-6 rounded-xl bg-card text-card-fg overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] outline outline-2 -outline-offset-2 outline-accent/60"
           data-replicated-value={draft}
           style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}
         >
@@ -148,19 +151,25 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
             ref={taRef}
             rows={1}
             aria-label={i18nT('pages.chat.userMessage.edit_message')}
-            className="bg-transparent text-card-fg resize-none overflow-hidden focus:outline-none text-sm leading-relaxed"
+            className="bg-transparent text-card-fg resize-none overflow-hidden focus:outline-none text-sm leading-6"
             value={draft}
             onChange={e => setDraft(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit() } if (e.key === 'Escape') cancel() }}
+            {...ime.bindComposition()}
+            onKeyDown={e => {
+              // Rule 1: textarea — claim the key, so a declined (IME) Enter is
+              // still consumed instead of inserting a newline into the draft.
+              if (e.key === 'Enter' && !e.shiftKey) { if (ime.claimEnter(e)) submit() }
+              if (e.key === 'Escape') { ime.reset(); cancel() }
+            }}
           />
         </div>
         {/* Actions sit BELOW the bubble (like the read-only action row) so they
             never impose a min-width floor on the auto-sized bubble. */}
-        <div className="flex justify-end gap-1.5 mt-1">
-          <button onClick={cancel} className="px-2.5 py-1 text-[13px] text-muted hover:text-text rounded border border-border hover:bg-hover transition-colors" title={i18nT('pages.chat.userMessage.cancel_esc')}>
+        <div className="flex justify-end gap-2 mt-1">
+          <button onClick={cancel} className="px-3 py-1 text-[13px] leading-5 text-muted hover:text-text rounded border border-border hover:bg-hover transition-colors" title={i18nT('pages.chat.userMessage.cancel_esc')}>
             {i18nT('pages.chat.userMessage.cancel')}
           </button>
-          <button onClick={submit} className="flex items-center gap-1 px-2.5 py-1 text-[13px] bg-accent text-accent-fg rounded hover:bg-accent/80 transition-colors" title={i18nT('pages.chat.userMessage.send_enter')}>
+          <button onClick={submit} className="flex items-center gap-1 px-3 py-1 text-[13px] leading-5 bg-accent text-accent-fg rounded hover:bg-accent/80 transition-colors" title={i18nT('pages.chat.userMessage.send_enter')}>
             <Send size={10} /> {i18nT('pages.chat.userMessage.send')}
           </button>
         </div>
@@ -170,13 +179,15 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
 
   const bubble = (
     // 'message-bubble' is a stable theming hook — see website/docs/theming-contract.md
-    <div ref={userRef} onCopy={handleCopy} className={`message-bubble msg-content px-4 py-1.5 text-sm leading-relaxed rounded-xl overflow-hidden min-w-0 max-w-[550px] ${isSteer ? 'bg-accent-subtle text-text' : 'bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
+    <div ref={userRef} onCopy={handleCopy} className={`message-bubble msg-content px-4 py-2 text-sm leading-6 rounded-xl overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] ${isSteer ? 'bg-accent-subtle text-text' : 'bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
       {renderContent(content, meta)}
     </div>
   )
 
   return (
-    <div data-role="user" className="group/msg flex flex-col items-end">
+    // Every box between the content column and the bubble is a fit-content flex
+    // item, so a percentage cap only bites once ALL of them carry one.
+    <div data-role="user" className="group/msg flex flex-col items-end max-w-full">
       {/* User-typed line breaks (Shift+Enter) are preserved at the markdown
           level, NOT via container `white-space: pre-wrap`. renderUserContentCb
           renders user content through MarkdownRenderer with `softBreaks`, which
@@ -190,11 +201,11 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
         <>
           {/* Injected into the RUNNING turn — badge + accent bubble + one-shot
               entrance so the steer is visibly distinct from a normal message. */}
-          <div className="inline-flex items-center gap-1 text-[12px] font-semibold text-accent mb-1 pr-1">
+          <div className="inline-flex items-center gap-1 text-[12px] leading-5 font-semibold text-accent mb-1 pr-1">
             <Target size={12} className="shrink-0" /> {i18nT('pages.chat.userMessage.steered_into_the_running_turn')}
           </div>
           <motion.div
-            className="relative"
+            className="relative w-fit max-w-full"
             initial={playSteer ? { opacity: 0, x: 16 } : false}
             animate={{ opacity: 1, x: 0 }}
             transition={{ duration: 0.32, ease: 'easeOut' }}
@@ -212,19 +223,11 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
           </motion.div>
         </>
       ) : bubble}
-      {/* Stale optimistic indicator — shown when the server echo never arrived
-          within the timeout window (#3898 item 3). */}
-      {!!(meta?.stale && meta?.optimistic) && (
-        <div className="inline-flex items-center gap-1 text-[12px] text-warning mt-0.5 pr-1" role="status" aria-label={i18nT('pages.chat.userMessage.message_unconfirmed') as string}>
-          <AlertCircle size={12} className="shrink-0" />
-          <span>{i18nT('pages.chat.userMessage.message_unconfirmed') as string}</span>
-        </div>
-      )}
       {/* Where the pointer cannot hover the footer is always visible and its
           descendant overrides grow every action to a 40px touch target (20px
           icon + 10px padding); hover-capable pointers keep the reveal-on-hover
           behavior and the compact 14px icons untouched. */}
-      <div className={`flex items-center gap-1.5 px-1 mt-1 opacity-0 transition-opacity duration-300 delay-100 group-hover/msg:opacity-100 group-hover/msg:delay-300 group-focus-within/msg:opacity-100 group-focus-within/msg:delay-300 ${HOVER_NONE_ACTIONS_ROW_CLS}`}>
+      <div className={`flex items-center gap-2 mt-1 opacity-0 transition-opacity duration-300 delay-100 group-hover/msg:opacity-100 group-hover/msg:delay-300 group-focus-within/msg:opacity-100 group-focus-within/msg:delay-300 ${HOVER_NONE_ACTIONS_ROW_CLS}`}>
         <button
           onClick={() => {
             const pastes = (meta?.pastes as PasteBlock[] | undefined) || []
@@ -277,7 +280,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
         {/* No `font-mono`: see the twin in AssistantMessage's footer — a
             formatted date is prose, and `font-mono` pinned `var(--mono)`, which
             the Font Family setting never writes. */}
-        {timestamp && <span className="text-muted text-[12px] tabular-nums" title={timestampTitle}>{timestamp}</span>}
+        {timestamp && <span className="text-muted text-[12px] leading-5 tabular-nums" title={timestampTitle}>{timestamp}</span>}
       </div>
     </div>
   )

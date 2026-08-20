@@ -675,9 +675,7 @@ class TestRedactCredentials:
         from kiro_crew.dashboard.token_auth import generate_token
         from kiro_crew.security import _CREDENTIAL_PATTERNS
 
-        floors = re.findall(
-            r"eyJ\[A-Za-z0-9_-\]\{(\d+),\}", _CREDENTIAL_PATTERNS.pattern
-        )
+        floors = re.findall(r"eyJ\[A-Za-z0-9_-\]\{(\d+),\}", _CREDENTIAL_PATTERNS.pattern)
         assert len(floors) == 1, f"expected one bounded eyJ floor, got {floors}"
         floor = int(floors[0])
 
@@ -3105,15 +3103,62 @@ class TestExfilExactHostExemption:
         assert secret not in result
         assert len(warnings) == 1
 
-    def test_composition_error_propagates_fail_closed(self) -> None:
-        """PlatformCompositionError from the adapter propagates (fail-closed),
-        never degrading to an empty set silently."""
+    def test_unbooted_path_does_no_context_resolution(self) -> None:
+        """The unbooted path must not RESOLVE a context -- not even once.
+
+        ``current_context()`` loads config and discovers plugin entry points
+        before it decides, and on a non-standalone profile it never memoizes its
+        fail-closed verdict, so a per-line caller (``_pump_stderr`` redacting
+        backend stderr) would re-pay that synchronous I/O for every single line
+        on the gateway event loop.  Pin that this lookup never reaches it: the
+        answer for "no context installed" is the same empty set the standalone
+        default would give, so resolving is pure cost.
+        """
+        import pytest as _pytest
+
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.platform import context as context_mod
+        from kiro_crew.platform.context import reset_context
+        from kiro_crew.security import redact
+
+        calls: list[str] = []
+        real_current = context_mod.current_context
+        real_load = KiroCrewConfig.load
+
+        with _pytest.MonkeyPatch.context() as mp:
+            mp.setenv("KIROCREW_PROFILE", "enterprise")
+            reset_context()
+
+            def _spy_current():  # type: ignore[no-untyped-def]
+                calls.append("current_context")
+                return real_current()
+
+            def _spy_load(*a, **k):  # type: ignore[no-untyped-def]
+                calls.append("config_load")
+                return real_load(*a, **k)
+
+            mp.setattr(context_mod, "current_context", _spy_current)
+            mp.setattr(KiroCrewConfig, "load", _spy_load)
+            try:
+                # Redact many lines, as a stderr drain would.
+                for _ in range(25):
+                    redact("boot line https://example.com/mcp")
+                assert calls == [], f"unbooted path resolved a context: {calls}"
+            finally:
+                reset_context()
+
+    def test_composition_error_degrades_to_full_redaction(self) -> None:
+        """PlatformCompositionError from the adapter degrades to the empty set =
+        full redaction, and MUST NOT propagate: this lookup can only ever RELAX
+        the heuristics, so the empty set is already the strictest answer.
+        Propagation aborted the calling operation (issue #4561: every pooled MCP
+        backend spawn in gatewayd died building its own log line)."""
         import dataclasses
 
         from kiro_crew.config import KiroCrewConfig
         from kiro_crew.platform.bootstrap import build_default_context
         from kiro_crew.platform.context import PlatformCompositionError, set_context
-        from kiro_crew.security import scan_exfiltration_urls
+        from kiro_crew.security import redact_exfiltration_urls
 
         class _RaisingCredentialPolicy(self._StubCredentialPolicy):
             def exempt_exact_hosts(self) -> "frozenset[str]":
@@ -3121,8 +3166,51 @@ class TestExfilExactHostExemption:
 
         base = build_default_context(KiroCrewConfig())
         set_context(dataclasses.replace(base, credentials=_RaisingCredentialPolicy(frozenset())))
-        with pytest.raises(PlatformCompositionError):
-            scan_exfiltration_urls("https://contoso.sharepoint.com/doc?nav=eyJ" + "A" * 220)
+        url = self._long_nav_url("contoso.sharepoint.com")
+        result, warnings = redact_exfiltration_urls(f"Doc: {url}")
+        assert "[REDACTED" in result
+        assert len(warnings) == 1
+
+    def test_unbooted_nonstandalone_profile_still_redacts(self) -> None:
+        """Regression for issue #4561: ``redact()`` in an UNBOOTED worker under a
+        non-standalone profile must not raise.
+
+        ``gatewayd`` never installs a ``PlatformContext``; under
+        ``KIROCREW_PROFILE=enterprise`` ``current_context()`` fail-closes, and
+        the exempt-host lookup inside ``redact()`` used to propagate that error,
+        killing every pooled MCP backend spawn while it built the spawn log
+        line.  The lookup must degrade to the empty set (maximum redaction)
+        instead: the log line is still fully redacted, the operation survives.
+        """
+        import pytest as _pytest
+
+        from kiro_crew.platform.context import (
+            PlatformCompositionError,
+            current_context,
+            reset_context,
+        )
+        from kiro_crew.security import redact
+
+        with _pytest.MonkeyPatch.context() as mp:
+            mp.setenv("KIROCREW_PROFILE", "enterprise")
+            reset_context()
+            try:
+                # Precondition: the context itself still fail-closes (that
+                # contract is unchanged; only the exempt-host lookup degrades).
+                with _pytest.raises(PlatformCompositionError):
+                    current_context()
+                # The gatewayd spawn-log call shape: must not raise. Compare the
+                # WHOLE line rather than asking whether it contains the host --
+                # equality proves nothing was redacted away, and a bare host
+                # substring test is the incomplete-URL-sanitization pattern.
+                line = "cmd --flag https://example.com"
+                assert redact(line) == line
+                # Heuristic-tripping URL is still redacted (empty exempt set =
+                # maximum strictness, never fail-open).
+                url = self._long_nav_url("contoso.sharepoint.com")
+                assert "[REDACTED" in redact(f"Doc: {url}")
+            finally:
+                reset_context()
 
     def test_adapter_failure_degrades_to_full_redaction(self) -> None:
         """A transient (non-composition) adapter failure degrades to the empty
@@ -3545,6 +3633,583 @@ class TestIsSensitiveBashCommand:
     def test_safe_command(self) -> None:
         assert is_sensitive_bash_command("cat ~/readme.md") is None
 
+    # ── Shell normalization: variable indirection and `cd` targets ──
+
+    def test_variable_assigned_in_the_command_is_resolved(self) -> None:
+        """A path reached through a variable the command itself assigned.
+
+        The normalizer expands `$HOME`, so `V=$HOME` resolves, but `$V` used as
+        a path prefix stayed literal and the path never matched. The assignment
+        is in the command text, so it can be substituted.
+        """
+        assert is_sensitive_bash_command("V=$HOME; awk 1 $V/.aws/credentials") is not None
+        assert is_sensitive_bash_command("V=$HOME; cat $V/.ssh/id_rsa") is not None
+        assert is_sensitive_bash_command("V=${HOME}; xxd $V/.ssh/id_rsa") is not None
+        # The variable can carry part of the sensitive path itself.
+        assert is_sensitive_bash_command("D=$HOME/.aws; cat $D/credentials") is not None
+
+    def test_unresolvable_variable_over_a_sensitive_tail_is_blocked(self) -> None:
+        """A variable assigned outside the command still cannot hide the tail.
+
+        The value lives in the shell, not the command text, so it cannot be
+        resolved. Fail closed only when the literal remainder is itself
+        sensitive — see the benign counterparts below.
+        """
+        assert is_sensitive_bash_command("awk 1 $V/.aws/credentials") is not None
+        assert is_sensitive_bash_command("cat $SOMEVAR/.ssh/id_rsa") is not None
+
+    def test_variable_over_a_benign_tail_is_allowed(self) -> None:
+        """An unresolved variable is not itself a reason to block."""
+        assert is_sensitive_bash_command("B=$HOME/build; cat $B/out.txt") is None
+        assert is_sensitive_bash_command("cat $PWD/out.txt") is None
+        assert is_sensitive_bash_command("cat $BUILD_DIR/report.log") is None
+
+    def test_bare_filename_after_cd_is_resolved_against_the_cd_target(self) -> None:
+        """`cd` + a bare filename read the same file as the absolute form.
+
+        A bare filename has no path separator, so it is not path-like and was
+        never checked; had it been, it would have resolved against the
+        gateway's working directory rather than the directory the command
+        moved to.
+        """
+        assert is_sensitive_bash_command("cd ~/.kiro/crew && cat token_signing.key") is not None
+        assert is_sensitive_bash_command("cd ~/.kiro/crew; cat token_signing.key") is not None
+        assert is_sensitive_bash_command("cd ~/.aws && cat credentials") is not None
+        assert is_sensitive_bash_command("cd ~/.ssh && cat id_rsa") is not None
+        # The `cd` target may itself arrive through $HOME.
+        assert (
+            is_sensitive_bash_command("cd $HOME/.kiro/crew && awk 1 token_signing.key") is not None
+        )
+
+    def test_cd_into_a_benign_directory_is_allowed(self) -> None:
+        """Tracking the `cd` target must not block ordinary relative reads."""
+        assert is_sensitive_bash_command("cd /tmp && cat notes.txt") is None
+        assert is_sensitive_bash_command("cd ~/project && cat config.json") is None
+        assert is_sensitive_bash_command("cd src && grep -rn pattern .") is None
+
+    def test_chained_relative_cd_resolves_against_prior_base(self) -> None:
+        """Relative cd targets must join against the prior base_dir, not overwrite."""
+        # cd ~/.kiro && cd crew → base should be ~/.kiro/crew, not bare "crew"
+        assert is_sensitive_bash_command("cd ~/.kiro && cd crew && cat token_signing.key") is not None
+        assert is_sensitive_bash_command("cd ~ && cd .aws && cat credentials") is not None
+        # Absolute cd resets the base entirely
+        assert is_sensitive_bash_command("cd /tmp && cd /home/user/.aws && cat credentials") is not None
+        # Benign chained cd is allowed
+        assert is_sensitive_bash_command("cd ~/project && cd src && cat main.py") is None
+
+    def test_quoted_separator_does_not_suppress_detection(self) -> None:
+        """A separator inside quotes must not shred the command and lose detection."""
+        # The semicolon is inside quotes — not a real shell separator
+        assert is_sensitive_bash_command('cat "a;b" ~/.aws/credentials') is not None
+        assert is_sensitive_bash_command("echo 'x; y' && cat ~/.ssh/id_rsa") is not None
+        # Quoted && inside an argument
+        assert is_sensitive_bash_command('awk "a&&b" ~/.aws/credentials') is not None
+        # A quote that breaks the `~/` adjacency the path regex needs, so only
+        # the quote-aware tokenizer can resolve it.
+        assert is_sensitive_bash_command('cat "a;b" "~"/.aws/credentials') is not None
+        assert is_sensitive_bash_command("awk '{a=1;b=2}' ~/\".aws\"/credentials") is not None
+
+    def test_quoted_separator_does_not_retarget_the_cd_base(self) -> None:
+        """A `cd` inside a quoted argument must not move the tracked directory.
+
+        The shell never leaves the directory it moved to, so neither may the
+        tracked base. Splitting on the quoted `;` would make `cd /tmp'` a
+        segment, and the bare filename would then resolve against `/tmp` and
+        read clean.
+        """
+        assert (
+            is_sensitive_bash_command(
+                "cd ~/.kiro/crew && echo 'x; cd /tmp' && cat token_signing.key"
+            )
+            is not None
+        )
+        assert (
+            is_sensitive_bash_command('cd ~/.aws && echo "a && cd /tmp" && cat credentials')
+            is not None
+        )
+        # The benign counterpart: no sensitive directory was ever entered.
+        assert is_sensitive_bash_command("echo 'x; cd /tmp' && cat notes.txt") is None
+
+    def test_separator_in_a_command_substitution_does_not_retarget_the_cd_base(self) -> None:
+        """A `cd` inside `$(...)` or backticks runs in a subshell.
+
+        It does not move the parent's directory, so its separators must not be
+        read as the parent's either — the same shape as a quoted separator, one
+        level of syntax removed.
+        """
+        assert (
+            is_sensitive_bash_command(
+                "cd ~/.kiro/crew && echo $(true; cd /tmp) && cat token_signing.key"
+            )
+            is not None
+        )
+        assert (
+            is_sensitive_bash_command(
+                "cd ~/.kiro/crew && echo `true; cd /tmp` && cat token_signing.key"
+            )
+            is not None
+        )
+        # An escaped separator is not a separator to a shell either.
+        assert (
+            is_sensitive_bash_command("cd ~/.aws && echo x\\; cd /tmp && cat credentials")
+            is not None
+        )
+
+    def test_assignment_only_counts_as_a_prefix(self) -> None:
+        """`NAME=value` past the command word is an argument, not an assignment.
+
+        A decoy could otherwise overwrite a real value: the shell keeps
+        `V=$HOME` and enters the protected directory, while the tracker had
+        recorded `V=/tmp` from an `echo` argument and resolved the `cd` there.
+        """
+        assert (
+            is_sensitive_bash_command(
+                "V=$HOME; echo V=/tmp; cd $V/.kiro/crew; cat token_signing.key"
+            )
+            is not None
+        )
+        assert (
+            is_sensitive_bash_command("D=$HOME/.aws; printf D=/tmp; cat $D/credentials") is not None
+        )
+        # A genuine leading assignment still resolves.
+        assert is_sensitive_bash_command("V=$HOME cat $V/.aws/credentials") is not None
+        # And an argument that merely looks like one does not deny on its own.
+        assert is_sensitive_bash_command("echo V=/tmp && cat notes.txt") is None
+
+    def test_cd_dash_returns_to_the_previous_directory(self) -> None:
+        """`cd -` goes back, so the tracked base has to go back with it."""
+        assert (
+            is_sensitive_bash_command("cd ~/.kiro/crew; cd /tmp; cd -; cat token_signing.key")
+            is not None
+        )
+        assert (
+            is_sensitive_bash_command("pushd ~/.aws; pushd /tmp; cd -; cat credentials") is not None
+        )
+        # A bare `cd` goes to the home directory.
+        assert is_sensitive_bash_command("cd ~/project; cd; cat .aws/credentials") is not None
+        # Going back to an ordinary directory stays allowed.
+        assert is_sensitive_bash_command("cd /tmp; cd -; cat notes.txt") is None
+
+    def test_subshell_cd_is_scoped_to_the_subshell(self) -> None:
+        """A `cd` inside `( ... )` applies inside it and is dropped on exit.
+
+        Both halves matter. The read inside the subshell must see the base --
+        `(cd` glued into one token matched no `cd` check, so the base was never
+        set and the bare filename read clean. And the base must not outlive the
+        closing paren, or an ordinary read after it would start denying.
+        """
+        assert is_sensitive_bash_command("(cd ~/.kiro/crew && cat token_signing.key)") is not None
+        assert is_sensitive_bash_command("( cd ~/.aws && cat credentials )") is not None
+        assert is_sensitive_bash_command("(cd ~/.ssh; cat id_rsa)") is not None
+        # The move does not escape the subshell.
+        assert is_sensitive_bash_command("( cd ~/project && cat README.md )") is None
+
+    def test_entering_a_sensitive_directory_taints_later_reads(self) -> None:
+        """A `cd` into a credential directory is not walked back by later syntax.
+
+        Positional resolution has to match real bash to be sound, and the grammar
+        is unbounded. The monotone pass asks a question that needs no emulation:
+        the move was seen, so a read after it is denied — whatever syntax follows.
+        """
+        # A `cd` that does not execute at runtime, but the move was still spelled.
+        assert is_sensitive_bash_command("cd ~/.ssh; false && cd /tmp; cat id_rsa") is not None
+        # An assignment prefix is temporary, so the shell keeps the real value.
+        assert (
+            is_sensitive_bash_command("V=$HOME; V=/tmp echo hi; cd $V/.ssh; cat id_rsa") is not None
+        )
+        # Inside a command substitution, in both spellings.
+        assert is_sensitive_bash_command("echo $(cd ~/.aws; cat credentials)") is not None
+        assert is_sensitive_bash_command("echo `cd ~/.aws; cat credentials`") is not None
+        # Through a nested shell, which this gate does not parse into.
+        assert is_sensitive_bash_command("bash -c 'cd ~/.aws; cat credentials'") is not None
+        # `popd` unwinds a stack the tracker does not model.
+        assert (
+            is_sensitive_bash_command("pushd ~/.aws; pushd /tmp; popd; cat credentials") is not None
+        )
+
+    def test_taint_needs_both_a_sensitive_move_and_a_read(self) -> None:
+        """Neither half denies on its own, so ordinary work stays allowed."""
+        # An ordinary directory, read verb present.
+        assert is_sensitive_bash_command("cd /tmp; cd -; cat notes.txt") is None
+        assert is_sensitive_bash_command("cd ~/project && cd src && cat main.py") is None
+        assert is_sensitive_bash_command("cd ~/project && cat README.md") is None
+        # A read whose joined path is sensitive while the `cd` target is not is
+        # caught by the positional pass, not this one — both are needed.
+        assert is_sensitive_bash_command("cd ~ && cat .aws/credentials") is not None
+
+    def test_unset_variable_cannot_reconstruct_a_sensitive_path(self) -> None:
+        """An unset variable expands to nothing, so the empty reading is a real
+        spelling of the path and must be judged: `$HOME/$X.aws/credentials` with
+        `$X` unset is `~/.aws/credentials`."""
+        assert is_sensitive_bash_command("cat $HOME/$X.aws/credentials") is not None
+        assert is_sensitive_bash_command("cat $HOME/${X}.aws/credentials") is not None
+        assert is_sensitive_bash_command("cat $HOME/$X.ssh/id_rsa") is not None
+        # A variable that expands to nothing onto a non-sensitive tail stays clean.
+        assert is_sensitive_bash_command("cat $HOME/$X.txt") is None
+        assert is_sensitive_bash_command("cat ~/$X/notes.md") is None
+
+    def test_chained_cd_expansions_do_not_blow_up_the_gate(self) -> None:
+        """A chain of `cd ${D:-x}` segments must not grow the tracked base set
+        without bound — each segment can multiply it, so the gate would hang.
+        The cap keeps the synchronous check fast."""
+        import time
+
+        cmd = "D=bar; " + "; ".join(["cd ${D:-foo}"] * 20) + "; cat notes.txt"
+        start = time.monotonic()
+        is_sensitive_bash_command(cmd)
+        assert time.monotonic() - start < 30.0
+
+    def test_parameter_expansion_resolves_like_a_plain_reference(self) -> None:
+        """`${V:-default}` and friends name a variable just as `${V}` does.
+
+        Matching only the bare braced form left `cat ${D:-/tmp}/credentials` with
+        no recognized reference at all, so neither the substitution nor the
+        unresolved-variable hypothesis saw it.
+        """
+        assert is_sensitive_bash_command("D=$HOME/.aws; cat ${D:-/tmp}/credentials") is not None
+        assert is_sensitive_bash_command("D=$HOME/.aws; cat ${D:=/tmp}/credentials") is not None
+        assert is_sensitive_bash_command("D=$HOME/.aws; cat ${D#/nope}/credentials") is not None
+        assert is_sensitive_bash_command("D=$HOME/.aws; cat ${D/zz/yy}/credentials") is not None
+        # One level of nesting resolves on the outer name.
+        assert is_sensitive_bash_command("D=$HOME/.aws; cat ${D:-${E}}/credentials") is not None
+        # A variable the command never assigned still fails closed on the tail.
+        assert is_sensitive_bash_command("cat ${SOMEVAR:-/tmp}/.ssh/id_rsa") is not None
+        # As a `cd` target.
+        assert (
+            is_sensitive_bash_command("D=$HOME/.kiro/crew; cd ${D:-/tmp}; cat token_signing.key")
+            is not None
+        )
+        # A benign remainder stays clean under any value.
+        assert is_sensitive_bash_command("B=$HOME/build; cat ${B:-/tmp}/out.txt") is None
+        assert is_sensitive_bash_command("cat ${PWD:-/tmp}/out.txt") is None
+
+    def test_a_masked_substitution_still_shows_the_path_inside_it(self) -> None:
+        """Masking is a trade, so the whole-line pass runs over BOTH spellings.
+
+        Masking keeps `cd "$(printf %s ~)/.kiro/crew"` as one token so its tail
+        still resolves. But it also hides a path written INSIDE the substitution,
+        and that shape is caught only on the raw text — losing it was a regression
+        against a read `main` already blocked.
+        """
+        assert is_sensitive_bash_command('echo $(ca""t ~/"."aws/credentials)') is not None
+        assert is_sensitive_bash_command("echo `cat ~/.ssh/id_rsa`") is not None
+        # And the masked-only shape keeps working, so neither pass was traded away.
+        assert (
+            is_sensitive_bash_command('cd "$(printf %s ~)/.kiro/crew" && cat token_signing.key')
+            is not None
+        )
+
+    def test_the_substitution_placeholder_cannot_be_assigned(self) -> None:
+        """The placeholder is this module's sentinel, not a variable to be set.
+
+        `_mask_substitutions` rewrites every substitution to it, so a command that
+        assigned that name chose what the masked pass resolved those placeholders
+        to — here making the scanner read the `cd` target as /tmp while bash
+        entered $HOME.
+        """
+        assert (
+            is_sensitive_bash_command(
+                "__kc_subst=/tmp; cd $(printf %s ~); cat .aws/credentials"
+            )
+            is not None
+        )
+
+    def test_a_parameter_expansion_is_judged_under_every_reading(self) -> None:
+        """An operator form can yield the variable's value OR the operand.
+
+        Resolving to the recorded value alone inverted `${D:+$HOME}`; leaving it
+        literal alone lost `${D:-/tmp}` where D is the sensitive directory. Both
+        readings are kept and either one being sensitive denies.
+        """
+        # The operand wins in bash, so the read AFTER the cd is what turns bad.
+        assert is_sensitive_bash_command("D=x; cd ${D:+$HOME}; cat .aws/credentials") is not None
+        assert is_sensitive_bash_command("D=x; cd ${D:-$HOME}; cat .aws/credentials") is not None
+        assert is_sensitive_bash_command("D=x; cd ${D/x/$HOME}; cat .aws/credentials") is not None
+        # The value wins here, and must not be lost by preferring the other reading.
+        assert (
+            is_sensitive_bash_command("D=$HOME/.kiro/crew; cd ${D:-/tmp}; cat token_signing.key")
+            is not None
+        )
+        # A benign remainder stays clean under every reading.
+        assert is_sensitive_bash_command("B=$HOME/build; cd ${B:-/tmp}; cat out.txt") is None
+
+    def test_a_command_prefix_assignment_does_not_persist(self) -> None:
+        """`V=/tmp echo hi` exports V for that command only; bash restores it after.
+
+        Persisting it diverged from the shell in the attacker's favour: the tracker
+        followed the `cd` into /tmp while the shell still had $HOME.
+        """
+        assert (
+            is_sensitive_bash_command("V=$HOME; V=/tmp echo hi; cd $V; cat .aws/credentials")
+            is not None
+        )
+        # An assignment-only segment still persists — that is the legitimate form.
+        assert is_sensitive_bash_command("V=$HOME; cd $V; cat .aws/credentials") is not None
+
+    def test_an_append_assignment_builds_on_the_recorded_value(self) -> None:
+        """`NAME+=value` appends, so the tracked value has to append too.
+
+        The assignment pattern matched only `=`, so the whole `V+=/crew` token
+        failed to match and the segment was read as a command word instead of an
+        assignment. The tracked value stayed on `$HOME/.kiro` while bash held
+        `$HOME/.kiro/crew`, and the read after the `cd` resolved against the
+        wrong directory.
+        """
+        assert (
+            is_sensitive_bash_command('V=$HOME/.kiro; V+=/crew; cd "$V"; cat token_signing.key')
+            is not None
+        )
+        # Appending more than once, and appending to a name never assigned.
+        assert (
+            is_sensitive_bash_command(
+                'V=$HOME; V+=/.kiro; V+=/crew; cd "$V"; cat token_signing.key'
+            )
+            is not None
+        )
+        assert is_sensitive_bash_command('V+=$HOME/.aws; cd "$V"; cat credentials') is not None
+        # A benign append is still not a reason to deny.
+        assert is_sensitive_bash_command('B=$HOME; B+=/build; cd "$B"; cat out.txt') is None
+
+    def test_a_substitutions_own_text_can_name_the_path(self) -> None:
+        """`$HOME` inside a substitution is expanded before masking, so it is visible.
+
+        Masking the substitution to an opaque placeholder threw that away: the
+        target read as `$__kc_subst/crew`, the home hypothesis rewrote it to
+        `~/crew` — benign — while bash entered `~/.kiro/crew` and read the key.
+        """
+        assert (
+            is_sensitive_bash_command('cd "$(printf %s "$HOME/.kiro")/crew"; cat token_signing.key')
+            is not None
+        )
+        assert (
+            is_sensitive_bash_command('cd `printf %s "$HOME/.aws"`; cat credentials') is not None
+        )
+        assert (
+            is_sensitive_bash_command('cd "$(printf %s $HOME)/.aws"; cat credentials') is not None
+        )
+        # Through a variable assigned from the substitution.
+        assert (
+            is_sensitive_bash_command(
+                'V=$(printf %s "$HOME/.kiro"); cd "$V/crew"; cat token_signing.key'
+            )
+            is not None
+        )
+        # Only a path-shaped last word is vouched for, so a substitution that ends
+        # on a command or subcommand name still falls through to the hypothesis
+        # rather than being read as a path — these must stay clean.
+        assert (
+            is_sensitive_bash_command('cd "$(git rev-parse --show-toplevel)" && cat README.md')
+            is None
+        )
+        assert is_sensitive_bash_command("cd $(mktemp -d) && cat notes.txt") is None
+        assert is_sensitive_bash_command("cat $(pwd)/out.txt") is None
+
+    def test_a_cd_into_a_directory_that_holds_a_secret_taints(self) -> None:
+        """`~/.kiro/crew` is not sensitive itself — only its leaves are.
+
+        Every check that guards a *move* asked `is_sensitive_path` about the `cd`
+        target, which answers "is this the protected thing". For the keystone the
+        answer is no, so the taint pass was inert for the one directory it exists to
+        protect, and `~/.aws` hid it: that one IS sensitive as a whole directory, so
+        every test written against that spelling passed.
+
+        Both shapes below are unresolvable by the segment walk — the first is one
+        opaque quoted argument, the second moves away again before the read — so
+        both depend on the taint pass.
+        """
+        assert (
+            is_sensitive_bash_command('bash -c "cd ~/.kiro/crew; cat token_signing.key"')
+            is not None
+        )
+        assert (
+            is_sensitive_bash_command("cd ~/.kiro/crew; false && cd /tmp; cat token_signing.key")
+            is not None
+        )
+        # The directory list is derived, so a directory that holds no secret is not
+        # tainted and an ordinary move still reads clean.
+        assert is_sensitive_bash_command("cd ~ && cat notes.txt") is None
+        assert is_sensitive_bash_command("cd /tmp && cat notes.txt") is None
+        assert is_sensitive_bash_command('bash -c "cd ~/src; cat main.py"') is None
+
+    def test_a_later_cd_does_not_erase_a_sensitive_one(self) -> None:
+        """The erasing `cd` does not have to run.
+
+        `false &&` short-circuits, so bash never leaves the crew directory — while
+        the walk had already moved its only base and resolved the read against
+        nothing. Deciding whether a `cd` executes means evaluating the command, so
+        nothing is forgotten instead.
+        """
+        assert (
+            is_sensitive_bash_command(
+                "H=$HOME; D=$H/.kiro/crew; cd $D; false && cd /tmp; cat token_signing.key"
+            )
+            is not None
+        )
+        assert (
+            is_sensitive_bash_command("cd ~/.aws; false && cd /tmp; cat credentials") is not None
+        )
+        # Ordinary chained moves are unaffected.
+        assert is_sensitive_bash_command("cd /tmp; cd /var/log; cat syslog") is None
+        assert is_sensitive_bash_command("cd ~ && cd src && cat main.py") is None
+
+    def test_a_declaration_builtin_is_an_assignment(self) -> None:
+        """`export NAME=value` assigns, so leaving the keyword in place lost it.
+
+        With the keyword still there the segment read as "a command word followed by
+        an operand", so the assignment-prefix run ended before it started and the
+        name was never recorded.
+        """
+        assert (
+            is_sensitive_bash_command("export D=$HOME/.kiro/crew; cd $D; cat token_signing.key")
+            is not None
+        )
+        for keyword in ("declare", "typeset", "local", "readonly"):
+            assert (
+                is_sensitive_bash_command(f"{keyword} D=$HOME/.aws; cd $D; cat credentials")
+                is not None
+            ), keyword
+        # Options before the name are skipped too.
+        assert (
+            is_sensitive_bash_command("export -p D=$HOME/.aws; cd $D; cat credentials") is not None
+        )
+        # A benign declaration is not a reason to deny.
+        assert is_sensitive_bash_command("export D=$HOME/src; cd $D; cat main.py") is None
+
+    def test_an_assignment_keeps_the_operator_form_literal(self) -> None:
+        """Collapsing an operator form at ASSIGNMENT time is one-way, and picked wrong.
+
+        `${X:+…}` names X, so resolving to the variable's value recorded `x` — while
+        bash yields the OPERAND for `:+`, entered the crew directory and read the
+        signing key. Recorded literally, both meanings survive to the point of use:
+        `_expansion_readings` derives the value form back out, and the operand is
+        still readable in the text.
+        """
+        assert (
+            is_sensitive_bash_command(
+                "X=x; D=${X:+$HOME/.kiro/crew}; cd $D; cat token_signing.key"
+            )
+            is not None
+        )
+        assert (
+            is_sensitive_bash_command("X=x; D=${X:-$HOME/.aws}; cd $D; cat credentials") is not None
+        )
+        # The value reading must not be lost either — this one needs it.
+        assert (
+            is_sensitive_bash_command("D=$HOME/.kiro/crew; cd ${D:-/tmp}; cat token_signing.key")
+            is not None
+        )
+        # A benign operand stays clean under every reading.
+        assert is_sensitive_bash_command("X=x; D=${X:+$HOME/build}; cd $D; cat out.txt") is None
+        assert is_sensitive_bash_command("B=$HOME/build; cd ${B:-/tmp}; cat out.txt") is None
+
+    def test_the_reserved_placeholder_name_is_refused_in_every_spelling(self) -> None:
+        """The segment walk numbers the placeholder, so the refusal has to be numbered too.
+
+        `_mask_substitutions_valued` emits `__kc_subst1`, `__kc_subst2`, … so two
+        substitutions in one segment cannot inherit each other's value. A refusal
+        that only knew the unnumbered spelling therefore covered a name the walk
+        no longer produces.
+
+        Asserted on the matcher rather than only end to end: the unresolved
+        reading is kept alongside the resolved one, so a recorded value cannot
+        remove a denial on its own and no single payload isolates this. The
+        invariant is still worth holding — it is what keeps a command from naming
+        this module's private sentinel at all.
+        """
+        from kiro_crew.security import _SUBST_PLACEHOLDER_NAME, _SUBST_PLACEHOLDER_NAME_RE
+
+        assert _SUBST_PLACEHOLDER_NAME_RE.match(_SUBST_PLACEHOLDER_NAME)
+        assert _SUBST_PLACEHOLDER_NAME_RE.match(f"{_SUBST_PLACEHOLDER_NAME}1")
+        assert _SUBST_PLACEHOLDER_NAME_RE.match(f"{_SUBST_PLACEHOLDER_NAME}12")
+        # A name that merely starts the same way is a different variable.
+        assert not _SUBST_PLACEHOLDER_NAME_RE.match(f"{_SUBST_PLACEHOLDER_NAME}_x")
+        assert not _SUBST_PLACEHOLDER_NAME_RE.match(f"x{_SUBST_PLACEHOLDER_NAME}")
+        # And the payload the refusal exists for stays denied in both spellings.
+        assert (
+            is_sensitive_bash_command("__kc_subst=/tmp; cd $(printf %s ~); cat .aws/credentials")
+            is not None
+        )
+        assert (
+            is_sensitive_bash_command("__kc_subst1=/tmp; cd $(printf %s ~); cat .aws/credentials")
+            is not None
+        )
+
+    def test_a_wrapped_cd_is_still_a_cd(self) -> None:
+        """`builtin` and `command` run the builtin, so the command word moves.
+
+        Unwrapped, the segment was not recognised as a `cd` at all, so no base was
+        tracked and the bare filename after it read clean.
+        """
+        assert is_sensitive_bash_command("builtin cd ~; cat .aws/credentials") is not None
+        assert is_sensitive_bash_command("command cd ~; cat .aws/credentials") is not None
+        assert is_sensitive_bash_command("builtin pushd ~; cat .aws/credentials") is not None
+        # A real program whose name merely starts the same way is not unwrapped.
+        assert is_sensitive_bash_command("commander cd /tmp && cat notes.txt") is None
+
+    def test_command_substitution_is_an_unresolved_value(self) -> None:
+        """A substitution's value needs the command to run, so fail closed on it.
+
+        Unquoted it also contains spaces, and `shlex` splits on them, so the
+        target used to shred into fragments that matched nothing. It is masked to
+        a single token before tokenization.
+        """
+        assert (
+            is_sensitive_bash_command('cd "$(printf %s ~)/.kiro/crew" && cat token_signing.key')
+            is not None
+        )
+        assert (
+            is_sensitive_bash_command("cd $(printf %s ~)/.aws && cat credentials") is not None
+        )
+        assert is_sensitive_bash_command("cd `printf %s ~`/.ssh && cat id_rsa") is not None
+        assert is_sensitive_bash_command("cat $(printf %s ~)/.aws/credentials") is not None
+        # Through a variable assigned from a substitution.
+        assert (
+            is_sensitive_bash_command("D=$(printf %s ~); cd $D/.kiro/crew && cat token_signing.key")
+            is not None
+        )
+        # A substitution over a benign remainder is not a reason to deny.
+        assert (
+            is_sensitive_bash_command('cd "$(git rev-parse --show-toplevel)" && cat README.md')
+            is None
+        )
+        assert is_sensitive_bash_command("cd $(mktemp -d) && cat notes.txt") is None
+        assert is_sensitive_bash_command("cat $(pwd)/out.txt") is None
+
+    def test_pushd_tracks_directory(self) -> None:
+        """pushd should be treated like cd for directory tracking."""
+        assert is_sensitive_bash_command("pushd ~/.kiro/crew && cat token_signing.key") is not None
+        assert is_sensitive_bash_command("pushd /tmp && cat notes.txt") is None
+
+    def test_home_with_backslash_separators_survives_tokenization(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """`$HOME` must still resolve when the home path holds backslashes.
+
+        `normalize_shell_command` substitutes the home into the command text
+        before `shlex.split(posix=True)`, which reads a backslash as an escape
+        character. A Windows home — `C:\\Users\\<name>` — was therefore
+        tokenized to `C:Users<name>`: separators eaten, the path no longer
+        under the home directory, and so every `$HOME`-spelled credential path
+        resolved clean. This reproduces that shape on any platform, since a
+        backslash is a legal POSIX filename character.
+        """
+        home = tmp_path / "Users\\runneradmin"
+        (home / ".aws").mkdir(parents=True)
+        (home / ".aws" / "credentials").write_text("[default]\n")
+        (home / ".kiro" / "crew").mkdir(parents=True)
+        (home / ".kiro" / "crew" / "token_signing.key").write_text("k\n")
+        monkeypatch.setenv("HOME", str(home))
+
+        assert is_sensitive_bash_command("cat $HOME/.aws/credentials") is not None
+        # Through a variable the command assigns from $HOME.
+        assert is_sensitive_bash_command("D=$HOME/.aws; cat $D/credentials") is not None
+        # As a `cd` target, with the operand a bare filename.
+        assert (
+            is_sensitive_bash_command("cd $HOME/.kiro/crew && awk 1 token_signing.key") is not None
+        )
+        # A benign remainder under the same home stays clean.
+        assert is_sensitive_bash_command("cat $HOME/notes.txt") is None
+
     # ── Symlink-staging (pentest recommendation item 3) ──
 
     def test_ln_home_anchored_sensitive_blocked(self) -> None:
@@ -3847,6 +4512,37 @@ class TestWindowsPathShapes:
         for cmd in cmds:
             assert is_sensitive_bash_command(cmd) is not None, cmd
 
+    @pytest.mark.parametrize("leaf", security._WRITE_PROTECTED_BASH_LEAVES)
+    def test_native_spelling_of_write_protected_leaf_is_blocked_on_any_host(
+        self, leaf: str
+    ) -> None:
+        # The write-protected leaf branch is POSIX-separator anchored, so on a
+        # Windows host the resolved home literal (``C:\Users\u``) spells every
+        # leaf with backslashes and reached the fenced file unblocked. Each leaf
+        # is an input to an authorization decision (migration completion, the
+        # on-call schedule, the incident index, the alias ownership record), so
+        # the native spelling has to be gated in the raw text like the fenced
+        # dirs already are -- host-independently, since the raw pass never
+        # depends on the runner's OS.
+        win_leaf = leaf.replace("/", "\\")
+        for prefix in security.crew_home_prefixes():
+            win_prefix = prefix.replace("/", "\\")
+            for anchor in ("C:\\Users\\u", "%USERPROFILE%", "$env:USERPROFILE"):
+                target = f"{anchor}\\{win_prefix}\\{win_leaf}"
+                for cmd in (
+                    f'echo forged > "{target}"',
+                    f'copy /Y evil.json "{target}"',
+                    f"python -c \"open(r'{target}','w')\"",
+                    f'del "{target}"',
+                ):
+                    assert is_sensitive_bash_command(cmd) is not None, cmd
+        # Adding a leaf must not fence the whole crew home: unrelated content in
+        # the same native spelling stays writable.
+        assert (
+            is_sensitive_bash_command('echo x > "C:\\Users\\u\\.kiro\\crew\\sessions.db"')
+            is None
+        )
+
     def test_appdata_alias_of_fenced_store_is_blocked(self) -> None:
         # %APPDATA% points INTO AppData\Roaming, so this spelling names the
         # store without the AppData\Roaming text the home-anchored branch
@@ -3910,6 +4606,98 @@ class TestWindowsPathShapes:
         for fenced in (".aws\\credentials", "AppData\\Roaming\\kiro-cli\\data.sqlite3"):
             cmd = f"type '{home}\\{fenced}'"
             assert is_sensitive_bash_command(cmd) is not None, cmd
+
+
+class TestBareTokenProtectedLeaves:
+    """The distinctive leaves are refused by NAME, with no anchor required.
+
+    Every other leaf branch needs a home anchor plus a crew prefix, so one ``cd`` walks
+    around all of them: after ``cd ~/.kiro/crew`` a relative ``echo forged >
+    connections-tool-aliases.json`` names no home, no prefix and no separator. For the
+    alias ownership record that is not a residual limit to accept the way it is for
+    credential paths -- the file IS the deletion grant (``alias_record.load_claimed``
+    returns the pairs the rebuild may strip from the spec), so the contract is about the
+    FILENAME: any command naming it as a path segment is refused, and anchoring is not
+    part of the contract.
+    """
+
+    def test_relative_redirect_after_cd_is_blocked(self) -> None:
+        for leaf in security._BARE_TOKEN_PROTECTED_LEAVES:
+            for cmd in (
+                f"cd ~/.kiro/crew && echo forged > {leaf}",
+                f"cd $HOME/.kiro/crew; echo forged >> {leaf}",
+                # no space between the operator and the target
+                f"cd ~/.kirocrew && echo forged >{leaf}",
+                f"cd ~/.kiro/crew && echo forged > '{leaf}'",
+            ):
+                assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_bare_name_with_any_verb_is_blocked(self) -> None:
+        # Verb-independent, like the anchored branches: naming the file is the signal,
+        # so a novel or forgotten write verb cannot slip past an enumerated list.
+        for leaf in security._BARE_TOKEN_PROTECTED_LEAVES:
+            for cmd in (
+                f"tee {leaf}",
+                f"touch {leaf}",
+                f"rm -f {leaf}",
+                f"mv /tmp/forged.json {leaf}",
+                f"cp /tmp/forged.json {leaf}",
+                f"cat {leaf}",
+                f"python -c \"open('{leaf}','w')\"",
+                f"install -m 600 /tmp/forged.json {leaf}",
+            ):
+                assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_subdir_relative_spellings_are_blocked(self) -> None:
+        # A path SEPARATOR before the name is the common bare-relative spelling and is
+        # outside the ``[\s'\"=:,;]`` token anchor the anchored branches use.
+        for leaf in security._BARE_TOKEN_PROTECTED_LEAVES:
+            for cmd in (
+                f"echo forged > ./{leaf}",
+                f"tee ./{leaf}",
+                f"cp /tmp/f.json crew/{leaf}",
+                f"echo forged > ../crew/{leaf}",
+            ):
+                assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_windows_relative_spelling_is_blocked(self) -> None:
+        # Host-independent: the raw pass never depends on the runner's OS, and a
+        # backslash-relative name carries no anchor for the Windows leaf branch either.
+        for leaf in security._BARE_TOKEN_PROTECTED_LEAVES:
+            for cmd in (
+                f"echo forged > .\\{leaf}",
+                f'copy /Y evil.json ".\\{leaf}"',
+                f"echo forged > crew\\{leaf}",
+                f"python -c \"open(r'.\\{leaf}','w')\"",
+            ):
+                assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_unrelated_names_and_crew_content_stay_allowed(self) -> None:
+        # Bare-token matching is deliberately narrow: it fences ONE distinctive
+        # filename, not the crew home and not every name that contains it.
+        assert is_sensitive_bash_command("touch ~/.kiro/crew/sessions.db") is None
+        assert is_sensitive_bash_command("touch ~/.kirocrew/sessions.db") is None
+        assert is_sensitive_bash_command("cat ~/.kiro/crew/config.json") is None
+        for leaf in security._BARE_TOKEN_PROTECTED_LEAVES:
+            # a DIFFERENT file whose name merely ends with the protected one
+            assert is_sensitive_bash_command(f"touch my-{leaf}") is None
+            assert is_sensitive_bash_command(f"cat legacy-{leaf}") is None
+            # a longer name that merely starts with it
+            assert is_sensitive_bash_command(f"cat {leaf}x") is None
+            assert is_sensitive_bash_command(f"cat {leaf}5") is None
+
+    def test_generic_leaves_are_not_bare_matched(self) -> None:
+        # SCOPE GUARD: bare-token matching is only safe for a globally distinctive
+        # name. Admitting a generic leaf (``index.json``, ``config.json``,
+        # ``rotation.yaml``) would refuse a large fraction of ordinary commands, so the
+        # tuple must never grow one -- and the anchored forms must keep working.
+        for generic in ("index.json", "config.json", "rotation.yaml", ".data-home-ready"):
+            assert generic not in security._BARE_TOKEN_PROTECTED_LEAVES
+            assert is_sensitive_bash_command(f"touch {generic}") is None
+        for leaf in security._WRITE_PROTECTED_BASH_LEAVES:
+            for prefix in security.crew_home_prefixes():
+                anchored = f"echo forged > ~/{prefix}/{leaf}"
+                assert is_sensitive_bash_command(anchored) is not None, anchored
 
 
 class TestDeniedCommandsKeystone:

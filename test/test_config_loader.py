@@ -180,6 +180,23 @@ def test_sandbox_allow_unsandboxed_exec_loads_from_config() -> None:
     assert enabled.agent.sandbox_allow_unsandboxed_exec is True
 
 
+def test_max_stop_hook_nudges_loads_from_config_and_round_trips() -> None:
+    """The Stop-hook nudge cap is built field-by-field in load(), so an
+    operator's value must hydrate and survive a to_dict() -> load() round-trip.
+    Without the loader wiring, load() re-defaults it to 100 and save() then
+    overwrites the operator's file value.
+    """
+    assert KiroCrewConfig().agent.max_stop_hook_nudges == 100
+    assert _load_from_dict({}).agent.max_stop_hook_nudges == 100
+    pinned = _load_from_dict({"agent": {"max_stop_hook_nudges": 7}})
+    assert pinned.agent.max_stop_hook_nudges == 7
+    # 0 = uncapped opt-in must survive too, not be re-defaulted to 100.
+    uncapped = _load_from_dict({"agent": {"max_stop_hook_nudges": 0}})
+    assert uncapped.agent.max_stop_hook_nudges == 0
+    # Round-trip: save() (to_dict) -> load() preserves the pinned value.
+    assert _load_from_dict(pinned.to_dict()).agent.max_stop_hook_nudges == 7
+
+
 def test_dashboard_tailscale_hydrates_and_survives_a_round_trip() -> None:
     """The opt-in must survive ``load()`` and a later ``save()``.
 
@@ -2761,6 +2778,73 @@ class TestSecurityBoundClamping:
         assert d["agent"]["max_subagents"] == 64
         assert d["agent"]["subagent_max_turns"] == 200
         assert d["session"]["pool_size"] == 10
+
+    def test_numeric_string_ceiling_is_still_enforced_at_extraction(self) -> None:
+        """``_clamp_security_bounds`` runs over the RAW dict and deliberately
+        skips non-int values (see ``test_non_int_value_not_clamped``) --
+        ``_safe_int``'s own docstring says clamping at the coercion site is
+        what actually enforces the range for a numeric STRING that slips past
+        it. ``max_subagents``/``subagent_max_turns`` previously reached the
+        dataclass with NO coercion at all, and ``subagent_auto_max``/
+        ``pool_size`` were ``_safe_int``-coerced but without bounds -- all
+        four let a numeric-string value bypass the declared ceiling entirely."""
+        from kiro_crew.config.loader import (
+            POOL_SIZE_MAX,
+            SUBAGENT_AUTO_MAX_CEILING,
+            SUBAGENT_MAX_TURNS_CEILING,
+        )
+
+        cfg = _load_from_dict(
+            {
+                "agent": {
+                    "max_subagents": "200",
+                    "subagent_max_turns": "99999",
+                    "subagent_auto_max": "500",
+                },
+                "session": {"pool_size": "1000"},
+            }
+        )
+        assert cfg.agent.max_subagents == SUBAGENT_AUTO_MAX_CEILING == 64
+        assert cfg.agent.subagent_max_turns == SUBAGENT_MAX_TURNS_CEILING == 200
+        assert cfg.agent.subagent_auto_max == SUBAGENT_AUTO_MAX_CEILING == 64
+        assert cfg.session.pool_size == POOL_SIZE_MAX == 10
+        for v in (
+            cfg.agent.max_subagents,
+            cfg.agent.subagent_max_turns,
+            cfg.agent.subagent_auto_max,
+            cfg.session.pool_size,
+        ):
+            assert isinstance(v, int) and not isinstance(v, bool)
+
+    def test_numeric_string_in_range_still_parses(self) -> None:
+        """A well-formed numeric string within bounds must keep working --
+        the fix must not turn a previously-accepted legacy string value into
+        the default."""
+        cfg = _load_from_dict(
+            {
+                "agent": {
+                    "max_subagents": "8",
+                    "subagent_max_turns": "150",
+                    "subagent_auto_max": "32",
+                },
+                "session": {"pool_size": "4"},
+            }
+        )
+        assert cfg.agent.max_subagents == 8
+        assert cfg.agent.subagent_max_turns == 150
+        assert cfg.agent.subagent_auto_max == 32
+        assert cfg.session.pool_size == 4
+
+    def test_subagent_max_turns_as_string_no_longer_crashes_a_turn_limit_check(
+        self,
+    ) -> None:
+        """The concrete downstream failure this bug caused: subagent.py compares
+        ``turns > turn_limit`` where turns is always a real int -- a string
+        subagent_max_turns reaching that comparison raised TypeError on the
+        first tool call of every subagent. Assert the loaded value is always
+        int-comparable."""
+        cfg = _load_from_dict({"agent": {"subagent_max_turns": "50"}})
+        assert not (cfg.agent.subagent_max_turns > 999)  # must not raise TypeError
 
     def test_in_range_values_unchanged(self) -> None:
         with unittest.mock.patch("kiro_crew.config.loader._log_config_clamp_event") as mock_event:

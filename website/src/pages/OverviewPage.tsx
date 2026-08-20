@@ -1,7 +1,7 @@
-import { type ReactNode, useState } from 'react'
+import { type ReactNode } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { ArrowLeft, ArrowRight, BarChart3, Brain, CheckCircle, Smartphone, Zap } from 'lucide-react'
+import { ArrowLeft, ArrowRight, BarChart3, Brain } from 'lucide-react'
 import { useAppSelector } from '../store'
 import { useUptime } from '../hooks/useUptime'
 import { api } from '../api/client'
@@ -154,9 +154,6 @@ export default function OverviewPage() {
   const refreshTrigger = useAppSelector(s => s.dashboard.refreshTrigger)
   const uptime = useUptime()
   const [params, setParams] = useSearchParams()
-  const [restarting, setRestarting] = useState(false)
-  const [restartMsg, setRestartMsg] = useState<ReactNode>('')
-  const [mobileSyncOpen, setMobileSyncOpen] = useState(false)
 
   const rawView = params.get('view')
   const view: DrillView | null = DRILL_VIEWS.includes(rawView as DrillView) ? (rawView as DrillView) : null
@@ -167,14 +164,6 @@ export default function OverviewPage() {
     return next
   }, { replace: true })
 
-  const restart = async () => {
-    setRestarting(true)
-    await api.restartSessions()
-    setRestartMsg(<><CheckCircle className="lucide-inline" /> {i18nT('pages.overviewPage.sessions_restarted')}</>)
-    setRestarting(false)
-    setTimeout(() => setRestartMsg(''), 5000)
-  }
-
   if (view === 'memory') {
     return <DrillIn title={i18nT('pages.overviewPage.memory')} onBack={() => setView(null)}><MemoryTab refreshTrigger={refreshTrigger} /></DrillIn>
   }
@@ -184,8 +173,10 @@ export default function OverviewPage() {
 
   return (
     <>
-      {/* Health hero */}
-      <div className="flex items-center justify-between gap-4 mb-5">
+      {/* Health hero. Status only — Overview edits no config, so it hosts no
+          apply/restart action. Restarting sessions to pick up config changes
+          lives with the surfaces that edit it (Capabilities header). */}
+      <div className="flex items-center gap-4 mb-5">
         <div>
           <div className="text-lg font-bold text-text-strong flex items-center gap-2">
             <span className={`w-2 h-2 rounded-full shrink-0 ${connected && status ? 'bg-ok' : 'bg-warn'}`} />
@@ -194,34 +185,6 @@ export default function OverviewPage() {
           <div className="text-[12.5px] text-muted mt-0.5">
             {i18nT('pages.overviewPage.up')} {uptime}{status?.version ? <> {i18nT('pages.overviewPage.v')}{status.version}</> : null}
           </div>
-        </div>
-        <div className="flex items-center gap-2">
-          {restartMsg && <span className="text-ok text-[13px] animate-rise">{restartMsg}</span>}
-          <button
-            onClick={() => setMobileSyncOpen(true)}
-            title="\u{1F4F1} \u0421\u043C\u0430\u0440\u0442\u0444\u043E\u043D / QR-\u043A\u043E\u0434"
-            className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-[13px] font-semibold font-body cursor-pointer transition-all duration-300 border-none bg-gradient-to-r from-accent to-accent-hover text-accent-fg shadow-[0_2px_8px_var(--accent-glow)] hover:shadow-[0_4px_20px_var(--accent-glow)] hover:-translate-y-0.5 active:translate-y-0"
-          >
-            <Smartphone className="lucide-inline" />
-            <span className="hidden sm:inline">{'\u{1F4F1}'} \u0421\u043C\u0430\u0440\u0442\u0444\u043E\u043D / QR-\u043A\u043E\u0434</span>
-          </button>
-          <button
-            onClick={restart}
-            disabled={restarting}
-            title={i18nT('pages.overviewPage.apply_config_changes_by_restarting_all_sessions')}
-            className={`group relative inline-flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-[13px] font-semibold font-body cursor-pointer transition-all duration-300 overflow-hidden border-none ${
-              restarting
-                ? 'bg-accent/60 text-accent-fg/80 cursor-wait'
-                : 'bg-gradient-to-r from-accent to-accent-hover text-accent-fg shadow-[0_2px_8px_var(--accent-glow)] hover:shadow-[0_4px_20px_var(--accent-glow)] hover:-translate-y-0.5 active:translate-y-0'
-            }`}
-          >
-            {restarting && <span className="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent animate-shimmer" />}
-            <span className={`transition-transform duration-300 ${restarting ? 'animate-spin' : 'group-hover:rotate-12'}`}><Zap className="lucide-inline" /></span>
-            {restarting
-              ? <span className="hidden sm:inline">{i18nT('pages.overviewPage.restarting')}</span>
-              : <><span className="hidden lg:inline">{i18nT('pages.overviewPage.apply_restart')}</span><span className="hidden sm:inline lg:hidden">{i18nT('pages.overviewPage.restart')}</span></>
-            }
-          </button>
         </div>
       </div>
 

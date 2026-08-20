@@ -27,6 +27,7 @@ from kiro_crew.config.loader import (
     update_config_locked,
 )
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.platform import update_layout
 from kiro_crew.platform.update_governance import (
     min_version,
     resolve_remote_url,
@@ -60,6 +61,18 @@ _update_info: dict[str, object] = {
     "self_updatable": False,
     "channel": "",
     "update_command": "",
+    #: Did the RELEASE VERSION move? Reported separately from ``available``
+    #: because the two answer different questions and one consumer needs the
+    #: narrower one.
+    #:
+    #: ``available`` is what the dashboard shows, and for a git checkout it is
+    #: true on commit distance alone. The unattended
+    #: ``GatewayOrchestrator._auto_apply_update`` applies `git reset --hard`, so
+    #: it requires BOTH: acting on commit distance alone would reset a
+    #: developer's checkout within 12 hours of any upstream commit, where before
+    #: it only did so at a release. Requiring both keeps that path firing no more
+    #: often than it did while the verdict was version-only.
+    "version_newer": False,
     "error": "",
 }
 _UPDATE_CHECK_INTERVAL = 43200  # 12 hours
@@ -128,10 +141,20 @@ _ERR_UNKNOWN = "unknown"
 #: makes the Windows machine a thin client for a gateway running on EC2 Linux, so
 #: the backend answering this call is a Linux install that identifies itself
 #: correctly on its own.
+#: The one externally-managed distribution whose remedy is an image pull
+#: rather than the desktop app.
+_CONTAINER_DISTRIBUTION = "docker"
+
+#: DERIVED, not restated: ``update_layout.EXTERNALLY_MANAGED`` owns WHICH
+#: distributions are externally managed, and this module owns only the wording
+#: shown for them. The two lists were duplicated once, and the copy here fell
+#: behind when Linux gained deb and rpm -- a package install then reached
+#: ``_check_release_feed()`` and was compared against the CLI wheel channel,
+#: which is exactly the wrong-stream false positive described above. Deriving the
+#: key set makes that drift impossible: a format added there appears here.
 _EXTERNALLY_MANAGED = {
-    "dmg": _ERR_MANAGED_BY_APP,
-    "appimage": _ERR_MANAGED_BY_APP,
-    "docker": _ERR_MANAGED_BY_IMAGE,
+    dist: _ERR_MANAGED_BY_IMAGE if dist == _CONTAINER_DISTRIBUTION else _ERR_MANAGED_BY_APP
+    for dist in update_layout.EXTERNALLY_MANAGED
 }
 
 
@@ -317,13 +340,21 @@ def _wheel_update_command(channel: str, artifact_base: str) -> str:
     as untrusted display metadata.
 
     ``--proto '=https'`` is not decoration: this string is copied into a shell and
-    pipes an installer into ``sh``, and ``artifact_base`` is overridable via
+    runs an installer, and ``artifact_base`` is overridable via
     ``KIROCREW_CDN_BASE``. Without the restriction, an ``http://`` override would
     hand the user a command that fetches a script in plaintext and executes it, so
     an on-path attacker could swap the installer. curl refuses any other scheme,
     which is also exactly what ``cli.sh`` does for every fetch it makes itself.
+
+    Delegates to :func:`update_layout.wheel_update_command` rather than composing
+    a second copy: this string used to pipe curl into ``sh``, which reports only
+    the shell's status, so a failed download read as a successful update. Keeping
+    one builder is what stops the displayed command and the one the gateway runs
+    from drifting apart on that.
     """
-    return f"curl -fsSL --proto '=https' {artifact_base}/cli.sh | sh -s -- --channel {channel}"
+    from kiro_crew.platform.update_layout import wheel_update_command
+
+    return wheel_update_command(channel)
 
 
 def _set_update_info(**fields: object) -> None:
@@ -344,6 +375,7 @@ def _set_update_info(**fields: object) -> None:
             "self_updatable": False,
             "channel": "",
             "update_command": "",
+            "version_newer": False,
             "error": "",
         }
     )
@@ -377,8 +409,10 @@ async def _do_update_check() -> None:
     Three install layouts, three answers:
 
     * **git checkout** — ``KIROCREW_PROJECT_DIR`` with a ``.git``. Fetch the
-      remote and compare its ``src/kiro_crew/__init__.py`` ``__version__``. This
-      is also the only layout ``POST /api/update`` can act on.
+      remote, then report an update when the checkout can be FAST-FORWARDED
+      (behind its upstream and not ahead of it) OR when the on-disk
+      ``__version__`` outranks the imported one. This is also the only layout
+      ``POST /api/update`` can act on.
     * **externally managed** — a desktop bundle or a container
       (:data:`_EXTERNALLY_MANAGED`). This gateway is NOT the update surface, so
       it reports which surface is instead of guessing a verdict.
@@ -529,6 +563,57 @@ async def _check_git_checkout(proj: str) -> None:
         _set_update_info(**base, error=_ERR_GIT_READ_FAILED)
         return
 
+    # How far the checkout is from its upstream, BOTH directions. This — not the
+    # version string — is what "up to date" means for a git checkout: the
+    # version is bumped only at a release, so a checkout hundreds of commits
+    # behind reads as current for as long as the next bump takes.
+    #
+    # Both counts are needed because one of the apply paths is DESTRUCTIVE.
+    # ``GatewayOrchestrator._auto_apply_update`` runs unattended under
+    # ``auto_update`` and applies ``git fetch`` + ``git reset --hard``, so an
+    # update offered on a branch carrying local commits discards them with no
+    # prompt. ``behind > 0`` alone is not safe: it is true both for a checkout
+    # that is purely behind AND for a DIVERGED one (ahead and behind at once),
+    # and the second is precisely the case with commits to lose. Only a checkout
+    # that is behind and NOT ahead can be fast-forwarded, so only that one is
+    # offered an update.
+    ahead = behind = 0
+    count = await asyncio.create_subprocess_exec(
+        "git",
+        "rev-list",
+        "--count",
+        "--left-right",
+        "HEAD...@{u}",
+        cwd=proj,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        count_out, _ = await asyncio.wait_for(count.communicate(), timeout=10)
+    except asyncio.TimeoutError:
+        try:
+            count.kill()
+        except ProcessLookupError:
+            pass
+        await count.communicate()
+        _set_update_info(**base, error=_ERR_GIT_READ_FAILED)
+        return
+    if count.returncode != 0:
+        logger.warning("Could not count commits against upstream in %s", proj)
+        _set_update_info(**base, error=_ERR_GIT_READ_FAILED)
+        return
+    # ``--left-right`` with the three-dot range prints "<ahead>\t<behind>": left
+    # is reachable from HEAD only, right from the upstream only.
+    try:
+        ahead_text, behind_text = count_out.decode(errors="replace").split()
+        ahead, behind = int(ahead_text), int(behind_text)
+    except ValueError:
+        logger.warning("Unparseable rev-list count in %s", proj)
+        _set_update_info(**base, error=_ERR_GIT_READ_FAILED)
+        return
+    # Fast-forwardable: behind, and carrying nothing of its own to lose.
+    can_fast_forward = behind > 0 and ahead == 0
+
     # Compare the remote's version (or the on-disk one when already pulled).
     target_sha = remote_sha if local_sha != remote_sha else local_sha
     show = await asyncio.create_subprocess_exec(
@@ -555,8 +640,16 @@ async def _check_git_checkout(proj: str) -> None:
         _set_update_info(**base, error=_ERR_GIT_READ_FAILED)
         return
     remote_version = match.group(1)
-    available = _is_newer(remote_version, _local_version)
-    if available is None:
+    # Two independent reasons a checkout is out of date, either one sufficient:
+    #   * it is behind its upstream — commits to pull;
+    #   * the on-disk ``__version__`` outranks the one this process IMPORTED, so
+    #     the pull already landed and only a restart is missing.
+    version_newer = _is_newer(remote_version, _local_version)
+    if version_newer is None and not can_fast_forward:
+        # Nothing left to go on: the version comparison failed AND there is no
+        # fast-forwardable distance. A check that could not answer must not
+        # answer "you are on the latest version". A fast-forwardable checkout is
+        # a verdict on its own, so an unparseable version does not discard it.
         logger.warning(
             "Cannot compare local version %s against remote %s",
             _local_version,
@@ -564,6 +657,21 @@ async def _check_git_checkout(proj: str) -> None:
         )
         _set_update_info(**base, remote_version=remote_version, error=_ERR_VERSION_UNPARSEABLE)
         return
+    # The version signal answers one question only: the pull already landed and
+    # this process is still running the code from before it. That state IS
+    # ``local_sha == remote_sha``, so requiring it is not a restriction but the
+    # signal's actual domain.
+    #
+    # Without that gate the term reaches a case it was never about. A checkout
+    # that pulled a version bump and then committed on top is AHEAD, so its
+    # upstream still reads newer than the version this process imported — and
+    # the unattended ``_auto_apply_update`` would answer that by resetting hard
+    # onto the upstream, dropping those commits. Its own preflight does not
+    # catch it either: ``git diff HEAD origin/<branch> --quiet`` compares tree
+    # CONTENT, so an ahead checkout whose commits changed anything reads as
+    # "has new commits" and proceeds to the reset.
+    restart_pending = bool(version_newer) and local_sha == remote_sha
+    available = can_fast_forward or restart_pending
 
     changes = ""
     if available:
@@ -601,6 +709,7 @@ async def _check_git_checkout(proj: str) -> None:
         available=available,
         changes=changes,
         remote_version=remote_version,
+        version_newer=bool(version_newer),
         checked=True,
     )
 
@@ -708,6 +817,10 @@ async def _check_release_feed(install_kind: str) -> None:
         **base,
         available=available,
         remote_version=remote_version,
+        # For a feed-checkable install the verdict IS the version comparison, so
+        # the two agree by construction. Reported anyway so the field means the
+        # same thing on every layout and no consumer has to special-case one.
+        version_newer=available,
         checked=True,
         **extra,
     )
@@ -1093,6 +1206,31 @@ async def api_gateway_restart(request: web.Request) -> web.Response:
 async def api_update_apply(request: web.Request) -> web.Response:
     """POST /api/update — git pull, rebuild, restart gateway."""
     state: DashboardState = request.app["state"]
+
+    # A policy-defined provider OWNS the update on this host. Checked before the
+    # git precondition below so an authenticated operator clicking Update cannot
+    # run the built-in mechanism their own policy excluded. A dashboard token
+    # proves who the caller is, not that this host may update by git.
+    from kiro_crew.platform.update_provider import apply_policy_update
+
+    applied = await apply_policy_update()
+    if applied is not None:
+        if not applied:
+            # A configured provider's failure is a failure. Falling through to
+            # the git path would be the bypass the policy exists to prevent.
+            state.push_update_progress(
+                "failed", "Policy-defined update command failed — see logs"
+            )
+            return web.json_response(
+                {
+                    "error": "policy-defined update command failed",
+                    "code": "policy_update_failed",
+                    "governance": True,
+                },
+                status=500,
+            )
+        await _restart_gateway(state)
+        return web.json_response({"ok": True, "status": "updating"})
 
     proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
     if not proj:

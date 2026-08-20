@@ -241,6 +241,22 @@ class DiscordClient:
         result = await self._api("POST", f"/channels/{channel_id}/messages", payload)
         return str(result.get("id")) if result else None
 
+    async def create_thread_from_message(
+        self, channel_id: str, message_id: str, name: str
+    ) -> str | None:
+        """Create a public thread rooted at an existing channel message."""
+        result = await self._api(
+            "POST",
+            f"/channels/{channel_id}/messages/{message_id}/threads",
+            {"name": name[:100], "auto_archive_duration": 1440},
+        )
+        if not result:
+            return None
+        thread_id = str(result.get("id") or "")
+        if thread_id:
+            self._channel_types[thread_id] = 11
+        return thread_id or None
+
     async def edit_message(
         self,
         channel_id: str,

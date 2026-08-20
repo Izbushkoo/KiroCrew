@@ -163,6 +163,21 @@ const REGISTRY_APPS = [
   },
 ]
 
+/**
+ * The row the gateway actually returns for an installed built-in the published
+ * catalog lists: display fields from the catalog, `origin` stamped from the
+ * installed app, no `_registry`, first-party provenance.
+ *
+ * Explore renders the rows the server sends and synthesizes nothing, so a test
+ * that installs a built-in must also let the registry response carry it --
+ * otherwise the fixture describes a response the real server cannot produce.
+ */
+const builtinServerRow = (name: string, displayName: string, author = 'kirocrew') => ({
+  name, displayName, author, description: 'A desk companion.', version: '1.0.0',
+  tags: ['fun'], installed: true, updateAvailable: false,
+  origin: 'builtin', lifecycle: 'locked', provenance: 'builtin', verified: true,
+})
+
 const NO_DEPS = { dependencies: { removable: [], shared: [], userInstalled: [] } }
 
 beforeEach(() => {
@@ -170,7 +185,7 @@ beforeEach(() => {
   vi.useFakeTimers({ shouldAdvanceTime: true })
   sessionStorage.clear()
   listApps.mockResolvedValue([BUILTIN_OFF, SECRETARY])
-  listRegistry.mockResolvedValue({ apps: REGISTRY_APPS })
+  listRegistry.mockResolvedValue({ apps: [...REGISTRY_APPS, builtinServerRow('pets', 'Pets')] })
   listRegistries.mockResolvedValue({
     registries: [{ name: 'kirodotdev-labs', repo: 'https://github.com/kirodotdev-labs/registry', branch: 'main' }],
   })
@@ -568,10 +583,15 @@ describe('AppsPage — editorial layer wiring', () => {
     // takes the spotlight and the uninstalled core app takes the feature card.
     listApps.mockResolvedValue([BUILTIN_OFF])
     listRegistry.mockResolvedValue({
-      apps: [{
-        name: 'zeta-app', displayName: 'Zeta App', author: 'kirocrew', description: 'Later in the alphabet.',
-        version: '1.0.0', tags: ['github'], installed: false, provenance: 'core',
-      }],
+      apps: [
+        {
+          name: 'zeta-app', displayName: 'Zeta App', author: 'kirocrew', description: 'Later in the alphabet.',
+          version: '1.0.0', tags: ['github'], installed: false, provenance: 'core',
+        },
+        // Explore renders server rows, so the installed built-in reaches the
+        // shelf the same way it does in production -- via the catalog.
+        { ...builtinServerRow('pets', 'Pets'), enabled: false },
+      ],
     })
     renderPage()
     await catalogReady()
@@ -597,6 +617,66 @@ describe('AppsPage — Library enable and update', () => {
     expect(probe).toHaveAttribute('data-path', '/apps/detail/secretary')
     expect(probe).toHaveAttribute('data-auto', 'update')
     // Navigation only — the page must not call the update endpoint itself.
+    expect(updateApp).not.toHaveBeenCalled()
+  })
+
+  it('syncs a PATH-installed app in place instead of routing at the registry', async () => {
+    // A directory install has no registry row, so the streaming registry install
+    // the detail page runs can only answer "not found in registry". Its refresh
+    // is POST /api/apps/{name}/update, which re-copies the recorded directory.
+    listApps.mockResolvedValue([{
+      ...SECRETARY, name: 'orchestrator-switch', displayName: 'Orchestrator Switch',
+      source: '/home/u/apps/orchestrator-switch', origin: 'local',
+    }])
+    listRegistry.mockResolvedValue({ apps: [] })
+    renderPage()
+    await screen.findByText('No apps available')
+    goLibrary()
+    fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
+    await waitFor(() => expect(updateApp).toHaveBeenCalledWith('orchestrator-switch'))
+    expect(screen.queryByTestId('detail-route')).toBeNull()
+  })
+
+  it('reflects a completed in-place sync, which is otherwise invisible', async () => {
+    // Re-copying a source directory usually carries the SAME version, so the
+    // card re-renders identically and silence is indistinguishable from a
+    // no-op. Without this the primary action the fix creates has no success
+    // signal at all.
+    listApps.mockResolvedValue([{
+      ...SECRETARY, name: 'orchestrator-switch', displayName: 'Orchestrator Switch',
+      source: '/home/u/apps/orchestrator-switch', origin: 'local',
+    }])
+    listRegistry.mockResolvedValue({ apps: [] })
+    renderPage()
+    await screen.findByText('No apps available')
+    goLibrary()
+    fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
+    expect(await screen.findByText(/Synced Orchestrator Switch from its source directory/)).toBeInTheDocument()
+  })
+
+  it('surfaces a failed in-place sync instead of leaving the card silent', async () => {
+    listApps.mockResolvedValue([{
+      ...SECRETARY, name: 'orchestrator-switch', displayName: 'Orchestrator Switch',
+      source: '/home/u/apps/orchestrator-switch', origin: 'local',
+    }])
+    listRegistry.mockResolvedValue({ apps: [] })
+    updateApp.mockRejectedValue(new Error('source path no longer exists'))
+    renderPage()
+    await screen.findByText('No apps available')
+    goLibrary()
+    fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
+    expect(await screen.findByText('source path no longer exists')).toBeInTheDocument()
+  })
+
+  it('still routes a registry-sourced app at the registry when it has no update', async () => {
+    listApps.mockResolvedValue([{ ...SECRETARY, source: 'registry:secretary' }])
+    listRegistry.mockResolvedValue({ apps: [] })
+    renderPage()
+    await screen.findByText('No apps available')
+    goLibrary()
+    fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
+    const probe = await screen.findByTestId('detail-route')
+    expect(probe).toHaveAttribute('data-auto', 'update')
     expect(updateApp).not.toHaveBeenCalled()
   })
 
@@ -655,6 +735,9 @@ describe('AppsPage — sources rail', () => {
       apps: [
         { name: 'core-app', displayName: 'Core App', author: 'kirocrew', description: 'From the core file.', version: '1.0.0', tags: ['github'], installed: false, provenance: 'core' },
         { name: 'ghost-app', displayName: 'Ghost App', author: 'someone', description: 'From a registry no longer configured.', version: '1.0.0', tags: ['github'], installed: false, _registry: 'ghost-registry', provenance: 'external' },
+        // A built-in reaches the rail as a CATALOG row, not as client-side
+        // synthesis, so the Built-in bucket needs one on the wire to count.
+        builtinServerRow('pets', 'Pets'),
       ],
     })
     renderPage()

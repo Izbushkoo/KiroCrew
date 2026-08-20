@@ -36,7 +36,8 @@ import TrustAppModal, { isTrustDeniedError, useTrustGate, type TrustAppTarget } 
 import SourcesPopover from '../components/appstore/SourcesPopover'
 import { categoryFor, categoryCounts, mergeCategoryOrder, type Category } from '../components/appstore/categories'
 import { hasHeroArt } from '../components/appstore/useHeroArt'
-import { isVerified, normalizeInstalledApp, normalizeRegistryApp, type InstalledApp, type RegistryApp } from '../components/appstore/types'
+import { isRegistrySourced, isVerified, normalizeInstalledApp, normalizeRegistryApp, type InstalledApp, type RegistryApp } from '../components/appstore/types'
+import { isBuiltinServerRow } from '../components/appstore/mergeBuiltinRow'
 
 import { i18nT } from '../i18n/t'
 import ErrorNotice from '../components/ErrorNotice'
@@ -76,12 +77,26 @@ function initialTab(): Tab {
  * that explains why they share a card. Both spell the refs as a list so
  * resolution is one code path regardless of type.
  */
-type EditorialSection = {
+type EditorialItem = {
   type: 'app' | 'collection'
   appRefs: string[]
   title?: string
   blurb?: string
   artwork?: EditorialArtwork
+}
+
+/**
+ * One BLOCK of the Discover page: a `form` saying how its items are arranged,
+ * and the items it arranges. The grouping is the document's, not inferred from
+ * array position -- `full` renders one card across the width, `row` renders its
+ * items side by side. An unrecognised form skips the WHOLE block (the
+ * arrangement cannot be drawn at all); an unrecognised item type skips just
+ * that card. `carousel` is a published form with no renderer here yet, so it
+ * takes the unknown-form path on purpose.
+ */
+type EditorialBlock = {
+  form: 'full' | 'row'
+  items: EditorialItem[]
 }
 
 /** A collection below this has lost members; see the drop in `featuredSections`. */
@@ -227,6 +242,14 @@ export default function AppsPage() {
   const [keepData, setKeepData] = useState(true)
   const [uninstallPreview, setUninstallPreview] = useState<UninstallPreview | null>(null)
   const [keepSpecific, setKeepSpecific] = useState<Set<string>>(new Set())
+  // Resource lists the uninstall dialog itemises, derived once so the count it
+  // prints and the check that decides to print it read the same value. Reading
+  // the list twice — a `?.` gate here, a `!` assertion there — is the shape that
+  // produced #3689; `normalizeInstalledApp` means the fallback is now only for a
+  // record that never reached the fetch boundary.
+  const uninstallAgents = uninstallTarget?.manifest?.agents || []
+  const uninstallSkills = uninstallTarget?.manifest?.skills || []
+  const uninstallCrons = uninstallTarget?.manifest?.crons || []
 
   const { data: apps = [], isLoading: appsLoading, error: appsError } = useQuery<InstalledApp[]>({
     queryKey: ['apps'],
@@ -244,7 +267,7 @@ export default function AppsPage() {
   const { data: registryData, isLoading: registryLoading, error: registryError } = useQuery<{
     apps: RegistryApp[]
     categoryOrder: string[]
-    editorialSections: EditorialSection[]
+    editorialSections: EditorialBlock[]
   }>({
     queryKey: ['registry'],
     // api.listRegistry() types `apps` as unknown[]; the backend payload matches
@@ -264,41 +287,59 @@ export default function AppsPage() {
         : []
       // Published layout gets the same treatment as the order: the server
       // already screened each artwork URL, but the SHAPE arrives over HTTP like
-      // any other payload, so a malformed section is dropped here rather than
+      // any other payload, so a malformed block is dropped here rather than
       // reaching a component that would throw mid-render.
-      const publishedSections: EditorialSection[] = Array.isArray(res.editorialSections)
-        ? res.editorialSections.flatMap((raw: unknown) => {
-            if (!raw || typeof raw !== 'object') return []
-            const s = raw as Record<string, unknown>
-            // An unrecognised type is skipped, not coerced: the document's
-            // contract is that a client renders what it knows and ignores the
-            // rest, which is what lets a new shape publish ahead of support.
-            if (s.type !== 'app' && s.type !== 'collection') return []
-            const refs = Array.isArray(s.appRefs)
-              ? s.appRefs.filter((n): n is string => typeof n === 'string' && !!n.trim()).map(n => n.trim())
+      const publishedSections: EditorialBlock[] = Array.isArray(res.editorialSections)
+        ? res.editorialSections.flatMap((rawBlock: unknown) => {
+            if (!rawBlock || typeof rawBlock !== 'object') return []
+            const b = rawBlock as Record<string, unknown>
+            // An unrecognised FORM skips the whole block: the arrangement is
+            // what a form names, and a block whose arrangement this client
+            // cannot draw has no partial rendering that is not a guess.
+            // `carousel` lands here deliberately until a renderer ships.
+            if (b.form !== 'full' && b.form !== 'row') return []
+            const items: EditorialItem[] = Array.isArray(b.items)
+              ? b.items.flatMap((raw: unknown) => {
+                  if (!raw || typeof raw !== 'object') return []
+                  const s = raw as Record<string, unknown>
+                  // An unrecognised item TYPE skips just this card -- a narrower
+                  // failure than the form's, because the arrangement can still
+                  // be drawn around a card it does not know.
+                  if (s.type !== 'app' && s.type !== 'collection') return []
+                  const refs = Array.isArray(s.appRefs)
+                    ? s.appRefs.filter((n): n is string => typeof n === 'string' && !!n.trim()).map(n => n.trim())
+                    : []
+                  // Dedupe and cap HERE as well as server-side. This boundary exists
+                  // to not trust the payload, and every bound it skipped was one the
+                  // component would have rendered: duplicate refs collide row keys,
+                  // and an `app` item carrying several refs would render a multi-row
+                  // card headed by one member's name.
+                  const unique = [...new Set(refs)].slice(0, MAX_SECTION_APPS)
+                  if (s.type === 'app' ? unique.length !== 1 : unique.length < MIN_COLLECTION_APPS) return []
+                  const title = typeof s.title === 'string' && s.title.trim() ? s.title.trim() : undefined
+                  // A collection is nothing without its theme, so one that arrives
+                  // without a title is dropped rather than rendered anonymously. A
+                  // whitespace-only title is absent, not present-and-blank -- otherwise
+                  // the card renders an empty heading over the rows.
+                  if (s.type === 'collection' && !title) return []
+                  return [{
+                    type: s.type,
+                    appRefs: unique,
+                    // An `app` item is headed by the app's own name; a published
+                    // title there means the document meant `collection`.
+                    title: s.type === 'collection' ? title : undefined,
+                    blurb: typeof s.blurb === 'string' ? s.blurb : undefined,
+                    artwork: normalizeEditorialArtwork(s.artwork),
+                  }]
+                })
               : []
-            // Dedupe and cap HERE as well as server-side. This boundary exists to
-            // not trust the payload, and every bound it skipped was one the
-            // component would have rendered: duplicate refs collide row keys, and
-            // an `app` section carrying several refs would render a multi-row card
-            // headed by one member's name.
-            const unique = [...new Set(refs)].slice(0, MAX_SECTION_APPS)
-            if (s.type === 'app' ? unique.length !== 1 : unique.length < MIN_COLLECTION_APPS) return []
-            const title = typeof s.title === 'string' && s.title.trim() ? s.title.trim() : undefined
-            // A collection is nothing without its theme, so one that arrives
-            // without a title is dropped rather than rendered anonymously. A
-            // whitespace-only title is absent, not present-and-blank -- otherwise
-            // the card renders an empty heading over the rows.
-            if (s.type === 'collection' && !title) return []
-            return [{
-              type: s.type,
-              appRefs: unique,
-              // An `app` section is headed by the app's own name; a published
-              // title there means the document meant `collection`.
-              title: s.type === 'collection' ? title : undefined,
-              blurb: typeof s.blurb === 'string' ? s.blurb : undefined,
-              artwork: normalizeEditorialArtwork(s.artwork),
-            }]
+            // The form's own floor, re-applied at the boundary: a `full` block
+            // holds exactly one card, a `row` needs two to have anything to sit
+            // beside. A block that lost cards to the item filter above can fall
+            // through its floor here, and dropping it whole beats rendering a
+            // half-width card against empty space.
+            if (b.form === 'full' ? items.length !== 1 : items.length < 2) return []
+            return [{ form: b.form, items }]
           })
         : []
       return {
@@ -324,51 +365,60 @@ export default function AppsPage() {
 
   // ---- Discover data -------------------------------------------------------
 
-  // Browse catalog: all non-hidden builtins (each carrying its live enabled
-  // state, so Discover shows Enabled/Disabled rather than dropping enabled
-  // ones) merged with registry entries; installed apps enrich matching
-  // registry entries with local hero/screenshot metadata.
+  // EXPLORE'S SOURCES ARE ALL REGISTRIES: the official registry, the user's own
+  // added registries, and any this build pins. All arrive as rows on
+  // `GET /api/apps/registry`, already carrying display copy, artwork, version and
+  // server-stamped trust/state, so this list is those rows — nothing is
+  // synthesized here, and a new kind of registry needs no change on this side.
+  //
+  // In particular a BUILT-IN appears on the shelf because the published catalog
+  // lists it, NOT because this client read the wheel's own manifests. Rendering
+  // built-ins from local manifests made the shelf a third source that only the
+  // client knew about, and every defect it caused followed from that: an author
+  // line the catalog had corrected but the client re-derived, a `version` taken
+  // from the wrong side, and a name-collision classification that existed purely
+  // to decide which local field to trust. Deleting the source deletes the class.
+  //
+  // The one local input that remains is a SUPPRESSION, not a source: a built-in
+  // its manifest marks `hidden` stays off the shelf even when the catalog lists
+  // it, because concealment is the wheel's call and a republished document must
+  // not be able to reveal an app this build deliberately hides.
+  //
+  // Offline, the shelf is whatever the server can still answer with — the
+  // catalog's cache, then the bundled seed. It is deliberately NOT topped up
+  // from local manifests: nothing is installable offline anyway, and installed
+  // built-ins remain fully visible and manageable under Library, which reads
+  // `GET /api/apps` locally.
   const browseApps: RegistryApp[] = useMemo(() => {
-    const builtinEntries: RegistryApp[] = apps
-      .filter(a => a.origin === 'builtin' && !a.manifest?.hidden)
-      .map(a => ({
-        name: a.name,
-        displayName: a.displayName || a.name,
-        description: a.manifest?.description || '',
-        version: a.version,
-        author: a.manifest?.author || 'kirocrew',
-        tags: a.manifest?.tags,
-        screenshots: a.manifest?.screenshots,
-        heroImage: a.manifest?.heroImage,
-        heroImageDark: a.manifest?.heroImageDark,
-        // Forwarded too: a builtin has no `registryEntry` (the core
-        // `app-registry.json` is empty), so anything omitted here is simply
-        // absent from the Discover catalog for every built-in app. The detail
-        // page reads these off the installed manifest and so happened to keep
-        // working, which is why the omission stayed invisible.
-        heroImageDetail: a.manifest?.heroImageDetail,
-        heroImageDetailDark: a.manifest?.heroImageDetailDark,
-        highlights: a.manifest?.highlights,
-        license: a.manifest?.license,
-        icon: a.manifest?.ui?.pages?.[0]?.icon || '',
-        iconUrl: a.manifest?.iconUrl || '',
-        installed: true,
-        enabled: a.enabled,
-        origin: 'builtin',
-        lifecycle: 'locked',
-        // Client-synthesized rows never pass through /api/apps/registry, so
-        // speak the server trust contract (_apply_trust_fields) directly.
-        provenance: 'builtin',
-        verified: true,
-      }))
-    const builtinNames = new Set(builtinEntries.map(a => a.name))
-    const enriched = registry.filter(r => !builtinNames.has(r.name)).map(r => {
-      const installed = apps.find(a => a.name === r.name)
-      return installed
-        ? { ...r, heroImage: r.heroImage || installed.manifest?.heroImage, heroImageDark: r.heroImageDark || installed.manifest?.heroImageDark, screenshots: r.screenshots || installed.manifest?.screenshots }
-        : r
-    })
-    return [...builtinEntries, ...enriched]
+    const hiddenBuiltins = new Set(
+      apps.filter(a => a.origin === 'builtin' && a.manifest?.hidden).map(a => a.name),
+    )
+    const installedNames = new Set(apps.map(a => a.name))
+    return registry
+      .filter(r => {
+        if (hiddenBuiltins.has(r.name)) return false
+        // A catalog-only BUILT-IN row — `source.type === 'builtin'` with nothing
+        // installed under that name — names an app this wheel does not ship. A
+        // built-in has no install coordinates, so the generic Install card would
+        // render a control that cannot work. Dropped until a
+        // `minClientVersion`-aware "needs a newer Kiro Crew" state exists to say
+        // so honestly. This reads `apps` purely as INSTALL STATE, never as a
+        // source of display copy.
+        if (
+          !installedNames.has(r.name) &&
+          (r as { source?: { type?: string } }).source?.type === 'builtin'
+        ) {
+          return false
+        }
+        return true
+      })
+      // `origin` is stamped from the INSTALLED app of the same name, so an
+      // EXTERNAL registry row named after an installed built-in arrives carrying
+      // `origin: "builtin"` while `_registry` / `provenance` still say external.
+      // The row's own copy is all that renders now, but the FIRST-PARTY LABEL and
+      // the Sources count still read `origin`, so a row that fails the trust test
+      // is demoted here rather than allowed to wear a badge it did not earn.
+      .map(r => (r.origin === 'builtin' && !isBuiltinServerRow(r) ? { ...r, origin: 'registry' } : r))
   }, [apps, registry])
 
   const featured = useMemo(() => pickFeatured(browseApps), [browseApps])
@@ -393,11 +443,18 @@ export default function AppsPage() {
    */
   const featuredSections = useMemo(() => {
     const byName = new Map(browseApps.map(a => [a.name, a]))
-    return (registryData?.editorialSections || []).flatMap(section => {
-      const resolved = section.appRefs.map(n => byName.get(n)).filter((a): a is RegistryApp => !!a)
-      const floor = section.type === 'collection' ? MIN_COLLECTION_APPS : 1
-      if (resolved.length < floor) return []
-      return [{ ...section, apps: resolved }]
+    return (registryData?.editorialSections || []).flatMap(block => {
+      const items = block.items.flatMap(item => {
+        const resolved = item.appRefs.map(n => byName.get(n)).filter((a): a is RegistryApp => !!a)
+        const floor = item.type === 'collection' ? MIN_COLLECTION_APPS : 1
+        if (resolved.length < floor) return []
+        return [{ ...item, apps: resolved }]
+      })
+      // Re-apply the form's floor AFTER resolution: a row whose second card
+      // dissolved (its apps left the registry) is a full-width slot holding a
+      // half-width card, which is an arrangement the curator did not write.
+      if (block.form === 'full' ? items.length !== 1 : items.length < 2) return []
+      return [{ form: block.form, items }]
     })
   }, [registryData, browseApps])
 
@@ -560,19 +617,42 @@ export default function AppsPage() {
       }
       return
     }
-    // Update navigates to detail page (streaming install UI). Blocked while
-    // Update All is running so the same update can't run twice concurrently.
+    // Update dispatches on the RECORDED SOURCE, mirroring ``handle_update_app``'s
+    // own branch. A registry-sourced app is re-cloned from its registry and the
+    // detail page owns that flow (streaming log plus the trust consent modal), so
+    // it navigates there. An app installed from a path has no registry row: it is
+    // refreshed in place from the directory recorded at install — the same call
+    // Update All makes — and routing it at the registry instead failed every sync
+    // with "not found in registry". A row absent from this list carries no source
+    // to read, so it navigates and the detail page re-dispatches on the record it
+    // loads. Blocked while Update All is running so the same update can't run
+    // twice concurrently.
     if (action === 'update') {
       if (updatingAll) return
-      updateApp(name)
-      return
+      const target = apps.find(a => a.name === name)
+      if (!target || isRegistrySourced(target)) {
+        updateApp(name)
+        return
+      }
     }
     setActionLoading(`${name}:${action}`)
     setError('')
     try {
       if (action === 'enable') await runEnable(name)
       else if (action === 'disable') await api.disableApp(name)
+      else if (action === 'update') await api.updateApp(name)
       invalidate()
+      // An in-place sync is the one action here whose success is otherwise
+      // INVISIBLE: re-copying a source directory usually carries the same
+      // version, so the card re-renders byte-identical and the dev cannot tell
+      // whether new bytes landed. Reflect it the way `disable` already does.
+      if (action === 'update') {
+        const app = apps.find(a => a.name === name)
+        setSuccessMsg(i18nT('pages.appsPage.synced_from_its_source_directory', {
+          name: app?.displayName || name,
+        }))
+        setTimeout(() => setSuccessMsg(''), 4000)
+      }
       // Show toast when hiding a builtin app
       if (action === 'disable') {
         const app = apps.find(a => a.name === name)
@@ -675,7 +755,7 @@ export default function AppsPage() {
         </>}
       />
 
-      <div className="px-2 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
         {/* Notifications */}
         {displayError && (
           <ErrorNotice
@@ -749,14 +829,14 @@ export default function AppsPage() {
                     {i18nT('pages.appsPage.not_installed_from_apps_your_local_source_code_w')}
                   </div>
                 )}
-                {(uninstallTarget.manifest?.agents?.length || 0) > 0 && (
-                  <div className="flex items-center gap-2"><Bot size={12} className="text-muted" /> {i18nT('pages.appsPage.agent', { count: uninstallTarget.manifest?.agents?.length || 0 })}</div>
+                {uninstallAgents.length > 0 && (
+                  <div className="flex items-center gap-2"><Bot size={12} className="text-muted" /> {i18nT('pages.appsPage.agent', { count: uninstallAgents.length })}</div>
                 )}
-                {(uninstallTarget.manifest?.skills?.length || 0) > 0 && (
-                  <div className="flex items-center gap-2"><Zap size={12} className="text-muted" /> {i18nT('pages.appsPage.skill', { count: uninstallTarget.manifest?.skills?.length || 0 })}</div>
+                {uninstallSkills.length > 0 && (
+                  <div className="flex items-center gap-2"><Zap size={12} className="text-muted" /> {i18nT('pages.appsPage.skill', { count: uninstallSkills.length })}</div>
                 )}
-                {(uninstallTarget.manifest?.crons?.length || 0) > 0 && (
-                  <div className="flex items-center gap-2"><Clock size={12} className="text-muted" /> {i18nT('pages.appsPage.cron_job', { count: uninstallTarget.manifest?.crons?.length || 0 })}</div>
+                {uninstallCrons.length > 0 && (
+                  <div className="flex items-center gap-2"><Clock size={12} className="text-muted" /> {i18nT('pages.appsPage.cron_job', { count: uninstallCrons.length })}</div>
                 )}
               </div>
 
@@ -849,21 +929,37 @@ export default function AppsPage() {
                   curator's cards with `featured`-flag picks would show the
                   same app twice and give the curator no way to say "only these". */}
               {showEditorial && featuredSections.length > 0 ? (
-                featuredSections.map((section, position) => (
+                /* Each block renders the arrangement its FORM names -- the
+                   grouping is the document's, not inferred from array position.
+                   `full` runs one card across the width with its art beside the
+                   copy; `row` lays its cards side by side, one column on a
+                   narrow viewport. The old rule here ("position 0 spans, the
+                   rest pair up") drew the same page for the 1+2 case but was a
+                   renderer secret: a curator adding a fourth card had no way to
+                   say which block it joined. */
+                <div className="flex flex-col gap-3.5 mb-6">
+                {featuredSections.map((block, position) => (
+                  <div
+                    key={`block:${position}`}
+                    className={
+                      block.form === 'row'
+                        ? 'grid grid-cols-1 md:grid-cols-2 gap-3.5 items-start'
+                        : ''
+                    }
+                  >
+                  {block.items.map((section, idx) => (
                   <ErrorBoundary
-                    /* Keyed by document POSITION plus the section's FULL data
-                       identity (cardDataKey over the whole section: members,
-                       title, blurb, artwork). The position prefix keeps two
-                       content-identical sections from colliding -- the publish
-                       gate checks duplicate refs within a section, not across
-                       them, and a colliding key lets React reconcile one card
-                       against the other's fiber. The cardDataKey suffix gives
-                       this boundary the same "any field changed" remount
-                       contract as the other three sites, so a corrected
-                       payload -- including a section-level artwork/title/blurb
-                       fix -- clears a latched fallback. */
-                    key={`${position}:${cardDataKey(section)}`}
-                    scope={`apps:featured-section:${position}:${section.type}`}
+                    /* Keyed by block+item POSITION plus the item's FULL data
+                       identity (cardDataKey: members, title, blurb, artwork).
+                       The position prefix keeps two content-identical cards from
+                       colliding -- the publish gate checks duplicate refs within
+                       an item, not across them, and a colliding key lets React
+                       reconcile one card against the other's fiber. The
+                       cardDataKey suffix gives this boundary the same "any field
+                       changed" remount contract as the other three sites, so a
+                       corrected payload clears a latched fallback. */
+                    key={`${position}:${idx}:${cardDataKey(section)}`}
+                    scope={`apps:featured-section:${position}:${idx}:${section.type}`}
                     fallback={
                       <BrowseCardFallback
                         label={section.title}
@@ -878,6 +974,15 @@ export default function AppsPage() {
                       title={section.title}
                       blurb={section.blurb}
                       artwork={section.artwork}
+                      /* A published placement, so the lead app's own hero may
+                         not fill the art band -- see FeaturedSpotlight's
+                         `curated`. The derived card below leaves it false. */
+                      curated
+                      layout={block.form === 'full' ? 'side' : 'stacked'}
+                      /* A row's collections fold their rows into a dialog: three
+                         inline install rows per card made the row taller than
+                         the lead above it, inverting the hierarchy. */
+                      compact={block.form === 'row'}
                       busyName={
                         featuredBusyName(actionLoading, section.apps)
                       }
@@ -886,7 +991,10 @@ export default function AppsPage() {
                       onOpenApp={(name, e) => openDetail(name, e)}
                     />
                   </ErrorBoundary>
-                ))
+                  ))}
+                  </div>
+                ))}
+                </div>
               ) : showEditorial && spotlight && (
                 <>
                   <ErrorBoundary
@@ -978,7 +1086,13 @@ export default function AppsPage() {
                   {filteredBrowse.length === 0 ? (
                     <EmptyState icon={<ShoppingBag size={32} />} title={i18nT('pages.appsPage.no_matching_apps')} subtitle={i18nT('pages.appsPage.try_a_different_search_or_category')} />
                   ) : (
-                    filteredBrowse.map(app => (
+                    /* Two rows to a line on a desktop dashboard. A row is a
+                       name, a provenance line and one control -- it never needed
+                       1100px, and at one per line the list spent a whole screen
+                       on four apps. `items-start` is not needed: every row is
+                       the same height. */
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-x-3.5">
+                    {filteredBrowse.map(app => (
                       <ErrorBoundary
                         /* Full-data key (cardDataKey): the boundary latches
                            its error state, so ANY corrected registry payload —
@@ -1004,7 +1118,8 @@ export default function AppsPage() {
                           onEnable={() => enableApp(app.name)}
                         />
                       </ErrorBoundary>
-                    ))
+                    ))}
+                    </div>
                   )}
                 </div>
               </div>

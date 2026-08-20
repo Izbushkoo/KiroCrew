@@ -8,9 +8,11 @@ import { describe, it, expect } from 'vitest'
 
 import {
   ALLOWED_TRANSITIONS,
+  canOpenTranscription,
   canTransition,
   isDuplicateSegment,
   mergeTranscriptSegments,
+  metaPollInterval,
   newSegmentText,
   reconcileTranscriptPage,
   resolveEnabledAgents,
@@ -629,5 +631,123 @@ describe('the live caption shows the newest speech, not the meeting opening', ()
   it('bounds the browser-only final segment buffer', () => {
     expect(CAPTION_FINALS_LIMIT).toBeGreaterThan(1)
     expect(TranscriptionSource).toContain('finalsRef.current.splice(')
+  })
+})
+
+describe('the meeting is polled while a start is still initializing agents', () => {
+  // `POST /start` awaits one dispatch per agent before it answers, so it can take
+  // tens of seconds, while the server persists `active` up front. Without a poll in
+  // that window the UI held a stale `idle`: Start disabled, no Live badge, and no
+  // microphone — the mic is bound to `status` — so recording appeared not to start
+  // until the user reloaded by hand.
+
+  it('polls on a short cadence while the start is in flight', () => {
+    expect(metaPollInterval({ status: 'idle', startInFlight: true })).toBe(1000)
+    // `undefined` is the same situation: meta has not arrived, nothing says active.
+    expect(metaPollInterval({ status: undefined, startInFlight: true })).toBe(1000)
+  })
+
+  it('does not poll an idle meeting that nobody is starting', () => {
+    expect(metaPollInterval({ status: 'idle', startInFlight: false })).toBe(false)
+    expect(metaPollInterval({ status: 'ended', startInFlight: false })).toBe(false)
+  })
+
+  it('hands back to the configured cadence as soon as a status is known', () => {
+    // The start rule is checked last, so a landed poll ends the fast window even
+    // while the mutation is still pending — that is what makes it self-limiting.
+    expect(metaPollInterval({ status: 'active', startInFlight: true, activeMs: 5000 })).toBe(5000)
+    expect(metaPollInterval({ status: 'paused', startInFlight: true, idleMs: 30_000 })).toBe(30_000)
+    expect(metaPollInterval({ status: 'reviewing', startInFlight: true, idleMs: 30_000 })).toBe(30_000)
+  })
+
+  it('falls back to the shipped defaults when the config has not loaded', () => {
+    expect(metaPollInterval({ status: 'active', startInFlight: false })).toBe(5000)
+    expect(metaPollInterval({ status: 'reviewing', startInFlight: false })).toBe(30_000)
+  })
+
+  it('respects a configured cadence over the defaults', () => {
+    expect(metaPollInterval({ status: 'active', startInFlight: false, activeMs: 250 })).toBe(250)
+    expect(metaPollInterval({ status: 'paused', startInFlight: false, idleMs: 60_000 })).toBe(60_000)
+  })
+
+  it('opens the window before the request and closes it however the start ends', () => {
+    // Guards the wiring, not the rule: a window opened in `onSuccess` would miss the
+    // wait entirely, and one closed there would poll a failed start forever.
+    const startCall = SessionSource.match(/const startMutation[\s\S]*?\n  \}\)/)
+    expect(startCall, 'no startMutation found').not.toBeNull()
+    const mutateBlock = startCall![0].slice(
+      startCall![0].indexOf('onMutate:'),
+      startCall![0].indexOf('onSettled:'),
+    )
+    expect(mutateBlock).toContain('setStartInFlight(true)')
+    expect(startCall![0]).toContain('onSettled: () => setStartInFlight(false)')
+  })
+
+  it('feeds the query from the shared rule rather than an inline copy', () => {
+    expect(SessionSource).toContain('refetchInterval: query =>')
+    expect(SessionSource).toContain('metaPollInterval({')
+  })
+})
+
+describe('the microphone waits for transcript ingress, not just for `active`', () => {
+  // `POST /start` persists `active` up front and then initializes agents with
+  // transcript ingress SUSPENDED — every dispatch in that window 409s. The fast
+  // start poll observes `active` within ~1s of Start, so binding the microphone
+  // to `status` alone opened it tens of seconds before ingress: early finals
+  // exhausted the short dispatch retry schedule and were permanently lost from
+  // the notes and tasks. The gate follows the server's own admission flag,
+  // `live.accepting_dispatches`, reported on every meta poll — client-side
+  // inference from the start mutation's outcome cannot be trusted in either
+  // direction (an error can hide a server-side success; a success response can
+  // be lost in transit).
+
+  it('keeps the mic closed while the poll sees `active` but ingress is not open', () => {
+    expect(canOpenTranscription({
+      status: 'active', ingressReady: false, transcriptFull: false,
+    })).toBe(false)
+  })
+
+  it('opens the mic once the poll reports ingress open on an active meeting', () => {
+    expect(canOpenTranscription({
+      status: 'active', ingressReady: true, transcriptFull: false,
+    })).toBe(true)
+  })
+
+  it('never opens the mic for a meeting that is not active, ingress or not', () => {
+    for (const status of ['idle', 'paused', 'reviewing', 'ended'] as const) {
+      expect(canOpenTranscription({ status, ingressReady: true, transcriptFull: false })).toBe(false)
+      expect(canOpenTranscription({ status, ingressReady: false, transcriptFull: false })).toBe(false)
+    }
+  })
+
+  it('a full transcript keeps the mic closed regardless of readiness', () => {
+    expect(canOpenTranscription({
+      status: 'active', ingressReady: true, transcriptFull: true,
+    })).toBe(false)
+  })
+
+  it('the status binding actually consults the readiness rule', () => {
+    // Guards the wiring: the effect must gate BOTH the open and the close branch on
+    // the shared rule, so a poll reporting ingress open flips the mic on without a
+    // status change and a fast poll observing `active` early cannot race one on.
+    const binding = SessionSource.match(/const mayOpen = canOpenTranscription\(\{[\s\S]*?\n  \}, \[status, ingressReady, transcriptFull, transcriptionActive\]\)/)
+    expect(binding, 'status binding no longer gates on canOpenTranscription').not.toBeNull()
+    expect(binding![0]).toContain('if (mayOpen && !transcriptionRef.current.active)')
+    expect(binding![0]).toContain('if (!mayOpen && transcriptionRef.current.active)')
+  })
+
+  it('readiness comes from the POLLED server flag, and unknown reads as not-ready', () => {
+    // Guards the two properties that make the whole failure class unreachable:
+    // (1) the gate's input is the server's own admission flag off the poll — not
+    // client-side inference from the start mutation's lifecycle, which round-trips
+    // through outcomes that can misrepresent the server (lost success, ambiguous
+    // error); (2) strict `=== true`, so a null `live` (meeting `active` on disk
+    // with no session installed) keeps the mic closed rather than dispatching
+    // into guaranteed 409s.
+    expect(SessionSource).toContain('live?.accepting_dispatches === true')
+    // And the mutation callbacks do not manipulate any mic gate.
+    const startCall = SessionSource.match(/const startMutation[\s\S]*?\n  \}\)/)
+    expect(startCall, 'no startMutation found').not.toBeNull()
+    expect(startCall![0]).not.toContain('Ingress')
   })
 })

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useCallback } from 'react'
-import { useQueryClient } from '@tanstack/react-query'
+import { useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { isArtifactEditing } from '../utils/artifactEditGuard'
+import { isReconcileNote } from '../lib/noteContract'
 import { useAppDispatch } from '../store'
 import { store } from '../store'
 import { sseStatus, sseConnected, sseDisconnected, sseSlots, sseTodoUpdate, setChannelTrusted, sseSlotTitle, triggerRefresh, fetchSlots, markSlotUnread, setUpdateProgress, sseSubagentStatus, sseSubagentText, touchSlotActivity, patchSlotSourceLinks, type SubagentDetail } from '../store/dashboardSlice'
@@ -8,13 +9,13 @@ import { addNotification, ackNotificationByTs, unackNotificationByTs, removeNoti
 import { MC_NOTIFICATION_EVENT, TURN_DONE_KIND, APPROVAL_KIND, shouldChimeOnTurnDone, type McNotificationDetail } from './notificationEvent'
 import { emitThemeSound } from './themeSound'
 import {
-  fetchHistory, missedChunkMarker, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentChunk, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setGoalLoops, sseGoalLoop, sseSideQueue, sweepStaleOptimistic
+  fetchHistory, missedChunkMarker, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentChunk, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setGoalLoops, sseGoalLoop, sseSideQueue
 } from '../store/chatSlice'
 import { TAB_ID } from '../api/tabId'
 import { api } from '../api/client'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import { applyStatusDelta, parseStatusDelta } from '../utils/pullRequestStatusDelta'
-import type { StatusData, ChatMessage, ChatSlot, Notification, PullRequestStatusBatch, TodoList } from '../types'
+import type { StatusData, ChatMessage, ChatSlot, ChatFolder, Notification, PullRequestStatusBatch, TodoList } from '../types'
 import { i18nT } from '../i18n/t'
 
 type LogCallback = ((data: { level: string; msg: string }) => void) | null
@@ -31,6 +32,27 @@ function voiceMessageId(message: ChatMessage): string {
   if (message.ts) return message.ts
   const serverId = message.meta?.mid
   return typeof serverId === 'string' ? serverId : ''
+}
+
+/**
+ * Invalidate React Query caches for keys that previously relied on the
+ * `refreshTrigger` counter being part of their queryKey.  Calling
+ * `invalidateQueries` refetches **in-place** (keeping the cached data visible
+ * to the UI) instead of minting a brand-new cache entry with `undefined` data
+ * — which is what caused the flash-to-empty bug (#4132, #4179).
+ */
+function invalidateRefreshQueries(qc: QueryClient): void {
+  qc.invalidateQueries({ queryKey: ['cron-jobs'] })
+  qc.invalidateQueries({ queryKey: ['cron-history-all'] })
+  qc.invalidateQueries({ queryKey: ['spawn-list'] })
+  qc.invalidateQueries({ queryKey: ['sessions-context'] })
+  qc.invalidateQueries({ queryKey: ['sessions-usage'] })
+  qc.invalidateQueries({ queryKey: ['agents-installed'] })
+  qc.invalidateQueries({ queryKey: ['mcp-tools'] })
+  qc.invalidateQueries({ queryKey: ['kirocrew-agents'] })
+  qc.invalidateQueries({ queryKey: ['default-agent'] })
+  qc.invalidateQueries({ queryKey: ['workspaces'] })
+  qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
 }
 
 /** Single multiplexed WebSocket replacing all SSE + polling connections. */
@@ -663,6 +685,48 @@ export function useWebSocket() {
             if (msg.channelTrusted !== undefined) {
               dispatch(setChannelTrusted(msg.channelTrusted))
             }
+            // Seed the ['chat-folders'] query cache from the folder tree carried
+            // on this frame so the sidebar groups sessions correctly on the FIRST
+            // paint. Sessions arrive on this WS frame the instant the socket
+            // connects; the folders otherwise come only from a separate HTTP GET,
+            // so without this the sidebar renders every session ungrouped (Unfiled)
+            // until that GET resolves, then visibly re-shuffles them into folders.
+            //
+            // Seed ONLY when the cache has no folder data yet (first paint). Two
+            // reasons this must not run on later frames, both from the shipped
+            // staleTime: Infinity on this query:
+            //   1. A `slots` frame fires on routine session activity, so a frame
+            //      landing inside an in-flight folder mutation's optimistic window
+            //      (collapse / reorder / rename / move) would overwrite the
+            //      optimistic cache value with backend state via a direct
+            //      setQueryData — which the mutation's cancelQueries cannot cancel
+            //      — snapping the folder back to its pre-action state until
+            //      onSettled refetches.
+            //   2. The WS payload omits per-folder `history_count` (the backend
+            //      computes it via a synchronous session scan that must not run on
+            //      this hot path). Seeding count-less data marks the query fresh,
+            //      so a mount-time query would skip GET /api/chat/folders and the
+            //      counts (the "hide when empty" filter's input) would never load.
+            // So seed the tree once, then invalidate to let the HTTP GET backfill
+            // counts; after the cache is populated, live frames leave it alone and
+            // folder create/rename/move propagate through their own mutation +
+            // invalidate path as before.
+            //
+            // Guard on `existing === undefined` (cache NEVER populated), NOT on
+            // `!existing || length === 0`: a user with genuinely zero folders has
+            // the HTTP GET cache the empty array `[]`, and `[].length === 0` would
+            // then re-match on EVERY subsequent slots frame — re-seeding `[]` and
+            // re-invalidating in a loop, hammering the session-scanning
+            // GET /api/chat/folders. `undefined` fires exactly once, on first paint.
+            if (Array.isArray(msg.folders)) {
+              const existing = queryClient.getQueryData<ChatFolder[]>(['chat-folders'])
+              if (existing === undefined) {
+                queryClient.setQueryData<ChatFolder[]>(['chat-folders'], msg.folders as ChatFolder[])
+                // Backfill history_count (omitted from the WS payload) — the seed
+                // marked the query fresh, so nudge the real GET to run.
+                queryClient.invalidateQueries({ queryKey: ['chat-folders'] })
+              }
+            }
             // Refresh the cached GitLab-hosts allowlist when it may have changed.
             // The generation is PROCESS-local, so a gateway restart can hand out a
             // number equal to the one this client last saw even though the
@@ -876,6 +940,7 @@ export function useWebSocket() {
           case 'refresh': {
             const kinds: string[] = data.kinds || []
             dispatch(triggerRefresh())
+            invalidateRefreshQueries(queryClient)
             if (kinds.includes('history')) dispatch(fetchHistory(false))
             break
           }
@@ -911,8 +976,11 @@ export function useWebSocket() {
             // trigger (no-op unless an L2 theme with that manifest sound is
             // active + unmuted). User/tool messages don't chime.
             if (data.role === 'assistant') emitThemeSound('message-received')
-            if (data.role === 'user' || data.role === 'inject' || data.role === 'subagent') { stopVoice(); voiceProgressRef.current = null; synthChainRef.current = Promise.resolve() }
-            if (data.slot && (data.role === 'user' || data.role === 'inject' || data.role === 'subagent')) {
+            // A note breadcrumb starts no turn, so no chat_done arrives to undo either
+            // effect: cutting speech would strand it and a thinking status would never clear.
+            const isPassiveNote = data.role === 'inject' && isReconcileNote(data.cls)
+            if (!isPassiveNote && (data.role === 'user' || data.role === 'inject' || data.role === 'subagent')) { stopVoice(); voiceProgressRef.current = null; synthChainRef.current = Promise.resolve() }
+            if (!isPassiveNote && data.slot && (data.role === 'user' || data.role === 'inject' || data.role === 'subagent')) {
               dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', text: 'Thinking…', ts: Date.now() }))
             }
             break
@@ -1371,6 +1439,7 @@ export function useWebSocket() {
           case 'sessions_restarting':
             // Backend pushed session restart status (restarting/ready)
             dispatch(triggerRefresh())
+            invalidateRefreshQueries(queryClient)
             break
           case 'update_progress': {
             const prog = data as { step: string; detail: string }
@@ -1390,6 +1459,7 @@ export function useWebSocket() {
           case 'refine':
             // Handled by ProjectsPage via Redux
             dispatch(triggerRefresh())
+            invalidateRefreshQueries(queryClient)
             break
           case 'channel_message':
           case 'channel_agent_status':
@@ -1563,16 +1633,6 @@ export function useWebSocket() {
       sendSlotFocusedImpl = () => {}
     }
   }, [connect, stopVoice, flushSlotActivity, forceReconnect])
-
-  // Client-side optimistic-timeout sweep (#3973).  The server heartbeat only
-  // fires while the WebSocket is alive — but a dead connection is exactly the
-  // scenario where stale optimistic bubbles matter most.  This interval drives
-  // the sweep independently so the "message not confirmed" indicator appears
-  // even when the socket is down.
-  useEffect(() => {
-    const id = setInterval(() => dispatch(sweepStaleOptimistic()), 10_000)
-    return () => clearInterval(id)
-  }, [dispatch])
 
   /** Subscribe to log events — call with callback on mount, null on unmount. */
   const subscribeLogs = useCallback((cb: LogCallback) => {

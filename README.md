@@ -60,18 +60,47 @@ remote Gateway over an SSH tunnel. See the
 [desktop app guide](docs/build/desktop-app.md).
 
 - **macOS** (one universal DMG, Apple Silicon + Intel): [Stable](https://download.crew.kiro.dev/desktop/stable/latest/KiroCrew.dmg) | [Insider](https://download.crew.kiro.dev/desktop/insider/latest/KiroCrew.dmg) | [Nightly](https://download.crew.kiro.dev/desktop/nightly/latest/KiroCrew.dmg)
-- **Linux x86_64**: [Stable](https://download.crew.kiro.dev/desktop/stable/latest/KiroCrew-x86_64.AppImage) | [Insider](https://download.crew.kiro.dev/desktop/insider/latest/KiroCrew-x86_64.AppImage) | [Nightly](https://download.crew.kiro.dev/desktop/nightly/latest/KiroCrew-x86_64.AppImage)
-- **Linux aarch64** (Graviton, Raspberry Pi, ARM laptops): [Stable](https://download.crew.kiro.dev/desktop/stable/latest/KiroCrew-aarch64.AppImage) | [Insider](https://download.crew.kiro.dev/desktop/insider/latest/KiroCrew-aarch64.AppImage) | [Nightly](https://download.crew.kiro.dev/desktop/nightly/latest/KiroCrew-aarch64.AppImage)
 - **Windows**: no desktop build yet, so run the Gateway from a [source install](#build-from-source) and open the dashboard in your browser
 
-Not sure which Linux file you need? `uname -m` prints it — `x86_64` or `aarch64`.
+**On Linux, start with the one-line install** — it is the smoothest path, works
+on every distro and both architectures, and puts `kirocrew` on your `PATH`,
+which is what makes `kirocrew service install` (and the AppArmor profile the
+agent sandbox needs on Ubuntu 23.10+) reachable:
+
+```bash
+curl -fsSL https://download.crew.kiro.dev/cli.sh | sh
+```
+
+You then work in the dashboard at `http://localhost:5476`. Add a **desktop
+package** when you want what only the Electron shell gives you: an
+application-menu entry and icon, a native window, a taskbar badge, a system-wide
+hotkey, a Gateway that starts and stops with the app, and in-app updates. A
+`.deb` or `.rpm` installs to a fixed path under `/opt`, which is what lets it set
+the AppArmor profile up for you; the AppImage needs no root but needs FUSE and
+carries a manual sandbox step. `uname -m` prints which architecture you need.
+
+| Linux desktop package | x86_64 | aarch64 (Graviton, Raspberry Pi, ARM laptops) |
+|---|---|---|
+| **`.deb`** (Debian, Ubuntu) | [Stable](https://download.crew.kiro.dev/desktop/stable/latest/KiroCrew-x86_64.deb) · [Insider](https://download.crew.kiro.dev/desktop/insider/latest/KiroCrew-x86_64.deb) · [Nightly](https://download.crew.kiro.dev/desktop/nightly/latest/KiroCrew-x86_64.deb) | [Stable](https://download.crew.kiro.dev/desktop/stable/latest/KiroCrew-aarch64.deb) · [Insider](https://download.crew.kiro.dev/desktop/insider/latest/KiroCrew-aarch64.deb) · [Nightly](https://download.crew.kiro.dev/desktop/nightly/latest/KiroCrew-aarch64.deb) |
+| **`.rpm`** (Fedora, RHEL, CentOS Stream, Amazon Linux 2023) | [Stable](https://download.crew.kiro.dev/desktop/stable/latest/KiroCrew-x86_64.rpm) · [Insider](https://download.crew.kiro.dev/desktop/insider/latest/KiroCrew-x86_64.rpm) · [Nightly](https://download.crew.kiro.dev/desktop/nightly/latest/KiroCrew-x86_64.rpm) | [Stable](https://download.crew.kiro.dev/desktop/stable/latest/KiroCrew-aarch64.rpm) · [Insider](https://download.crew.kiro.dev/desktop/insider/latest/KiroCrew-aarch64.rpm) · [Nightly](https://download.crew.kiro.dev/desktop/nightly/latest/KiroCrew-aarch64.rpm) |
+| **AppImage** (no root, any distro) | [Stable](https://download.crew.kiro.dev/desktop/stable/latest/KiroCrew-x86_64.AppImage) · [Insider](https://download.crew.kiro.dev/desktop/insider/latest/KiroCrew-x86_64.AppImage) · [Nightly](https://download.crew.kiro.dev/desktop/nightly/latest/KiroCrew-x86_64.AppImage) | [Stable](https://download.crew.kiro.dev/desktop/stable/latest/KiroCrew-aarch64.AppImage) · [Insider](https://download.crew.kiro.dev/desktop/insider/latest/KiroCrew-aarch64.AppImage) · [Nightly](https://download.crew.kiro.dev/desktop/nightly/latest/KiroCrew-aarch64.AppImage) |
+
+```bash
+sudo apt install ./KiroCrew-x86_64.deb     # Debian, Ubuntu
+sudo dnf install ./KiroCrew-x86_64.rpm     # Fedora, RHEL, CentOS Stream, AL2023
+```
+
+The Linux desktop app needs **glibc 2.34 or newer** (Ubuntu 22.04+, Debian 12+,
+Fedora, CentOS Stream 9, Amazon Linux 2023). On an older host — Ubuntu 20.04,
+Debian 11, Amazon Linux 2 — use the one-line install above.
+
 Every architecture below is a first-class lane: each gets its own build, its own
 auto-update feed, and its own SLSA provenance attestation.
 
 | Install path | x86_64 | aarch64 (ARM64) |
 |---|---|---|
-| **Desktop AppImage** | yes | yes |
 | **CLI one-liner / wheel** | yes | yes (the wheel is `py3-none-any`; native libraries are vendored per architecture) |
+| **Desktop `.deb` / `.rpm` / AppImage** | yes | yes |
 | **Docker image** | yes | yes (`linux/amd64` and `linux/arm64` under every tag, so `docker pull` picks yours) |
 
 Take Stable unless you have a reason not to — the table below says who each
@@ -352,11 +381,12 @@ the published manifest, installs through `pipx` when available or a managed
 virtual environment at `~/.kiro/crew-venv` (beside the data home; override with
 `KIROCREW_VENV`), and records the channel in `~/.kiro/crew/channel`. The channels
 are `stable`, `insider`, and `nightly`, and `KIROCREW_CHANNEL` sets the default.
-On Linux it installs a Python 3.10+ interpreter from your distro when the system
-lacks one — via `apt` on Debian/Ubuntu, `dnf` on Amazon Linux / RHEL / CentOS
-Stream, `yum` on CentOS 7. Where no base-repo package supplies 3.10+ (CentOS 7,
-older Ubuntu) it uses an already-installed [mise](https://mise.jdx.dev/) if you
-have one, otherwise it prints how to install a newer Python and stops. The
+On Linux and macOS, when the system lacks a Python 3.10+ interpreter the
+installer provisions one itself — no package manager, no sudo: it downloads a
+SHA-256-pinned [uv](https://docs.astral.sh/uv/) binary (or uses your installed
+`uv`) and installs a python-build-standalone CPython 3.12 into
+`~/.kiro/crew-python`. Pass `--managed-python` to always use the provisioned
+interpreter and skip the system ones. The
 signed installer never pipes an unsigned third-party script into a shell.
 
 **Pin an exact wheel.** You can also install one exact wheel directly and pin it to its published
@@ -648,6 +678,7 @@ make this tool possible:
 <a href="https://github.com/ashtnemi448" title="ashtnemi448"><img src="https://github.com/ashtnemi448.png?size=64" width="64" height="64" alt="ashtnemi448" /></a>
 <a href="https://github.com/ashvinctrl" title="Ashvin"><img src="https://github.com/ashvinctrl.png?size=64" width="64" height="64" alt="Ashvin" /></a>
 <a href="https://github.com/aswindjs" title="Aswin Damodar"><img src="https://github.com/aswindjs.png?size=64" width="64" height="64" alt="Aswin Damodar" /></a>
+<a href="https://github.com/atomsbaza" title="PISIT KOOLPLUKPOL"><img src="https://github.com/atomsbaza.png?size=64" width="64" height="64" alt="PISIT KOOLPLUKPOL" /></a>
 <a href="https://github.com/av-writes-code" title="av-writes-code"><img src="https://github.com/av-writes-code.png?size=64" width="64" height="64" alt="av-writes-code" /></a>
 <a href="https://github.com/avmikhli1" title="avmikhli1"><img src="https://github.com/avmikhli1.png?size=64" width="64" height="64" alt="avmikhli1" /></a>
 <a href="https://github.com/ayahiro1729" title="ayahiro1729"><img src="https://github.com/ayahiro1729.png?size=64" width="64" height="64" alt="ayahiro1729" /></a>
@@ -682,6 +713,7 @@ make this tool possible:
 <a href="https://github.com/colewhitley" title="Cole Whitley"><img src="https://github.com/colewhitley.png?size=64" width="64" height="64" alt="Cole Whitley" /></a>
 <a href="https://github.com/ConnorLoP" title="Connor LoPresti"><img src="https://github.com/ConnorLoP.png?size=64" width="64" height="64" alt="Connor LoPresti" /></a>
 <a href="https://github.com/ConstantineWang" title="Jiacheng Wang"><img src="https://github.com/ConstantineWang.png?size=64" width="64" height="64" alt="Jiacheng Wang" /></a>
+<a href="https://github.com/coozgan" title="Joshyfruit"><img src="https://github.com/coozgan.png?size=64" width="64" height="64" alt="Joshyfruit" /></a>
 <a href="https://github.com/cruisercohen" title="Matt Cohen"><img src="https://github.com/cruisercohen.png?size=64" width="64" height="64" alt="Matt Cohen" /></a>
 <a href="https://github.com/CrysisDeu" title="Zezhen Xu"><img src="https://github.com/CrysisDeu.png?size=64" width="64" height="64" alt="Zezhen Xu" /></a>
 <a href="https://github.com/Csan25" title="Csan25"><img src="https://github.com/Csan25.png?size=64" width="64" height="64" alt="Csan25" /></a>
@@ -733,6 +765,7 @@ make this tool possible:
 <a href="https://github.com/greatfighter" title="Spencer"><img src="https://github.com/greatfighter.png?size=64" width="64" height="64" alt="Spencer" /></a>
 <a href="https://github.com/gregory-chapman" title="Gregory Chapman"><img src="https://github.com/gregory-chapman.png?size=64" width="64" height="64" alt="Gregory Chapman" /></a>
 <a href="https://github.com/greysonevins" title="Greyson Nevins"><img src="https://github.com/greysonevins.png?size=64" width="64" height="64" alt="Greyson Nevins" /></a>
+<a href="https://github.com/gspivey" title="Gerard Spivey"><img src="https://github.com/gspivey.png?size=64" width="64" height="64" alt="Gerard Spivey" /></a>
 <a href="https://github.com/haozihong" title="haozihong"><img src="https://github.com/haozihong.png?size=64" width="64" height="64" alt="haozihong" /></a>
 <a href="https://github.com/harpreetmultani1994" title="Harpreet Singh"><img src="https://github.com/harpreetmultani1994.png?size=64" width="64" height="64" alt="Harpreet Singh" /></a>
 <a href="https://github.com/hazlijohar95" title="Hazli Johar"><img src="https://github.com/hazlijohar95.png?size=64" width="64" height="64" alt="Hazli Johar" /></a>
@@ -933,6 +966,7 @@ make this tool possible:
 <a href="https://github.com/Ship-Loop" title="Siddartha "><img src="https://github.com/Ship-Loop.png?size=64" width="64" height="64" alt="Siddartha " /></a>
 <a href="https://github.com/shortbloke" title="Martin Rowan"><img src="https://github.com/shortbloke.png?size=64" width="64" height="64" alt="Martin Rowan" /></a>
 <a href="https://github.com/ShotaroKataoka" title="Shotaro Kataoka"><img src="https://github.com/ShotaroKataoka.png?size=64" width="64" height="64" alt="Shotaro Kataoka" /></a>
+<a href="https://github.com/shrihan-vijay" title="Shrihan Vijay"><img src="https://github.com/shrihan-vijay.png?size=64" width="64" height="64" alt="Shrihan Vijay" /></a>
 <a href="https://github.com/shubag" title="shubag"><img src="https://github.com/shubag.png?size=64" width="64" height="64" alt="shubag" /></a>
 <a href="https://github.com/skagraw16" title="skagraw16"><img src="https://github.com/skagraw16.png?size=64" width="64" height="64" alt="skagraw16" /></a>
 <a href="https://github.com/smeyffret" title="smeyffret"><img src="https://github.com/smeyffret.png?size=64" width="64" height="64" alt="smeyffret" /></a>
@@ -1007,6 +1041,7 @@ make this tool possible:
 <a href="https://github.com/yytdfc" title="yytdfc"><img src="https://github.com/yytdfc.png?size=64" width="64" height="64" alt="yytdfc" /></a>
 <a href="https://github.com/zach-herridge" title="Zach Herridge"><img src="https://github.com/zach-herridge.png?size=64" width="64" height="64" alt="Zach Herridge" /></a>
 <a href="https://github.com/zachakin" title="Zach Akin-Amland"><img src="https://github.com/zachakin.png?size=64" width="64" height="64" alt="Zach Akin-Amland" /></a>
+<a href="https://github.com/zakil-02" title="Zakaria Akil"><img src="https://github.com/zakil-02.png?size=64" width="64" height="64" alt="Zakaria Akil" /></a>
 <a href="https://github.com/zander8807" title="zander8807"><img src="https://github.com/zander8807.png?size=64" width="64" height="64" alt="zander8807" /></a>
 <a href="https://github.com/Zedmor" title="Akim Akimov"><img src="https://github.com/Zedmor.png?size=64" width="64" height="64" alt="Akim Akimov" /></a>
 <a href="https://github.com/zeiadzaf" title="Zeiad"><img src="https://github.com/zeiadzaf.png?size=64" width="64" height="64" alt="Zeiad" /></a>

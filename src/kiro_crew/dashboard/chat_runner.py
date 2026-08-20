@@ -116,6 +116,8 @@ from kiro_crew.dashboard.session_directive_apply import apply_session_directive
 from kiro_crew.dashboard.state import (
     CRON_NOTIFY_PREFIX,
     CRON_NOTIFY_RE,
+    HOOK_CONTINUATION_RECOVERY_PREFIX,
+    HOOK_HALTED_RECOVERY_PREFIX,
     NATIVE_SUBAGENT_DONE_RESULT_CAP,
     NATIVE_SUBAGENT_DONE_TRUNC_MARKER,
     NATIVE_SUBAGENT_OUTPUT_HARD,
@@ -135,6 +137,8 @@ from kiro_crew.dashboard.state import (
     build_stale_recovery_prompt,
     build_tool_stall_recovery_prompt,
     is_read_only_bash,
+    parse_hook_continuations,
+    should_queue_hook_continuation,
     should_queue_refusal_recovery,
     unsafe_bash_reason,
 )
@@ -176,6 +180,7 @@ from kiro_crew.members import record_activity
 from kiro_crew.messaging.identity import publish_turn_identity
 from kiro_crew.messaging.link import SLACK_NAMESPACE, telemetry_channel_of
 from kiro_crew.messaging.renderer import chunk_text
+from kiro_crew.metrics.events import TURN_TIMEOUT_CAUSE, emit_counter
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.platform import redact_via_context
 from kiro_crew.providers.acp import is_claude_backend
@@ -1070,6 +1075,28 @@ def _redact_acp_string(s: str) -> str:
     return s
 
 
+# Native subagent cards carry a short error string only, so a long provider
+# message is clipped. The request id is what identifies the failure
+# server-side and the formatter appends it LAST, so a plain head-slice drops
+# precisely the part worth keeping.
+_MAX_NATIVE_CARD_ERROR = 200
+_RE_TRAILING_REQUEST_ID = re.compile(r"\(request_id:\s*[0-9a-fA-F-]+\)\s*$")
+
+
+def _clip_card_error(text: str, limit: int = _MAX_NATIVE_CARD_ERROR) -> str:
+    """Clip *text* to *limit* characters, keeping any trailing request id."""
+    if len(text) <= limit:
+        return text
+    match = _RE_TRAILING_REQUEST_ID.search(text)
+    if not match:
+        return text[:limit]
+    suffix = match.group(0).strip()
+    head = limit - len(suffix) - 4  # room for the elision marker and a space
+    if head <= 0:
+        return text[:limit]
+    return f"{text[:head]}... {suffix}"
+
+
 def _emit_mcp_oauth_request(
     state: "DashboardState",
     slot: "_ChatSlot",
@@ -1376,6 +1403,10 @@ _REDIRECT_PLACEHOLDER = "\x00REDIR\x00"
 _REDIRECT_RE = re.compile(r"[0-9]*>&[0-9]*|&>>?")
 # After redirects are masked, split on remaining separators.
 _CMD_SPLIT_RE = re.compile(r"\s*(?:\|\||&&|;|&|\n|\|)\s*")
+# Grant-safe variant: excludes bare & (background/arithmetic) and \n (display)
+# because this function serves the Trust dropdown (grant direction) where each
+# extra segment becomes one more binary offered for auto-approval.
+_CMD_GRANT_SPLIT_RE = re.compile(r"\s*(?:\|\||&&|;|\|)\s*")
 # Command substitution forms that split-then-fnmatch cannot safely reach:
 # $(...), backticks, and process substitution <(...)/>(...). Deny-by-default
 # when any are present — the pattern match would operate on the outer shell
@@ -1383,7 +1414,7 @@ _CMD_SPLIT_RE = re.compile(r"\s*(?:\|\||&&|;|&|\n|\|)\s*")
 _CMD_SUBSTITUTION_RE = re.compile(r"\$\(|`|<\(|>\(")
 
 
-def _mask_quoted_separators(text: str) -> tuple[str, dict[str, str]]:
+def _mask_quoted_separators(text: str, *, mask_escaped: bool = False) -> tuple[str, dict[str, str]]:
     """Replace command separators that appear INSIDE quotes with placeholders.
 
     The split regex (``_CMD_SPLIT_RE``) is quote-unaware, so a separator inside
@@ -1415,7 +1446,18 @@ def _mask_quoted_separators(text: str) -> tuple[str, dict[str, str]]:
     for ch in text:
         if escaped:
             escaped = False
-            out.append(ch)
+            # When mask_escaped is True (grant path), an escaped separator
+            # (e.g. \|) is treated as a literal — mask it so the split regex
+            # skips it.  When False (deny path), escaped separators still
+            # segment because treating \; as a literal would let an attacker
+            # hide a second command behind an escape.
+            if mask_escaped and ch in "|&;\n":
+                ph = f"\x00SEP{n}\x00"
+                n += 1
+                restore[ph] = ch
+                out.append(ph)
+            else:
+                out.append(ch)
             continue
         if ch == "\\" and quote != "'":
             escaped = True
@@ -1575,7 +1617,7 @@ def _native_subagent_sync(state, slot, subagents, tracker, card_output=None) -> 
             if stype in ("failed", "error") and smsg:
                 err, _ = redact_exfiltration_urls(smsg)
                 err, _ = redact_credentials(err)
-                err = err[:200]
+                err = _clip_card_error(err)
             info["done"] = True
             _feed = _native_card_feed(card_output, card_id)
             _elapsed = time.time() - info["started"]
@@ -1823,25 +1865,44 @@ def _safe_native_crew_debug_title(title: str) -> str:
     return safe
 
 
-def _split_command_segments(tool_title: str) -> tuple[str, list[str]] | None:
+def _split_command_segments(
+    tool_title: str,
+    split_re: "re.Pattern[str] | None" = None,
+    mask_escaped: bool = False,
+) -> tuple[str, list[str]] | None:
     """Split a shell tool title into its unquoted command segments.
 
     Returns ``(normalized_title, segments)``. Returns ``None`` — which every
     caller MUST treat as "deny" — when the command contains substitution
     (``$(...)``, backticks, process substitution), because no amount of
-    per-segment matching can reach inside a sub-command.
+    per-segment matching can reach inside a sub-command, or when it contains a
+    NUL byte, which would forge one of this function's own placeholders.
 
     Extracted so that every command-keyed approval path shares ONE splitter:
     a second, independently written shell splitter is exactly how a bypass
     gets introduced (quoted separators, masked redirects, backgrounding).
+
+    Pass ``split_re=_CMD_GRANT_SPLIT_RE`` for the grant path (Trust dropdown)
+    where bare ``&`` and ``\\n`` must NOT widen the offered set.
     """
     normalized = _normalize_tool_name(tool_title)
     if _CMD_SUBSTITUTION_RE.search(normalized):
         return None
+    # Both masking passes below key on NUL-delimited placeholders
+    # (``\x00REDIR\x00``, ``\x00SEP{n}\x00``), so the scheme is only
+    # unambiguous while the input carries no NUL of its own. A title that
+    # already contains one forges a placeholder: the redirect-restore loop
+    # then draws more placeholders than it masked and raises StopIteration
+    # (aborting the turn), and a forged ``\x00SEP{n}\x00`` restores to a
+    # separator the command never had. NUL is never legitimate here -- execve
+    # cannot carry it in an argument -- so deny by default rather than strip,
+    # which would match patterns against text that is not what would run.
+    if "\x00" in normalized:
+        return None
     # First mask separators that live INSIDE quotes (a quoted "a|b" must not be
     # split on its `|`), so _CMD_SPLIT_RE only ever cuts on real, unquoted
     # command boundaries. The placeholders are restored in each segment below.
-    quote_masked, sep_restore = _mask_quoted_separators(normalized)
+    quote_masked, sep_restore = _mask_quoted_separators(normalized, mask_escaped=mask_escaped)
     # Two-pass split: mask known redirect forms (2>&1, &>, &>>) so their &
     # isn't mistaken for a background operator, then split on remaining &.
     # Track masked positions to reconstruct original text in each segment.
@@ -1852,7 +1913,7 @@ def _split_command_segments(tool_title: str) -> tuple[str, list[str]] | None:
         return _REDIRECT_PLACEHOLDER
 
     masked = _REDIRECT_RE.sub(_mask, quote_masked)
-    split_parts = _CMD_SPLIT_RE.split(masked)
+    split_parts = (split_re or _CMD_SPLIT_RE).split(masked)
     # Restore original redirect syntax in each segment for pattern matching.
     redir_iter = iter(redirects)
     segments = []
@@ -1915,32 +1976,65 @@ _BROWSER_CLI_PAGE_VERBS = frozenset(
         # Core / lifecycle. `close` is deliberately absent -- see the
         # exclusion note below. `detach` stays: it releases the session
         # without taking the operator's window with it.
-        "open", "attach", "detach", "goto", "resize",
+        "open",
+        "attach",
+        "detach",
+        "goto",
+        "resize",
         # Interaction
-        "type", "click", "dblclick", "fill", "drag", "drop", "hover",
-        "select", "check", "uncheck",
+        "type",
+        "click",
+        "dblclick",
+        "fill",
+        "drag",
+        "drop",
+        "hover",
+        "select",
+        "check",
+        "uncheck",
         # Reading the page
-        "snapshot", "find", "generate-locator", "highlight",
+        "snapshot",
+        "find",
+        "generate-locator",
+        "highlight",
         # Dialogs
-        "dialog-accept", "dialog-dismiss",
+        "dialog-accept",
+        "dialog-dismiss",
         # Navigation
-        "go-back", "go-forward", "reload",
+        "go-back",
+        "go-forward",
+        "reload",
         # Keyboard / mouse
-        "press", "keydown", "keyup",
-        "mousemove", "mousedown", "mouseup", "mousewheel",
+        "press",
+        "keydown",
+        "keyup",
+        "mousemove",
+        "mousedown",
+        "mouseup",
+        "mousewheel",
         # Capture (writes only into the service's own output dir)
-        "screenshot", "pdf",
+        "screenshot",
+        "pdf",
         # Tabs. `tab-close` is absent for the same reason as `close`.
-        "tab-list", "tab-new", "tab-select",
+        "tab-list",
+        "tab-new",
+        "tab-select",
         # Read-only request metadata: route-list prints the mock table
         # (pattern strings, no URLs) and config-print prints the session's
         # launch configuration.
         "route-list",
         # DevTools / diagnostics
-        "console", "tracing-start", "tracing-stop",
-        "video-stop", "video-chapter", "video-show-actions",
+        "console",
+        "tracing-start",
+        "tracing-stop",
+        "video-stop",
+        "video-chapter",
+        "video-show-actions",
         "video-hide-actions",
-        "show", "pause-at", "resume", "step-over",
+        "show",
+        "pause-at",
+        "resume",
+        "step-over",
         # Session management. The listing only; `close-all` / `kill-all`
         # are absent -- they are the widest-blast-radius verbs the CLI has.
         "list",
@@ -2052,13 +2146,25 @@ _BROWSER_CLI_SAFE_FLAGS = frozenset(
         # so the named-session form this repo's own prompt.md tells the agent to
         # use (`--s=chrome`) fell through to interactive approval on EVERY
         # command after `attach` -- the documented primary workflow.
-        "-s", "--s", "--session",
-        "--json", "--raw", "--help", "--version",
-        "--headed", "--browser", "--persistent",
-        "--extension", "--cdp", "--endpoint",
-        "--domain", "--hide",
+        "-s",
+        "--s",
+        "--session",
+        "--json",
+        "--raw",
+        "--help",
+        "--version",
+        "--headed",
+        "--browser",
+        "--persistent",
+        "--extension",
+        "--cdp",
+        "--endpoint",
+        "--domain",
+        "--hide",
         # Shape-only capture options: they change the image, not its location.
-        "--type", "--full-page", "--hires",
+        "--type",
+        "--full-page",
+        "--hires",
     }
 )
 
@@ -2338,10 +2444,28 @@ def _extract_base_command(tool_title: str) -> str:
     "Running: ls /tmp" -> "ls"
     "Running: cat /etc/hosts | wc -l" -> "cat,wc"
     "Running: grep -r foo . && echo done" -> "grep,echo"
+    "Running: grep -E 'foo|bar' file.txt" -> "grep"
     "SomeMcpTool" -> "SomeMcpTool"
+
+    Delegates to :func:`_split_command_segments` with
+    ``_CMD_GRANT_SPLIT_RE`` — the same shared splitter (quote masking,
+    redirect masking, substitution denial) but a narrower operator set that
+    excludes bare ``&`` and ``\\n``.  Those operators are correct for the
+    deny path (enforcement) where over-splitting fails closed, but wrong
+    for the grant path (Trust dropdown) where each extra segment becomes
+    one more binary offered for auto-approval.
+
+    When the command contains substitution, returns only the first token —
+    the enforcement path independently denies substitution commands.
     """
-    normalized = _normalize_tool_name(tool_title)
-    segments = re.split(r"\s*(?:\|\||&&|;|\|)\s*", normalized)
+    split = _split_command_segments(tool_title, split_re=_CMD_GRANT_SPLIT_RE, mask_escaped=True)
+    if split is None:
+        # Command substitution — can't safely extract bases.  Return only
+        # the first token so the Trust dropdown doesn't offer junk patterns.
+        normalized = _normalize_tool_name(tool_title)
+        parts = normalized.strip().split(None, 1)
+        return parts[0] if parts else normalized
+    normalized, segments = split
     bases = []
     for seg in segments:
         parts = seg.strip().split(None, 1)
@@ -3416,15 +3540,21 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         )
         merge = False
 
+    in_stage = bool(slot._in_stage_execution)
     hold_users = bool(
         (
             state.subagents is not None
             and state.subagents.running_agents_for(f"dashboard:{slot.key}")
         )
-        or slot._in_stage_execution
+        or in_stage
     )
     if hold_users:
-        next_msg, consumed = _dequeue_next_system_message(slot)
+        # During a multi-stage plan hold cron notifications too: each stage is
+        # its own _run_chat whose tail-drain runs while _in_stage_execution is
+        # still set, so draining a cron here starts an unrelated turn between
+        # stages and scatters the plan. It drains at end-of-plan once the gate
+        # clears. Sub-agent completions / recovery still flow.
+        next_msg, consumed = _dequeue_next_system_message(slot, exclude_cron=in_stage)
     else:
         next_msg, consumed = _dequeue_next_message(slot, merge_enabled=merge)
     if next_msg is None:
@@ -3494,6 +3624,23 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         row_cls = "msg msg-inject"
     else:
         row_cls = "msg msg-u"
+    # Durable provenance for every `inject` row. `cls` is NOT persisted for this
+    # role (chat_persistence only keeps it for `role == "system"`), and the
+    # frontend's `meta.cronLabel` exists on the wire only because parse_cls_meta
+    # synthesizes it at emit time — so anything keyed on it silently disappears
+    # after a flush + rehydrate. `meta` IS persisted and restored, so the render
+    # side can ask what a row IS instead of guessing from what its text is not.
+    #
+    # The recovery split matters: build_recovery_requeue replays the USER'S OWN
+    # message verbatim when the turn emitted nothing, and that row must keep
+    # rendering as speech. `synthetic_payload` is the existing answer to exactly
+    # that question, so reuse it rather than inventing a second signal.
+    if row_role == "inject":
+        _inject_kind = "cron" if is_cron else "recovery" if synthetic_payload else "user_replay"
+        _inject_meta: dict = {"injectKind": _inject_kind}
+        if is_cron:
+            _inject_meta["cronLabel"] = cron_label
+        _row_meta = {**_row_meta, **_inject_meta} if isinstance(_row_meta, dict) else _inject_meta
     slot.append(
         row_role,
         next_msg,
@@ -3538,8 +3685,28 @@ async def _run_pending_synthesis(state: DashboardState, slot: _ChatSlot) -> None
 
         # All delivery guards hold. Consume immediately before the turn begins.
         slot._pending_synthesis = False
+        # Append the row BEFORE dispatching, matching `_start_next_queued_turn`.
+        # This site bypasses that function (it runs no queue entry), and it was
+        # the only turn-dispatching path that appended nothing — so the prompt
+        # reached the conversation log with no dashboard row, and on replay it
+        # resurfaced attributed to the USER. `inject` is the role every other
+        # runner-authored continuation already uses, which is exactly what
+        # SUBAGENT_SYNTHESIS_PREFIX's own docstring promises.
+        slot.append(
+            "inject",
+            SUBAGENT_SYNTHESIS_PROMPT,
+            "msg msg-inject",
+            meta={"injectKind": "synthesis"},
+        )
+        state.push_slots_update()
         synthesis_task = spawn_guarded_turn(
-            state, slot, _run_chat(state, slot, SUBAGENT_SYNTHESIS_PROMPT)
+            state,
+            slot,
+            # Declare the provenance structurally too. Without it this turn starts
+            # a time-to-first-token clock whose own contract excludes synthetic
+            # prompts, and `_is_synthetic` has to recover the same fact by
+            # re-matching the marker string downstream.
+            _run_chat(state, slot, SUBAGENT_SYNTHESIS_PROMPT, _synthetic_payload=True),
         )
         try:
             await synthesis_task
@@ -3644,6 +3811,11 @@ async def _run_chat(
 ) -> None:
     """Stream LLM response into *slot*.  Survives browser disconnect."""
 
+    # Capture before any await: a Stop can complete while pre-turn setup is
+    # suspended and reset _stop_state to idle before continuation processing.
+    # The monotonic generation preserves that user intent across the whole call.
+    _stop_gen_at_entry = slot._stop_generation
+
     session_key = effective_session_key(slot)
     sessions = getattr(state, "sessions", None)
 
@@ -3678,6 +3850,7 @@ async def _run_chat(
         tool_name: str = "",
         tool_input: dict | None = None,
         tool_response: dict | None = None,
+        hook_continuation_count: int = 0,
     ) -> list[str]:
         """Fire script hooks. Returns stdout texts from exit-0 hooks (for context injection)."""
         injected: list[str] = []
@@ -3694,6 +3867,7 @@ async def _run_chat(
                 tool_input=tool_input,
                 tool_response=tool_response,
                 parent_session_key=session_key,
+                hook_continuation_count=hook_continuation_count,
             )
             for r in results:
                 if r.exit_code == 0 and r.stdout:
@@ -3918,6 +4092,17 @@ async def _run_chat(
     # the turn ends — and the user did not stop it — a recovery continuation is
     # enqueued so the model learns why and can adapt instead of stalling.
     _refusal_reasons: list[tuple[str, str]] = []
+    # Track how deep an unbroken hook-continuation run is, so the Stop hook can
+    # see it: each consecutive hook continuation is one deeper; any other turn
+    # (a real user message, a refusal recovery) breaks the run and resets it.
+    # Gate on synthetic provenance, not the marker text alone: a real dequeued
+    # continuation carries _synthetic_payload, but a user who types the marker
+    # verbatim is ordinary speech and must not inflate the depth a gate hook
+    # sees (would let a spoofed message drive the hook's self-limit).
+    if _synthetic_payload and message.startswith(HOOK_CONTINUATION_RECOVERY_PREFIX):
+        slot._hook_continuation_depth += 1
+    else:
+        slot._hook_continuation_depth = 0
     # Runner-authored continuations are orchestration, not user input, and the
     # post-fan-out synthesis prompt is one too: never mirror either to linked
     # surfaces (Slack/Telegram) as if the user typed it — only the assistant reply
@@ -4211,6 +4396,15 @@ async def _run_chat(
         # (the dashboard steer handler) can reach the running session's client
         # to inject a mid-turn steer. Cleared in the finally below.
         slot._acp_client = getattr(client, "client", None)
+        # This consumer implements the low-fidelity child downgrade (the
+        # interactive card) — opt in so the handle-level fail-close gate
+        # yields those events here instead of rejecting them itself.
+        # setattr: the LLMProvider interface doesn't declare the attribute;
+        # AcpSessionProvider forwards it to the handle, other providers ignore.
+        try:
+            setattr(client, "child_fidelity_aware", True)
+        except Exception:  # pragma: no cover - providers without the attr
+            pass
         # Companion steer handle: lets the steer handler cut the current text
         # segment at the steer boundary (see _steer_segment_cut). Same
         # lifecycle as _acp_client.
@@ -4753,11 +4947,7 @@ async def _run_chat(
         # stream, the assistant reply and the stream teardown together. Disconnect
         # is the user saying "not into this conversation", which applies to the
         # answer as much as to the echo — so it is one gate, not four.
-        if (
-            state.slack_client
-            and not is_slash
-            and not slack_mirror_is_paused(state, session_key)
-        ):
+        if state.slack_client and not is_slash and not slack_mirror_is_paused(state, session_key):
             _mirror_thread, _mirror_chan = state.sessions.get_slack_link(session_key)
             if _mirror_thread and _mirror_chan:
                 try:
@@ -5280,21 +5470,46 @@ async def _run_chat(
                     else:
                         _dir_args = session_directive.decode(_out, _dir_tool)
                         if _dir_args is None and event.tool_final:
-                            # The gate already AUTHENTICATED this as a directive
-                            # tool via the canonical _meta identity, and this is
-                            # the FINAL frame — so a marker that does not decode
-                            # means the effect is being dropped outright. Never
-                            # let that be silent: this exact silence can hide a
-                            # rawOutput-envelope escaping bug.
-                            # Mid-stream frames legitimately decode to None and
-                            # are excluded by the tool_final guard.
-                            logger.warning(
-                                "session-directive decode FAILED for %r "
-                                "(tool_call_id=%s, out_len=%d) — effect dropped",
-                                _dir_tool,
-                                event.tool_call_id,
-                                len(_out or ""),
-                            )
+                            if session_directive.is_refusal(_out):
+                                # encode() refused to emit a marker because the
+                                # VALIDATED payload exceeded the delivery limit.
+                                # Nothing was applied and the result text already
+                                # told the model so, so this is the by-design
+                                # loud failure — it must not fire the warning
+                                # below, which exists to surface a lost marker.
+                                logger.info(
+                                    "session-directive REFUSED for %r "
+                                    "(tool_call_id=%s): payload over the %d-char "
+                                    "delivery limit; nothing applied",
+                                    _dir_tool,
+                                    event.tool_call_id,
+                                    session_directive.MAX_DIRECTIVE_CHARS,
+                                )
+                                # SINGLE-CONSUME + strip: a refusal is terminal,
+                                # so release the mapping and cache the
+                                # marker-free text for any later frame carrying
+                                # this same tool_call_id (which no longer
+                                # resolves _dir_tool).
+                                _pending_dir_tool.pop(event.tool_call_id, None)
+                                _out = _redact_tool_field(session_directive.strip_marker(_out))
+                                _dir_consumed_out[event.tool_call_id] = _out
+                            else:
+                                # The gate already AUTHENTICATED this as a
+                                # directive tool via the canonical _meta
+                                # identity, and this is the FINAL frame — so a
+                                # marker that does not decode means the effect is
+                                # being dropped outright. Never let that be
+                                # silent: this exact silence can hide a
+                                # rawOutput-envelope escaping bug.
+                                # Mid-stream frames legitimately decode to None
+                                # and are excluded by the tool_final guard.
+                                logger.warning(
+                                    "session-directive decode FAILED for %r "
+                                    "(tool_call_id=%s, out_len=%d) — effect dropped",
+                                    _dir_tool,
+                                    event.tool_call_id,
+                                    len(_out or ""),
+                                )
                         if _dir_args is not None:
                             # SINGLE-CONSUME (see the native branch above): drop
                             # the mapping BEFORE applying, so a second result
@@ -5394,6 +5609,22 @@ async def _run_chat(
                 # to the interactive card. A child WITH full context takes the
                 # same branches as the main agent (mode parity).
                 _child_low_fidelity = event.child_low_fidelity
+                # DISPLAY-ONLY warning for the interactive card: the human
+                # must know the title is ALL there is (the params the gates
+                # would verify are absent, so the displayed text is
+                # agent-authored and unverifiable). Computed HERE — outside
+                # the context-builder block — so the card is labeled whenever
+                # the fidelity guards are active, including hosts with no
+                # context builder. Never written into event.title: the
+                # TrustDropdown derives its learned patterns from the title,
+                # and a mutated title would store junk pattern entries for
+                # exactly the requests that need the clearest presentation.
+                _child_lf_warning = (
+                    "⚠️ UNVERIFIED child request (security context "
+                    "missing — title is agent-authored): "
+                    if _child_low_fidelity
+                    else ""
+                )
                 if state.context_builder:
                     # Pass the raw shell command (not just the display title)
                     # so the security gate evaluates what actually executes.
@@ -5465,7 +5696,8 @@ async def _run_chat(
                         # reached us (cache miss): command bytes are absent, so
                         # every gate below would judge the LLM-authored title
                         # alone. Fail closed past all auto-approve paths — the
-                        # request falls through to the interactive card. When
+                        # request falls through to the interactive card (which
+                        # carries the _child_lf_warning display prefix). When
                         # the child's session/update frames WERE routed (the
                         # normal case), tool_input carries the real command
                         # bytes and the child takes the exact same mode
@@ -5588,9 +5820,10 @@ async def _run_chat(
                 # parent turn. Deny-by-default (CWE-1188): with no active crew this
                 # predicate is False no matter the trust flags, so the tool falls
                 # through to the normal interactive/trust gate below.
-                if _native_crew_should_auto_approve(
-                    _native_tracker, state, slot
-                ) and not _child_low_fidelity:
+                if (
+                    _native_crew_should_auto_approve(_native_tracker, state, slot)
+                    and not _child_low_fidelity
+                ):
                     logger.debug(
                         "Native crew auto-approve: %r (request_id=%s)",
                         _safe_native_crew_debug_title(event.title),
@@ -5718,7 +5951,7 @@ async def _run_chat(
                 # "creating a durable scheduled job is allowed".
                 _bc_cmd = (
                     _extract_bash_command(event.tool_input)
-                    if (event.is_shell and event.tool_input)
+                    if (event.is_shell and event.tool_input and not _child_low_fidelity)
                     else ""
                 )
                 _bc_ok = False
@@ -5777,7 +6010,13 @@ async def _run_chat(
                 # a scope check is not a pure read — it retires a lapsed grant and
                 # logs that, which must happen once per event, not twice.
                 slot_trusted = _slot_is_trusted(slot)
-                if slot._trust_reads and not slot_trusted and not yolo_active and cmd:
+                if (
+                    slot._trust_reads
+                    and not slot_trusted
+                    and not yolo_active
+                    and cmd
+                    and not _child_low_fidelity
+                ):
                     if is_read_only_bash(cmd):
                         try:
                             validated_tool = _validate_tool_name(
@@ -5914,7 +6153,10 @@ async def _run_chat(
                 cmd = _extract_bash_command(event.tool_input) if event.tool_input else ""
                 if cmd:
                     perm_meta["is_read_only"] = "1" if is_read_only_bash(cmd) else ""
-                # Pre-compute pattern fields for the TrustDropdown
+                # Pre-compute pattern fields for the TrustDropdown.
+                # NOTE: derived from the UN-annotated event.title — the
+                # _child_lf_warning prefix is applied to the DISPLAY text
+                # only, so learned trust patterns keep meaning tool identity.
                 _safe_title, _ = redact_exfiltration_urls(event.title)
                 _safe_title, _ = redact_credentials(_safe_title)
                 perm_meta["tool_title"] = _safe_title
@@ -5928,7 +6170,7 @@ async def _run_chat(
                 perm_meta["base_command"] = _base
                 slot.append(
                     "permission",
-                    _safe_title,
+                    f"{_child_lf_warning}{_safe_title}" if _child_lf_warning else _safe_title,
                     json.dumps(perm_meta),
                 )
                 loop = asyncio.get_running_loop()
@@ -5965,7 +6207,11 @@ async def _run_chat(
                             slot._slack_thread_ts,
                             event.request_id,
                             session_key,
-                            event.title,
+                            (
+                                f"{_child_lf_warning}{event.title}"
+                                if _child_lf_warning
+                                else event.title
+                            ),
                             event.tool_input or "",
                         )
                         if _slack_approval_ts is None:
@@ -6070,6 +6316,24 @@ async def _run_chat(
                             "retrying the same call.",
                             "msg msg-a",
                         )
+                    # Tell any monitoring loop bound to this slot that a cycle
+                    # could not obtain approval. This branch IS the evidence a
+                    # reactive stop needs: the prompt ran its full window with no
+                    # decision, which an auto-approved tool never reaches. The
+                    # loop stops on its next wake instead of spending the rest of
+                    # its cap on cycles that cannot act. Best-effort and
+                    # non-blocking — a monitoring convenience must never change
+                    # how this turn's denial is reported.
+                    try:
+                        from kiro_crew.autonudge import (
+                            get_instance as _autonudge_get,  # circular: autonudge -> dashboard.chat -> chat_runner
+                        )
+
+                        _autonudge = _autonudge_get()
+                        if _autonudge is not None:
+                            _autonudge.notify_approval_stalled(slot.key)
+                    except Exception:
+                        logger.debug("autonudge.notify_approval_stalled failed", exc_info=True)
                 finally:
                     if _approval_card is not None:
                         try:
@@ -6317,6 +6581,16 @@ async def _run_chat(
                 _sid = event.sub_session_id
                 if _sid in _native_tracker and event.tool_call_id:
                     _native_tc_card[event.tool_call_id] = f"native:{_redact_tool_field(_sid)}"
+                # Permission-rejection notices (the handle's own "⛔ …" lines,
+                # e.g. drain-time rejects yielded at turn start) arrive BEFORE
+                # any subagent_list populates the per-turn tracker — dropping
+                # them here would leave the user watching a child tool fail
+                # with no explanation. When the card cannot exist yet, persist
+                # the explanation as a slot notice instead.
+                if _sid not in _native_tracker and event.text and event.text.startswith("⛔"):
+                    _txt, _ = redact_exfiltration_urls(event.text)
+                    _txt, _ = redact_credentials(_txt)
+                    slot.append("notice", _txt, "msg msg-info")
                 # Some kiro-cli builds also stream the sub-agent's own text via
                 # agent_message_chunk on this channel — surface it on the card.
                 if _sid in _native_tracker and event.text:
@@ -6333,6 +6607,12 @@ async def _run_chat(
                         {"id": _card_id, "slot": slot.key, "text": _txt},
                     )
             elif event.kind == EVENT_COMPLETE:
+                # Hang-attribution snapshot BEFORE the close-all safety net
+                # below force-marks every card done: only children still
+                # unfinished at the cut may count toward timeout attribution
+                # (terminal entries linger in the tracker for reconnect
+                # replay and would corrupt the series).
+                _children_unfinished = any(not _i.get("done") for _i in _native_tracker.values())
                 # Safety net: complete any native subagent cards still marked
                 # running at turn end (in case a terminal status was missed),
                 # so cards don't stay stuck "running".
@@ -6423,6 +6703,25 @@ async def _run_chat(
                     elapsed_ms=_turn_elapsed_ms,
                     exhausted=_turn_exhausted,
                 )
+                if "timeout" in (event.stop_reason or ""):
+                    # Hang-resilience series: attribute the CAUSE of a turn
+                    # timeout (the 2h-ceiling hang class). Both attrs are
+                    # booleans read defensively from live state — the inner
+                    # client may be an AcpClient (flag on itself) or an
+                    # AcpSessionProvider (flag on its handle).
+                    _ac = slot._acp_client
+                    _awaiting = bool(
+                        getattr(_ac, "_awaiting_permission", False)
+                        or getattr(getattr(_ac, "_handle", None), "_awaiting_permission", False)
+                    )
+                    emit_counter(
+                        TURN_TIMEOUT_CAUSE,
+                        {
+                            "path": "provider_timeout",
+                            "awaiting_permission": _awaiting,
+                            "children_announced": _children_unfinished,
+                        },
+                    )
                 _stop_reason = event.stop_reason
                 # Recorded on the slot so post-turn consumers reached later
                 # (which do not receive the event) can tell a turn that really
@@ -6544,9 +6843,7 @@ async def _run_chat(
                 # recovery cycle); the emitted flag dedups the metric and
                 # blocks a later "recovered" mis-emit.
                 if not slot._tool_stall_exhausted_emitted:
-                    _emit_recovery_outcome(
-                        "tool_stall", "exhausted", slot._tool_stall_retries
-                    )
+                    _emit_recovery_outcome("tool_stall", "exhausted", slot._tool_stall_retries)
                     slot._tool_stall_exhausted_emitted = True
                 _emit_stall("Session stuck — please start a new chat.")
             else:
@@ -6894,9 +7191,7 @@ async def _run_chat(
                         "stale_recover", "recovered", slot._stale_recovery_retries
                     )
                 if slot._tool_stall_retries > 0 and not slot._tool_stall_exhausted_emitted:
-                    _emit_recovery_outcome(
-                        "tool_stall", "recovered", slot._tool_stall_retries
-                    )
+                    _emit_recovery_outcome("tool_stall", "recovered", slot._tool_stall_retries)
             slot._empty_response_retries = 0
             slot._prompt_busy_retries = 0
             slot._acp_pipe_death_retries = 0
@@ -6970,7 +7265,97 @@ async def _run_chat(
         # [:500]) so the tail — e.g. the harness [OPTIONS:] line — reaches both
         # the matcher and the hook body.
         _final = redact_credentials(redact_exfiltration_urls(assistant_text)[0])[0]
-        await _fire(HOOK_EVENT_STOP, _final)
+        # Report how deep this hook-continuation run is so a gate hook can
+        # diagnose or apply a stricter limit than the configurable backstop.
+        _stop_hook_out = await _fire(
+            HOOK_EVENT_STOP,
+            _final,
+            hook_continuation_count=slot._hook_continuation_depth,
+        )
+
+        # ── Stop-hook continuation ─────────────────────────────────────────
+        # A Stop hook that exits 0 and prints {"decision": "block", "reason":
+        # ...} asks the harness to continue with `reason` as the next message
+        # (https://kiro.dev/docs/hooks/types#agent-stop), so a hook can judge the
+        # finished turn and keep the session going — a test-gate hook, or one that
+        # auto-continues a trivial read — without a round-trip to the user.
+        # Suppressed on a user stop or a pending reset so a hook can never
+        # override the Stop button. A configurable consecutive-turn backstop
+        # bounds faulty always-block hooks; 0 explicitly disables that backstop.
+        # The finally block's dequeue loop dispatches accepted continuations.
+        if should_queue_hook_continuation(slot._stopping, needs_session_reset, _stop_reason) and (
+            # Suppress if any user stop was initiated during this turn (streaming,
+            # completion persistence, or the hook _fire above): stop_turn()
+            # reporting "idle" resets _stop_state before this guard reads
+            # _stopping, but _stop_generation counts stop INITIATIONS and never
+            # rewinds, so an entry-vs-now delta is the durable signal.
+            slot._stop_generation
+            == _stop_gen_at_entry
+        ):
+            _hook_reasons = parse_hook_continuations(_stop_hook_out)
+            # No block decision -> nothing to queue; skip the cap load and
+            # arithmetic on the common empty path (also what the old
+            # `_hook_reasons and _nudge_cap` short-circuit did).
+            if _hook_reasons:
+                _nudge_cap = (
+                    await asyncio.to_thread(KiroCrewConfig.load)
+                ).agent.max_stop_hook_nudges
+                # Config loading yields to the event loop. Recheck the Stop
+                # boundary before mutating the queue so a Stop that lands during
+                # that await cannot be bypassed by the stale outer guard.
+                if (
+                    not should_queue_hook_continuation(
+                        slot._stopping, needs_session_reset, _stop_reason
+                    )
+                    or slot._stop_generation != _stop_gen_at_entry
+                ):
+                    _hook_reasons = []
+            else:
+                _nudge_cap = 0
+            # The cap bounds TOTAL consecutive continuation turns, and one Stop
+            # event can carry several block reasons, so clamp to the remaining
+            # budget rather than checking depth once and queueing all of them.
+            # _hook_continuation_depth only counts turns that have RUN, so also
+            # subtract continuations already sitting in the queue from an earlier
+            # multi-reason event: they will run and add depth, and ignoring them
+            # lets each event recompute room from depth alone and overshoot.
+            _pending = sum(
+                1
+                for _it in slot._queue
+                if is_synthetic_recovery_item(_it)
+                and _it["content"].startswith(HOOK_CONTINUATION_RECOVERY_PREFIX)
+            )
+            _room = (
+                len(_hook_reasons)
+                if not _nudge_cap
+                else max(0, _nudge_cap - slot._hook_continuation_depth - _pending)
+            )
+            # queue_insert(0, …) prepends, so insert in reverse to keep several
+            # hooks' instructions in firing order.
+            for _reason in reversed(_hook_reasons[:_room]):
+                slot.queue_insert(
+                    0,
+                    f"{HOOK_CONTINUATION_RECOVERY_PREFIX}\n{_reason}",
+                    kind=SYNTHETIC_RECOVERY_KIND,
+                )
+            if _hook_reasons and _room < len(_hook_reasons):
+                # The run reached the cap: some (or all) reasons were refused.
+                # Surface an inject row (renders as a halt card carrying the
+                # reached depth) but dispatch nothing for the excess. This is the
+                # backstop against a buggy always-block hook looping an
+                # unattended session. `0` disables the cap entirely.
+                _dropped = len(_hook_reasons) - _room
+                slot.append(
+                    "inject",
+                    f"{HOOK_HALTED_RECOVERY_PREFIX} #{slot._hook_continuation_depth}\n"
+                    f"A Stop hook asked to continue, but this run reached "
+                    f"agent.max_stop_hook_nudges = {_nudge_cap} "
+                    f"(depth {slot._hook_continuation_depth}); {_dropped} nudge(s) "
+                    f"were dropped and the run was halted. Raise or disable the "
+                    f"cap in config to allow more.",
+                    "msg msg-inject",
+                )
+                state.push_slots_update()
 
         # ── Tool-refusal recovery ──────────────────────────────────────────
         # A recoverable refusal (host-gate policy deny or the read-only bash
@@ -7021,9 +7406,7 @@ async def _run_chat(
                     # from the thread would name whoever owns the thread at mint
                     # time, so a relink landing mid-turn would stamp the control
                     # with a conversation that never asked the question.
-                    _mirror_token = await asyncio.to_thread(
-                        mint_options_token, state, session_key
-                    )
+                    _mirror_token = await asyncio.to_thread(mint_options_token, state, session_key)
                     _mirror_blocks = build_options_blocks(
                         _mirror_options, staleness_token=_mirror_token
                     )
@@ -7646,18 +8029,43 @@ async def _run_chat(
         # Completion can be bypassed by cancellation, provider errors, or timeouts.
         # Close cards idempotently and retain only bounded terminal records for
         # reconnect replay until the next turn installs a fresh tracker.
+        # Snapshot which children were still unfinished FIRST — close_all
+        # force-marks every card done, and terminal entries linger in the
+        # tracker for replay, so reading the tracker afterwards would blame
+        # long-completed children for a later ceiling timeout.
+        _children_unfinished_final = any(not _i.get("done") for _i in _native_tracker.values())
         try:
             _native_subagent_close_all(state, slot, _native_tracker, _native_card_output)
         finally:
             slot._native_subagent_tracker = _retain_terminal_native(_native_tracker)
             slot._native_subagent_output = {}
         slot._batch_rejected = False
+        # Stash the hang-attribution snapshot BEFORE dropping the client ref:
+        # if this turn was cut by the dashboard ceiling (_bounded_turn), the
+        # done-callback (finish_turn_task) runs AFTER this finally, when
+        # _acp_client is already None — it reads these two fields to emit
+        # kirocrew.turn.timeout.cause for the ceiling path.
+        _lc = slot._acp_client
+        slot._last_turn_awaiting_permission = bool(
+            getattr(_lc, "_awaiting_permission", False)
+            or getattr(getattr(_lc, "_handle", None), "_awaiting_permission", False)
+        )
+        slot._last_turn_children_announced = _children_unfinished_final
         # Steer handle: turn is over, drop the live client ref so a late steer
         # can't target a dead session (the route also re-checks running state).
         slot._acp_client = None
         # Same lifecycle for the segment-cut handle: a late steer must not
         # flush into a finished turn's (already-flushed) locals.
         slot._steer_segment_cut = None
+        # Same lifecycle for the child-fidelity opt-in latched at turn start:
+        # it is THIS consumer's promise to render the low-fidelity downgrade
+        # card. Leaving it set would let a later, fidelity-UNAWARE consumer of
+        # the same provider/handle inherit the opt-in and silently disable the
+        # handle-level fail-close choke point.
+        try:
+            setattr(client, "child_fidelity_aware", False)
+        except Exception:
+            pass
         # Ensure file changes always surface, even on cancel/error. Wrapped so
         # a raise here cannot skip the re-arm below and re-introduce the orphan
         # bug this fix prevents.

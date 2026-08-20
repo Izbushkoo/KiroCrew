@@ -239,6 +239,8 @@ async def api_hook_detail(request: web.Request) -> web.Response:
         hook = await _mutate_hook_store(store.update, hook_id, validated)
     except _StoreUnavailable:
         return _store_unavailable_response()
+    except ValueError as exc:
+        return web.json_response({"error": str(exc), "code": "invalid_hook"}, status=400)
     if not hook:
         return web.json_response({"error": "not found", "code": "hook_not_found"}, status=404)
     _sel().log_api_access(

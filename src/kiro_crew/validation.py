@@ -2215,6 +2215,49 @@ def _validate_hook_has_action(args: dict) -> None:
     """A hook must have either a command or skills — an empty hook is invalid."""
     if not args.get("command") and not args.get("skills"):
         raise ValidationError("command", "either command or skills must be provided")
+    # Skills injection only fires for a *standalone* skills hook (no command) on
+    # UserPromptSubmit/AgentSpawn — see ScriptHookStore.fire(), which emits the
+    # "Load skills:" directive only when `hook.skills and not hook.command` and
+    # the event is one of those two. Reject any other pairing at save time so a
+    # hook can never save cleanly and then silently never fire:
+    #   - skills + a command: the command runs but the skills are inert.
+    #   - skills on PreToolUse/PostToolUse/Stop: the directive has no consumer.
+    if args.get("skills"):
+        if args.get("command"):
+            raise ValidationError(
+                "skills",
+                "skills cannot be combined with a command — the skills would "
+                "never fire; use a skills-only hook or drop the skills",
+            )
+        event = args.get("event", "")
+        if event in ("PreToolUse", "PostToolUse", "Stop"):
+            raise ValidationError(
+                "skills",
+                f"skills hooks cannot fire on {event} events — "
+                "choose UserPromptSubmit or AgentSpawn",
+            )
+
+
+def _validate_hook_create(args: dict) -> None:
+    """Validate a hook at creation time: action + regex syntax."""
+    _validate_hook_has_action(args)
+    _validate_hook_regex(args)
+
+
+def _validate_hook_update(args: dict) -> None:
+    """Validate a hook at update time: regex syntax (action already checked by store)."""
+    _validate_hook_regex(args)
+
+
+def _validate_hook_regex(args: dict) -> None:
+    """Reject an invalid regex pattern at save time with a field-level error."""
+    matcher = args.get("matcher", "")
+    mode = args.get("matcher_mode", "glob")
+    if mode == "regex" and matcher:
+        try:
+            re.compile(matcher)
+        except re.error as exc:
+            raise ValidationError("matcher", f"invalid regex: {exc}") from None
 
 
 HOOK_CREATE_SCHEMA = ToolSchema(
@@ -2229,7 +2272,7 @@ HOOK_CREATE_SCHEMA = ToolSchema(
         FieldSpec("timeout", int, min_val=1, max_val=300, default=30),
         FieldSpec("enabled", bool, default=True),
     ],
-    custom_validator=_validate_hook_has_action,
+    custom_validator=_validate_hook_create,
 )
 
 HOOK_UPDATE_SCHEMA = ToolSchema(
@@ -2244,25 +2287,45 @@ HOOK_UPDATE_SCHEMA = ToolSchema(
         FieldSpec("timeout", int, min_val=1, max_val=300),
         FieldSpec("enabled", bool),
     ],
+    custom_validator=_validate_hook_update,
 )
 
 # ── Tool Schemas (File I/O) ──
 
+#: Syntactic shape gate for a filesystem path arriving over the dashboard's
+#: file endpoints. It admits POSIX (``/x``, ``~/x``) *and* native Windows
+#: (``C:\x``, ``C:/x``, UNC ``\\host\share\x``) absolute paths. A prefix is
+#: still required, so a bare relative path is refused exactly as before --
+#: the endpoints that support relative input rewrite it to an absolute path
+#: via ``_resolve_project_relative`` under ``resolve=1``, ahead of this gate.
+#:
+#: One pattern rather than a ``sys.platform`` branch: a drive letter and a UNC
+#: root have no meaning on POSIX, so accepting those shapes there admits no
+#: path that was previously unreachable, and a single pattern cannot drift
+#: between platforms the way two would. This is a *syntax* gate only -- the
+#: security boundary is downstream, where ``hooks.validate_file_path``
+#: canonicalizes through ``realpath`` (resolving ``..`` and following symlinks)
+#: and refuses the resolved target via ``is_sensitive_path``.
+#:
+#: The prefix alternation is matched separately from the body so that ``:``
+#: stays confined to a drive prefix: an NTFS alternate data stream
+#: (``C:\x\file.txt:hidden``, which reads a different byte stream than the path
+#: the caller appears to name) has a ``:`` in the body and is still refused.
+#: A drive-relative path (``C:x``) is likewise refused -- it resolves against a
+#: per-drive working directory the caller cannot see.
+_FS_PATH_PATTERN = re.compile(r"^(?:[~/]|[A-Za-z]:[\\/]|\\\\)[-\w.@~/\\ ]+$")
+
 FILE_READ_SCHEMA = ToolSchema(
     tool_name="file_read",
     fields=[
-        FieldSpec(
-            "path", str, required=True, max_len=4096, pattern=re.compile(r"^[~/][-\w.@~/ ]+$")
-        ),
+        FieldSpec("path", str, required=True, max_len=4096, pattern=_FS_PATH_PATTERN),
     ],
 )
 
 FILE_WRITE_SCHEMA = ToolSchema(
     tool_name="file_write",
     fields=[
-        FieldSpec(
-            "path", str, required=True, max_len=4096, pattern=re.compile(r"^[~/][-\w.@~/ ]+$")
-        ),
+        FieldSpec("path", str, required=True, max_len=4096, pattern=_FS_PATH_PATTERN),
         FieldSpec("content", str, required=True, max_len=512000),
     ],
 )

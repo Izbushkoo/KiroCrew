@@ -96,6 +96,34 @@ export function comparePinnedThenSort(
   return compareBySort(a, b, key)
 }
 
+/**
+ * How many local calendar days back an instant falls, seen from `now`.
+ *
+ * `Date.UTC` projects the LOCAL calendar fields onto fixed-length UTC days, so
+ * the result counts civil days rather than elapsed time. That is what makes it
+ * survive DST: a local day is not always 86_400_000 ms long, but its
+ * (year, month, date) triple is unambiguous, and both sides are projected the
+ * same way. Negative for a future instant, which the caller folds into today.
+ *
+ * Deliberately stateless. An earlier revision of this file cached the
+ * local-midnight instants and kept them honest with a growing set of validity
+ * terms: the clock leaving the cached day in either direction, the zone
+ * changing under it, and then the offset at each cached midnight moving
+ * independently of the others. Each boundary added to such a cache needs its
+ * own offset probe or it silently serves a label from a day that no longer
+ * begins where it did. Deriving the day index per call retires that whole class
+ * -- nothing is retained, so nothing can outlive the zone it was built in --
+ * and measures cheaper than the guarded cache it replaces, because comparing
+ * two day indices allocates no `Date` where re-probing three midnights did.
+ * It is the shape the command palette's own relative-time formatter already uses.
+ */
+function localDaysAgo(now: Date, then: Date): number {
+  const DAY_MS = 86_400_000
+  const nowDay = Math.floor(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) / DAY_MS)
+  const thenDay = Math.floor(Date.UTC(then.getFullYear(), then.getMonth(), then.getDate()) / DAY_MS)
+  return nowDay - thenDay
+}
+
 /** Relative timestamp for a session row.
  *  Accepts ISO string (active slots) or Unix epoch seconds (history `modified`). */
 export function fmtRelativeTime(ts: string | number | undefined): string {
@@ -103,19 +131,17 @@ export function fmtRelativeTime(ts: string | number | undefined): string {
   const d = typeof ts === 'number' ? new Date(ts * 1000) : new Date(ts)
   if (isNaN(d.getTime())) return ''
   const now = new Date()
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate())
-  const startOfYesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)
-  const startOf6DaysAgo = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 6)
+  const daysAgo = localDaysAgo(now, d)
   // Every branch read the BROWSER's locale before this, so a zh dashboard on an
   // en-US browser showed "3:04 PM" and "Jul 30". This is the twin of
   // `commandPalette/providers/recentsProvider.ts`; the two are now consistent.
   const time = fmtDateFields(d, { hour: '2-digit', minute: '2-digit' })
-  if (d >= startOfToday) return time
+  if (daysAgo <= 0) return time
   // The existing catalog key, NOT `fmtRelative`: CLDR returns a lowercase
   // "yesterday", which clashed with the capitalized group header in ChatSidebar
   // that already uses this same key. One key, one casing.
-  if (d >= startOfYesterday) return `${i18nT('pages.chatSidebar.yesterday')} ${time}`
-  if (d >= startOf6DaysAgo) return `${fmtDateFields(d, { weekday: 'short' })} ${time}`
+  if (daysAgo === 1) return `${i18nT('pages.chatSidebar.yesterday')} ${time}`
+  if (daysAgo <= 6) return `${fmtDateFields(d, { weekday: 'short' })} ${time}`
   if (d.getFullYear() === now.getFullYear()) return fmtDateFields(d, { month: 'short', day: 'numeric' })
   return fmtDateFields(d, { year: 'numeric', month: 'short', day: 'numeric' })
 }

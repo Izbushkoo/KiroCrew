@@ -46,6 +46,7 @@ from kiro_crew.dashboard.state import (
     CRON_NOTIFY_PREFIX,
     DashboardState,
 )
+from kiro_crew.dashboard.token_auth import caller_names_a_missing_slot
 from kiro_crew.notifications.bus import (
     NotificationPayload,
     NotificationValidationError,
@@ -920,9 +921,11 @@ async def api_notification_agent_push(request: web.Request) -> web.Response:
     # reaching it could impersonate system notifications and bypass its app
     # rate limits / declared-channel checks. Apps publish through
     # POST /api/notifications where their
-    # token-verified ``app:<name>`` source is enforced. The middleware sets
-    # ``request["app"]`` only on app-token auth; the internal-secret path
-    # (the MCP tool) never does.
+    # token-verified ``app:<name>`` source is enforced. The middleware publishes
+    # ``request["app"]`` on app-token auth and, since issue #3690, also on the
+    # internal-secret path whenever the calling session resolves to an app — so
+    # this check now bites for an app agent arriving over MCP too, which it
+    # could not before.
     if request.get("app"):
         # Permission denial on a security boundary — audited before the
         # response (backend-security-controls: every denial emits SEL).
@@ -950,6 +953,32 @@ async def api_notification_agent_push(request: web.Request) -> web.Response:
             error="internal-secret authentication required (cookie callers forbidden)",
         )
         return web.json_response({"error": "internal-secret authentication required"}, status=403)
+    # A caller whose own slot is GONE cannot be attributed (issue #3690). The
+    # app-token check above refuses an app by name, but a tab closed while this
+    # call was in flight takes the ``_app`` that check reads with it, so an
+    # app-owned session going through that race would publish source="system"
+    # here as though it were the person. Absence of an app claim is only
+    # trustworthy for a caller that never had a slot (a Slack thread, a cron the
+    # person owns); a ``dashboard:`` key names one, so a missing slot is a
+    # failure to attribute rather than proof of the dashboard user. Refused HERE
+    # rather than in the middleware: a popped slot no longer says whose tab it
+    # was, so refusing centrally would also refuse the person's own in-flight
+    # calls on every internal route. This route refuses because of what it
+    # publishes -- ``source="system"`` on the system.agent channel.
+    if caller_names_a_missing_slot(
+        getattr(state, "_slots", None), request.headers.get("X-Session-Key", "")
+    ):
+        _sel().log_api_access(
+            caller=str(request.headers.get("X-Session-Key") or ""),
+            operation="notification_agent_push",
+            outcome="denied",
+            source="notifications_api",
+            error="calling session's slot is gone; cannot attribute a system publish",
+        )
+        return web.json_response(
+            {"error": "calling session not found", "code": "caller_session_missing"},
+            status=403,
+        )
     # Bound the body BEFORE decoding, mirroring the app push endpoint: without
     # this the strict-internal route inherits the server-wide client_max_size,
     # and a large JSON object would be buffered and decoded on the event-loop
@@ -1293,7 +1322,13 @@ async def api_send_message(request: web.Request) -> web.Response:
                     # cronLabel in cls JSON provides structured data for frontend.
                     wrapped = f'{CRON_NOTIFY_PREFIX}"{label}"]\n{text}\n{CRON_NOTIFY_END}'
                     inject_cls = json.dumps({"cronLabel": label})
-                    if slot.running:
+                    # Queue while a turn is live OR a multi-stage plan is mid-flight.
+                    # During stage execution slot.task is None between stages (see
+                    # chat_orchestrator), so slot.running alone reads False in that
+                    # window and would let this injection start a concurrent turn that
+                    # clobbers the plan. _in_stage_execution closes it — same predicate
+                    # the user-typed path uses (chat_handlers._api_chat).
+                    if slot.running or slot._in_stage_execution:
                         if len(slot._queue) >= 50:
                             evicted = slot.queue_pop(0)
                             logger.warning(
@@ -1313,7 +1348,15 @@ async def api_send_message(request: web.Request) -> web.Response:
                         from kiro_crew.dashboard.chat_runner import _run_chat
                         from kiro_crew.dashboard.turn_dispatch import spawn_guarded_turn
 
-                        slot.append("inject", wrapped, inject_cls)
+                        # `cls` is not persisted for role `inject`, so the label
+                        # must also ride in `meta`, which is — otherwise the row
+                        # loses its identity on the next rehydrate.
+                        slot.append(
+                            "inject",
+                            wrapped,
+                            inject_cls,
+                            meta={"injectKind": "cron", "cronLabel": label},
+                        )
                         task = spawn_guarded_turn(state, slot, _run_chat(state, slot, wrapped))
                         slot.task = task
                         state.push_slots_update()
@@ -2762,6 +2805,8 @@ async def api_discord_config_get(request: web.Request) -> web.Response:
             "enabled": bool(dc.enabled),
             "allowed_user_ids": [str(u) for u in dc.allowed_user_ids],
             "allowed_thread_ids": [str(t) for t in dc.allowed_thread_ids],
+            "allowed_channel_ids": [str(c) for c in dc.allowed_channel_ids],
+            "auto_thread": bool(dc.auto_thread),
             "soft_threshold_pct": int(dc.soft_threshold_pct),
             "session_folder": dc.session_folder,
         }
@@ -2903,6 +2948,31 @@ async def _discord_config_save_locked(request: web.Request) -> web.Response:
         if new_ids != [str(t) for t in dc_cfg.get("allowed_thread_ids", [])]:
             staged["allowed_thread_ids"] = new_ids
             applied.append("allowed_thread_ids")
+
+    if "allowed_channel_ids" in body:
+        raw_ids = body.get("allowed_channel_ids")
+        if not isinstance(raw_ids, list):
+            return _deny("allowed_channel_ids must be a list")
+        new_ids = []
+        for item in raw_ids:
+            s = str(item).strip()
+            if not s:
+                continue
+            if not s.isdigit():
+                return _deny(f"invalid Discord channel ID: {s} (numeric IDs only)")
+            if s not in new_ids:
+                new_ids.append(s)
+        if new_ids != [str(c) for c in dc_cfg.get("allowed_channel_ids", [])]:
+            staged["allowed_channel_ids"] = new_ids
+            applied.append("allowed_channel_ids")
+
+    if "auto_thread" in body:
+        val = body.get("auto_thread")
+        if not isinstance(val, bool):
+            return _deny("auto_thread must be a boolean")
+        if val != bool(dc_cfg.get("auto_thread", True)):
+            staged["auto_thread"] = val
+            applied.append("auto_thread")
 
     if "soft_threshold_pct" in body:
         pct = body.get("soft_threshold_pct")

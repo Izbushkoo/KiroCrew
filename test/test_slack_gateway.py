@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -853,6 +854,7 @@ class TestCheckForUpdates:
         orch.dashboard_state = ds
         orch._auto_apply_update = AsyncMock()
         import kiro_crew.dashboard.handlers as _h
+        from kiro_crew.platform.governance import UpdatePins
         orig = _h._update_info.copy()
         # Create a config with auto_update=False
         fake_cfg = MagicMock()
@@ -861,12 +863,80 @@ class TestCheckForUpdates:
             _h._update_info.update({"available": True, "version": "9.9.9"})
             with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
                 with patch("kiro_crew.config.KiroCrewConfig.load", return_value=fake_cfg):
-                    await orch._check_for_updates()
+                    with patch(
+                        "kiro_crew.platform.governance.active_update_pins",
+                        return_value=UpdatePins(),
+                    ):
+                        await orch._check_for_updates()
         finally:
             _h._update_info.clear()
             _h._update_info.update(orig)
         orch._auto_apply_update.assert_not_awaited()
         ds.push_refresh.assert_called_with("update_available")
+
+    @pytest.mark.asyncio
+    async def test_commit_distance_alone_lights_the_badge_but_does_not_auto_apply(self):
+        """A git checkout behind upstream with an UNCHANGED version is not reset.
+
+        `available` is true on commit distance alone so the dashboard stops
+        claiming "you're on the latest version". This path is not the dashboard:
+        it applies `git reset --hard`, so acting on commit distance would reset a
+        developer's checkout within 12 hours of any upstream commit, where before
+        it only did so at a release. The badge is lit instead; the dashboard's own
+        apply (`git pull`, dirty tree refused) is the non-destructive way in.
+        """
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        orch._auto_apply_update = AsyncMock()
+        import kiro_crew.dashboard.handlers as _h
+
+        fake_cfg = MagicMock()
+        fake_cfg.auto_update = True
+        orig = _h._update_info.copy()
+        try:
+            _h._update_info.update(
+                {"available": True, "self_updatable": True, "version_newer": False}
+            )
+            with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
+                with patch("kiro_crew.config.KiroCrewConfig.load", return_value=fake_cfg):
+                    with patch(
+                        "kiro_crew.platform.update_governance.update_required",
+                        return_value=False,
+                    ):
+                        await orch._check_for_updates()
+        finally:
+            _h._update_info.clear()
+            _h._update_info.update(orig)
+        orch._auto_apply_update.assert_not_awaited()
+        ds.push_refresh.assert_called_with("update_available")
+
+    @pytest.mark.asyncio
+    async def test_a_version_bump_still_auto_applies(self):
+        """The pre-existing trigger is unchanged: a release moved, so apply."""
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        orch._auto_apply_update = AsyncMock()
+        import kiro_crew.dashboard.handlers as _h
+
+        fake_cfg = MagicMock()
+        fake_cfg.auto_update = True
+        orig = _h._update_info.copy()
+        try:
+            _h._update_info.update(
+                {"available": True, "self_updatable": True, "version_newer": True}
+            )
+            with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
+                with patch("kiro_crew.config.KiroCrewConfig.load", return_value=fake_cfg):
+                    with patch(
+                        "kiro_crew.platform.update_governance.update_required",
+                        return_value=False,
+                    ):
+                        await orch._check_for_updates()
+        finally:
+            _h._update_info.clear()
+            _h._update_info.update(orig)
+        orch._auto_apply_update.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_min_version_mandate_fires_even_when_not_available(self):
@@ -2451,11 +2521,37 @@ class TestRunMethod:
         orch._shutdown.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_run_no_dashboard_uses_api_server(self):
-        """--no-dashboard uses _init_api_server."""
+    async def test_run_no_dashboard_uses_api_server(self, tmp_path, monkeypatch):
+        """--no-dashboard waits for and then clears its run marker."""
         import kiro_crew
+        from kiro_crew.instances import run_marker
 
         orch = _make_orchestrator(no_dashboard=True)
+        orch._dashboard_port = 5476
+
+        monkeypatch.setattr(run_marker, "config_dir", lambda: tmp_path)
+        run_marker.write_marker(orch._dashboard_port)
+        original_write_marker = run_marker.write_marker
+        events = []
+
+        def slow_write_marker(port):
+            events.append("write-start")
+            time.sleep(0.05)
+            original_write_marker(port)
+            events.append("write-end")
+
+        original_clear_marker = run_marker.clear_marker
+
+        def recording_clear_marker(port):
+            events.append("clear")
+            original_clear_marker(port)
+
+        monkeypatch.setattr(run_marker, "write_marker", slow_write_marker)
+        monkeypatch.setattr(run_marker, "clear_marker", recording_clear_marker)
+        marker = run_marker.marker_path(orch._dashboard_port)
+        pid_marker = run_marker.pid_path(orch._dashboard_port)
+        assert marker.exists()
+        assert pid_marker.exists()
 
         orch._init_services = AsyncMock()
         orch._start_embeddings = AsyncMock()
@@ -2482,9 +2578,14 @@ class TestRunMethod:
                     with patch("kiro_crew.slack.interactions.init"):
                         with patch("kiro_crew.slack.events.SeenCache"):
                             with patch("kiro_crew.session.cleanup_orphaned_sessions"):
-                                with patch("kiro_crew.dashboard.handlers._bg_mcp_probe", new_callable=AsyncMock):
+                                with patch(
+                                    "kiro_crew.dashboard.handlers._bg_mcp_probe",
+                                    new_callable=AsyncMock,
+                                ):
                                     with patch("os._exit"):
-                                        with patch("resource.getrlimit", return_value=(256, 10240)):
+                                        with patch(
+                                            "resource.getrlimit", return_value=(256, 10240)
+                                        ):
                                             with patch("resource.setrlimit"):
                                                 await orch.run()
         finally:
@@ -2492,6 +2593,173 @@ class TestRunMethod:
 
         orch._init_dashboard.assert_not_awaited()
         orch._init_api_server.assert_awaited_once()
+        assert events == ["write-start", "write-end", "clear"]
+        assert not marker.exists()
+        assert not pid_marker.exists()
+
+    @pytest.mark.asyncio
+    async def test_run_stalled_marker_write_does_not_block_shutdown(
+        self, tmp_path, monkeypatch
+    ):
+        """A hung marker write times out; the marker is cleared and _shutdown runs.
+
+        Regression: an unbounded ``await self._marker_write_task`` sat before
+        the bounded ``_shutdown()`` call, so a stalled write consumed the
+        graceful-shutdown deadline and active slots were SIGKILLed unsaved.
+        """
+        import kiro_crew
+        from kiro_crew.instances import run_marker
+        from kiro_crew.slack import gateway as gateway_mod
+
+        orch = _make_orchestrator(no_dashboard=True)
+        orch._dashboard_port = 5477
+
+        monkeypatch.setattr(run_marker, "config_dir", lambda: tmp_path)
+        run_marker.write_marker(orch._dashboard_port)
+        # Shrink the wait budget so the timeout path runs fast in tests.
+        monkeypatch.setattr(gateway_mod, "_MARKER_WRITE_WAIT_SECS", 0.05)
+
+        events = []
+        stall = threading.Event()
+        original_write_marker = run_marker.write_marker
+        original_clear_marker = run_marker.clear_marker
+
+        def stalled_write_marker(port):
+            events.append("write-start")
+            stall.wait(5.0)  # far longer than the shrunk 0.05s budget
+            original_write_marker(port)  # late write republishes the marker
+            events.append("write-end")
+
+        def recording_clear_marker(port):
+            events.append("clear")
+            original_clear_marker(port)
+
+        monkeypatch.setattr(run_marker, "write_marker", stalled_write_marker)
+        monkeypatch.setattr(run_marker, "clear_marker", recording_clear_marker)
+        marker = run_marker.marker_path(orch._dashboard_port)
+        pid_marker = run_marker.pid_path(orch._dashboard_port)
+        assert marker.exists()
+
+        orch._init_services = AsyncMock()
+        orch._start_embeddings = AsyncMock()
+        orch._auto_migrate_memory = AsyncMock()
+        orch._init_cron = AsyncMock()
+        orch._init_heartbeat = AsyncMock()
+        orch._init_mcp_discovery = MagicMock()
+        orch._init_subagents = MagicMock()
+        orch._init_task_runner = MagicMock()
+        orch._init_dashboard = AsyncMock()
+        orch._init_api_server = AsyncMock()
+        orch._init_autonudge = AsyncMock()
+        orch._check_for_updates = AsyncMock()
+        orch._shutdown = AsyncMock()
+
+        kiro_crew.shutdown_event.set()
+        loop = asyncio.get_running_loop()
+        try:
+            with patch.object(loop, "add_signal_handler"):
+                with patch("kiro_crew.slack.events.init_socket_mode"):
+                    with patch("kiro_crew.slack.interactions.init"):
+                        with patch("kiro_crew.slack.events.SeenCache"):
+                            with patch("kiro_crew.session.cleanup_orphaned_sessions"):
+                                with patch(
+                                    "kiro_crew.dashboard.handlers._bg_mcp_probe",
+                                    new_callable=AsyncMock,
+                                ):
+                                    with patch("os._exit"):
+                                        with patch(
+                                            "resource.getrlimit", return_value=(256, 10240)
+                                        ):
+                                            with patch("resource.setrlimit"):
+                                                await orch.run()
+        finally:
+            kiro_crew.shutdown_event.clear()
+            # Release AND drain the stalled writer inside this finally: if an
+            # assertion below failed with the worker still parked, monkeypatch
+            # teardown would restore the real config_dir/write_marker and the
+            # worker would wake later and write markers OUTSIDE tmp_path.
+            stall.set()
+            for _ in range(200):  # up to ~10s; normally a few ms
+                if "write-start" not in events or events.count("clear") >= 2:
+                    break
+                await asyncio.sleep(0.05)
+
+        # The stalled write did not complete before the bounded wait expired,
+        # yet the marker was cleared and graceful shutdown still ran — the
+        # timeout kept the deadline intact.
+        assert events[:2] == ["write-start", "clear"]
+        orch._shutdown.assert_awaited_once()
+
+        # The released writer republished the marker files after the
+        # timed-out clear. The writer thread must then self-clear them
+        # (same thread, no event-loop callback os._exit could beat),
+        # otherwise a stopped gateway leaves stale runtime state behind.
+        assert "write-end" in events
+        assert events.index("write-end") > events.index("clear")
+        assert events.count("clear") == 2  # timed-out clear + writer self-clear
+        assert not marker.exists()
+        assert not pid_marker.exists()
+
+    @pytest.mark.asyncio
+    async def test_run_failed_marker_write_still_clears(self, tmp_path, monkeypatch):
+        """A marker write that raises must not skip the shutdown clear."""
+        import kiro_crew
+        from kiro_crew.instances import run_marker
+
+        orch = _make_orchestrator(no_dashboard=True)
+        orch._dashboard_port = 5478
+
+        monkeypatch.setattr(run_marker, "config_dir", lambda: tmp_path)
+        run_marker.write_marker(orch._dashboard_port)  # pre-existing marker
+
+        def failing_write_marker(port):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(run_marker, "write_marker", failing_write_marker)
+        marker = run_marker.marker_path(orch._dashboard_port)
+        pid_marker = run_marker.pid_path(orch._dashboard_port)
+        assert marker.exists()
+
+        orch._init_services = AsyncMock()
+        orch._start_embeddings = AsyncMock()
+        orch._auto_migrate_memory = AsyncMock()
+        orch._init_cron = AsyncMock()
+        orch._init_heartbeat = AsyncMock()
+        orch._init_mcp_discovery = MagicMock()
+        orch._init_subagents = MagicMock()
+        orch._init_task_runner = MagicMock()
+        orch._init_dashboard = AsyncMock()
+        orch._init_api_server = AsyncMock()
+        orch._init_autonudge = AsyncMock()
+        orch._check_for_updates = AsyncMock()
+        orch._shutdown = AsyncMock()
+
+        kiro_crew.shutdown_event.set()
+        loop = asyncio.get_running_loop()
+        try:
+            with patch.object(loop, "add_signal_handler"):
+                with patch("kiro_crew.slack.events.init_socket_mode"):
+                    with patch("kiro_crew.slack.interactions.init"):
+                        with patch("kiro_crew.slack.events.SeenCache"):
+                            with patch("kiro_crew.session.cleanup_orphaned_sessions"):
+                                with patch(
+                                    "kiro_crew.dashboard.handlers._bg_mcp_probe",
+                                    new_callable=AsyncMock,
+                                ):
+                                    with patch("os._exit"):
+                                        with patch(
+                                            "resource.getrlimit", return_value=(256, 10240)
+                                        ):
+                                            with patch("resource.setrlimit"):
+                                                await orch.run()
+        finally:
+            kiro_crew.shutdown_event.clear()
+
+        # The failed write must not divert control past the clear: the
+        # pre-existing marker files are removed and shutdown completed.
+        assert not marker.exists()
+        assert not pid_marker.exists()
+        orch._shutdown.assert_awaited_once()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4499,147 +4767,167 @@ class TestInitServicesLoopResponsiveness:
     Invariant (issue #3051): the loop runs callbacks one at a time, so a
     synchronous subprocess/scan inside ``_init_services`` starves every other
     coroutine — including the loop-stall watchdog heartbeat once armed — for
-    its whole duration. These tests run a fast ticker concurrently with a
-    deliberately slow dependency install / store scan and assert the ticker's
-    max inter-tick gap stays under a load-adaptive ceiling. A regression to
-    the old synchronous shape (subprocess.run / a bare on-loop call) blocks
-    the ticker for the whole slow window and blows the ceiling.
+    its whole duration.
+
+    These tests assert the PROPERTY, not a duration (#4235): a fast ticker
+    runs concurrently with the init work, and the stand-in for each slow
+    call blocks — in whatever execution context production invoked it —
+    until it OBSERVES the ticker advance. Fixed code runs the work off the
+    loop (``asyncio.to_thread`` / an async subprocess), so the loop stays
+    free, the ticker advances, and the probe returns almost immediately. A
+    mutant reverted to the old synchronous on-loop shape blocks the loop
+    itself, the ticker can never advance while the probe waits, and the
+    probe gives up at a deliberately generous deadline and flags
+    starvation.
+
+    The previous shape bounded the ticker's max inter-tick gap by an
+    absolute, load-adaptive ceiling; a scheduler stall on a saturated
+    runner blew the ceiling with the invariant intact (a 1.87s gap against
+    the 0.40s floor at a commit whose diff contained zero Python files).
+    Polling for the property makes host contention cost only wall-clock,
+    never the verdict, while an on-loop regression still fails
+    deterministically: ticks CANNOT happen while the loop is blocked, so no
+    amount of waiting turns a mutant green.
     """
 
-    _SLOW_SECS = 0.5
-    # Floor for the gap ceiling. The real ceiling adapts to host load (see
-    # _gap_ceiling): an absolute constant alone is the flake class AGENTS.md
-    # warns about — coverage + a saturated -n auto runner can produce
-    # hundred-ms scheduler hiccups on a perfectly healthy loop.
-    _MAX_GAP_SECS = 0.4
-    # Multiple of the measured control gap. The mutant signal is ~_SLOW_SECS
-    # (0.5s) vs a healthy ~0.01s, so 8x still kills every mutant on any host
-    # where the control gap stays under ~60ms.
-    _GAP_CEILING_FACTOR = 8
+    # Ticks a probe must observe while the slow work is in flight. Each tick
+    # proves the loop scheduled another coroutine DURING the work; requiring
+    # a handful rules out a single lucky wakeup counting as liveness.
+    _MIN_TICKS_DURING_WORK = 5
+    # How long a probe waits for those ticks before declaring the loop
+    # starved. Generous on purpose (testing-conventions § Determinism: poll
+    # with a generous deadline): a loaded host only DELAYS ticks, so
+    # contention costs wall-clock, never the verdict. Only a blocked loop —
+    # where ticks cannot happen at all — exhausts it, so this is paid only
+    # on a genuinely regressed run.
+    _PROBE_DEADLINE_SECS = 30.0
 
     @staticmethod
-    def _gap_ticker(state: dict):
-        state["last"] = time.monotonic()
+    def _make_ticker(state: dict):
+        """A coroutine that advances ``state['ticks']`` whenever the loop is free.
+
+        Stand-in for the loop-stall watchdog heartbeat: anything that blocks
+        the loop freezes this counter for the whole block.
+        """
 
         async def _ticker():
-            state["last"] = time.monotonic()
             while True:
                 await asyncio.sleep(0.01)
-                now = time.monotonic()
-                state["max_gap"] = max(state["max_gap"], now - state["last"])
                 state["ticks"] += 1
-                state["last"] = now
 
         return _ticker
 
-    @staticmethod
-    def _fold_final_gap(state: dict) -> None:
-        """Record the gap between the last tick and measurement end.
+    def _make_probe(self, state: dict, label: str, result=None):
+        """A stand-in for slow init work that polls the loop-liveness property.
 
-        Without this, a block at the TAIL of the measured call is invisible:
-        the parent coroutine resumes first and cancels the ticker before it
-        can run once more to observe the gap.
+        Runs in whatever execution context production invokes it in. Off the
+        loop (the fixed shape) the ticker keeps running, the tick delta
+        reaches ``_MIN_TICKS_DURING_WORK`` almost immediately, and *label* is
+        recorded in ``state['probed']``. On the loop (the regressed shape)
+        the ticker is starved for exactly as long as this function runs, the
+        delta can never advance, and *label* lands in ``state['starved']``
+        once the deadline expires.
         """
-        state["max_gap"] = max(state["max_gap"], time.monotonic() - state["last"])
 
-    async def _gap_ceiling(self) -> float:
-        """Measure the host's baseline tick gap and derive the failure ceiling.
+        def _probe(*args, **kwargs):
+            start = state["ticks"]
+            give_up = time.monotonic() + self._PROBE_DEADLINE_SECS
+            while state["ticks"] - start < self._MIN_TICKS_DURING_WORK:
+                if time.monotonic() >= give_up:
+                    state["starved"].append(label)
+                    return result
+                time.sleep(0.01)
+            state["probed"].append(label)
+            return result
 
-        Runs the same ticker over a plain ``asyncio.sleep`` window with
-        nothing offloaded — any gap observed here is pure scheduler noise —
-        then allows the measured phase a small multiple of it, floored at
-        _MAX_GAP_SECS for quiet hosts.
-        """
-        control = {"ticks": 0, "max_gap": 0.0}
-        task = asyncio.create_task(self._gap_ticker(control)())
-        await asyncio.sleep(0.02)  # ticker baseline
-        try:
-            await asyncio.sleep(self._SLOW_SECS)
-            self._fold_final_gap(control)
-        finally:
-            task.cancel()
-        return max(self._MAX_GAP_SECS, self._GAP_CEILING_FACTOR * control["max_gap"])
+        return _probe
 
     @pytest.mark.asyncio
     async def test_slow_pip_install_does_not_starve_heartbeat(self):
         orch = _make_orchestrator()
-        ceiling = await self._gap_ceiling()
-        state = {"ticks": 0, "max_gap": 0.0}
-        _ticker = self._gap_ticker(state)
+        state: dict = {"ticks": 0, "starved": [], "probed": []}
+        _ticker = self._make_ticker(state)
 
-        async def _slow_exec(*args, **kwargs):
+        async def _async_exec(*args, **kwargs):
+            # The FIXED shape: production awaits communicate() on the loop,
+            # so this waits for the ticker asynchronously — each await IS the
+            # loop servicing another callback, which is the property.
             proc = MagicMock()
             proc.returncode = 0
             proc.kill = MagicMock()
 
             async def _communicate():
-                await asyncio.sleep(self._SLOW_SECS)  # yields to the loop
+                start = state["ticks"]
+                give_up = time.monotonic() + self._PROBE_DEADLINE_SECS
+                while state["ticks"] - start < self._MIN_TICKS_DURING_WORK:
+                    if time.monotonic() >= give_up:
+                        state["starved"].append("pip-communicate")
+                        return (b"", b"")
+                    await asyncio.sleep(0.01)
+                state["probed"].append("pip-communicate")
                 return (b"", b"")
 
             proc.communicate = MagicMock(side_effect=_communicate)
             return proc
 
-        def _blocking_run(*args, **kwargs):  # the OLD, buggy shape
-            time.sleep(self._SLOW_SECS)  # blocks the loop thread
-            return MagicMock(returncode=0, stdout="", stderr=b"")
+        # The OLD, buggy shape: a mutant reverted to subprocess.run invokes
+        # this synchronously ON the loop, where the probe's ticks can never
+        # arrive — it flags starvation at the deadline. Patched on the
+        # subprocess MODULE (not the gateway namespace) because the fixed
+        # gateway no longer imports subprocess at all.
+        _blocking_run = self._make_probe(
+            state,
+            "pip-blocking-run",
+            result=MagicMock(returncode=0, stdout="", stderr=b""),
+        )
 
         with patch("importlib.util.find_spec", return_value=None):
             with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/proj"}):
                 with patch.object(
                     GatewayOrchestrator, "_is_brazil_install", return_value=False
                 ):
-                    # Patch BOTH shapes: the fixed code awaits the async exec
-                    # (ticker keeps running); a mutant reverted to
-                    # subprocess.run blocks the loop and starves the ticker.
-                    # The sync shape is patched on the subprocess MODULE (not
-                    # the gateway namespace) because the fixed gateway no
-                    # longer imports subprocess at all.
                     with patch(
-                        "asyncio.create_subprocess_exec", side_effect=_slow_exec
+                        "asyncio.create_subprocess_exec", side_effect=_async_exec
                     ):
                         with patch(
                             "subprocess.run",
                             side_effect=_blocking_run,
                         ):
                             ticker_task = asyncio.create_task(_ticker())
-                            # Let the ticker establish its baseline BEFORE the
-                            # measured call: awaiting a coroutine runs it
-                            # inline, so without this yield an on-loop block
-                            # would happen before the first tick and never be
-                            # observed as a gap.
-                            await asyncio.sleep(0.02)
                             try:
+                                # Above every probe deadline so a regressed
+                                # run fails on the starvation assert below,
+                                # not on a torn-down timeout.
                                 await asyncio.wait_for(
-                                    orch._check_missing_deps(), timeout=10
+                                    orch._check_missing_deps(), timeout=60
                                 )
-                                self._fold_final_gap(state)
                             finally:
                                 ticker_task.cancel()
-        assert state["max_gap"] < ceiling, (
-            f"loop blocked for {state['max_gap']:.2f}s during dep install "
-            f"(ceiling {ceiling:.2f}s)"
+        assert state["starved"] == [], (
+            f"loop starved during dep install: {state['starved']} observed no "
+            f"ticker progress within {self._PROBE_DEADLINE_SECS:.0f}s"
+        )
+        assert "pip-communicate" in state["probed"], (
+            "dep install never awaited the async subprocess — the loop-free "
+            f"path was not taken (probed={state['probed']})"
         )
 
     @pytest.mark.asyncio
     async def test_slow_fts_rebuild_does_not_starve_heartbeat(self):
         """rebuild_index and vector init scale with usage; both must run off-loop."""
         orch = _make_orchestrator(slack_enabled=False)
-        ceiling = await self._gap_ceiling()
-        state = {"ticks": 0, "max_gap": 0.0}
-        _ticker = self._gap_ticker(state)
-
-        def _slow_rebuild():
-            time.sleep(self._SLOW_SECS)  # off-loop this is harmless
-            return 3
-
-        def _slow_vector_init():
-            time.sleep(self._SLOW_SECS)  # off-loop this is harmless
+        state: dict = {"ticks": 0, "starved": [], "probed": []}
+        _ticker = self._make_ticker(state)
 
         mock_mem_inst = MagicMock()
         mock_mem_inst.init = MagicMock()
-        mock_mem_inst.rebuild_index = MagicMock(side_effect=_slow_rebuild)
+        mock_mem_inst.rebuild_index = MagicMock(
+            side_effect=self._make_probe(state, "rebuild-index", result=3)
+        )
         mock_vm_inst = MagicMock()
-        mock_vm_inst.init = MagicMock(side_effect=_slow_vector_init)
+        mock_vm_inst.init = MagicMock(
+            side_effect=self._make_probe(state, "vector-init")
+        )
         with patch("kiro_crew.slack.gateway.MemoryStore", return_value=mock_mem_inst):
             with patch("kiro_crew.vector_memory.VectorMemoryStore") as mock_vm:
                 mock_vm.return_value = mock_vm_inst
@@ -4657,19 +4945,23 @@ class TestInitServicesLoopResponsiveness:
                                                         new=AsyncMock(return_value=_fake_async_proc(stdout=b"kiro-cli 1.30.0")),
                                                     ):
                                                         ticker_task = asyncio.create_task(_ticker())
-                                                        # Baseline tick first — see the
-                                                        # comment in the pip test above.
-                                                        await asyncio.sleep(0.02)
                                                         try:
+                                                            # Above the sum of both probe
+                                                            # deadlines so a regressed run
+                                                            # fails on the starvation
+                                                            # assert, not on teardown.
                                                             await asyncio.wait_for(
-                                                                orch._init_services(), timeout=10
+                                                                orch._init_services(), timeout=90
                                                             )
-                                                            self._fold_final_gap(state)
                                                         finally:
                                                             ticker_task.cancel()
-        assert state["max_gap"] < ceiling, (
-            f"loop blocked for {state['max_gap']:.2f}s during service init "
-            f"(ceiling {ceiling:.2f}s)"
+        assert state["starved"] == [], (
+            f"loop starved during service init: {state['starved']} observed no "
+            f"ticker progress within {self._PROBE_DEADLINE_SECS:.0f}s"
+        )
+        assert {"rebuild-index", "vector-init"} <= set(state["probed"]), (
+            "service init skipped a probed call — the invariant was not "
+            f"exercised (probed={state['probed']})"
         )
 
 
@@ -5869,14 +6161,128 @@ class TestChannelTransportStartGate:
         assert orch._socket_client is socket_client
 
 
-class TestMandatoryUpdateOnWheelInstall:
-    """A policy min-version makes an update mandatory. On a wheel/cli.sh install
-    the git-based auto-apply cannot run, so the mandatory branch must NOTIFY
-    (warn + light the dashboard badge) instead of silently returning — which is
-    what it did before, leaving the host below the floor with no signal."""
+class TestProviderFailureDoesNotFallBackToLegacy:
+    """A policy-selected provider OWNS the update. Falling through to the legacy
+    updater on its failure would run the built-in git/CDN update on a host whose
+    administrator selected a different package manager."""
 
     @pytest.mark.asyncio
-    async def test_mandatory_update_on_wheel_notifies_not_silent(self, monkeypatch):
+    async def test_provider_raising_does_not_run_legacy(self, monkeypatch):
+        from kiro_crew.platform.update_provider import CommandProvider
+
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+
+        provider = CommandProvider(check_command="c", apply_command="a")
+        monkeypatch.setattr(
+            "kiro_crew.platform.update_provider.resolve_provider", lambda: provider
+        )
+        boom = AsyncMock(side_effect=RuntimeError("provider exploded"))
+        monkeypatch.setattr(orch, "_check_for_updates_via_provider", boom)
+        legacy = AsyncMock()
+        monkeypatch.setattr(orch, "_check_for_updates_legacy", legacy)
+
+        # Contained, not propagated: this runs on the gateway boot path.
+        await orch._check_for_updates()
+
+        legacy.assert_not_awaited()
+        boom.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_resolution_failure_still_uses_legacy(self, monkeypatch):
+        """Only RESOLUTION failures may fall back: if the policy cannot be read
+        we do not know a provider was selected, so built-in behaviour is right."""
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+
+        def _boom():
+            raise RuntimeError("policy unreadable")
+
+        monkeypatch.setattr(
+            "kiro_crew.platform.update_provider.resolve_provider", _boom
+        )
+        legacy = AsyncMock()
+        monkeypatch.setattr(orch, "_check_for_updates_legacy", legacy)
+
+        await orch._check_for_updates()
+        legacy.assert_awaited_once()
+
+
+class TestWheelInstallerRejectsUnsafeCdnBase:
+    """The installer command embeds the CDN bases and is handed to a shell, and
+    KIROCREW_CDN_BASE is operator-set, so a metacharacter could append a second
+    command. `kirocrew update` already gates on this; the unattended path must too."""
+
+    @pytest.mark.asyncio
+    async def test_unsafe_base_refuses_before_spawning(self, monkeypatch):
+        import kiro_crew.dashboard.handlers as handlers
+
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+
+        handlers._update_info.clear()
+        handlers._update_info.update({"update_command": "curl x | sh"})
+        monkeypatch.setattr(
+            "kiro_crew.platform.update_layout.cdn_bases_are_safe", lambda: False
+        )
+        spawn = AsyncMock()
+        monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+
+        await orch._auto_apply_wheel_update()
+
+        spawn.assert_not_awaited()
+        ds.push_refresh.assert_called_with("update_available")
+
+
+class TestProviderNotificationIsVisible:
+    """The SSE snapshot renders the update badge from _update_info["available"],
+    which only the legacy check writes. A provider carries its own result, so
+    notifying without publishing it left the badge reading a stale False and the
+    operator never saw a waiting policy-defined update."""
+
+    @pytest.mark.asyncio
+    async def test_auto_update_off_publishes_state_before_notifying(self, monkeypatch):
+        import kiro_crew.dashboard.handlers as handlers
+        import kiro_crew.platform.update_governance as gov
+        from kiro_crew.platform.update_provider import UpdateCheckResult
+
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+
+        handlers._update_info.clear()
+        handlers._update_info.update({"available": False})
+        monkeypatch.setattr(gov, "update_required", lambda _v: False)
+
+        cfg = MagicMock()
+        cfg.auto_update = False
+        # A real provider: the method asserts isinstance(provider, UpdateProvider),
+        # which a bare MagicMock does not satisfy.
+        from kiro_crew.platform.update_provider import CommandProvider
+
+        provider = CommandProvider(check_command="c", apply_command="a")
+        provider.check = AsyncMock(  # type: ignore[method-assign]
+            return_value=UpdateCheckResult(available=True, remote_version="9.9.9")
+        )
+
+        with patch("kiro_crew.config.KiroCrewConfig.load", return_value=cfg):
+            await orch._check_for_updates_via_provider(provider)
+
+        # The badge must be able to see it, not just the log.
+        assert handlers._update_info["available"] is True
+        assert handlers._update_info["remote_version"] == "9.9.9"
+        ds.push_refresh.assert_called_with("update_available")
+
+
+class TestMandatoryUpdateOnWheelInstall:
+    """A policy min-version makes an update mandatory. On a wheel/cli.sh install
+    the gateway now auto-applies via the signed installer (cli.sh handles
+    RSA-SHA256 verification). The _auto_apply_wheel_update method is called
+    instead of merely lighting the dashboard badge."""
+
+    @pytest.mark.asyncio
+    async def test_mandatory_update_on_wheel_auto_applies(self, monkeypatch):
         import kiro_crew.dashboard.handlers as handlers
         import kiro_crew.platform.update_governance as gov
 
@@ -5887,14 +6293,14 @@ class TestMandatoryUpdateOnWheelInstall:
         async def _noop_check():
             return None
 
-        # Wheel install below a policy floor: a feed-checkable layout reports
-        # self_updatable False, and the check can leave available False (a
-        # pre-release remote reads as not-newer) even though the floor mandates
-        # the update. Start from available False to prove the branch lights it.
+        # Wheel install below a policy floor with a NEWER build available: the
+        # mandatory update applies. (A mandatory floor with no newer build is
+        # covered by test_mandatory_wheel_no_newer_build_notifies below — that
+        # path must NOT apply, to avoid an infinite update→restart loop.)
         handlers._update_info.clear()
         handlers._update_info.update(
             {
-                "available": False,
+                "available": True,
                 "self_updatable": False,
                 "install_kind": "wheel",
                 # A feed-checkable wheel carries an installer command; that is
@@ -5908,15 +6314,53 @@ class TestMandatoryUpdateOnWheelInstall:
 
         apply_called = AsyncMock()
         monkeypatch.setattr(orch, "_auto_apply_update", apply_called)
+        wheel_apply_called = AsyncMock()
+        monkeypatch.setattr(orch, "_auto_apply_wheel_update", wheel_apply_called)
 
         await orch._check_for_updates()
 
-        # Must NOT attempt the git apply on a non-git tree, and must surface it.
+        # Must NOT attempt the git apply on a non-git tree.
         apply_called.assert_not_awaited()
-        ds.push_refresh.assert_called_once_with("update_available")
-        # The dashboard badge reads _update_info["available"]; a mandatory
-        # update must light it even though the check left it False.
-        assert handlers._update_info.get("available") is True
+        # Must call the wheel auto-apply for mandatory updates.
+        wheel_apply_called.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_mandatory_wheel_no_newer_build_notifies(self, monkeypatch):
+        """A wheel install below the floor but with NO newer build available
+        must NOT apply — applying would reinstall the same below-floor version
+        and execv-restart into the same state forever. It notifies instead."""
+        import kiro_crew.dashboard.handlers as handlers
+        import kiro_crew.platform.update_governance as gov
+
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+
+        async def _noop_check():
+            return None
+
+        handlers._update_info.clear()
+        handlers._update_info.update(
+            {
+                "available": False,  # floor pinned above the latest build
+                "self_updatable": False,
+                "install_kind": "wheel",
+                "update_command": "curl -fsSL … | sh",
+            }
+        )
+        monkeypatch.setattr(handlers, "_do_update_check", _noop_check)
+        monkeypatch.setattr(gov, "update_required", lambda _v: True)
+        monkeypatch.setattr(gov, "min_version", lambda: "9.9.9")
+
+        wheel_apply_called = AsyncMock()
+        monkeypatch.setattr(orch, "_auto_apply_update", AsyncMock())
+        monkeypatch.setattr(orch, "_auto_apply_wheel_update", wheel_apply_called)
+
+        await orch._check_for_updates()
+
+        # Must NOT apply (would loop); must notify via the dashboard badge.
+        wheel_apply_called.assert_not_awaited()
+        ds.push_refresh.assert_called_with("update_available")
 
     @pytest.mark.asyncio
     async def test_mandatory_update_on_externally_managed_does_not_badge(self, monkeypatch):

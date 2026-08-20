@@ -516,8 +516,14 @@ class TestHardlinkScanBudget:
         # common healthy-host spawn pays nothing (and emits no truncation
         # warning). Both collection loops (SENSITIVE_DIRS and
         # SENSITIVE_FILES) carry the gate.
+        #
+        # REGULAR FILES only, and that half is not cosmetic: every directory has
+        # nlink >= 2, and SENSITIVE_FILES carries directories on purpose, so a bare
+        # nlink test armed the walk on every spawn. Behaviour is covered in
+        # test_sandbox_hardlink_scan.py; this is the source-level pin that both
+        # collection loops still carry the gate.
         script = _build_launcher_script("strict")
-        assert script.count("if _st.st_nlink > 1:") == 2
+        assert script.count("if stat.S_ISREG(_st.st_mode) and _st.st_nlink > 1:") == 2
 
     def test_per_root_budget_covers_a_busy_tmp(self):
         # The budget only applies once a credential inode is actually
@@ -1325,6 +1331,50 @@ class TestCgroupScopeArgv:
             assert mem == sb._default_max_memory_mb()
             assert weight == sb._CGROUP_DEFAULT_CPU_WEIGHT
             assert quota == 0
+            # Fractions must not truncate into invalid TasksMax=0 /
+            # MemoryMax=0M properties.
+            with patch(
+                "kiro_crew.config.loader._raw_config",
+                return_value={
+                    "resource_limits": {
+                        "max_processes": 0.5,
+                        "max_memory_mb": 0.9,
+                    }
+                },
+            ):
+                procs, mem, _, _ = sb._cgroup_limits_from_config()
+            assert procs == sb._CGROUP_DEFAULT_MAX_PROCESSES
+            assert mem == sb._default_max_memory_mb()
+            # NaN/Infinity (json.loads accepts both) must fall back to
+            # defaults WITHOUT raising: int(nan)/int(inf) raise inside the
+            # surrounding try/except, which would silently discard an
+            # otherwise-valid stricter limit on a later field in the same
+            # block (e.g. a legitimate max_memory_mb after a bogus
+            # max_processes).
+            with patch(
+                "kiro_crew.config.loader._raw_config",
+                return_value={
+                    "resource_limits": {
+                        "max_processes": float("nan"),
+                        "max_memory_mb": 512,
+                    }
+                },
+            ):
+                procs, mem, _, _ = sb._cgroup_limits_from_config()
+            assert procs == sb._CGROUP_DEFAULT_MAX_PROCESSES
+            assert mem == 512  # must not be discarded by the NaN above it
+            with patch(
+                "kiro_crew.config.loader._raw_config",
+                return_value={
+                    "resource_limits": {
+                        "max_processes": 64,
+                        "max_memory_mb": float("inf"),
+                    }
+                },
+            ):
+                procs, mem, _, _ = sb._cgroup_limits_from_config()
+            assert procs == 64  # must not be discarded by the inf below it
+            assert mem == sb._default_max_memory_mb()
         finally:
             self._reset_probe()
 
@@ -1340,13 +1390,23 @@ class TestCgroupScopeArgv:
         assert 10_000 < mb < 11_000  # ~10.6 GB, expected range
 
     def test_default_max_memory_falls_back_when_ram_unknown(self):
-        """If sysconf can't report RAM, fall back to the flat MB constant."""
+        """If sysconf can't report RAM, fall back to the flat MB constant.
+
+        ``system_memory`` is stubbed out alongside ``os.sysconf`` because it is
+        the second probe: on Windows ``GlobalMemoryStatusEx`` answers, so patching
+        only ``sysconf`` would no longer make RAM unknown and this would assert
+        against a derived value instead of the fallback.
+        """
         import kiro_crew.sandbox as sb
 
-        with patch("os.sysconf", side_effect=OSError("no sysconf")):
+        with patch("os.sysconf", side_effect=OSError("no sysconf")), patch.object(
+            sb.platform_compat, "system_memory", return_value=None
+        ):
             assert sb._default_max_memory_mb() == sb._CGROUP_FALLBACK_MAX_MEMORY_MB
         # Non-positive product also falls back (never returns 0 -> unlimited).
-        with patch("os.sysconf", return_value=0):
+        with patch("os.sysconf", return_value=0), patch.object(
+            sb.platform_compat, "system_memory", return_value=None
+        ):
             assert sb._default_max_memory_mb() == sb._CGROUP_FALLBACK_MAX_MEMORY_MB
 
     @pytest.mark.skipif(sys.platform != "linux", reason="cgroup v2 scope enforcement is Linux-only")

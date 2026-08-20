@@ -529,32 +529,24 @@
           "finding_dimension_in_file": "{{dimension}} in {{file}}"
         },
         "reviewChat": {
-          "closed_notice": "This conversation has ended and the reviewer is no longer loaded, so it cannot answer anything new. The questions above are kept.",
-          "empty_hint": "This reviewer still has the reasoning behind its findings. Ask why one was raised, or what it checked.",
-          "end_chat": "End conversation",
-          "error_busy": "It is still answering the previous question.",
-          "error_empty": "Type a question first.",
-          "error_expired": "The reviewer is no longer loaded, so it cannot answer. Review this pull request again to ask more.",
-          "error_generic": "The question could not be answered. Try again.",
-          "error_needs_override": "Turn on YOLO to continue this conversation — answering may require running a tool.",
-          "error_override_expiring": "Tool authorization runs out before an answer would finish. Extend it, then ask again.",
-          "error_override_lapsed": "Tool authorization ended while the reviewer was answering, so the answer was stopped. Re-authorize, then ask again.",
-          "error_persist_failed": "The answer could not be saved, so it is not part of this conversation. Ask again.",
-          "error_tool_denied": "The reviewer tried to use a tool your security policy blocks, so the answer was stopped. Nothing ran.",
-          "error_transcript_unsafe": "This conversation cannot be saved safely, so it was not written. Check the review's folder.",
+          "error_generic": "The follow-up session could not be opened. Try again.",
           "error_run_deleted": "This review was deleted, so the conversation has ended.",
-          "error_too_long": "That question is too long. Shorten it and send again.",
-          "needs_override_notice": "The reviewer is still loaded, but it cannot answer while tool approval is unavailable — it may need to read code to answer, and that cannot be authorised right now. Turn on YOLO to continue this conversation.",
-          "placeholder": "Ask why a finding was raised…",
           "ran_tools": "Looked at: {{tools}}",
           "reasoning": "Reasoning",
           "refused_notice": "It needed to run a tool to answer fully and was not allowed, so this answer is limited. Turn on YOLO to let it.",
           "role_reviewer": "Reviewer",
           "role_you": "You",
-          "send": "Send",
-          "sending": "Asking…",
           "title": "Ask the reviewer",
-          "unsent_label": "Not sent"
+          "earlier_questions": "Earlier questions",
+          "resume_hint": "Opens a chat that resumes the reviewer, so it still has the reasoning behind its findings.",
+          "open_session": "Open a follow-up session",
+          "opening": "Opening…",
+          "not_recorded_notice": "This review did not keep a reviewer session, so there is nothing to reopen. Review this pull request again to ask about it.",
+          "transcript_gone_notice": "The reviewer's session is no longer on disk, so there is nothing to reopen. Review this pull request again to ask about it.",
+          "continue_hint": "The conversation with this reviewer continues in the Chat tab.",
+          "continue_session": "Continue the follow-up session",
+          "run_live_notice": "This review is still running. Its findings can change until it finishes, so there is nothing to ask about yet.",
+          "loading": "Loading…"
         },
         "runCard": {
           "cancel": "Cancel",
@@ -700,6 +692,12 @@
         "resize_sidebar": "Resize sidebar",
         "select_a_review_to_see_its_progress_and_report": "Select a review to see its progress and report.",
         "start_a_new_one_several_can_run_at_once": "Start a new one — several can run at the same time."
+      }
+    },
+    "commandBar": {
+      "manifest": {
+        "display_name": "Command Bar",
+        "description": "Replaces the quick-search (Cmd+K / Ctrl+K) surface with a launcher: type a command, not a query. The first page carries app commands, destinations and system settings and issues no request, so typing costs nothing. Sessions become a row you enter; searching knowledge, artifacts, skills and prompts is not available while this is enabled — disable it to get that back."
       }
     },
     "crewCompanion": {
@@ -911,6 +909,14 @@
           "regenerate_summary": "Regenerate summary",
           "retry": "Retry"
         },
+        "assigneePicker": {
+          "assigned_but_not_a_member": "These assignees are not repo members.",
+          "choose_assignees": "Choose assignees",
+          "filter_members": "Filter members…",
+          "no_members": "No members to assign — this repo has no readable roster.",
+          "not_a_member": "{{login}} is not a member of this repo",
+          "this_is_you": "{{login}} (you)"
+        },
         "detailOverflowMenu": {
           "more_actions": "More actions"
         },
@@ -930,6 +936,7 @@
         "issueDetail": {
           "added_the": "added the",
           "added_this_to_the": "added this to the",
+          "assign_me": "Assign to me",
           "assigned": "assigned",
           "assignees": "Assignees",
           "by": "· by",
@@ -943,7 +950,11 @@
           "couldn_t_load_activity": "Couldn't load activity:",
           "dates": "Dates",
           "done": "Done",
+          "done_editing_assignees": "Done editing assignees",
+          "done_editing_labels": "Done editing labels",
           "edit": "Edit",
+          "edit_assignees": "Edit assignees",
+          "edit_labels": "Edit labels",
           "finding_suggestions": "Finding suggestions…",
           "in": "in",
           "issues": "& issues",
@@ -973,6 +984,7 @@
           "self_assigned_this": "self-assigned this",
           "suggested": "Suggested",
           "timeline": "Timeline",
+          "unassign_me": "Unassign me",
           "unassigned": "unassigned",
           "updated": "Updated"
         },
@@ -1367,6 +1379,9 @@
         "select_a": "Select a",
         "select_an_issue_to_see_its_details": "Select an issue to see its details.",
         "to_see_its_details": "to see its details."
+      },
+      "api": {
+        "assignees_changed_elsewhere": "The assignees changed elsewhere since you loaded this issue."
       }
     },
     "mdNotebook": {
@@ -1479,7 +1494,7 @@
         "autoCommit": "Autosave to history",
         "autoCommitHelp": "Commits your edits to the vault's local git history every {{n}} minutes, so you never have to save by hand. Nothing is pushed to a remote.",
         "autoSync": "Auto sync",
-        "autoSyncHelp": "Pushes your changes to GitHub and pulls the latest, on a timer. Paused while a conflict needs your decision.",
+        "autoSyncHelp": "Pushes your changes to GitHub and pulls the latest, on a timer. Keeps running in the background when Notes is closed, as long as Kiro Crew is open. Paused while a conflict needs your decision.",
         "badgeCloned": "Cloned",
         "badgeLocal": "Local folder",
         "clear": "Clear",
@@ -1497,6 +1512,7 @@
         "minutes": "minutes",
         "noRemote": "No remote",
         "open": "Open",
+        "prefsSaveFailed": "Could not save the sync setting: {{message}}",
         "recording": "Recording…",
         "remove": "Remove",
         "removeConfirm": "Remove this vault from the app? Your files are left untouched on disk — only the connection is forgotten.",
@@ -2731,9 +2747,7 @@
         "typesetting_hints_one": "{{count}} typesetting hint",
         "typesetting_hints_other": "{{count}} typesetting hints"
       },
-      "editor": {
-        "loading_editor": "Loading editor…"
-      },
+      "editor": {},
       "fileTree": {
         "delete_file": "Delete {{file}}",
         "files": "Files",
@@ -3305,6 +3319,10 @@
       "skipped": "Skipped",
       "try_again": "Try again",
       "we_could_not_scan_agent_setup": "We could not scan agent setup",
+      "found_setup_kirocrew_could_not_read": "Found setup Kiro Crew could not read",
+      "found_setup_but_could_not_read_it": "Kiro Crew found {{sources}} but could not read the files, so nothing was imported.",
+      "some_setup_could_not_be_read": "Kiro Crew could not read {{sources}} — not listed below.",
+      "files_could_not_be_read": "Files could not be read",
       "your_existing_kirocrew_setup_will_not_be_affecte": "Your existing Kiro Crew setup will not be affected."
     },
     "agentSelector": {
@@ -3649,7 +3667,6 @@
     "contentRenderer": {
       "changes_update_svg_preview_as_you_type": "Changes update the preview as you type.",
       "editing_svg": "Editing SVG",
-      "loading_editor": "Loading editor…",
       "svg_source_code": "SVG source code"
     },
     "detailPanel": {
@@ -3665,17 +3682,12 @@
       "close": "Close"
     },
     "diffBlock": {
-      "collapse": "▲ collapse",
-      "context_lines": "context lines",
-      "diff": "diff",
       "generating_diff": "generating diff…",
-      "lines_hidden": "lines hidden",
       "open": "Open"
     },
     "diffPanel": {
       "click_to_copy_path": "Click to copy path",
-      "contents_identical": "Contents are identical",
-      "loading_diff": "Loading diff…"
+      "contents_identical": "Contents are identical"
     },
     "discoverySearchBar": {
       "clear_search": "Clear search",
@@ -3716,15 +3728,22 @@
       "save": "Save"
     },
     "fileChangeChips": {
+      "additions_one": "{{count}} addition",
+      "additions_other": "{{count}} additions",
       "artifact": "Artifact",
       "changed": "changed",
       "file_one": "{{count}} file",
       "file_other": "{{count}} files",
       "more": "more",
       "no_changes": "no changes",
+      "open": "Open File",
+      "open_in_side_panel": "Open {{path}} in side panel",
+      "removals_one": "{{count}} removal",
+      "removals_other": "{{count}} removals",
       "show": "Show",
       "show_less": "Show less",
-      "this_document_is_tracked_as_a_session_artifact_n": "This document is tracked as a session artifact, not a source-file change"
+      "this_document_is_tracked_as_a_session_artifact_n": "This document is tracked as a session artifact, not a source-file change",
+      "toggle_diff": "Show or hide the diff for {{path}}"
     },
     "filePickerMenu": {
       "folder": "Folder",
@@ -3753,7 +3772,7 @@
     },
     "folderSuggestionCard": {
       "folder_suggestion": "Folder suggestion",
-      "move_to_folder_question": "Move this session to {{folder}}?",
+      "move_to_folder_question": "Move this session into folder “{{folder}}”?",
       "no_thanks": "Not now",
       "yes_move_it": "Move it"
     },
@@ -3884,7 +3903,6 @@
       "add_to_knowledge": "Add to Knowledge",
       "add_to_knowledge_library": "Add to Knowledge Library",
       "added": "Added!",
-      "autocomplete": "Autocomplete",
       "cancel": "Cancel",
       "cancel_discard_unsaved_edits": "Cancel — discard unsaved edits",
       "capture_the_current_file_content_as_a_new_artifa": "Capture the current file content as a new artifact version",
@@ -3892,6 +3910,7 @@
       "click_to_copy_path": "Click to copy path",
       "close_esc": "Close (Esc)",
       "close_find": "Close find",
+      "collapse_unchanged": "Collapse unchanged",
       "copy_content": "Copy content",
       "copy_path": "Copy path",
       "discard_unsaved_changes": "Discard unsaved changes?",
@@ -3906,7 +3925,6 @@
       "in_knowledge_library": "In Knowledge Library",
       "in_library": "In Library",
       "line_numbers": "Line numbers",
-      "loading_diff": "Loading diff…",
       "more_options": "More options",
       "next_enter": "Next (Enter)",
       "next_match": "Next match",
@@ -3917,7 +3935,6 @@
       "save_this_file_as_an_artifact_versioned_persiste": "Save this file as an artifact (versioned, persistent, comment-able)",
       "select_any_text_to_add_inline_comments_then_subm": "Select any text to add inline comments, then submit them all to the chat.",
       "tip": "Tip:",
-      "toggle_autocomplete": "Toggle autocomplete",
       "toggle_diff_view": "Toggle diff view",
       "toggle_line_numbers": "Toggle line numbers",
       "toggle_word_wrap": "Toggle word wrap",
@@ -3925,8 +3942,11 @@
       "word_wrap": "Word wrap"
     },
     "markdownRenderer": {
+      "click_to_copy": "Click to copy",
       "click_to_open_shift_click_to_reveal_in_finder": "Click to open / Shift+click to reveal in Finder",
       "close": "Close",
+      "copied": "Copied!",
+      "ctrl_click_to_copy": "Ctrl+click to copy",
       "download_d": "Download (d)",
       "download_image": "Download image",
       "generating_diagram": "generating diagram…"
@@ -4009,9 +4029,7 @@
     },
     "monacoCodeBlock": {
       "close_editor": "Close editor",
-      "edit_code_block": "Edit code block",
-      "edit_in_monaco_editor": "Edit in Monaco editor",
-      "loading_editor": "Loading editor…"
+      "edit_code_block": "Edit code block"
     },
     "notifications": {
       "notificationDetailPanel": {
@@ -4237,6 +4255,11 @@
       "undo_remove": "Undo remove",
       "will_be_removed_on_save": "Will be removed on save."
     },
+    "selectionToolbar": {
+      "ask": "Ask in Side Chat",
+      "copy": "Copy",
+      "quote": "Quote"
+    },
     "sendToInstanceSubmenu": {
       "failed": "Failed",
       "not_connected": "not connected",
@@ -4258,6 +4281,8 @@
       "tags": "Tags…"
     },
     "sessionColorSwatches": {
+      "custom_color": "Custom color",
+      "hex_color_code": "Hex color code",
       "no_color": "No color"
     },
     "sessionGridView": {
@@ -4272,6 +4297,25 @@
       "split_right": "Split right",
       "split_right_d": "Split right (⌘D)",
       "terminal_pane_coming_in_phase_2": "Terminal pane — coming in Phase 2"
+    },
+    "sessionPulseSurveyCard": {
+      "dismiss": "Dismiss survey",
+      "email_disclosure": "We may want to contact you about your feedback. Your rating and any feedback are sent to the Kiro Crew team.",
+      "email_placeholder": "you@example.com (optional)",
+      "email_prompt": "Share your email to join our research panel",
+      "feedback_question": "Do you have additional feedback about this experience?",
+      "optional": "Optional",
+      "rating_excellent": "Excellent",
+      "rating_fair": "Fair",
+      "rating_good": "Good",
+      "rating_poor": "Poor",
+      "rating_question": "How would you rate your experience with Kiro Crew today?",
+      "rating_very_poor": "Very Poor",
+      "select_rating_hint": "Select a rating to submit",
+      "submit": "Submit",
+      "submit_error": "Couldn't submit — please try again.",
+      "submitting": "Submitting…",
+      "thanks": "Thanks for your feedback!"
     },
     "sessionRefStrip": {
       "n_messages": "{{n}} msgs",
@@ -4852,7 +4896,9 @@
       "update_one": "{{count}} update",
       "update_other": "{{count}} updates",
       "v": "v",
-      "installed_app_find_in_library_and_enable": "Installed {{name}}. Turn it on below to enable it."
+      "installed_app_find_in_library_and_enable": "Installed {{name}}. Turn it on below to enable it.",
+      "synced_from_its_source_directory": "Synced {{name}} from its source directory.",
+      "updated_from_the_registry": "Updated {{name}} from the registry."
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/mo",
@@ -5159,17 +5205,14 @@
         "approved": "Approved",
         "artifacts_this_session": "This session",
         "ask_me_to_use_a_dynamic_workflow_to_runs_from_th": "Ask me to \"use a dynamic workflow to …\" — runs from this chat appear here live.",
-        "back_to_files": "Back to files",
         "cancel": "Cancel",
-        "changed_files": "Changed files",
-        "discard_unsaved_changes": "Discard unsaved changes?",
         "failed_click_to_retry": "Failed — click to retry",
-        "files": "Files",
         "input": "Input",
         "last_tool": "Last tool:",
+        "links": "Links",
         "load_output_from_disk": "Load output from disk",
         "loading": "Loading…",
-        "no_files_changed_yet": "No files changed yet",
+        "no_links_yet": "No links in this session yet. Mention a URL in the chat and it will appear here.",
         "no_subagents_running": "No subagents running",
         "no_workflow_runs": "No workflow runs",
         "open_artifact": "Open artifact",
@@ -5177,12 +5220,9 @@
         "output_shown_in_chat": "(output shown in chat)",
         "reject": "Reject",
         "rejected": "Rejected",
-        "remove": "Remove",
-        "remove_file_from_list": "Remove file from list",
         "resolving": "Resolving…",
         "resolving_2": "resolving...",
         "resources": "Resources",
-        "retry": "Retry",
         "trusted": "Trusted",
         "trusted_base": "Trusted base",
         "trusted_command": "Trusted command",
@@ -5275,20 +5315,28 @@
       "pinnedPrompt": {
         "collapse_pinned_prompt": "Collapse pinned prompt",
         "expand_pinned_prompt": "Expand pinned prompt",
-        "jump_to_this_prompt": "Jump to this prompt"
+        "jump_to_this_turn": "Jump to this turn"
       },
       "recoveryCard": {
         "backend_error_continuing": "backend error · continuation sent automatically",
         "cancelled_continuing": "stalled tool call cancelled · continuation sent automatically",
+        "consolidated_summary_requested": "consolidated summary requested",
+        "continued_by_a_hook": "Continued by a hook",
         "continued_by_you": "Continued at your request",
         "empty_output_continuing": "agent returned no output · continuation sent automatically",
+        "hook_loop_halted": "Hook loop halted",
+        "hook_requested_continuing": "requested by a hook · continuing",
+        "injected_by_the_gateway": "injected by the gateway",
         "n_patterns": "{{count}} patterns",
         "n_tool_calls_blocked": "{{count}} tool calls blocked",
         "no_response_returned": "No response returned",
+        "nudge_cap_reached": "nudge cap reached",
         "recovered_continuing": "continuation sent automatically",
         "resuming_the_interrupted_turn": "resuming the interrupted turn",
         "safety_policy_continuing": "safety policy blocked the call · continuation sent automatically",
         "session_busy_continuing": "session busy · continuation sent automatically",
+        "subagents_finished": "Sub-agents finished",
+        "system_notice": "System notice",
         "tool_call_blocked": "Tool call blocked",
         "tool_stopped_responding": "Tool stopped responding",
         "turn_interrupted": "Turn interrupted",
@@ -5309,7 +5357,7 @@
       "sideChat": {
         "ago": "ago",
         "ask_a_side_question": "Ask a side question",
-        "ask_a_side_question_main_agent_keeps_working": "Start a side conversation without interrupting the active run.",
+        "ask_a_side_question_main_agent_keeps_working": "Ask a side question without interrupting the active run. Nothing here is saved to the chat.",
         "context_from": "Context from",
         "refresh_context": "Refresh context",
         "refresh_blocked_queued": "Finish or cancel the queued questions first — refreshing would discard them",
@@ -5324,7 +5372,6 @@
         "close_tab": "Close tab",
         "menu_git": "Git",
         "menu_git_desc": "Branch, changes, and recent commits",
-        "move_to_bottom_panel": "Move to bottom panel",
         "open_in_editor": "Open in Editor",
         "open_side_panel_tab": "Open side panel tab",
         "pick_a_panel_to_view": "Pick a panel to view",
@@ -5381,7 +5428,6 @@
         "send": "Send",
         "send_enter": "Send (Enter)",
         "steered_into_the_running_turn": "Steered into the running turn",
-        "message_unconfirmed": "Message not confirmed — may not have been delivered",
         "pin_message": "Pin message",
         "unpin_message": "Unpin message"
       },
@@ -5417,6 +5463,10 @@
         "copy_link": "Copy link to message",
         "unpin": "Unpin",
         "jump_to_message": "Jump to message"
+      },
+      "earlierMessagesBar": {
+        "load_earlier_messages": "Load earlier messages",
+        "error_retry": "Couldn't load earlier messages — retry"
       }
     },
     "chatPage": {
@@ -5424,7 +5474,10 @@
       "agent_selector": "Agent selector",
       "chat_messages": "Chat messages",
       "continue_a_previous_chat": "Continue a previous chat?",
+      "could_not_continue": "Couldn't continue",
+      "could_not_regenerate": "Couldn't regenerate",
       "could_not_set_the_agent_default_model": "Could not set the agent's default model",
+      "could_not_switch_variant": "Couldn't switch version",
       "dismiss_error": "Dismiss error",
       "dismiss_upload_error": "Dismiss upload error",
       "enter_split_view": "Enter split view",
@@ -5533,6 +5586,7 @@
       "new_chat_session": "New chat session",
       "new_folder": "New folder",
       "new_subfolder": "New subfolder",
+      "no_older_sessions": "No older sessions — closed tabs appear here",
       "no_sessions": "No sessions",
       "no_sessions_match": "No sessions match",
       "older_sessions": "Older sessions",
@@ -5553,6 +5607,7 @@
       "running_session_other": "{{count}} running sessions",
       "search_older_sessions": "Search older sessions…",
       "search_sessions": "Search sessions…",
+      "session_dropped_into_itself": "Can't drop a session into itself… itself… itself…",
       "session_one": "{{count}} session",
       "session_other": "{{count}} sessions",
       "sessions": "Sessions",
@@ -6386,8 +6441,6 @@
       }
     },
     "overviewPage": {
-      "apply_config_changes_by_restarting_all_sessions": "Apply config changes by restarting all sessions",
-      "apply_restart": "Apply & Restart",
       "back_to_overview": "Back to Overview",
       "days_of_history": "days of history",
       "h_idle": "h idle",
@@ -6396,11 +6449,8 @@
       "memory_graph_and_store_internals_live_on_the_dev": "Memory graph and store internals live on the Developer page",
       "messages": "messages",
       "overview": "Overview",
-      "restart": "Restart",
-      "restarting": "Restarting…",
       "semantic_memory_active": "· semantic memory active",
       "sessions": "sessions ·",
-      "sessions_restarted": "Sessions restarted.",
       "summarizes_chats_into_memory_after": "Summarizes chats into memory after",
       "today": "Today:",
       "tokens": "tokens",
@@ -6466,6 +6516,7 @@
     "projectsPage": {
       "agent": "Agent:",
       "analyzing_task_and_building_step_by_step_plan": "Analyzing task and building step-by-step plan",
+      "auto_approve": "Auto-approve",
       "auto_approve_tool_calls": "Auto-approve tool calls",
       "cancel": "Cancel",
       "chat": "Chat",
@@ -7127,7 +7178,7 @@
         "use_ctrl_not_option_for_chat_1_9": "Use ⌃ Ctrl (not ⌥ Option) for chat 1–9"
       },
       "skillsPanel": {
-        "analyze_each_completed_session_and_draft_a_reusa": "Analyze each completed session and draft a reusable SKILL.md when a non-trivial multi-step procedure is detected. Off by default. Drafts are staged to the pending queue on the Skills tab for review — nothing goes live without your approval (see below).",
+        "analyze_each_completed_session_and_draft_a_reusa": "Analyze each completed session and draft a reusable SKILL.md when the session demonstrates a recurring procedure — one a future session, working on a different target, would run again. Off by default. Drafts are staged to the pending queue on the Skills tab for review — nothing goes live without your approval (see below).",
         "auto_generate_skills_from_sessions": "Auto-generate skills from sessions",
         "keep_every_auto_generated_candidate_in_the_pendi": "Keep every auto-generated candidate in the pending queue until you approve it. Turning this off lets prose-only skills publish automatically; skills that bundle scripts always require approval regardless.",
         "require_approval_before_generated_skills_go_live": "Require approval before generated skills go live",

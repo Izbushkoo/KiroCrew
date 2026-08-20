@@ -34,6 +34,9 @@ from kiro_crew.dashboard.chat_auto_tag import maybe_auto_tag
 from kiro_crew.dashboard.chat_folders import _unhide_folder
 from kiro_crew.dashboard.chat_orchestrator import _stage_loop
 from kiro_crew.dashboard.chat_persistence import (
+    _FLUSH_SNAPSHOT_RETRIES,
+    _TRANSIENT_ROLES,
+    COLOR_HEX_RE,
     _attach_variants,
     _rehydrate_slot_title,
     get_reasoning_effort_values,
@@ -52,6 +55,7 @@ from kiro_crew.dashboard.chat_utils import (
     _MANUAL_RESUME_MSG,
     SYNTHETIC_RECOVERY_KIND,
     _build_stream_chunk,
+    _collapse_wire_rows,
     _edit_queued_by_id,
     _emit_agent_assignment,
     _history_key_for,
@@ -65,7 +69,6 @@ from kiro_crew.dashboard.chat_utils import (
     effective_session_key,
     slot_history_key,
 )
-from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.state import (
     _MAX_PENDING_CONTEXT,
     DashboardState,
@@ -74,8 +77,10 @@ from kiro_crew.dashboard.state import (
     _normalize_slot_key,
     is_stop_event_row,
     is_turn_interrupted,
+    parse_cls_meta,
     request_slot_origin,
 )
+from kiro_crew.dashboard.system_notices import SESSION_RELOAD_KIND, is_system_notice
 from kiro_crew.dashboard.turn_dispatch import spawn_guarded_turn
 from kiro_crew.history import carry_provenance, is_incognito_transcript
 from kiro_crew.messaging.link import is_channel_session_key
@@ -102,6 +107,19 @@ if TYPE_CHECKING:  # circular at runtime: autonudge -> dashboard.chat -> chat_ha
     from kiro_crew.autonudge import NudgeLoop
 
 logger = logging.getLogger(__name__)
+
+# Feed notice appended by api_chat_slot_reload. A constant, not LLM-derived
+# text, so it needs no redaction pass.
+_SESSION_RELOAD_NOTICE = (
+    "Reloading session: relaunching the agent process with a freshly loaded "
+    "agent spec, environment, and MCP servers. The conversation is preserved."
+)
+
+# Approval modes that grant auto-approval to the SLOT they name, as opposed to
+# the process-global YOLO grant. A tuple, not a set: membership is tested against
+# a request-supplied value, and tuple `in` compares by equality rather than
+# hashing, so a non-string body value answers False instead of raising.
+_SLOT_SCOPED_TRUST_MODES = ("trust", "trust_reads")
 
 
 def _sweep_stale_permissions(slot: "_ChatSlot") -> None:
@@ -264,6 +282,22 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         slot.theme_consent = theme_consent
         slot.theme_consent_sha = theme_consent_sha
 
+    if not message:
+        # One guard, above every dispatch branch. An empty wire text reaches
+        # here only from programmatic callers (app tokens, curl, integrations)
+        # — the dashboard composer always inlines staged files into the
+        # message text. Such a send may still carry attachments in `meta`:
+        # nothing downstream queues or broadcasts it, so any success receipt
+        # would report work that was silently dropped. Refusing here keeps
+        # every branch below (steer/queue, crew, subagent-hold, new turn)
+        # unable to bypass the check — the guard used to sit below the busy
+        # branch, which is exactly how the false `queued: true` receipt
+        # happened. `message_required` is the backend-owned code already used
+        # for this refusal (handlers/messaging.py).
+        return web.json_response(
+            {"error": "message is required", "code": "message_required"}, status=400
+        )
+
     if slot.running or slot._in_stage_execution:
         # Mid-turn steer: inject into the RUNNING turn instead of queueing for
         # the next turn. Gated on an explicit `steer` flag + a live, steer-capable
@@ -354,25 +388,23 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             # steer requested but unavailable → fall through to queue below.
         # Queue the message — return JSON immediately (no SSE needed).
         # The existing SSE reader will pick up queued messages as _run_chat
-        # processes the queue in its finally block.
-        if message:
-            qid = slot.queue_append(message)
-            _c, _ = redact_exfiltration_urls(message)
-            _c, _ = redact_credentials(_c)
-            _redacted = _redact_for_display(_c)
-            state.broadcast_ws(
-                "queue_push",
-                {
-                    "slot": slot.key,
-                    "content": _redacted,
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "queue_id": qid,
-                },
-            )
+        # processes the queue in its finally block. The message is non-empty
+        # here (hoisted guard above the busy branch), so `queued: true`
+        # always reports a real enqueue.
+        qid = slot.queue_append(message)
+        _c, _ = redact_exfiltration_urls(message)
+        _c, _ = redact_credentials(_c)
+        _redacted = _redact_for_display(_c)
+        state.broadcast_ws(
+            "queue_push",
+            {
+                "slot": slot.key,
+                "content": _redacted,
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "queue_id": qid,
+            },
+        )
         return web.json_response({"ok": True, "queued": True})
-
-    if not message:
-        return web.json_response({"error": "message is required"}, status=400)
 
     # ── Crew Mode dispatch (RFC orchestrator-chat-sessions) ─────────
     # MUST precede the hold-users gate below: crew topics ARE background
@@ -691,6 +723,81 @@ async def api_chat_slots(request: web.Request) -> web.Response:
     return web.json_response(payloads)
 
 
+async def api_chat_slot_source_links(request: web.Request) -> web.Response:
+    """GET /api/chat/slots/{slot}/source-links — every PR/issue link, unbudgeted.
+
+    The slots payload caps chips per kind, so the sidebar's "+N" overflow chip
+    has nothing on the client to expand into. This is the lazy read behind that
+    expand, kept off the slots broadcast on purpose: widening the budget would
+    put up to ``_MAX_SOURCE_LINKS_PER_SLOT`` links per slot on the wire for every
+    row nobody expanded, on every push.
+    """
+    # circular import: source_providers imports chat state helpers, so a
+    # top-level import would close a cycle (same pattern as api_chat_slots'
+    # owner-only check-status gate above).
+    from kiro_crew.dashboard.handlers.source_providers import (
+        ensure_gitlab_hosts_loaded,
+        is_owner_dashboard_request,
+    )
+
+    state: DashboardState = request.app["state"]
+    slot = state._slots.get(request.match_info["slot"])
+    if not slot:
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+
+    # App ownership check (App Kit §5.2): deny-by-default for app tokens. An app
+    # token scoped to /api/chat/slots/* would otherwise name any slot the list
+    # endpoint reveals and read every pull request and issue URL a dashboard or
+    # foreign-app session ever mentioned. Same indistinguishable 404 as the send
+    # path -- SAME error code too, so the response cannot be used to probe which
+    # foreign slots exist.
+    request_app = request.get("app", "")
+    if request_app and request_app != slot._app:
+        sel().log_api_access(
+            caller=request_app,
+            operation="chat_source_links",
+            outcome="denied",
+            source="app_isolation",
+            resources=f"slot={slot.key}",
+            error=(
+                "app cannot access unscoped slots"
+                if not slot._app
+                else "app does not own this slot"
+            ),
+        )
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    if request_app:
+        # The ALLOW is a permission decision too, and an audit trail that records
+        # only refusals cannot answer which app actually read a slot's links.
+        # Dashboard callers are deliberately not logged here: they are the owner,
+        # and every sidebar expand would otherwise write an event.
+        sel().log_api_access(
+            caller=request_app,
+            operation="chat_source_links",
+            outcome="allowed",
+            source="app_isolation",
+            resources=f"slot={slot.key}",
+        )
+
+    # Same warm-up as GET /api/chat/slots: link extraction is synchronous and
+    # cannot load the self-managed GitLab allowlist itself, so a cold expand
+    # would drop every self-hosted MR link from the revealed set.
+    try:
+        await ensure_gitlab_hosts_loaded()
+    except Exception:
+        logger.debug(
+            "GitLab allowlist warm-up failed; expanded chips may lag one round", exc_info=True
+        )
+
+    # Cached status only, owner-gated exactly like the list endpoint. No
+    # schedule_check_refresh here: that pushes a `slots` update, which by
+    # definition cannot carry links outside the budget, so the provider work
+    # would produce a result this response can never show.
+    return web.json_response(
+        slot.source_links_payload(include_check_status=is_owner_dashboard_request(request))
+    )
+
+
 def _finite_number(value: Any) -> float | None:
     """Return *value* as a float when it is a real, finite number, else None.
 
@@ -1003,6 +1110,383 @@ async def api_chat_slot_summary_generate(request: web.Request) -> web.Response:
     )
 
 
+def _load_redacted(body: str) -> str:
+    """Apply the transcript redaction pair, in the one order the repo uses."""
+    redacted, _ = redact_exfiltration_urls(body)
+    redacted, _ = redact_credentials(redacted)
+    return redacted
+
+
+def _same_persisted_body(
+    disk_body: str, window_body: str, role: str, disk_ts: str = "", window_ts: str = ""
+) -> bool:
+    """True when *disk_body* is the persisted form of *window_body*.
+
+    A persisted row can differ from its window copy by exactly the redaction
+    transform, and EITHER side can be the redacted one, which is why the compare
+    applies it symmetrically. A restore redacts on load while keeping ``ts``
+    verbatim (``chat_persistence.py:708-709``), so the window holds the redacted
+    text; a save redacts every non-user role on the way out
+    (``chat_persistence.py:1282-1284``) while the window keeps it verbatim
+    (``state.py:2107``), so in a session that was never restored the DISK holds the
+    redacted text instead. Redacting one side only cannot converge on that second
+    pair — redacting an already-redacted body just reproduces it — so the row reads
+    as un-flushed and the persisted suffix is appended twice.
+
+    Applying the transform is also what separates a persisted row from a foreign
+    row that merely shares a ``ts``: on a coarse clock two writers flooring off the
+    same previous row both emit ``previous + 1µs`` (``history.py:1179-1219``), so
+    matching on ``ts`` alone treats an unrelated row as the window's own and drops
+    an un-flushed message from a response the client uses as a replacement.
+
+    Two bodies can redact to the same text while being different messages, so the
+    redaction-equivalent branch ALSO requires the stamps to match. That costs the
+    legitimate case nothing: this branch only ever fires for a row and its own
+    persisted copy, which differ by the transform precisely because one side was
+    redacted, and both the save and the load copy ``ts`` verbatim
+    (``chat_persistence.py:1288`` and ``:714``). A foreign row whose credential
+    merely redacts to the same text carries its own writer's stamp, so it no longer
+    consumes the window row.
+
+    The requirement is on this branch ALONE, which is why it does not reintroduce
+    the duplication above. A durable injection is byte-identical to its window row,
+    so it returns at the plain-equality check and never reaches here — and that pair
+    genuinely does carry different stamps, because the two writers mint
+    independently.
+    """
+    if disk_body == window_body:
+        return True
+    if role == "user":
+        return False
+    if disk_ts != window_ts:
+        return False
+    return _load_redacted(disk_body) == _load_redacted(window_body)
+
+
+#: Window rows a bounded read must NOT hand back. ``_TRANSIENT_ROLES`` documents
+#: itself as being about a window-region DISK line
+#: (``chat_persistence.py:1320-1322``) and ``chat_persistence.py:1571`` uses it that
+#: way. A bounded read answers a different question — which WINDOW rows does the
+#: client still need — and three of those roles are still needed. ``permission``:
+#: a pending approval is actionable and the client reads it out of the transcript,
+#: so dropping it hides the approval bar while the server is still waiting.
+#: ``chunk``/``streaming``: ``_prepare_messages`` does not discard a chunk run, it
+#: collapses one into a single ``streaming`` row, and that is the only way in-flight
+#: assistant text reaches this endpoint — the client filters raw ``chunk`` itself.
+#: ``done`` is discarded by ``_prepare_messages`` regardless, and ``queued`` stays
+#: listed because the client rebuilds those bubbles from the payload's ``queue``.
+_UNOWED_WINDOW_ROLES = _TRANSIENT_ROLES - {"permission", "chunk", "streaming"}
+
+
+def _is_answered_permission(m: dict) -> bool:
+    """True for a ``permission`` row whose approval has already been answered.
+
+    A permission row is never persisted, so it is always owed and therefore always
+    lands in the tail — i.e. after every row that DID reach disk. For a pending
+    approval that is the right place: it is the newest row, and nothing can follow
+    it because the agent is blocked waiting on it. An answered one is history, and
+    the agent has since produced turns that ARE on disk, so putting it in the tail
+    moves it after them and the rendered order no longer matches what happened.
+
+    The decision is written into the row's ``cls`` JSON in place
+    (``state.py`` ``_mark_permission_resolved``), which is also the only place the
+    stale-sweep and the slot resolver read it, so ``cls`` is the single source of
+    truth here. Truthiness rather than key presence mirrors the client's own
+    ``!meta.resolved`` test (``chatSlice.ts`` ``selectSlotPendingApproval``), so an
+    empty decision still counts as pending and an actionable approval is never lost.
+    """
+    if m.get("role") != "permission":
+        return False
+    meta = parse_cls_meta(m.get("cls", "")) or {}
+    return bool(meta.get("resolved"))
+
+
+def _snapshot_slot_window(slot: "_ChatSlot") -> tuple[int, list[dict]]:
+    """Capture ``(_disk_older_count, window)`` as one internally consistent pair.
+
+    Call this on the EVENT LOOP where possible. The two reads have no ``await``
+    between them, so no loop-scheduled writer can land in the middle — and the
+    finalization that motivates this, ``chat_runner._flush_segment``, is a plain
+    ``def`` that is never handed to ``to_thread``, so it cannot interleave with a
+    loop capture. It assigns ``slot.messages = head`` and only then appends the
+    finalized assistant row, so a reader that lands between those two statements
+    sees a transient chunk-free window missing that row. A worker thread CAN land
+    there, which is why capturing inside the threaded scan is the weaker option.
+
+    From a thread the pair can still tear, so retry: a front trim bumps
+    ``_disk_older_count`` (state.py:2191-2200) between the reads, and a PRE-trim
+    window paired with a POST-trim count shortens ``window_disk``, hides the
+    trimmed rows' ids and re-appends rows the disk read already returned. A trim
+    is the only mutation that changes the window/count relationship, so read the
+    count, copy the window, then confirm the count is unchanged. ``slot._lock``
+    is an ``asyncio.Lock`` and cannot be acquired from a thread, so this mirrors
+    the bounded re-read ``_save_slot_to_history`` uses for the same race
+    (chat_persistence.py:1711-1722).
+    """
+    for _ in range(_FLUSH_SNAPSHOT_RETRIES):
+        disk_older_count = slot._disk_older_count
+        window = list(slot.messages)
+        if slot._disk_older_count == disk_older_count:
+            break
+    else:
+        disk_older_count = slot._disk_older_count
+        window = list(slot.messages)
+    return disk_older_count, window
+
+
+def _append_unflushed_tail(
+    slot: "_ChatSlot",
+    all_msgs: list[dict],
+    *,
+    snapshot: tuple[int, list[dict]] | None = None,
+) -> list[dict]:
+    """Append window messages that are not yet on disk to a chained disk read.
+
+    ``all_msgs`` is a disk read, so it omits transient roles while the window
+    retains them, and it spans any older sessions a chained read walks. Sizing the
+    tail by subtracting the two lengths therefore mixes units AND measures the
+    whole file: it both re-appends rows the disk read already returned and lets a
+    row from another writer consume a turn that is still owed.
+
+    Takes the window itself rather than a caller-supplied count, so a caller cannot
+    pass a length captured before an ``await``; the window can grow while a threaded
+    disk read is in flight. ``snapshot`` is the one safe way to supply it: a
+    ``(disk_older_count, window)`` PAIR from ``_snapshot_slot_window`` captured on
+    the event loop AFTER the disk read, which is consistent by construction and
+    cannot observe a mid-finalization window. Passing no snapshot falls back to
+    capturing inside this thread, which is weaker — see that helper.
+
+    Prefer message identity. A save copies each window row's ``meta.mid`` to disk,
+    so a window row whose id appears in the disk read is persisted. Rows written by
+    any other writer carry no id — ``ConversationLog.append`` persists no ``meta``
+    — so they cannot be mistaken for a flushed window row.
+
+    A disk read holding no ids at all needs a different boundary: a session
+    persisted before ids existed, or rows a durable injector appended without
+    going through a save. Walk the window and the disk read forward TOGETHER and
+    stop at the first row that is not accounted for. A row from another writer no
+    longer ENDS the run, which is what sizing the boundary as
+    ``len(all_msgs) - slot._disk_older_count`` did — that measures the whole file,
+    so a foreign append walked one row too far and dropped the owed turn. Both
+    estimators the slot already carries are wrong here for opposite reasons: that
+    subtraction over-counts, and ``_disk_window_len`` is not advanced by an
+    injector, so it under-counts and would re-append a persisted row.
+
+    The window is matched against the disk region as an ordered SUBSEQUENCE: a row
+    that does not match the window row under consideration is SKIPPED rather than
+    treated as the end of the window. The save is non-destructive against a
+    cross-process append and merges the preserved rows back in TIME order
+    (``_interleave_foreign_lines``), so the region can read
+    ``[window, foreign, window]`` and an unmatched row means "not mine", not "end of
+    window". Ending the run there leaves every persisted row after it in the tail,
+    which appends an already-persisted suffix a second time.
+
+    Skipping cannot pass over a row that should have matched: both sequences are
+    chronological — the save's merge preserves each side's internal order — so a
+    later window row's persisted copy cannot precede the current row's. It is also
+    bounded: the disk cursor only ever moves forward, so the scans total
+    O(window + region), and the first window row with no match anywhere in the
+    remaining region ends the walk, which is the genuine end of the flushed prefix.
+
+    A row matches on role plus content, compared through the redaction transform
+    on both sides (``_same_persisted_body``). A shared ``ts`` is never SUFFICIENT —
+    on a coarse clock two writers flooring off the same previous row both emit
+    ``previous + 1µs`` (``history.py:1179-1219``), so accepting it alone drops an
+    un-flushed message — but it is REQUIRED on the redaction-equivalent branch,
+    where the only legitimate pair is a row and its own copy and the stamp is
+    carried through verbatim.
+
+    Ids are counted over the on-disk WINDOW REGION only,
+    ``all_msgs[slot._disk_older_count:]``. The rows before that are the frozen prefix
+    — on-disk rows older than the window, so none of them is in ``slot.messages``.
+    Counting them would let an occurrence that exists only in the prefix fund a match
+    for a window row that was never flushed, and the boundary would then walk past it.
+    The fallback below already starts its disk cursor at the same offset.
+
+    Id matching is selected only when EVERY row in that region carries a valid id, not
+    merely when some row does. A durable injection is written by two writers — the
+    window copy through ``slot.append``, where an id is minted, and the durable copy
+    through ``append_if_absent``, which persists no ``meta`` at all — so the region can
+    legitimately hold a MIX. Choosing id matching on the strength of one id-carrying
+    row then applies it to a row that structurally cannot match, which reads as
+    un-flushed and appends the injection a second time. A mixed region belongs on the
+    ordered path, which compares the fields both writers do record.
+
+    Ids are matched as a MULTISET, one disk occurrence consumed per window row, not
+    as a set. ``meta`` on an inbound message is caller-supplied and an id is minted
+    only when one is *absent*, so a caller can post the same id twice. A set then
+    matches EVERY window row carrying that id, so the boundary walks past a row that
+    was never persisted and the response omits it — the silent-loss direction. One
+    disk row is enough for that; two disk rows sharing an id are not required.
+    Consuming an occurrence bounds the match to as many rows as really reached disk,
+    and the earliest window row is the persisted one because flushes follow window
+    order.
+
+    Only string ids are matched. A truthy non-string ``mid`` survives to disk for the
+    same caller-supplied reason and would raise ``TypeError`` if hashed.
+
+    The id path selects the owed rows by MEMBERSHIP rather than by a prefix
+    boundary. A boundary assumes every persisted row precedes every un-flushed one.
+    When it does not, a later match moves the boundary past an un-flushed row and
+    the response omits it — a drop, which is worse than the duplication this
+    function exists to prevent. Ending the walk at the first miss is not the
+    remedy either: a transient row is dropped by the save and so can never match,
+    and stopping there re-appends every persisted row after it. Rows the client does
+    not need are skipped outright (``_UNOWED_WINDOW_ROLES``), so selecting by
+    membership cannot surface one the boundary happened to exclude; a pending
+    ``permission`` row is deliberately not among them. Because an id in
+    the disk window region proves that row reached disk, the owed set is simply the
+    rows whose id did not, kept in window order. Where the persisted rows really
+    are a prefix this returns the same answer, so it is a strict generalisation.
+    """
+    if snapshot is None:
+        snapshot = _snapshot_slot_window(slot)
+    disk_older_count, window = snapshot
+    window_disk = all_msgs[disk_older_count:]
+    disk_mid_positions: dict[str, list[int]] = {}
+    every_row_has_an_id = bool(window_disk)
+    for i, m in enumerate(window_disk):
+        meta = m.get("meta")
+        mid = meta.get("mid") if isinstance(meta, dict) else None
+        if isinstance(mid, str) and mid:
+            disk_mid_positions.setdefault(mid, []).append(i)
+        else:
+            every_row_has_an_id = False
+    tail: list[dict]
+    if every_row_has_an_id:
+        # Membership, not a prefix boundary: see the docstring for why neither a
+        # boundary nor a break-on-miss is correct here.
+        #
+        # Owed rows are MERGED at their window position, not concatenated after the
+        # whole disk slice. Window order is authoritative and a persisted row can
+        # sit LATER in it than an owed one: _flush_segment pulls a stop_event out of
+        # the trailing chunk run and re-appends it AFTER the finalized assistant row
+        # (chat_runner.py:2686-2687), so a stop that reached disk during streaming
+        # follows a reply that is still owed. Appending owed rows last renders that
+        # pair inverted -- stop before the reply it belongs to.
+        #
+        # Every row here carries an id, so the position is derivable without the
+        # body matching the other arm needs. Persisted rows keep their disk order
+        # and none is dropped; each owed row is only INSERTED before the disk row of
+        # the next window row that reached disk, so this is additive.
+        owed_before: dict[int, list[dict]] = {}
+        pending: list[dict] = []
+        for m in window:
+            if m.get("role", "assistant") in _UNOWED_WINDOW_ROLES:
+                continue
+            if _is_answered_permission(m):
+                continue
+            meta = m.get("meta")
+            mid = meta.get("mid") if isinstance(meta, dict) else None
+            positions = disk_mid_positions.get(mid) if isinstance(mid, str) else None
+            if positions:
+                at = positions.pop(0)
+                if pending:
+                    owed_before.setdefault(at, []).extend(pending)
+                    pending = []
+                continue
+            pending.append(m)
+        if not owed_before and not pending:
+            return all_msgs
+        merged: list[dict] = list(all_msgs[:disk_older_count])
+        for i, m in enumerate(window_disk):
+            merged.extend(owed_before.get(i, ()))
+            merged.append(m)
+        merged.extend(pending)
+        return merged
+    else:
+        start = 0
+        d = min(disk_older_count, len(all_msgs))
+        # An owed row is one the disk slice does not already carry, and this arm walks
+        # the WHOLE window so that a single owed row cannot strand the rows behind it.
+        # There are two ways to be owed, and both route to ``owed_rows``:
+        #
+        #   1. A TRANSIENT role. A disk read omits transient roles entirely, so such a
+        #      row can NEVER be matched and is ALWAYS owed. Only ``_UNOWED_WINDOW_ROLES``
+        #      (``done``/``queued``) and an already-answered ``permission`` are genuinely
+        #      not owed.
+        #   2. A non-transient row the forward scan does not find on disk. This used to
+        #      ``break`` the loop outright, which left ``start`` pointing AT the unmatched
+        #      row, so ``window[start:]`` re-emitted every LATER window row -- including
+        #      rows already on disk. With a stop_event flushed before reply finalization
+        #      (``_flush_segment`` re-appends the stop AFTER the finalized assistant row,
+        #      see the note at the top of this function) the window reads
+        #      ``[... unflushed reply, flushed stop]``: the reply missed, the loop broke,
+        #      and the persisted stop came back a second time and out of order -- the
+        #      very duplication this function exists to remove.
+        #
+        # The sibling id-carrying arm above already has the right rule, so mirror it
+        # rather than inventing a second one: an unmatched row is held, a later match
+        # flushes what is held at ITS disk position, and leftovers stay in the tail.
+        # That keeps owed rows in window order instead of after the whole disk slice.
+        #
+        # Nothing is emitted twice: ``start`` only advances on a match, and a match flushes
+        # ``owed_rows`` first, so every flushed row had an index below ``start``. Whatever
+        # is left over sits at or after ``start`` and is carried by the trailing slice --
+        # but that slice needs the unowed/answered exclusions applied to it as well, for
+        # the reason recorded at the slice itself.
+        owed_at: dict[int, list[dict]] = {}
+        owed_rows: list[dict] = []
+        for i, m in enumerate(window):
+            role = m.get("role", "assistant")
+            if role in _TRANSIENT_ROLES:
+                if role not in _UNOWED_WINDOW_ROLES and not _is_answered_permission(m):
+                    owed_rows.append(m)
+                continue
+            body = m.get("content", "")
+            probe = d
+            while probe < len(all_msgs):
+                row = all_msgs[probe]
+                if row.get("role", "assistant") == role and _same_persisted_body(
+                    row.get("content", ""),
+                    body,
+                    role,
+                    row.get("ts", ""),
+                    m.get("ts", ""),
+                ):
+                    break
+                probe += 1
+            if probe >= len(all_msgs):
+                owed_rows.append(m)
+                continue
+            if owed_rows:
+                owed_at.setdefault(probe, []).extend(owed_rows)
+                owed_rows = []
+            d = probe + 1
+            start = i + 1
+        # ``start`` does NOT advance past an unowed row: such a row takes the
+        # ``_TRANSIENT_ROLES`` branch above, is correctly kept out of ``owed_rows`` by the
+        # guard there, and then ``continue``s -- skipping ``start = i + 1``. So a raw
+        # ``window[start:]`` re-admits any unowed row that TRAILS the last match, and the
+        # exclusion the guard performed is undone. The sibling arm does not have this hole
+        # because it applies both exclusions at the TOP of its loop, so its leftovers can
+        # never hold one. Apply the same two exclusions here, which is what actually
+        # mirrors it.
+        #
+        # Two symptoms, one cause. A trailing ``done`` reaches the bounded response and
+        # ``_prepare_messages`` then drops it while rendering (``chat_utils.py``), so a
+        # page whose only row is that ``done`` renders EMPTY and replaces the transcript.
+        # A trailing answered ``permission`` is instead re-ordered after every persisted
+        # row -- the misordering ``_is_answered_permission`` exists to prevent.
+        #
+        # ``chunk``/``streaming`` and a still-PENDING ``permission`` are genuinely owed and
+        # MUST survive this filter; narrowing it further would be the opposite defect.
+        tail = [
+            m
+            for m in window[start:]
+            if m.get("role", "assistant") not in _UNOWED_WINDOW_ROLES
+            and not _is_answered_permission(m)
+        ]
+        if not owed_at and not tail:
+            return all_msgs
+        merged_idless: list[dict] = []
+        for idx, row in enumerate(all_msgs):
+            merged_idless.extend(owed_at.get(idx, ()))
+            merged_idless.append(row)
+        merged_idless.extend(tail)
+        return merged_idless
+
+
 async def api_chat_slot_detail(request: web.Request) -> web.Response:
     """GET /api/chat/slots/{slot} — message history for a slot.
 
@@ -1069,6 +1553,96 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
             # Re-read the tail after the await: that suspension point lets a message
             # land mid-read, and the client replaces its list with this response.
             messages = older + list(slot.messages)
+        elif state.conversation_log:
+            # _disk_older_count == 0: the window is supposed to be the whole
+            # session. But disk can grow beyond the window (a concurrent writer,
+            # a foreign append, or a persistence race). Detect and include any
+            # rows the in-memory window is missing (#4373).
+            # Safety: skip when the slot has unflushed rows or pending rewrites.
+            _slot_idle = (
+                len(mem_msgs) <= getattr(slot, "_disk_window_len", 0)
+                and not getattr(slot, "_pending_rewrite", False)
+                and not getattr(slot, "_dirty_flag", False)
+            )
+            if _slot_idle:
+                history_key = slot_history_key(slot)
+                try:
+                    disk_msgs = await asyncio.to_thread(
+                        state.conversation_log.read_messages_chained, history_key
+                    )
+                except Exception:
+                    logger.warning(
+                        "read_messages_chained failed for %s", history_key, exc_info=True
+                    )
+                    disk_msgs = []
+                # Re-read after the await to capture anything that arrived mid-read.
+                current_mem = list(slot.messages)
+                # Post-await re-check: slot may have gained unflushed rows.
+                _slot_idle = (
+                    len(current_mem) <= getattr(slot, "_disk_window_len", 0)
+                    and not getattr(slot, "_pending_rewrite", False)
+                    and not getattr(slot, "_dirty_flag", False)
+                )
+                if _slot_idle and len(disk_msgs) > len(current_mem):
+                    # Validate alignment: if rotation shifted offsets, the disk
+                    # prefix no longer matches memory — skip reconciliation to
+                    # avoid appending the wrong slice (#4373 fix, GPT finding 2).
+                    _aligned = True
+                    if current_mem and disk_msgs:
+                        # Spot-check last memory row against its expected disk position.
+                        last_mem = current_mem[-1]
+                        disk_at = disk_msgs[len(current_mem) - 1] if len(current_mem) <= len(disk_msgs) else None
+                        if disk_at and (
+                            last_mem.get("ts", "") != disk_at.get("ts", "")
+                            or last_mem.get("role") != disk_at.get("role")
+                        ):
+                            _aligned = False
+                    if not _aligned:
+                        messages = current_mem
+                    else:
+                        # Disk has rows the window does not — reconcile by appending
+                        # the missing tail to the slot and returning the union.
+                        fresh = disk_msgs[len(current_mem):]
+                        for msg in fresh:
+                            role = msg.get("role", "assistant")
+                            cls = msg.get("cls") or (
+                                "msg msg-u" if role == "user" else "msg msg-a"
+                            )
+                            content = msg.get("content", "")
+                            if role != "user":
+                                content, _ = redact_exfiltration_urls(content)
+                                content, _ = redact_credentials(content)
+                            slot.append(
+                                role,
+                                content,
+                                cls,
+                                ts=msg.get("ts", ""),
+                                broadcast=False,
+                                meta=(
+                                    _redact_meta_for_role(role, msg["meta"])
+                                    if isinstance(msg.get("meta"), dict)
+                                    else None
+                                ),
+                            )
+                            carry_provenance(slot.messages[-1], msg)
+                            _attach_variants(slot, msg)
+                        # Replayed rows came from disk — drain the replay
+                        # frames and mark the window persisted (not dirty) so a
+                        # fork/SSE drain or the next save does not duplicate them.
+                        slot.drain()
+                        slot._resumed_count = len(slot.messages)
+                        slot._disk_window_len = len(slot.messages)
+                        slot._dirty = False
+                        # Use the full disk corpus (which includes the prefix
+                        # plus the reconciled tail) rather than slot.messages,
+                        # because slot.append may have trimmed the head under
+                        # _MAX_SLOT_MESSAGES — returning slot.messages alone
+                        # would lose older rows without signaling has_more.
+                        messages = disk_msgs
+                else:
+                    messages = current_mem
+            else:
+                messages = mem_msgs
         else:
             messages = mem_msgs
         total = len(messages)
@@ -1092,14 +1666,28 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
             logger.warning("read_messages_chained failed for %s", history_key, exc_info=True)
             all_msgs = []
         # Append any un-flushed in-memory tail messages beyond what's on disk.
-        # Use _disk_older_count to isolate current-session disk count, since
-        # chained disk includes older sessions that inflate disk_len.
-        mem_len = len(slot.messages)
-        disk_len = len(all_msgs)
-        current_session_disk = max(0, disk_len - slot._disk_older_count)
-        unflushed = mem_len - current_session_disk
-        if unflushed > 0:
-            all_msgs = list(all_msgs) + list(slot.messages[-unflushed:])
+        # Snapshot on the LOOP, after the disk read: the two reads inside the helper
+        # have no await between them, so a synchronous finalization cannot be caught
+        # half-done the way a worker thread can catch it.
+        tail_snapshot = _snapshot_slot_window(slot)
+        all_msgs = await asyncio.to_thread(
+            _append_unflushed_tail, slot, all_msgs, snapshot=tail_snapshot
+        )
+        # One row must mean one displayed message BEFORE `limit` is applied. The
+        # owed rows above can include `chunk`/`streaming`, and a segment still
+        # streaming is hundreds of rows that render as one message, so slicing
+        # first spends the caller's budget on rows the response will not carry
+        # and returns a mid-sentence fragment.
+        #
+        # Reduce the whole corpus, not a trailing slice: the helper places owed
+        # rows at the disk index they belong to, so they are not a contiguous
+        # suffix and a slice-scoped fold would miss the interleaved ones. In a
+        # thread for the same reason the append is -- whole-corpus work does not
+        # belong on the event loop.
+        #
+        # `done` is already excluded upstream (`_UNOWED_WINDOW_ROLES`), so on
+        # this path the reduction's remaining job is folding the chunk runs.
+        all_msgs = await asyncio.to_thread(_collapse_wire_rows, all_msgs)
         total = len(all_msgs)
         if before is not None:
             end = max(0, min(before, total))
@@ -1109,9 +1697,9 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
         messages = all_msgs[start:end]
         has_more = start > 0
         # The cursor the client should send next, in the RAW index space this
-        # slice was taken in. The client cannot derive it from the response: the
-        # returned rows are _prepare_messages output, which collapses chunk runs
-        # and drops done, so their count is not the span consumed here.
+        # slice was taken in. The client cannot derive it from the response:
+        # `_prepare_messages` drops `done`, so the returned row count is not
+        # the span consumed here.
         next_before = start
 
     # Snapshot every slot field the response needs BEFORE leaving the event
@@ -1440,24 +2028,84 @@ def _unblock_pending_waits(state: DashboardState, slot: _ChatSlot) -> None:
         logger.info("Stop: cancelled %d pending question(s) on slot %s", cancelled, slot.key)
 
 
-async def _reset_slot_session(state: DashboardState, slot: _ChatSlot, session_key: str) -> None:
+def _subagents_attached_response(
+    state: DashboardState, slot: _ChatSlot, session_key: str, operation: str
+) -> web.Response | None:
+    """409 while sub-agent children are attached to *session_key*, else None.
+
+    One guard for every endpoint whose action cannot coexist with children —
+    dispatching a new turn (continue) interleaves with their writes, and a
+    session teardown (reload) kills the shared runtime they run on. Two copies
+    of this block is how the probes diverge, and this one fails toward
+    discarding a child's work.
+
+    Three probes, none optional:
+
+    * `running_agents_for` on the true session key. QUEUED children count too:
+      a spawn that hit the concurrency/stagger gate is deliberately absent
+      from `_agents` (see `SubagentInfo.queued`), yet it WILL start on its own.
+    * IN-FLIGHT RESULT DELIVERY: the last child can finish — emptying both
+      probes — while its `[Subagent completion event]` injection is still
+      landing, and that injection needs both the transcript order and the
+      session it reports to. The runner's own synthesis gate pairs the same
+      conditions at both its call sites (chat_runner).
+    * Fail closed on a None running-probe: that is the probe FAILING, not a
+      slot with no children, and mistaking the two is exactly the hazard this
+      guard exists to prevent. Mirrors the stage gate in chat_orchestrator.
+    """
+    subs = getattr(state, "subagents", None)
+    if subs is None:
+        return None
+    running = subs.running_agents_for(session_key)
+    queued = 0
+    if running is not None:
+        try:
+            queued = subs._queued_depth(session_key)
+        except Exception:
+            # An unreadable queue is unknown children, not zero children.
+            logger.debug("%s: queued-depth probe failed", operation, exc_info=True)
+            queued = 1
+    inflight = getattr(slot, "_subagent_deliveries_inflight", 0)
+    if running is None or running or queued or inflight:
+        return web.json_response(
+            {"error": "sub-agents are running", "code": "slot_subagents_running"},
+            status=409,
+        )
+    return None
+
+
+async def _reset_slot_session(
+    state: DashboardState,
+    slot: _ChatSlot,
+    session_key: str,
+    *,
+    skip_if_busy: bool = False,
+) -> bool:
     """Reset a slot's agent session, releasing anything blocked on the old one.
 
     The switch handlers (agent, model, bulk model, reasoning effort, workspace)
-    reset the session so the next message starts under the new setting. That
-    tears down the agent process — but a pending ``ask_question`` lives in
-    dashboard state, not in the session, so without this it survives the reset:
-    the card stays on screen inviting an answer, and the blocked HTTP request
-    holds an MCP worker until its own timeout with no agent left to receive the
-    answer it eventually returns.
+    and the reload endpoint reset the session so the next message starts under
+    the new setting. That tears down the agent process — but a pending
+    ``ask_question`` lives in dashboard state, not in the session, so without
+    this it survives the reset: the card stays on screen inviting an answer,
+    and the blocked HTTP request holds an MCP worker until its own timeout with
+    no agent left to receive the answer it eventually returns.
 
     Routing every reset through one helper rather than adding a second call at
     each site is deliberate, and is the same reasoning as
-    :func:`_unblock_pending_waits`: five call sites each having to remember an
+    :func:`_unblock_pending_waits`: six call sites each having to remember an
     extra line is how one of them gets missed.
+
+    ``skip_if_busy`` forwards to :meth:`SessionManager.reset`, which evaluates
+    busyness atomically with the session pop; False means the reset was
+    declined or there was no live session to tear down. The unblock still runs
+    first even then: a wait can only be pending from a turn old enough to have
+    completed an LLM round-trip, and such a turn is visible to any caller's
+    has_active_turn() fast path — so a decline here implies a turn that started
+    microseconds ago, which cannot have posted a card yet.
     """
     _unblock_pending_waits(state, slot)
-    await state.sessions.reset(session_key)
+    return await state.sessions.reset(session_key, skip_if_busy=skip_if_busy)
 
 
 def _resolve_stop_event(slot: _ChatSlot, outcome: str) -> None:
@@ -1868,10 +2516,18 @@ async def api_chat_slot_continue(request: web.Request) -> web.Response:
     browser tab acting on a stale cache, would otherwise dispatch a duplicate
     turn against one slot — real tokens, real tool calls, real repo writes. Every
     other dispatch route guards the same way (see ``api_chat_slot_regenerate``).
+
+    NOT readiness-gated, and that is deliberate — see
+    ``kiro_readiness.reject_if_kiro_unverified``. Continue is an ordinary send: it
+    queues one synthetic message and lets the runner dispatch it, mutating nothing
+    durable up front, so the ACP attempt is its authority and a signed-out install
+    reports ``AcpAuthRequired`` in the transcript. Gating it instead put the
+    button behind a latch that is refreshed by re-probing ``kiro-cli``, and a
+    probe that merely TIMES OUT reads as signed-out: on a host where that probe is
+    slow the press was refused with a 503 forever while typing the same request by
+    hand worked. The unequal treatment of two paths that dispatch the same turn is
+    the bug; the transcript's own error card is the report either way.
     """
-    blocked = await reject_if_kiro_unverified(request)
-    if blocked is not None:
-        return blocked
     state: DashboardState = request.app["state"]
     name = request.match_info["slot"]
     slot = state._slots.get(name)
@@ -1944,45 +2600,16 @@ async def api_chat_slot_continue(request: web.Request) -> web.Response:
         # completion injections. `api_chat` queues instead of dispatching for the
         # same reason; Continue has nowhere to queue to, so it refuses.
         #
-        # Two things this must NOT get wrong, both of which look like a working
-        # guard right up until they lose a file write:
-        #
-        # * `effective_session_key`, never `f"dashboard:{slot.key}"`. A slot born
-        #   on a channel carries the channel key (`slack:<ts>`) and its children
-        #   register under THAT, so the dashboard-prefixed form silently matches
-        #   nothing — `_history_key_for`'s own docstring says as much.
-        # * QUEUED children count. A spawn that hit the concurrency/stagger gate
-        #   is deliberately absent from `_agents` (see `SubagentInfo.queued`), so
-        #   `running_agents_for` cannot see it, yet it WILL start on its own and
-        #   write concurrently with the turn this endpoint would dispatch.
-        # * IN-FLIGHT RESULT DELIVERY counts too. The last child can finish —
-        #   emptying both probes — while its `[Subagent completion event]`
-        #   injection is still landing. Starting a turn in that window interleaves
-        #   with the injection and corrupts transcript order. This is why the
-        #   runner's own synthesis gate pairs the two conditions at BOTH its call
-        #   sites (`chat_runner.py:2273` and `:2305`): `running_agents_for(...)`
-        #   alone is not "no children are touching this slot".
-        subs = getattr(state, "subagents", None)
-        if subs is not None:
-            child_key = effective_session_key(slot)
-            running = subs.running_agents_for(child_key)
-            # Fail closed on None: that is the probe FAILING, not a slot with no
-            # children, and mistaking the two dispatches the interleaved turn this
-            # guard exists to prevent. Mirrors the stage gate in chat_orchestrator.
-            queued = 0
-            if running is not None:
-                try:
-                    queued = subs._queued_depth(child_key)
-                except Exception:
-                    # An unreadable queue is unknown children, not zero children.
-                    logger.debug("continue: queued-depth probe failed", exc_info=True)
-                    queued = 1
-            inflight = getattr(slot, "_subagent_deliveries_inflight", 0)
-            if running is None or running or queued or inflight:
-                return web.json_response(
-                    {"error": "sub-agents are running", "code": "slot_subagents_running"},
-                    status=409,
-                )
+        # Children guard — see _subagents_attached_response for the three
+        # probes and why each is load-bearing. `effective_session_key`, never
+        # `f"dashboard:{slot.key}"`: a channel-born slot's children register
+        # under the channel key, and the dashboard-prefixed form silently
+        # matches nothing — `_history_key_for`'s own docstring says as much.
+        denied_409 = _subagents_attached_response(
+            state, slot, effective_session_key(slot), "continue"
+        )
+        if denied_409 is not None:
+            return denied_409
         if not _has_conversation(slot):
             return web.json_response(
                 {"error": "nothing to continue", "code": "slot_empty"}, status=409
@@ -2030,8 +2657,7 @@ def _has_conversation(slot: _ChatSlot) -> bool:
     cannot disagree about what counts as the conversation's floor.
     """
     for m in slot.messages:
-        meta = m.get("meta") or {}
-        if m.get("role") == "assistant" and meta.get("kind") == "compaction":
+        if is_system_notice(m.get("role"), m.get("meta")):
             continue
         if m.get("role") in ("user", "assistant") and m.get("content"):
             return True
@@ -2681,6 +3307,9 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
         )
     else:
         state._restricted_keys.discard(f"dashboard:{name}")
+        # Durable, so no rollback can retract this frame — a client pruning its
+        # per-slot cards on it can never be pruning a slot that comes back.
+        state.push_slots_update()
     # The app was already told, and compensated if the persist above failed — see
     # the notify block before the pop and the rollback in the except branch.
     # Kill the per-tab session to free resources
@@ -3347,6 +3976,97 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "reasoning_effort": effort})
 
 
+async def api_chat_slot_reload(request: web.Request) -> web.Response:
+    """POST /api/chat/slots/{slot}/reload -- relaunch the slot's agent process.
+
+    A live agent process mounts its MCP servers and builds its tool table once,
+    at session-init time; config that changes afterwards (a newly added MCP
+    server, an env or agent-spec fix) never reaches it. Reload is the in-place
+    remedy: tear the process down exactly like the agent/workspace switch
+    handlers do, then eagerly re-arm the resume spawn, so the relaunched
+    process re-reads its agent spec and environment and re-initializes MCP
+    servers via session/load -- with the conversation preserved.
+
+    Refused with 409 while a turn is in flight (killing an in-flight ACP
+    process orphans the streaming prompt: resume refusals, empty responses)
+    and while sub-agent children are attached (their shared runtime is torn
+    down with the parent session -- see ``SessionManager.reset`` -- so a
+    reload under a working child silently discards its work). The
+    has_active_turn() check is a best-effort fast path; the authoritative
+    guard is the reset's skip_if_busy, which evaluates busyness atomically
+    with the session pop (see _reset_slot_session for why the unblock half of
+    the chokepoint is safe even when the guard declines).
+    """
+    state: DashboardState = request.app["state"]
+    name = request.match_info["slot"]
+    slot = state._slots.get(name)
+    if not slot:
+        return web.json_response(
+            {"error": "not found", "code": "slot_not_found"}, status=404
+        )
+    # The session the reload will tear down. ``effective_session_key``, never
+    # ``_history_key_for``: a channel- or cron-born slot runs its turns under
+    # its linked key, and the dashboard-prefixed spelling names a session that
+    # never existed -- the reset would "succeed" against nothing while the
+    # live process kept its stale config.
+    session_key = effective_session_key(slot)
+    # App isolation, same policy as the cancel routes: reload is a teardown,
+    # so an app token must own both the slot and the session the teardown
+    # lands on, and a denial is indistinguishable from a missing slot.
+    denied = _app_cancel_denied(request, slot, "chat.slot_reload", session_key)
+    if denied is not None:
+        return denied
+    provider = state.sessions.get_provider(session_key)
+    if provider is not None and provider.has_active_turn():
+        return web.json_response(
+            {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+        )
+    # Children guard, shared with api_chat_slot_continue: RUNNING children die
+    # with the parent runtime, and _subagents_attached_response documents why
+    # queued children and in-flight deliveries count too.
+    denied_409 = _subagents_attached_response(state, slot, session_key, "reload")
+    if denied_409 is not None:
+        return denied_409
+    reloaded = await _reset_slot_session(state, slot, session_key, skip_if_busy=True)
+    if not reloaded:
+        provider = state.sessions.get_provider(session_key)
+        if provider is not None and provider.has_active_turn():
+            return web.json_response(
+                {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+            )
+        if provider is not None:
+            # A turn slipped into the guard window and already FINISHED: the
+            # declined reset left a live idle session untouched, and falling
+            # through would report success while the stale process survives --
+            # the silent failure this endpoint exists to prevent. Retry once;
+            # a second decline means another turn is genuinely racing, which
+            # is the turn-in-flight case.
+            reloaded = await _reset_slot_session(
+                state, slot, session_key, skip_if_busy=True
+            )
+            if not reloaded:
+                return web.json_response(
+                    {"error": "a turn is in flight", "code": "turn_in_flight"},
+                    status=409,
+                )
+    logger.info("Slot %s session reloaded (had_live_session=%s)", name, reloaded)
+    # Feed notice: the visible confirmation (and the durable record) that the
+    # relaunch happened. Tagged so the last-real-message scans skip it on both
+    # sides (is_system_notice here, isSystemNoticeKind on the frontend).
+    # append() itself broadcasts the row -- with the per-row ``mid`` identity
+    # clients dedupe on -- so an explicit broadcast here would deliver the
+    # notice twice.
+    slot.append(
+        "assistant", _SESSION_RELOAD_NOTICE, "msg msg-a",
+        meta={"kind": SESSION_RELOAD_KIND},
+    )
+    # Respawn + session/load now rather than on the next message, so the fresh
+    # process (and its rebuilt toolset) is ready when the user comes back.
+    schedule_eager_spawn(state, slot, allow_resume=True)
+    state.push_slots_update()
+    return web.json_response({"ok": True})
+
+
 async def api_chat_slot_workspace(request: web.Request) -> web.Response:
     """POST /api/chat/slots/{slot}/workspace — set workspace for a chat slot."""
     state: DashboardState = request.app["state"]
@@ -3684,6 +4404,128 @@ async def api_recent_projects(request: web.Request) -> web.Response:
     return web.json_response({"dirs": dirs})
 
 
+async def _reconcile_slot_window(
+    state: DashboardState, slot: "_ChatSlot"
+) -> None:
+    """Detect and reconcile stale in-memory window from disk.
+
+    A live slot's window can fall behind disk when messages are written to the
+    session file by a path that does not (or cannot) also push into the
+    in-memory window — e.g. a concurrent subagent flush, a channel-origin
+    append, or a persistence race during heavy traffic.
+
+    This function compares the slot's believed disk coverage
+    (``_disk_older_count + len(messages)``) against the actual on-disk message
+    count. If disk has grown beyond what the slot accounts for, the missing
+    tail is read and appended to the in-memory window, making the next detail
+    or resume response self-healing on refresh.
+
+    Safety: skips reconciliation when the slot has unflushed in-memory rows
+    beyond what the last save persisted (``len(messages) > _disk_window_len``),
+    because a concurrent flush could persist those rows between the
+    ``represented`` snapshot and the disk read, leading to a duplicate
+    append. Re-validates after the await to guard against appends that landed
+    during the disk read.
+    """
+    if not state.conversation_log:
+        return
+    # Safety gate: do not reconcile a slot that has in-memory rows the last
+    # flush has not yet persisted, or that is mid-rewind, or that has unsaved
+    # in-place edits (dirty) — clearing dirty at the end would erase the edit.
+    if len(slot.messages) > getattr(slot, "_disk_window_len", 0):
+        return
+    if getattr(slot, "_pending_rewrite", False):
+        return
+    if getattr(slot, "_dirty_flag", False):
+        return
+    history_key = slot_history_key(slot)
+    represented = (getattr(slot, "_disk_older_count", 0) or 0) + len(slot.messages)
+    try:
+        disk_msgs = await asyncio.to_thread(
+            state.conversation_log.read_messages_chained, history_key
+        )
+    except Exception:
+        logger.warning(
+            "reconcile: read_messages_chained failed for %s", history_key, exc_info=True
+        )
+        return
+    disk_total = len(disk_msgs)
+    if disk_total <= represented:
+        return
+    # Post-await safety: the slot may have received appends (and a flush) while
+    # we were reading disk. Re-check and recompute represented to avoid
+    # duplicating rows that arrived during the await.
+    if len(slot.messages) > getattr(slot, "_disk_window_len", 0):
+        return
+    if getattr(slot, "_pending_rewrite", False):
+        return
+    if getattr(slot, "_dirty_flag", False):
+        return
+    represented = (getattr(slot, "_disk_older_count", 0) or 0) + len(slot.messages)
+    if disk_total <= represented:
+        return
+    # Validate alignment: if transcript rotation shifted offsets, the disk
+    # prefix no longer matches memory — abort to avoid appending wrong rows.
+    # The slot's window starts at disk offset _disk_older_count, so we compare
+    # the last memory row against its expected position on disk.
+    disk_older = getattr(slot, "_disk_older_count", 0) or 0
+    if slot.messages and (disk_older + len(slot.messages)) <= len(disk_msgs):
+        last_mem = slot.messages[-1]
+        expected_pos = disk_older + len(slot.messages) - 1
+        disk_at = disk_msgs[expected_pos]
+        if (
+            last_mem.get("ts", "") != disk_at.get("ts", "")
+            or last_mem.get("role") != disk_at.get("role")
+        ):
+            logger.info(
+                "reconcile: slot %s alignment mismatch at offset %d — skipping "
+                "(possible transcript rotation)",
+                slot.key,
+                expected_pos,
+            )
+            return
+    # Disk has rows the slot does not know about — append the tail.
+    fresh = disk_msgs[represented:]
+    logger.info(
+        "reconcile: slot %s has %d messages in memory + %d older on disk = %d represented, "
+        "but disk has %d; appending %d missing rows",
+        slot.key,
+        len(slot.messages),
+        getattr(slot, "_disk_older_count", 0) or 0,
+        represented,
+        disk_total,
+        len(fresh),
+    )
+    for msg in fresh:
+        role = msg.get("role", "assistant")
+        cls = msg.get("cls") or ("msg msg-u" if role == "user" else "msg msg-a")
+        content = msg.get("content", "")
+        if role != "user":
+            content, _ = redact_exfiltration_urls(content)
+            content, _ = redact_credentials(content)
+        slot.append(
+            role,
+            content,
+            cls,
+            ts=msg.get("ts", ""),
+            broadcast=False,
+            meta=(
+                _redact_meta_for_role(role, msg["meta"])
+                if isinstance(msg.get("meta"), dict)
+                else None
+            ),
+        )
+        carry_provenance(slot.messages[-1], msg)
+        _attach_variants(slot, msg)
+    # The appended rows came from the file, so drain the replay frames and
+    # mark the window as persisted (not dirty) — the next save must not
+    # re-serialize them, and a fork/SSE drain must not treat them as new.
+    slot.drain()
+    slot._resumed_count = len(slot.messages)
+    slot._disk_window_len = len(slot.messages)
+    slot._dirty = False
+
+
 def _resume_session_identity(state: DashboardState, history_key: str) -> str:
     """The session a transcript runs under, spelled as a slot spells its own.
 
@@ -3762,8 +4604,27 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
                     error="app does not own this slot",
                 )
                 return web.json_response({"error": "not found"}, status=404)
-        total = len(existing.messages)
-        recent = existing.messages[-200:] if total > 200 else existing.messages
+        # Reconcile: if disk grew beyond what the in-memory window covers,
+        # append the missing tail so a page refresh self-heals (#4373).
+        await _reconcile_slot_window(state, existing)
+        # Reduce the wire-only rows before bounding, for the same reason the
+        # detail handler does: a segment still streaming is hundreds of `chunk`
+        # rows that render as one message, so a raw 200-row bound over the live
+        # window can be filled entirely by one unfinished reply -- and it then
+        # returns only that window's slice of the reply, dropping the text
+        # ahead of it. Reducing first makes the bound, `total` and the cursor
+        # below all count displayed messages.
+        #
+        # It also puts the cursor's two terms in the same unit: persisted rows
+        # carry no wire-only role, so `_disk_older_count` is already a message
+        # count, while a raw window length is not.
+        #
+        # O(window) on the event loop, and the window is capped -- the
+        # `_prepare_messages` redaction pass on the next line is the larger
+        # cost at this call site either way.
+        window = _collapse_wire_rows(existing.messages)
+        total = len(window)
+        recent = window[-200:] if total > 200 else window
         prepared = _prepare_messages(recent, existing.running)
         # Raw index this window starts at: the frozen on-disk prefix plus the
         # in-memory rows it skipped. has_more is derived from the same number so
@@ -3875,6 +4736,9 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
         slot.pinned = True
     if meta.get("color_index") is not None:
         slot.color_index = meta["color_index"]
+    _ch = meta.get("color_hex")
+    if isinstance(_ch, str) and COLOR_HEX_RE.match(_ch):
+        slot.color_hex = _ch.lower()
     if meta.get("color_theme"):
         slot.color_theme = meta["color_theme"]
         slot.theme_consent = meta.get("theme_consent") is True
@@ -3995,6 +4859,26 @@ async def api_chat_mode(request: web.Request) -> web.Response:
     mode = body.get("mode", "normal")
     slot_key = body.get("slot") or None
 
+    # The safety override (YOLO) is PROCESS-GLOBAL while an approval mode is
+    # per-slot, so revoking it on behalf of a request that named ONE slot drops
+    # every OTHER slot out of YOLO too. That is how a programmatic per-slot
+    # `trust` — the call an automation makes when it creates a session — silently
+    # ends an operator's live grant minutes after they enabled it.
+    #
+    # A slot-scoped `trust`/`trust_reads` therefore leaves the grant alone: it
+    # asks for auto-approval on one slot and cannot be answered by withdrawing
+    # authority elsewhere. Everything else still revokes, so `normal` remains the
+    # off-switch at any scope and the dashboard picker (which always names its own
+    # slot) keeps working.
+    #
+    # A grant DECLARED in owner-only config is exempt from the narrowing: it has
+    # no TTL, and selecting another approval mode is the one action documented to
+    # end it. Identity is the grant's source, never its permanence — an
+    # `until_shutdown` ad-hoc pick is equally permanent and must stay protected.
+    slot_scoped_trust = slot_key is not None and mode in _SLOT_SCOPED_TRUST_MODES
+    if mode != "yolo" and (not slot_scoped_trust or safety_override().is_declared):
+        safety_override().deactivate("dashboard")
+
     if mode == "yolo":
         result = await asyncio.to_thread(safety_override().activate, "dashboard")
         if not result.active:
@@ -4012,7 +4896,6 @@ async def api_chat_mode(request: web.Request) -> web.Response:
         except Exception:
             logger.warning("SEL audit failed for YOLO mode activation", exc_info=True)
     elif mode == "trust_reads":
-        safety_override().deactivate("dashboard")
         if slot_key and slot_key in state._slots:
             state._slots[slot_key]._trust = False
             state._slots[slot_key]._trust_reads = True
@@ -4032,7 +4915,6 @@ async def api_chat_mode(request: web.Request) -> web.Response:
         except Exception:
             logger.warning("SEL audit failed for trust_reads mode activation", exc_info=True)
     elif mode == "trust":
-        safety_override().deactivate("dashboard")
         mgr = getattr(state, "channel_manager", None)
         if slot_key is not None:
             if slot_key not in state._slots:
@@ -4065,7 +4947,6 @@ async def api_chat_mode(request: web.Request) -> web.Response:
         except Exception:
             logger.warning("SEL audit failed for trust mode activation", exc_info=True)
     else:  # normal
-        safety_override().deactivate("dashboard")
         mgr = getattr(state, "channel_manager", None)
         if slot_key is not None:
             if slot_key not in state._slots:
@@ -4354,7 +5235,16 @@ MAX_COLOR_INDEX = 20
 
 
 async def api_chat_slot_color(request: web.Request) -> web.Response:
-    """PATCH /api/chat/slots/{slot}/color — set session color."""
+    """PATCH /api/chat/slots/{slot}/color — set session color.
+
+    Accepts ``color_index`` (int 0..MAX_COLOR_INDEX or null, resolved
+    client-side against the viewer's generated palette) and/or ``color_hex``
+    (``#rrggbb`` or null, a theme-independent custom color). The two are
+    mutually exclusive: setting a non-null value for one clears the other, so
+    a slot can never carry both and clients need no precedence rule. Keys are
+    ``in body``-gated so an old client sending only ``color_index`` cannot
+    silently null an existing hex.
+    """
     state: DashboardState = request.app["state"]
     name = request.match_info["slot"]
     slot = state._slots.get(name)
@@ -4364,6 +5254,8 @@ async def api_chat_slot_color(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
+    has_ci = "color_index" in body
+    has_ch = "color_hex" in body
     ci = body.get("color_index")
     if ci is not None and (
         isinstance(ci, bool) or not isinstance(ci, int) or ci < 0 or ci > MAX_COLOR_INDEX
@@ -4372,10 +5264,25 @@ async def api_chat_slot_color(request: web.Request) -> web.Response:
             {"error": f"color_index must be a non-negative integer <= {MAX_COLOR_INDEX} or null"},
             status=400,
         )
-    slot.color_index = ci
+    ch = body.get("color_hex")
+    if ch is not None and (not isinstance(ch, str) or not COLOR_HEX_RE.match(ch)):
+        return web.json_response(
+            {"error": "color_hex must be #RRGGBB or null", "code": "invalid_color_hex"},
+            status=400,
+        )
+    if has_ci:
+        slot.color_index = ci
+        if ci is not None:
+            slot.color_hex = None
+    if has_ch:
+        slot.color_hex = ch.lower() if isinstance(ch, str) else None
+        if ch is not None:
+            slot.color_index = None
     slot._dirty = True
     state.push_slots_update()
-    return web.json_response({"ok": True, "color_index": ci})
+    return web.json_response(
+        {"ok": True, "color_index": slot.color_index, "color_hex": slot.color_hex}
+    )
 
 
 _MAX_CONTEXT_PER_SOURCE = 10

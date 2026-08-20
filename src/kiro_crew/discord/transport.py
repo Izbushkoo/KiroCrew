@@ -10,9 +10,9 @@ Dependency direction is ``discord -> messaging`` (allowed); the neutral
 
 Security: :meth:`authorize` is **deny-by-default**. A Discord bot can be DM'd
 by anyone who shares a server with it, so an empty ``allowed_user_ids`` MUST
-authorize nobody. Guild traffic additionally requires an exact thread-ID
-allow-list match and a Discord-confirmed thread channel type; normal guild
-channels are always denied.
+authorize nobody. Guild traffic additionally requires either an exact thread-ID
+allow-list match or an approved channel whose message can be promoted into a
+new thread; turns never run directly in a normal guild channel.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from kiro_crew.discord.client import (
     DiscordClient,
     DiscordInbound,
 )
+from kiro_crew.messaging.identity import channel_inbound_permitted
 from kiro_crew.messaging.transport import (
     ConfiguredChannelTarget,
     InboundMessage,
@@ -93,13 +94,25 @@ class DiscordTransport(MessagingTransport):
         *,
         allowed_user_ids: Iterable[str] = (),
         allowed_thread_ids: Iterable[str] = (),
+        allowed_channel_ids: Iterable[str] = (),
+        auto_thread: bool = True,
+        on_thread_created: Callable[[str], None] | None = None,
         dispatch: DispatchFn | None = None,
     ) -> None:
         self._client = client
         # Deny-by-default: freeze both allow-lists as snowflake strings so they
         # cannot mutate under an in-flight authorization decision.
         self._allowed: frozenset[str] = frozenset(str(u) for u in allowed_user_ids)
-        self._allowed_threads: frozenset[str] = frozenset(str(t) for t in allowed_thread_ids)
+        # Mutable: an approved user's message in an allowed channel can promote
+        # itself into a brand-new thread at runtime (see ``receive`` below), and
+        # that thread must immediately become valid for the user's own follow-up
+        # replies -- not just for button interactions (tracked separately on the
+        # dispatcher's own allow-set). A frozenset here would silently strand
+        # every reply the user sends into the thread the bot just created.
+        self._allowed_threads: set[str] = {str(t) for t in allowed_thread_ids}
+        self._allowed_channels: frozenset[str] = frozenset(str(c) for c in allowed_channel_ids)
+        self._auto_thread = auto_thread
+        self._on_thread_created = on_thread_created
         self._dispatch = dispatch
         self.capabilities = DISCORD_CAPABILITIES
 
@@ -203,13 +216,66 @@ class DiscordTransport(MessagingTransport):
         if not inbound.text and not inbound.attachments:
             return
         thread_id: str | None = None
+        conversation_id = inbound.channel_id
         if inbound.guild_id:
             # Discord's guild intents deliver every visible channel message.
             # Unrelated chatter is expected background traffic, not a security
             # event: discard it silently unless an approved user tried to use
             # an unapproved thread. Messages in configured threads still pass
             # through the normal user authorization audit below.
-            if inbound.channel_id not in self._allowed_threads:
+            if inbound.channel_id in self._allowed_channels:
+                if inbound.user_id not in self._allowed:
+                    # Reuse the normal denial audit without creating a shared
+                    # channel thread for an unauthorized sender.
+                    self.authorize(
+                        DiscordInboundMessage(
+                            channel_type="discord",
+                            user_id=inbound.user_id,
+                            conversation_id=inbound.channel_id,
+                            text=inbound.text,
+                        )
+                    )
+                    return
+                if not self._auto_thread or not inbound.message_id:
+                    return
+                # Re-check the same runtime channels-governance gate that
+                # ``DiscordDispatcher.handle_message`` enforces, but *before* the
+                # REST call below: creating the thread is itself a visible,
+                # irreversible side effect (a real public thread appears in the
+                # server), so a policy that denies Discord inbound after connect
+                # must stop it from happening at all -- not just stop the turn
+                # that would have followed it.
+                if not await channel_inbound_permitted("discord"):
+                    sel().log_api_access(
+                        caller=inbound.user_id,
+                        operation="discord_transport.receive",
+                        outcome="denied_by_channels_governance",
+                        source="discord",
+                    )
+                    return
+                title = " ".join(inbound.text.split())[:90] or "Kiro Crew"
+                created = await self._client.create_thread_from_message(
+                    inbound.channel_id, inbound.message_id, title
+                )
+                if not created:
+                    sel().log_api_access(
+                        caller=inbound.user_id,
+                        operation="discord_transport.receive",
+                        outcome="thread_create_failed",
+                        source="discord",
+                    )
+                    return
+                thread_id = created
+                conversation_id = created
+                # Authorize the thread transport-side FIRST: this is the set
+                # ``receive`` itself checks for every subsequent message
+                # (`elif inbound.channel_id not in self._allowed_threads` below).
+                # The dispatcher's own copy (button interactions) is updated via
+                # the callback right after.
+                self._allowed_threads.add(created)
+                if self._on_thread_created is not None:
+                    self._on_thread_created(created)
+            elif inbound.channel_id not in self._allowed_threads:
                 if inbound.user_id in self._allowed:
                     sel().log_api_access(
                         caller=inbound.user_id,
@@ -218,11 +284,12 @@ class DiscordTransport(MessagingTransport):
                         source="discord",
                     )
                 return
-            thread_id = inbound.channel_id
+            else:
+                thread_id = inbound.channel_id
         msg = DiscordInboundMessage(
             channel_type="discord",
             user_id=inbound.user_id,
-            conversation_id=inbound.channel_id,
+            conversation_id=conversation_id,
             text=inbound.text,
             thread_id=thread_id,
             message_id=inbound.message_id,

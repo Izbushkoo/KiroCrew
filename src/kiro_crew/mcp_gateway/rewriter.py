@@ -38,6 +38,7 @@ from kiro_crew import __version__, platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
 from kiro_crew.env import spec_env_path, spec_path_key
+from kiro_crew.mcp_gateway import STUB_MODULE
 from kiro_crew.mcp_gateway.hashing import hash_command, is_secret_env_key
 from kiro_crew.mcp_gateway.manager import is_credential_env_key
 from kiro_crew.mcp_utils import mcp_server_alias
@@ -120,7 +121,10 @@ _TARGET_ARGS_SEP = "|"
 #: launch time because kiro-cli strips env when it spawns MCP
 #: subprocesses, so neither a propagated var nor a ``python3`` on PATH
 #: that can import ``kiro_crew`` is guaranteed.
-_STUB_MODULE = "kiro_crew.mcp_gateway.stub"
+#:
+#: Aliased from the package constant so the launch line and the cmdline
+#: fingerprint the Sessions surface counts stubs by cannot drift apart.
+_STUB_MODULE = STUB_MODULE
 
 
 def _resolve_target_command(
@@ -211,6 +215,12 @@ def _withheld_env_count(entry_env: dict[str, Any], forward_env: bool) -> int:
     disagree on their values) and the daemon's own credential-scrub set —
     mirroring ``gatewayd._declared_non_secret_env`` exactly, so this
     classifier never promises an env the forwarder will refuse to apply.
+
+    That mirror is load-bearing BECAUSE of the default flip: with forwarding off
+    this function short-circuits on ``len(entry_env)`` and the forwarder is never
+    consulted, so the two could not disagree. With forwarding on they must agree
+    key for key, which ``test_the_eligibility_count_matches_the_forwarder``
+    pins by construction.
     """
     if not forward_env:
         return len(entry_env)
@@ -1640,12 +1650,13 @@ def env_sidecar_name(agent_name: str, server_name: str) -> str:
 
 
 def forward_declared_env_enabled() -> bool:
-    """Return ``mcp_gateway.forward_declared_env`` (default ``False``).
+    """Return ``mcp_gateway.forward_declared_env`` (default ``True``).
 
     Function-local config import: ``config.loader`` imports THIS module at its
     own module top level, so a top-level import here would be circular. Mirrors
     ``backend._mcp_apps_enabled``. Fails CLOSED — an unreadable config means the
-    declared env is not forwarded.
+    declared env is not forwarded, which also leaves the server unwrapped rather
+    than pooling it without the env it declares.
     """
     try:
         # circular import: config.loader imports THIS module at its own top level

@@ -8,7 +8,6 @@ import hmac as _hmac_mod
 import json
 import os
 import sys
-import tempfile
 import textwrap
 import threading
 import time
@@ -18,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yarl
 from aiohttp import web  # noqa: F401  (used by builtin re-shell tests)
 from aiohttp.test_utils import TestClient, TestServer  # noqa: F401
 
@@ -1019,52 +1019,82 @@ async def _run_sync(mod, locked):
             result = await mod._sync_start_locked()
     mod._UPSTREAM_REMOTE = None
     script = mock_start.call_args[0][1][2] if mock_start.call_args else None
+    # Stubbing _start_run also stubs out its `finally` cleanup, so anything the
+    # sync staged for removal (the dependency-only path snapshots dep_sync into a
+    # temp dir) would outlive the test. Remove exactly what it registered, in the
+    # order it registered it — file before directory.
+    if mock_start.call_args:
+        for path in mock_start.call_args.kwargs.get("cleanup_paths") or []:
+            try:
+                os.unlink(path)
+            except OSError:
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    pass
     return result, script
 
 
 @pytest.mark.asyncio
-async def test_sync_refuses_entirely_when_a_console_script_is_locked():
-    """Nothing may run — not even fetch/merge.
+async def test_sync_substitutes_a_dependency_only_install_when_a_script_is_locked():
+    """The sync proceeds; only the editable reinstall is swapped out.
 
-    pip cannot replace the locked binary, and merging anyway is not a safe
-    consolation prize: a revision that adds a dependency would land with that
-    dependency absent, the run would report success, and the next restart would
-    fail to import it. Leaving the checkout on a revision whose dependencies are
-    satisfied is the only outcome that cannot brick the gateway.
+    pip cannot replace the locked wrapper, but it does not have to. An editable
+    install serves source straight from ``src``, so the merge alone makes the new
+    revision live; the only thing the reinstall was still buying is a dependency
+    the revision added, and installing a dependency never touches the project's
+    own console script. Refusing the whole sync instead left the single-checkout
+    Windows layout — the ordinary one — with no working Pull+build at all.
     """
     import kiro_crew.apps.builtins.dev_fleet.server as mod
+    from kiro_crew.apps.builtins.dev_fleet import dep_sync
 
     result, script = await _run_sync(mod, [r"C:\repo\.venv\Scripts\kirocrew.exe"])
 
-    assert result["ok"] is False
-    # No run was started at all, so fetch/merge never happened.
-    assert script is None
-    err = result["error"]
-    assert "kirocrew.exe" in err          # names the blocker
-    assert "pip install -e" in err        # and the remedy
-    assert "Stop the gateway" in err
+    assert result["ok"] is True
+    # A run was started, so fetch and merge do happen.
+    assert script is not None
+    # Steps are JSON-embedded in the generated script, so quotes arrive escaped;
+    # comparing against a de-escaped copy keeps these assertions independent of
+    # how many encoding layers the script generator happens to use.
+    flat = script.replace("\\", "")
+    assert "dep_sync.py" in flat
+    assert '"-e"' not in flat
+    # It must NOT be run as `-m kiro_crew...dep_sync`. That would import the
+    # module from the working tree after the merge has landed, pulling the whole
+    # package __init__ chain with it, so a revision that raises the
+    # `requires-python` floor with newer syntax would SyntaxError while being
+    # parsed and the floor refusal written for that revision could never run.
+    assert dep_sync.__name__ not in flat
+    assert '"-m"' not in flat.split('"merge"', 1)[1]
+    # The file it runs is a snapshot taken BEFORE the merge, so it lives outside
+    # the checkout being synced.
+    assert r"C:repo\dep_sync.py" not in flat
+    # ORDER MATTERS, and it is the SAME order the reinstall it replaces uses:
+    # fetch -> merge -> install. Installing first would need the merge to be
+    # proven impossible to fail, which cannot be done completely; a failed install
+    # after a landed merge is exactly what the reinstall path already does.
+    assert flat.index('"merge"') < flat.index("dep_sync.py")
 
 
 @pytest.mark.asyncio
-async def test_refusal_remedy_is_cwd_independent_and_quoted():
-    """The suggested command must not depend on where it is pasted.
+async def test_sync_keeps_the_editable_reinstall_when_nothing_is_locked():
+    """A venv this gateway is NOT served by must still get the real reinstall.
 
-    `-e .` resolves against the terminal's cwd, and this project is normally
-    checked out as several worktrees at once — so the same line copied from a
-    feature worktree would install THAT tree into the primary venv and repoint
-    its editable install away from the primary checkout. Both paths are also
-    quoted, because a Windows home directory routinely contains a space.
+    The substitution is a concession to a lock, not an improvement to prefer: it
+    cannot refresh a console script, so anywhere pip can do the whole job, it
+    should.
     """
     import kiro_crew.apps.builtins.dev_fleet.server as mod
+    from kiro_crew.apps.builtins.dev_fleet import dep_sync
 
-    result, _ = await _run_sync(mod, [r"C:\repo\.venv\Scripts\kirocrew.exe"])
-    err = result["error"]
+    result, script = await _run_sync(mod, [])
 
-    # The install target is named explicitly, never left to the shell's cwd —
-    # including in the prose, so the message never shows the misleading form.
-    assert "pip install -e ." not in err
-    assert f'pip install -e "{_SYNC_REPO}"' in err
-    assert f'git -C "{_SYNC_REPO}"' in err
+    assert result["ok"] is True
+    flat = script.replace("\\", "")
+    assert '"-e"' in flat
+    assert dep_sync.__name__ not in flat
+    assert "dep_sync.py" not in flat
 
 
 @pytest.mark.asyncio
@@ -2675,6 +2705,43 @@ async def test_hmac_health_bypasses_verification():
             assert body["status"] == "ok"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wire_target",
+    [
+        "/api/fleet?name=my%20worktree",  # space
+        "/api/fleet?name=caf%C3%A9",  # non-ASCII
+        "/api/fleet?name=a+b",  # '+' (decodes to space in query)
+    ],
+)
+async def test_hmac_gateway_signed_escapable_query_passes(wire_target: str):
+    """The gateway signs the RAW percent-encoded request-target; the middleware
+    must recompute over the same wire bytes, not aiohttp's decoded
+    path + query_string reconstruction, or every escapable query value 401s."""
+    secret = "test-secret"
+    app = _make_hmac_app()
+    with patch.object(mod, "_load_app_secret", return_value=secret):
+        async with TestClient(TestServer(app)) as client:
+            headers = _sign_request(secret, "GET", wire_target)
+            # encoded=True keeps the exact signed bytes on the wire, mirroring
+            # the gateway's yarl.URL(..., encoded=True) forwarding.
+            resp = await client.get(yarl.URL(wire_target, encoded=True), headers=headers)
+            assert resp.status == 200, await resp.text()
+
+
+@pytest.mark.asyncio
+async def test_hmac_gateway_signed_no_query_target_passes():
+    """Without a query string neither side appends a '?' — raw and decoded
+    spellings coincide and the signature must still verify."""
+    secret = "test-secret"
+    app = _make_hmac_app()
+    with patch.object(mod, "_load_app_secret", return_value=secret):
+        async with TestClient(TestServer(app)) as client:
+            headers = _sign_request(secret, "GET", "/api/fleet")
+            resp = await client.get("/api/fleet", headers=headers)
+            assert resp.status == 200, await resp.text()
+
+
 # =============================================================================
 # R35(b): worktree removal verdict_oid gate
 # =============================================================================
@@ -3359,7 +3426,7 @@ def _mk_make_live_wt(tmp_path, *, venv: bool = False, dist: bool = False,
     return wt
 
 
-def _assert_sandboxed(path, what: str) -> None:
+def _assert_sandboxed(path, what: str, sandbox_root) -> None:
     """Fail loudly when a host-mutating make-live seam resolves outside the sandbox.
 
     The seams below decide WHERE the cutover writes and WHAT it executes. If one is
@@ -3368,10 +3435,17 @@ def _assert_sandboxed(path, what: str) -> None:
     drop-in to point at a pytest tmpdir and restarts the unit, which then fails
     203/EXEC on every boot once the tmpdir is reaped. Asserting containment here
     makes the next missed seam fail inside the test instead of taking down the host.
+
+    *sandbox_root* is THIS test's own directory, not a generic temp root. The
+    distinction is the whole strength of the check: "somewhere under the system temp
+    dir" is satisfied by any tmp path at all, whereas "inside the tree this test
+    built" is satisfied only by the redirect actually taking effect. It also stops the
+    assertion depending on where ``tempfile`` happens to be rooted, which the suite's
+    isolation floor now controls.
     """
     resolved = Path(path).resolve()
-    tmp_root = Path(tempfile.gettempdir()).resolve()
-    assert tmp_root in resolved.parents, (
+    root = Path(sandbox_root).resolve()
+    assert root == resolved or root in resolved.parents, (
         f"{what} resolved OUTSIDE the temp sandbox: {resolved}. A test that reaches "
         f"the cutover path must never touch a real host path."
     )
@@ -3416,15 +3490,14 @@ def _stub_make_live(monkeypatch, wt, *, live=None, in_pod=False, unit_status="ok
     monkeypatch.setattr(mod, "_live_worktree_path", AsyncMock(return_value=live))
     monkeypatch.setattr(mod, "_in_pod", lambda: in_pod)
     monkeypatch.setattr(mod, "_live_user_unit_status", AsyncMock(return_value=unit_status))
-    sandbox_dropin = (
-        Path(wt).parent / "_systemd" / f"{mod._LIVE_GATEWAY_UNIT}.d" / "make-live.conf"
-    )
-    _assert_sandboxed(sandbox_dropin, "_dropin_path")
+    sandbox_root = Path(wt).parent
+    sandbox_dropin = sandbox_root / "_systemd" / f"{mod._LIVE_GATEWAY_UNIT}.d" / "make-live.conf"
+    _assert_sandboxed(sandbox_dropin, "_dropin_path", sandbox_root)
     monkeypatch.setattr(mod, "_dropin_path", lambda: sandbox_dropin)
     monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(0, "", "")))
     # Prove the redirect actually took: a rename of the production symbol would
     # otherwise leave the real path live while every test still looked green.
-    _assert_sandboxed(mod._dropin_path(), "patched _dropin_path()")
+    _assert_sandboxed(mod._dropin_path(), "patched _dropin_path()", sandbox_root)
     if pointer_dir is not None:
         pointer_dir.mkdir(parents=True, exist_ok=True)
         ptr_file = pointer_dir / "live_target.json"
@@ -5575,6 +5648,39 @@ async def test_hmac_invalid_signature_denial_is_audited(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_startup_skips_background_tasks_when_disabled(monkeypatch):
+    """``dev_fleet_startup`` must not start the refresher/reaper/warm tasks
+    when background tasks are disabled, so tests that boot the real app via
+    ``create_app()`` (e.g. the HMAC tests above) never drag in a live network
+    ``git fetch``. See issue #1832: an unstubbed ``_status_refresher`` leaked
+    into unrelated tests and flaked ``Gateway Tests (macOS)``."""
+    monkeypatch.setattr(mod, "_load_app_secret", lambda: "sekrit")
+    monkeypatch.setattr(mod, "_background_tasks_disabled", lambda: True)
+    app = mod.create_app()
+    async with TestClient(TestServer(app)):
+        assert mod._refresher_task is None
+        assert mod._reaper_task is None
+        assert mod._warm_task is None
+
+
+@pytest.mark.asyncio
+async def test_startup_starts_background_tasks_when_enabled(monkeypatch):
+    """The opposite of the above: with the gate off (production default),
+    startup still creates all three background tasks."""
+    monkeypatch.setattr(mod, "_load_app_secret", lambda: "sekrit")
+    monkeypatch.setattr(mod, "_background_tasks_disabled", lambda: False)
+    monkeypatch.setattr(mod, "_upstream_remote", AsyncMock(return_value="origin"))
+    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(0, "", "")))
+    monkeypatch.setattr(mod, "_fleet_refresh", AsyncMock(return_value=None))
+    monkeypatch.setattr(mod, "_auto_prune_reaper", AsyncMock(return_value=None))
+    app = mod.create_app()
+    async with TestClient(TestServer(app)):
+        assert mod._refresher_task is not None
+        assert mod._reaper_task is not None
+        assert mod._warm_task is not None
+
+
+@pytest.mark.asyncio
 async def test_prunable_merged_unverified_when_oid_lookup_fails():
     """OID verification unavailable -> never a prune candidate (preview must
     match the removal path, which would refuse anyway)."""
@@ -6606,6 +6712,85 @@ async def test_prune_run_deduplicates_names(reset_prune_state):
     assert len(st["results"]) == 2
     # completed batch never leaves a finished name in ``current``
     assert st["current"] is None
+
+
+@pytest.mark.asyncio
+async def test_prune_run_processes_force_only_names(reset_prune_state):
+    """A force-override on a kept worktree arrives in ``force_names`` disjoint
+    from ``names``. It must still be processed and counted: absent from the
+    work list, its ``done`` bump would have no denominator or item row,
+    producing the impossible ``1/0`` counter (and a false failure toast). The
+    forced item also skips the prunable-verdict recheck — ``_prunable`` is
+    never consulted for it."""
+    prunable_calls: list[str] = []
+    removed: list[str] = []
+
+    async def fake_find(nm):
+        return {"path": f"/wt/{nm}", "branch": f"feat/{nm}"}, None
+
+    async def fake_prunable(path, branch):
+        prunable_calls.append(path)
+        return {"ok": True, "code": "merged"}
+
+    async def fake_remove(nm, force=False, progress=None, _caller="handler"):
+        removed.append(nm)
+        return {"ok": True, "removed": True}
+
+    with patch.object(mod, "_find_worktree", side_effect=fake_find), \
+         patch.object(mod, "_prunable", side_effect=fake_prunable), \
+         patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None), \
+         patch.object(mod, "_staged_target", return_value=None), \
+         patch.object(mod, "_worktree_remove", side_effect=fake_remove):
+        # No regular candidates; a single kept worktree via force-override.
+        r = await mod._prune_run([], force_names={"wt-kept"})
+        assert r == {"ok": True, "total": 1}
+        await _await_prune_idle()
+
+    st = await mod._prune_status()
+    # The forced worktree is in the denominator, has an item row, and is done.
+    assert st["total"] == 1 and st["done"] == 1
+    assert set(st["items"]) == {"wt-kept"}
+    assert st["items"]["wt-kept"]["status"] == "done"
+    assert removed == ["wt-kept"]
+    # Forced items bypass the prunable verdict recheck entirely.
+    assert prunable_calls == []
+
+
+@pytest.mark.asyncio
+async def test_prune_run_unions_regular_and_forced_names(reset_prune_state):
+    """A mixed batch (regular candidates + a forced kept worktree) processes
+    the order-preserving union: every name is counted and removed exactly
+    once, and only the non-forced names go through the prunable recheck."""
+    prunable_paths: list[str] = []
+    removed: list[str] = []
+
+    async def fake_find(nm):
+        return {"path": f"/wt/{nm}", "branch": f"feat/{nm}"}, None
+
+    async def fake_prunable(path, branch):
+        prunable_paths.append(path)
+        return {"ok": True, "code": "merged"}
+
+    async def fake_remove(nm, force=False, progress=None, _caller="handler"):
+        removed.append(nm)
+        return {"ok": True, "removed": True}
+
+    with patch.object(mod, "_find_worktree", side_effect=fake_find), \
+         patch.object(mod, "_prunable", side_effect=fake_prunable), \
+         patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None), \
+         patch.object(mod, "_staged_target", return_value=None), \
+         patch.object(mod, "_worktree_remove", side_effect=fake_remove):
+        r = await mod._prune_run(["wt-a", "wt-b"], force_names={"wt-forced"})
+        assert r == {"ok": True, "total": 3}
+        await _await_prune_idle()
+
+    st = await mod._prune_status()
+    assert st["total"] == 3 and st["done"] == 3
+    assert set(st["items"]) == {"wt-a", "wt-b", "wt-forced"}
+    assert all(it["status"] == "done" for it in st["items"].values())
+    assert sorted(removed) == ["wt-a", "wt-b", "wt-forced"]
+    # Only the two regular candidates go through the verdict recheck.
+    assert sorted(prunable_paths) == ["/wt/wt-a", "/wt/wt-b"]
 
 
 @pytest.mark.asyncio

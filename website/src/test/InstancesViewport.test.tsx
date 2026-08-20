@@ -1,32 +1,12 @@
-import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { act, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders, createTestStore } from './helpers'
 import InstancesViewport from '../components/InstancesViewport'
 
-// Prevent happy-dom from scheduling a real iframe fetch task when src is set.
-// The component sets `<iframe src="http://localhost:7778/?token=tok">` which
-// happy-dom attempts to navigate (even with disableIframePageLoading: true it
-// logs a DOMException + dispatches an error event). Override the src property
-// to store the value (so getAttribute assertions pass) without triggering
-// happy-dom's [connectedToDocument] navigation path.
-const _iframeSrcStore = new WeakMap<HTMLIFrameElement, string>()
-Object.defineProperty(HTMLIFrameElement.prototype, 'src', {
-  set(value: string) { _iframeSrcStore.set(this, value); this.setAttribute('src', value) },
-  get() { return _iframeSrcStore.get(this) ?? this.getAttribute('src') ?? '' },
-  configurable: true,
-})
-const origSetAttribute = HTMLIFrameElement.prototype.setAttribute
-HTMLIFrameElement.prototype.setAttribute = function (name: string, value: string) {
-  if (name === 'src') {
-    // Store as a DOM attribute (readable via getAttribute) but call the
-    // parent Element.setAttribute which does NOT trigger iframe navigation.
-    Element.prototype.setAttribute.call(this, name, value)
-    return
-  }
-  origSetAttribute.call(this, name, value)
-}
-afterAll(() => { HTMLIFrameElement.prototype.setAttribute = origSetAttribute })
+// The postinstall patch (scripts/patch-happy-dom-iframe.mjs) makes happy-dom's
+// disabled-iframe path dispatch 'load' instead of throwing DOMException when
+// handleDisabledFileLoadingAsSuccess is true — no per-test workaround needed.
 
 vi.mock('../lib/embedded', () => ({ isEmbeddedPane: vi.fn(() => false) }))
 import { isEmbeddedPane } from '../lib/embedded'

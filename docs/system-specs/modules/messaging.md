@@ -36,7 +36,9 @@ Slack's transport path is gated behind the `messaging.use_transport` config flag
 | `messaging/driver.py` | **Layer 2** — `TurnDriver` (channel-neutral turn loop), approval-mode constants, `_redact` helper |
 | `messaging/renderer.py` | **Layer 2b** — `Renderer` ABC, `OutputEvent`, output-kind constants + `OUTPUT_KINDS`, `chunk_text` helper, `apply_options_cap`/`cap_choices`/`format_overflow` (`max_buttons` enforcement) |
 | `messaging/display_safety.py` | `strip_ansi` / `canonicalize_display` / `redact_for_display` — credential redaction against the form a platform RENDERS, not the bytes sent. Hoisted out of `slack/format.py` when the shared overflow sink began writing choice text into the parsed body on every widget channel |
-| `messaging/split.py` | `split_markdown_safe` — the shared fence-safe markdown splitter (stdlib-only, pure). Prefix-stable so streaming callers can send sealed chunks and keep only the last as a live buffer |
+| `messaging/split.py` | `split_markdown_safe` — the shared fence-safe markdown splitter (stdlib-only, pure). Prefix-stable so streaming callers can send sealed chunks and keep only the last as a live buffer. Also exports `iter_fence_spans`, the same fence machine viewed as character spans over a whole message |
+| `messaging/outbound_files.py` | `extract_local_refs` (+ `extract_local_refs_off_loop`) — pulls local markdown image references out of an outbound reply into `OutboundFile` payloads carrying the validated bytes, with `Rejection` reasons for everything refused. Channel-neutral; the upload stays per-transport |
+| `messaging/raster.py` | `sniff_raster_mime` — what counts as a raster, decided by leading bytes. Dependency-free (no `kiro_crew` imports) so both the inbound sniff and the outbound extractor can share it |
 | `messaging/link.py` | **Layer 3** — session-key namespacing (`session_key`/`canonical_key`/`legacy_key`/`is_legacy_slack_key`) + `ChannelLink` + DM-scope key derivation / `should_rotate_generation` |
 | `messaging/conversation.py` | `ConversationState` — per-conversation rotating *generation* bookkeeping (advanced by `/new` and idle/daily reset), seeded from the persisted session map |
 | `slack/transport.py` | Slack reference `MessagingTransport` (`SlackTransport`) over `SlackClientOps` |
@@ -178,6 +180,26 @@ Its contract:
 - **Termination.** Pathological input — a single unbreakable 10k-char line, a 5000-backtick run, a budget too small to hold a line's own fence scaffolding — terminates, at worst emitting over-budget chunks rather than spinning. Whole-line placement seals progress by consuming the line; the dirty-cut fallback keeps a width of at least one character. The **final** chunk of an unclosed fence is left open on purpose: callers own final presentation, and a streaming caller still holds it as a live buffer.
 
 No call sites yet: the channels route onto it in follow-up changes, and `test/test_messaging_split.py` pins each contract item above.
+
+`iter_fence_spans(text) -> Iterator[tuple[int, int]]` is the same machine viewed over a whole message instead of one chunk's line fragments: it yields the character spans that lie inside a fenced block, opener line through closer line, with an unclosed fence running to the end. Both it and `split_markdown_safe` drive the module's single `_advance` state machine, so the open/close rule — which run length closes which fence character — exists once. A consumer that needs "is this offset inside code?" uses it rather than re-deriving the rule; the fence regexes stay private.
+
+## Outbound file extraction (`outbound_files.py`)
+
+An agent that produces an image writes it into the reply as markdown — `![chart](/tmp/chart.png)`. The dashboard renders that inline; a chat channel delivers the raw text, so the user reads a filesystem path where the picture should be. `extract_local_refs(text, *, limits=None) -> ExtractResult` pulls those references out for a transport to upload, and is the channel-neutral half of that: it decides which local references are safe to send, rewrites the text without them, and reports every refusal. The upload itself stays per-channel — each transport has its own multipart shape, per-file ceiling and count limit. `extract_local_refs_off_loop` is the async form; extraction reads files, so an async caller uses it rather than blocking the gateway's single loop.
+
+`ExtractResult` carries `rewritten_text`, `files: list[OutboundFile]`, and `rejections: list[Rejection]`. An `OutboundFile` is `(path, data, alt, mime)` with `size_bytes` derived from `data`. A `Rejection` is `(dest, reason, detail)`, where `reason` is one of the module's `REASON_*` codes and `str()` renders the default prose. `ExtractLimits` sets the per-message budgets: `max_files` (references considered), `max_total_bytes` (aggregate, and the memory bound), and an optional `max_file_bytes` for a channel whose per-file ceiling sits below the aggregate.
+
+Its contract:
+
+- **Extraction runs BEFORE any splitter.** A reply is chunked to the channel's message-length limit downstream; after a split one `![alt](path)` can straddle two chunks, and a cut inside the markup leaves half a link in each — unrecognisable to any later pass and visible to the user as broken markdown. Running first also shrinks the text the splitter has to cut.
+- **Transports upload `OutboundFile.data` and MUST NOT re-open `path`.** Every gate below is applied to one inode, and a path resolved a second time at upload can name a different file by then — anything able to write that directory in between (another turn, a subagent, a cron) would substitute what gets sent. `path` is provenance: the filename to put on the upload, and what a log line or a rejection names.
+- **A reference inside a code fence is literal.** Which offsets are fenced comes from `iter_fence_spans` above, so nothing about the grammar is re-derived here.
+- **Only a real raster is sent.** Type comes from the leading bytes via `messaging/raster.py`, never an extension: a shell script named `.png` is refused, and SVG is scriptable markup with no signature. The same table decides inbound sniffing, so the two directions cannot disagree about a file.
+- **The security floor is applied per reference**, because reply text is not trustworthy input — a prompt-injected agent chooses what it writes. `is_sensitive_path` denylist; symlinks refused rather than resolved, so the bytes come from the inode the written path names; a descriptor-pinned read (`hooks.safe_read_file_bytes_nolink`) so a hardlinked inode, a non-regular file, or a final-component swap after the checks is refused against the inode actually opened.
+- **Every refusal is returned, never swallowed**, and the refused reference keeps its original markup so the path stays visible in the message. A file dropped in silence leaves a reply that talks about a picture with no picture and no explanation — the defect this module exists to prevent. This holds for a per-file-cap refusal too, so a channel with a low ceiling never has to drop an already-stripped file after the fact.
+- **Caps bound work, not just output.** `max_files` counts references *examined*, so a reply full of unreadable paths cannot drive unbounded filesystem work or an unbounded rejection list. `max_total_bytes` is handed to the read itself, so an oversize file is refused rather than allocated, and `max_file_bytes` narrows that same read when a channel's ceiling is lower.
+
+No call sites yet: the channels route onto it in follow-up changes, and `test/test_outbound_files.py` pins each contract item above.
 
 ## Layer 3 — session-key namespacing (`link.py`)
 
@@ -508,9 +530,12 @@ DM denials and authorization failures in configured threads are SEL-audited.
 Because Discord's global guild/message-content intents deliver every visible
 channel message, unrelated guild chatter is discarded silently; an approved
 user attempting an unapproved thread remains audit-worthy. Guild turns require
-both an approved sender and an exact `discord.allowed_thread_ids` match, then a
-REST channel lookup must confirm Discord type 10/11/12 before dispatch. Normal
-guild channels are always rejected. An approved thread is a shared disclosure
+an approved sender and either an exact `discord.allowed_thread_ids` match or an
+exact `discord.allowed_channel_ids` match. An allowed channel message is never
+handled in the shared channel itself: with `discord.auto_thread` enabled, the
+transport creates a public thread from that message and dispatches the turn
+there. Existing thread IDs still require a REST channel lookup confirming
+Discord type 10/11/12. An approved thread is a shared disclosure
 boundary: every member who can view it can read agent/tool output. Enabling any
 thread also means Discord delivers message content from every server channel
 the bot can see, although Kiro Crew immediately discards traffic outside
@@ -532,6 +557,18 @@ resolution: ACP request IDs are reusable across provider/gateway restarts, so a
 stale button without the matching nonce fails closed. The decision window
 denies by default on timeout and retires the nonce with it.
 
+### Resume-binding expectations (`discord/resume_expectation.py`)
+
+An inbound resume binding lives on the bound session's `session_map.json` row. A recycle, restart prune, or dashboard unlink can destroy that row and the only evidence the channel was attached, so the resolver silently falls back to its DM session; the expectation record makes that loss reportable.
+
+**Store.** `$KIROCREW_HOME/trust/discord_resume_expectations.json` holds channel-id → `{key, title, version, retired}` rows under agent-blocked `trust/`, with an owner-only directory and `restrict_to_owner` file write because modes do not protect files on Windows. `retired` defaults false when loading an older row. Every filesystem step, including `config_dir()`, runs in a worker; an `asyncio.Lock` serializes read-modify-write without spanning Discord I/O.
+
+**Refuse before route.** `DiscordSessionResume.route` returns one `RoutingDecision` containing either the session key or a refusal. Plain turns and session-targeting commands use that decision once; drained turns keep their enqueue-time native decision. `!new`/`!unlink` release every exact-channel binding, `!sessions`/`!help` remain reachable for recovery, and tool approval dispatches no turn while retaining its nonce-keyed visible failure path. Four states run: no owner/no record; no owner/retired record; one owner/no record (bootstrap); one matching owner/active record. Four refuse: active record without owner (lost link, retire after notice), any owner different from the active record or present beside a retired record (announce and adopt after delivery), multiple owners, or a resolution that keeps changing.
+
+**Versioned acknowledgement.** Settlement follows a confirmed send and compare-and-sets the quoted version, so a newer picker/dashboard record wins and failed delivery settles nothing. A delivered detach replaces the active record with a durable retired marker in one write: no owner may route natively, while an owner racing the write still meets retained evidence and is refused before adoption. This avoids a clear-then-restore transaction whose compensating write could fail after evidence was deleted. **Persistence is fail-closed.** Memory publishes only after a durable write; only an absent file means empty, while I/O, UTF-8, JSON, shape, non-integer version, or non-boolean retired errors refuse routing. A pick records before binding. `!unlink`/`!new` serialize map removal, forced off-loop write, and versioned expectation retirement against pickers. Failed forced writes remain owed, keep the active expectation, and visibly fail the command; a later retirement failure costs one self-retiring notice rather than a silent resume.
+
+**Gateway-wide by design.** One unreadable shared file may hide any channel's record, so all Discord routing refuses; a cached-channel exception would silently route the first unknown post-restart channel. Nothing overwrites, quarantines, or discards the file. *Repair:* stop the gateway, copy the file aside, restore or edit it to `channel_id → {key, title, version, retired}` with integer versions and boolean `retired` flags, then restart. Never truncate or delete it; `{}` is valid only when no channel has resume history. **One decision per message.** Route, refusal send, and settlement serialize per channel. Settlement waits for every message queued before the notice; each is refused, and only the last delivered notice settles. **Lifecycle.** This channel-keyed store detects loss but is not routing authority. If a channel-keyed binding authority lands, migrate these rows and delete this state machine.
+
 ## Discord settings API
 
 - `GET /api/discord/config` — masked `bot_token_preview` + `bot_token_set`,
@@ -546,8 +583,9 @@ denies by default on timeout and retires the nonce with it.
   and are verified against Discord `GET /users/@me` before storage; rejection
   returns 400 and writes nothing, network failure saves with
   `verify_warning`. `bot_token_clear` must be a strict boolean.
-  `allowed_user_ids` and `allowed_thread_ids` accept numeric snowflake strings
-  only. Secrets land in `config_dir/.env` (atomic 0600) with `os.environ`
+  `allowed_user_ids`, `allowed_thread_ids`, and `allowed_channel_ids` accept
+  numeric snowflake strings only; `auto_thread` is a strict boolean. Secrets
+  land in `config_dir/.env` (atomic 0600) with `os.environ`
   synced; non-secrets go to
   `config.json` under `discord`. All fields are boot-read, so
   `restart_required` is true on any actual change.

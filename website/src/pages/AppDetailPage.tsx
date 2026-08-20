@@ -18,13 +18,14 @@ import { api } from '../api/client'
 import { PageHeader, Card, CardTitle, Badge, Btn } from '../components/ui'
 import AppIcon from '../components/AppIcon'
 import TrustAppModal, { APP_EXECUTION_DENIED, isTrustDeniedError, useTrustGate } from '../components/appstore/TrustAppModal'
+import { isRegistrySourced } from '../components/appstore/types'
 import { recordEvent } from '../rum'
 import { useTheme } from '../hooks/useTheme'
 import AskAgentButton from '../components/AskAgentButton'
 
 import { i18nT } from '../i18n/t'
 import { appDisplayName, appDescription, appHighlights } from '../components/appstore/appManifest'
-import { stringList } from '../components/appstore/types'
+import { isBuiltinServerRow, mergeBuiltinRow } from '../components/appstore/mergeBuiltinRow'
 import { fmtDateNumeric } from '../i18n/format'
 type AppInfo = {
   name: string
@@ -198,6 +199,14 @@ export default function AppDetailPage() {
   const [app, setApp] = useState<AppInfo | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  /**
+   * Success reflection for an in-place sync. This page otherwise has only an
+   * error surface, so a successful ``update`` re-rendered a byte-identical page:
+   * re-copying a source directory normally carries the same version, which makes
+   * silence indistinguishable from a no-op. The list card states the outcome for
+   * the same reason, and both paths this fix wires need to say it.
+   */
+  const [successMsg, setSuccessMsg] = useState('')
   const clearError = useCallback(() => {
     setError('')
   }, [])
@@ -240,40 +249,65 @@ export default function AppDetailPage() {
 
       if (installed) {
         const m = installed.manifest || {}
-        setApp({
-          name: installed.name,
-          displayName: installed.displayName || m.displayName || installed.name,
-          description: m.description || '',
-          version: registryEntry?.version || m.version || installed.version || '0.0.0',
-          author: m.author || registryEntry?.author || '',
-          // Built-in apps aren't in the registry feed, so registryEntry is
-          // undefined for them — their icon/hero metadata lives on the
-          // manifest. Fall back to it so built-in detail pages render the real
-          // icon and hero instead of the generic Package box.
-          icon: registryEntry?.icon || m.ui?.pages?.[0]?.icon || '',
-          iconUrl: registryEntry?.iconUrl || m.iconUrl || m.ui?.pages?.[0]?.iconUrl || '',
-          iconUrlDark: registryEntry?.iconUrlDark || m.iconUrlDark || '',
-          tags: m.tags || registryEntry?.tags || [],
-          highlights: m.highlights || registryEntry?.highlights || [],
-          screenshots: registryEntry?.screenshots || m.screenshots || [],
-          screenshotsDark: registryEntry?.screenshotsDark || m.screenshotsDark || [],
-          heroImage: registryEntry?.heroImage || m.heroImage || '',
-          heroImageDark: registryEntry?.heroImageDark || m.heroImageDark || '',
-          heroImageDetail: registryEntry?.heroImageDetail || m.heroImageDetail || '',
-          heroImageDetailDark: registryEntry?.heroImageDetailDark || m.heroImageDetailDark || '',
-          repo: registryEntry?.repo || '',
-          installed: true,
-          installedVersion: installed.version,
-          enabled: installed.enabled,
-          managed: installed.managed,
-          source: installed.source,
-          installedAt: installed.installedAt,
-          origin: installed.origin,
-          resources: installed.resources,
-          lifecycle: installed.lifecycle,
-          updateAvailable: registryEntry?.updateAvailable || false,
-          manifest: m,
-        })
+        // A built-in the registry response carries goes through the SAME merge
+        // the browse list uses. Spelled separately, the two chains disagreed:
+        // this page preferred the manifest (`m.author || registryEntry?.author`)
+        // while the list preferred the row, so one app could read
+        // "Kiro Crew · Developer Tools" in the list and "kirocrew · Productivity"
+        // one click later. The catalog is the store's inventory on both surfaces
+        // or on neither.
+        if (registryEntry && isBuiltinServerRow(registryEntry)) {
+          setApp({
+            ...mergeBuiltinRow(registryEntry, { ...m, version: installed.version }),
+            name: installed.name,
+            installed: true,
+            installedVersion: installed.version,
+            enabled: installed.enabled,
+            managed: installed.managed,
+            source: installed.source,
+            installedAt: installed.installedAt,
+            origin: installed.origin,
+            resources: installed.resources,
+            lifecycle: installed.lifecycle,
+            updateAvailable: registryEntry.updateAvailable || false,
+            manifest: m,
+          })
+        } else {
+          setApp({
+            name: installed.name,
+            displayName: installed.displayName || m.displayName || installed.name,
+            description: m.description || '',
+            version: registryEntry?.version || m.version || installed.version || '0.0.0',
+            author: m.author || registryEntry?.author || '',
+            // A non-built-in installed app may have no registry entry at all (a
+            // local-directory install), so the manifest is the only source for
+            // icon/hero metadata; without this fallback the page renders the
+            // generic Package box.
+            icon: registryEntry?.icon || m.ui?.pages?.[0]?.icon || '',
+            iconUrl: registryEntry?.iconUrl || m.iconUrl || m.ui?.pages?.[0]?.iconUrl || '',
+            iconUrlDark: registryEntry?.iconUrlDark || m.iconUrlDark || '',
+            tags: m.tags || registryEntry?.tags || [],
+            highlights: m.highlights || registryEntry?.highlights || [],
+            screenshots: registryEntry?.screenshots || m.screenshots || [],
+            screenshotsDark: registryEntry?.screenshotsDark || m.screenshotsDark || [],
+            heroImage: registryEntry?.heroImage || m.heroImage || '',
+            heroImageDark: registryEntry?.heroImageDark || m.heroImageDark || '',
+            heroImageDetail: registryEntry?.heroImageDetail || m.heroImageDetail || '',
+            heroImageDetailDark: registryEntry?.heroImageDetailDark || m.heroImageDetailDark || '',
+            repo: registryEntry?.repo || '',
+            installed: true,
+            installedVersion: installed.version,
+            enabled: installed.enabled,
+            managed: installed.managed,
+            source: installed.source,
+            installedAt: installed.installedAt,
+            origin: installed.origin,
+            resources: installed.resources,
+            lifecycle: installed.lifecycle,
+            updateAvailable: registryEntry?.updateAvailable || false,
+            manifest: m,
+          })
+        }
       } else if (registryEntry) {
         setApp({
           ...registryEntry,
@@ -318,6 +352,15 @@ export default function AppDetailPage() {
     autoActionTriggered.current = true
     // Clear the state so a refresh or Back/Forward doesn't re-fire it.
     navigate(`${location.pathname}${location.search}`, { replace: true, state: null })
+    // An installed app whose bytes came from a directory on this machine has no
+    // registry row to install from — its refresh is the update endpoint, which
+    // re-copies the source directory recorded at install. The streaming registry
+    // install is for everything else: a registry-sourced app, and an app not
+    // installed at all.
+    if (stateAction === 'update' && app.installed && !isRegistrySourced(app)) {
+      handleAction('update')
+      return
+    }
     handleInstall()
   }, [app, location]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -472,6 +515,7 @@ export default function AppDetailPage() {
     }
     setActionLoading(action)
     clearError()
+    setSuccessMsg('')
     try {
       if (action === 'enable') { await runEnable(app.name); return }
       if (action === 'disable') await api.disableApp(app.name)
@@ -480,6 +524,17 @@ export default function AppDetailPage() {
         recordEvent('app_disable', { app: app.name, version: app.installedVersion || app.version })
       }
       await load()
+      // `load()` clears the error but does not speak to success, and a same-version
+      // re-copy changes nothing visible, so say it explicitly. The Sync button that
+      // reaches here is not gated on source, and `handle_update_app` re-clones a
+      // registry-sourced app from the registry rather than copying a directory, so
+      // each case has to name where the update actually came from.
+      if (action === 'update') {
+        setSuccessMsg(isRegistrySourced(app)
+          ? i18nT('pages.appsPage.updated_from_the_registry', { name: appDisplayName(app) })
+          : i18nT('pages.appsPage.synced_from_its_source_directory', { name: appDisplayName(app) }))
+        setTimeout(() => setSuccessMsg(''), 4000)
+      }
       window.dispatchEvent(new Event('mc:apps-changed'))
     } catch (e: unknown) {
       // A third-party app that has not been granted execution trust yet is a
@@ -546,16 +601,13 @@ export default function AppDetailPage() {
   const desktopOnly = needsDesktopApp(app)
   const canUpdate = app.lifecycle === 'gateway'
   const canUninstall = app.lifecycle !== 'locked'
-  // stringList (not `|| []`): a mistyped truthy non-array from a user-authored
-  // manifest would pass `||` and then throw on `.map`. This fetch path
-  // (/api/apps/{name}) has no query-boundary normalizer, so coerce here.
-  const manifestAgents = stringList(app.manifest?.agents)
-  const manifestSkills = stringList(app.manifest?.skills)
-  const rawCrons = app.manifest?.crons
-  const manifestCrons = Array.isArray(rawCrons) ? rawCrons.filter(c => !!c && typeof c.name === 'string') : []
-  const agentCount = manifestAgents.length
-  const skillCount = manifestSkills.length
-  const cronCount = manifestCrons.length
+  // Resource lists, derived once. `manifest` is absent for a registry-only app,
+  // and `normalizeInstalledApp` fills the lists for an installed one — so the
+  // fallback here is the registry case, not a defence against a partial
+  // manifest, and nothing below re-asserts past it (#3689).
+  const agents = app.manifest?.agents || []
+  const skills = app.manifest?.skills || []
+  const crons = app.manifest?.crons || []
   // Theme-aware hero banner source (mirrors the Browse card resolution).
   // Prefer the wide detail-ratio banner (heroImageDetail*); fall back to the
   // Browse hero, then the opposite theme.
@@ -574,11 +626,22 @@ export default function AppDetailPage() {
   return (
     <>
       <PageHeader title={i18nT('pages.appDetailPage.apps')} subtitle={appDisplayName(app)} />
-      <div className="px-2 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
         {/* Back link */}
         <button className="flex items-center gap-1.5 text-[13px] text-muted hover:text-text mb-5 bg-transparent border-none cursor-pointer p-0 font-body transition-colors" onClick={() => navigate('/apps')}>
           <ArrowLeft size={14} /> {i18nT('pages.appDetailPage.back_to_apps')}
         </button>
+
+        {/* In-place sync succeeded. Stated because nothing else on the page
+            changes when a re-copy carries the same version. No dismiss control:
+            unlike the error box below — which persists until cleared and so needs
+            one — this clears itself, and a close button on a self-closing notice
+            is a control whose only outcome is to race the timer. */}
+        {successMsg && (
+          <div className="mb-4 bg-ok/10 border border-ok/20 rounded-lg p-3 animate-rise">
+            <span className="text-ok text-sm block">{successMsg}</span>
+          </div>
+        )}
 
         {/* Error */}
         {error && (
@@ -968,26 +1031,26 @@ export default function AppDetailPage() {
           )}
 
           {/* Resources (installed only) */}
-          {app.installed && (agentCount > 0 || skillCount > 0 || cronCount > 0) && (
+          {app.installed && (agents.length > 0 || skills.length > 0 || crons.length > 0) && (
             <Card>
               <CardTitle>{i18nT('pages.appDetailPage.resources')}</CardTitle>
               <div className="grid gap-1.5 mt-2 text-[13px]">
-                {agentCount > 0 && (
+                {agents.length > 0 && (
                   <div className="flex items-start gap-2 text-muted">
                     <Bot size={13} className="mt-0.5 shrink-0" />
-                    <div>{manifestAgents.map((a: string) => a.split('/').pop()?.replace('.json', '')).join(', ')}</div>
+                    <div>{agents.map((a: string) => a.split('/').pop()?.replace('.json', '')).join(', ')}</div>
                   </div>
                 )}
-                {skillCount > 0 && (
+                {skills.length > 0 && (
                   <div className="flex items-start gap-2 text-muted">
                     <Zap size={13} className="mt-0.5 shrink-0" />
-                    <div>{manifestSkills.map((s: string) => s.split('/').pop()).join(', ')}</div>
+                    <div>{skills.map((s: string) => s.split('/').pop()).join(', ')}</div>
                   </div>
                 )}
-                {cronCount > 0 && (
+                {crons.length > 0 && (
                   <div className="flex items-start gap-2 text-muted">
                     <Clock size={13} className="mt-0.5 shrink-0" />
-                    <div>{manifestCrons.map((c) => c.name).join(', ')}</div>
+                    <div>{crons.map((c) => c.name).join(', ')}</div>
                   </div>
                 )}
               </div>

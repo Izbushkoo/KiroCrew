@@ -13,7 +13,7 @@ build is driven by [`packaging/build-desktop.sh`](../../packaging/build-desktop.
 ## What `make desktop` produces
 
 ```bash
-make desktop               # macOS: ONE universal DMG (arm64 + x86_64) · Linux: AppImage
+make desktop               # macOS: ONE universal DMG (arm64 + x86_64) · Linux: AppImage + deb + rpm
 UNIVERSAL=0 make desktop   # macOS: faster host-arch-only DMG (local iteration)
 ```
 
@@ -23,7 +23,7 @@ Output lands in **`website/electron/dist/`**:
 |---------|----------|----------|
 | `make desktop` | macOS | `KiroCrew-<version>-universal.dmg` |
 | `UNIVERSAL=0 make desktop` | macOS | `KiroCrew-<version>-arm64.dmg` (Apple Silicon host) or `KiroCrew-<version>.dmg` (Intel host) |
-| `make desktop` | Linux | `KiroCrew-*.AppImage` (host arch) |
+| `make desktop` | Linux | `KiroCrew-*.AppImage`, `*.deb`, `*.rpm` (host arch) |
 
 The electron-builder configuration lives in
 [`website/electron/package.json`](../../website/electron/package.json):
@@ -33,8 +33,32 @@ The electron-builder configuration lives in
 - macOS display name: `Kiro Crew` via `CFBundleDisplayName`; `CFBundleName`
   remains aligned with `productName` because Electron uses it to locate the
   `KiroCrew Helper` app bundles during startup
-- mac target: `dmg` (category `public.app-category.developer-tools`)
-- linux target: `AppImage` (category `Development`)
+- mac target: `dmg` (category `public.app-category.developer-tools`). The DMG
+  uses a 660×420 logical-size branded drag-to-Applications background, packaged
+  as a multi-resolution TIFF with 660×420 (1×) and 1320×840 (2×) representations
+  for Retina displays. The background is a flat light purple carrying the opening
+  animation's white ghost cast and wordmark, with a single chevron between the
+  96px app and `/Applications` targets. It holds no gradient: the brand guideline
+  restricts them, so the accent is one tone. Nothing is painted behind the icon
+  captions either — Finder draws them in dark text even under Dark Mode, so they
+  read on the accent directly.
+- Windows target: assisted NSIS. A 164×314 welcome/finish sidebar and a 150×57
+  page header reuse the Kiro Crew logo while preserving native NSIS controls,
+  localization, the per-user default, and the no-UAC default path.
+- linux targets: `AppImage`, `deb`, `rpm` (category `Development`). One backend
+  tree is packaged three times, with `scripts/stamp-distribution.sh` re-run
+  between electron-builder invocations so each artifact's beacon `dist` names
+  its OWN format -- a single stamp would label one artifact as another.
+- `desktopName` + `linux.syncDesktopName` are what make window association
+  work: Electron derives its app_id from `desktopName`, and electron-builder
+  derives the `.desktop` file's name and `StartupWMClass` from the same value,
+  so the three agree by construction instead of by coincidence. Overriding
+  `StartupWMClass` by hand breaks that agreement.
+- `deb.depends` declares alternatives (`libgtk-3-0 | libgtk-3-0t64`) because
+  Ubuntu 24.04's 64-bit `time_t` transition renamed several libraries;
+  `rpm.depends` needs no such thing but uses entirely different names
+  (`gtk3`, `nss`, `alsa-lib`). Both lists are verified against a real
+  `apt-get install` / `dnf` resolution by `scripts/smoke-linux-packages.sh`.
 
 ### macOS default — one universal DMG for both arches
 
@@ -58,15 +82,19 @@ an Intel Mac where the universal build cannot run. Per-arch targets:
 |--------|-----------|----------|
 | macOS arm64 (Apple Silicon) | Apple Silicon Mac (`UNIVERSAL=0`) | arm64 `.dmg` |
 | macOS x86_64 (Intel) | Intel Mac | x86_64 `.dmg` |
-| Linux x86_64 | x86_64 Linux | x86_64 `.AppImage` |
-| Linux aarch64 (Graviton/ARM) | aarch64 Linux | aarch64 `.AppImage` |
+| Linux x86_64 | x86_64 Linux | x86_64 `.AppImage`, `.deb`, `.rpm` |
+| Linux aarch64 (Graviton/ARM) | aarch64 Linux | aarch64 `.AppImage`, `.deb`, `.rpm` |
 
 **Both Linux architectures ship.** `build-desktop.yml` builds them on
 `ubuntu-22.04` and `ubuntu-22.04-arm`, and `publish-linux.yml` runs once per
 arch — each writing its own immutable S3 key, its own electron-updater channel
 file (`latest-linux.yml` for x64, `latest-linux-arm64.yml` for arm64) and its own
-`latest` alias. Published basenames are `KiroCrew-x86_64.AppImage` and
-`KiroCrew-aarch64.AppImage`.
+`latest` alias. Published basenames are `KiroCrew-<arch>.<ext>` for each of the
+six (arch, format) pairs -- `KiroCrew-x86_64.deb`, `KiroCrew-aarch64.rpm`, and so
+on. A package format also gets its own feed DIRECTORY
+(`feed/<channel>/deb/latest-linux.yml`), because electron-updater derives the
+channel FILE name from platform and arch with no hook to change it, so two
+formats sharing a directory would overwrite each other's metadata.
 
 Two properties are load-bearing and worth knowing before you touch that lane:
 
@@ -75,7 +103,15 @@ Two properties are load-bearing and worth knowing before you touch that lane:
   install, plus the `python -m kiro_crew --version` self-containment gate), so a
   host that cannot execute the target architecture cannot build it. macOS gets
   away with one host only because Rosetta 2 executes the x86_64 slice.
-- **The runner's glibc is the floor for every user.** The AppImage links against
+- **The runner's glibc is the ceiling on what the artifacts may require.** The
+  binaries link against it, so the runner bounds compatibility. The MEASURED
+  requirement of the shipped binaries is lower than the runner's own version:
+  the highest `GLIBC_*` symbol version across the Electron binary and every
+  bundled `.so` is **2.34**, which covers Ubuntu 22.04+, Debian 12+, Fedora,
+  CentOS Stream 9 and Amazon Linux 2023, and excludes Ubuntu 20.04, Debian 11
+  and Amazon Linux 2. Read the requirement with
+  `objdump -T <binary> | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1` rather
+  than assuming it equals the runner's glibc. The AppImage links against
   it, which is why both Linux legs stay on 22.04 (glibc 2.35) rather than moving
   to 24.04 (2.39) — the newer floor would exclude AL2023, Debian 12 and RHEL 9.
 
@@ -218,7 +254,7 @@ pipeline end-to-end:
 3. pip-install kiro_crew + deps into the bundled interpreter
 4. Stage the dashboard into the package's static dir
 5. Prune caches/tests/unused stdlib to shrink bundle
-6. Package with electron-builder                      → website/electron/dist/ (DMG / AppImage)
+6. Package with electron-builder                      → website/electron/dist/ (DMG / AppImage / NSIS)
 ```
 
 On macOS (universal by default) the pipeline repeats steps 2–5 once per
@@ -246,7 +282,13 @@ Step by step:
 5. **Prune** — removes `__pycache__`, test dirs, and unused stdlib modules
    (tkinter, idlelib, etc.) to shrink the bundle.
 6. **Package** — in `website/electron/`, runs electron-builder to produce the
-   installer(s) in `website/electron/dist/`.
+   installer(s) in `website/electron/dist/`. The macOS DMG and Windows NSIS
+   wizard consume the checked-in artwork under `packaging/installer-assets/`.
+   The build reads only the committed rasters; edit the SVG sources beside them
+   and run `node packaging/installer-assets/build-assets.mjs` to regenerate the
+   TIFF and BMPs. That script is the only place that knows the output shapes
+   the two installers require — a multi-representation TIFF for Retina, and
+   24-bit BMPs, which NSIS cannot read at the 32-bit depth `sips` emits.
 
 ### Build flags
 
@@ -415,6 +457,13 @@ The build is already wired for this — `website/electron/package.json` enables
 `scripts/notarize.js` afterSign hook notarizes when credentials are present and
 silently skips when they aren't. You only supply the secrets at build time via
 env vars (nothing is committed):
+
+For release builds, the unsigned Electron-built DMG is retained only as a
+layout template. `packaging/signing/build-dmg.sh` converts it to a writable
+image, verifies that its app name matches the signed/stapled app, replaces that
+one bundle, shrinks and recompresses the image, and then the release workflow
+signs and notarizes the resulting DMG. Recreating the image from a plain folder
+would discard Finder's volume-bound background reference.
 
 ```bash
 # 1. Signing identity — a Developer ID Application cert exported as .p12

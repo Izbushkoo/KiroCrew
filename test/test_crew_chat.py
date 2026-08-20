@@ -11,6 +11,8 @@ and mode plumbing (_VALID_MODES, create validation).
 from __future__ import annotations
 
 import asyncio
+import errno
+import json
 import logging
 import os
 import subprocess
@@ -18,6 +20,7 @@ import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -75,6 +78,54 @@ def _slot_save(side_effect: BaseException | None = None):
     )
 
 
+def _durable_store_file(slot_key: str, name: str) -> list[dict[str, Any]]:
+    """Read ONE named store file, WITHOUT building a `CrewStore`.
+
+    The mechanism the named readers below share. `CrewStore.__init__` reads all
+    three store files, so building one to answer a single-file question also
+    opens the two files nothing awaited, and on Windows an open that lands in a
+    `Path.replace()` window fails with `PermissionError` — issue #4142. Missing
+    is empty here for the same reason it is in `CrewStore._load`: a file that
+    was never written means nothing has been recorded yet.
+    """
+    path = crew_mod.data_home() / "crew" / crew_mod._store_name(slot_key) / name
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+
+
+def _durable_queue(slot_key: str = "s1") -> list[dict[str, Any]]:
+    """Read one slot's queue file, WITHOUT building a `CrewStore`.
+
+    Every caller of this asks the same question — "is this queue row on disk
+    yet?" — and `queue.json` is the only file the code under test awaits before
+    the moment being asserted. Building a store to answer it also reads
+    `topics.json` and `forwards.json`, which nothing awaits: `_reconcile` hands
+    them to the executor via `st.save()` and returns. So a store built here can
+    open a file that is mid-`replace()`, and on Windows that open fails with
+    `PermissionError` — issue #4142. Reading the one file the product promises
+    is durable keeps the assertion and drops the unpromised dependency.
+    """
+    return _durable_store_file(slot_key, "queue.json")
+
+
+def _durable_forwards(slot_key: str = "s1") -> list[dict[str, Any]]:
+    """Read one slot's forwards file — see :func:`_durable_queue` for the why.
+
+    The closed-slot completion path is the caller that promises this file is on
+    disk before it returns, so a "the forward is durable" assertion can be
+    answered from `forwards.json` alone and need not depend on the durability of
+    `topics.json` and `queue.json`, which no caller there promises.
+    """
+    return _durable_store_file(slot_key, "forwards.json")
+
+
+def _durable_entry(slot_key: str, msg_id: str) -> dict[str, Any] | None:
+    """`CrewStore.entry` against the queue FILE — see :func:`_durable_queue`."""
+    return next((e for e in _durable_queue(slot_key) if e.get("msg_id") == msg_id), None)
+
+
 # ── store ──
 
 
@@ -129,6 +180,111 @@ class TestCrewStore:
             assert (st.dir / "queue.json").exists()
 
 
+class TestWindowsReplaceWindow:
+    """Issue #4142: a store read must not race a store write nothing awaited.
+
+    `CrewStore` publishes each file by writing a temp file and calling
+    `Path.replace`. That is atomic on both platforms, but only POSIX makes it
+    invisible to a concurrent opener — on Windows the destination is briefly
+    unopenable and `open()` fails with `PermissionError` (errno 13), which
+    `_load` re-raises as `RuntimeError`. Windows CI is the only place that
+    fails, so the platform difference is emulated here to give the bug a
+    deterministic reproduction that runs everywhere.
+    """
+
+    @staticmethod
+    def _emulate_windows_replace(monkeypatch, target: str) -> tuple[set[str], threading.Event]:
+        """Make `target` unopenable while its write is in flight, as Windows does.
+
+        The write parks on the returned gate instead of sleeping, so the window
+        is open for as long as the test needs rather than for a guessed number of
+        milliseconds — a timing-based window would make this test itself flaky.
+        The gate has a timeout so a regression cannot hang CI.
+        """
+        inflight: set[str] = set()
+        gate = threading.Event()
+        real_write_text, real_replace, real_read_text, real_read_bytes = (
+            Path.write_text, Path.replace, Path.read_text, Path.read_bytes)
+
+        def write_text(self, data, *a, **k):          # type: ignore[no-untyped-def]
+            if self.name == f".{target}.tmp":
+                inflight.add(str(self.parent / target))
+                gate.wait(timeout=10.0)
+            return real_write_text(self, data, *a, **k)
+
+        def replace(self, dest):                      # type: ignore[no-untyped-def]
+            try:
+                return real_replace(self, dest)
+            finally:
+                inflight.discard(str(dest))
+
+        def read_text(self, *a, **k):                 # type: ignore[no-untyped-def]
+            if str(self) in inflight:
+                raise PermissionError(errno.EACCES, "Permission denied", str(self))
+            return real_read_text(self, *a, **k)
+
+        def read_bytes(self, *a, **k):                # type: ignore[no-untyped-def]
+            # Faulted alongside read_text so the emulator stays armed against
+            # the call the store actually makes: ``CrewStore._load`` reads bytes
+            # through ``read_bytes_with_retry`` (#4331). Patching only read_text
+            # would leave the positive control below passing vacuously — it
+            # would observe no failure because it never intercepted the read,
+            # not because the window closed.
+            if str(self) in inflight:
+                raise PermissionError(errno.EACCES, "Permission denied", str(self))
+            return real_read_bytes(self, *a, **k)
+
+        monkeypatch.setattr(Path, "write_text", write_text)
+        monkeypatch.setattr(Path, "replace", replace)
+        monkeypatch.setattr(Path, "read_text", read_text)
+        monkeypatch.setattr(Path, "read_bytes", read_bytes)
+        return inflight, gate
+
+    @pytest.mark.asyncio
+    async def test_the_durable_queue_read_does_not_touch_unawaited_files(
+            self, monkeypatch) -> None:            # type: ignore[no-untyped-def]
+        # `ingest` awaits `queue.json` by name and nothing else: `_reconcile`
+        # hands `topics.json` and `forwards.json` to the executor and never waits.
+        # So a durability assertion may read the queue and must not read the
+        # other two, which may still be mid-replace.
+        inflight, gate = self._emulate_windows_replace(monkeypatch, "topics.json")
+        orch, slot = _orch(), _slot(key="winrace")
+        shown: list[list[str]] = []
+        control: list[str] = []
+
+        def _on_append(*a: object, **k: object) -> None:
+            # The property: the queue row is on disk the moment the user can see
+            # their message. Answerable from the queue file alone.
+            shown.append([e["text"] for e in _durable_queue("winrace")])
+            # Positive control, in the same window: the three-file read this
+            # assertion used to do DOES fail here, so a pass above is the fix
+            # working and not an emulator that never armed.
+            assert inflight, "the topics.json write is not in flight — window missed"
+            try:
+                CrewStore("winrace")
+            except RuntimeError as exc:
+                control.append(str(exc))
+
+        slot.append = MagicMock(side_effect=_on_append)
+        try:
+            with patch.object(orch, "_post", return_value=True), \
+                    patch.object(orch, "_decide", new=AsyncMock()):
+                await orch.ingest(slot, "do the thing")
+        finally:
+            # Release the parked write AND join it. Left unjoined, the executor
+            # thread outlives the test: it straddles this monkeypatch teardown,
+            # and its write failure would surface in whatever runs next.
+            gate.set()
+            st = orch._stores.get("winrace")
+            if st is not None:
+                await st.wait_writes()
+
+        assert shown == [["do the thing"]], \
+            f"queue row was not readable while topics.json was mid-replace: {shown}"
+        assert control and "topics.json" in control[0], \
+            "building a whole store did NOT fail in the window — the emulator is inert"
+
+
 # ── ingest ──
 
 
@@ -179,7 +335,7 @@ class TestIngest:
         # The real harm: a later successful save must not resurrect it.
         st.save()
         await st.wait_writes()
-        assert CrewStore("s1").queue == [], "a later save persisted the rejected request"
+        assert _durable_queue() == [], "a later save persisted the rejected request"
         # Nothing was promised to the user, and nothing was routed.
         post.assert_not_called()
         assert decide.await_count == 0 and decide.call_count == 0
@@ -225,7 +381,7 @@ class TestIngest:
         assert (st.dir / "queue.json").read_text(encoding="utf-8") == "{ this is not json"
         # A file that was never written is a legitimate empty store.
         (st.dir / "queue.json").unlink()
-        assert CrewStore("s1").queue == []
+        assert _durable_queue() == []
 
     def test_enqueue_writes_only_the_queue_file(self) -> None:
         """A rollback-able write must touch ONLY the file it changed.
@@ -261,7 +417,7 @@ class TestIngest:
              patch.object(orch, "_post", return_value=True):
             await orch.ingest(slot, "do thing A")
 
-        on_disk = CrewStore("s1").queue
+        on_disk = _durable_queue()
         assert [e["text"] for e in on_disk] == ["do thing A"], \
             "an acknowledged request was dropped when only its transcript failed"
         assert on_disk[0]["state"] == "pending"
@@ -311,6 +467,7 @@ class TestIngest:
         assert secret not in body and secret not in title
         # Same text, same treatment, on the two paths that persist it.
         assert secret not in (st.topic("r1") or {}).get("digest", "")
+        await orch._store("s1").wait_writes()      # reads below are ON-DISK
         assert not any(secret in f.get("body", "") for f in CrewStore("s1").forwards)
 
     @pytest.mark.asyncio
@@ -828,7 +985,7 @@ class TestGptRoundEleven:
         slot.key = "vis1"                    # own store; no state from other tests
         on_disk_when_shown: list[list[str]] = []
         slot.append = MagicMock(side_effect=lambda *a, **k: on_disk_when_shown.append(
-            [e["text"] for e in CrewStore("vis1").queue]))
+            [e["text"] for e in _durable_queue("vis1")]))
 
         with patch.object(orch, "_post", return_value=True), \
                 patch.object(orch, "_decide", new=AsyncMock()):
@@ -1809,7 +1966,7 @@ class TestGptRoundFive:
                           side_effect=lambda *a, **k: order.append("post") or True):
             assert await orch._settle_stragglers(slot) is False
         assert order.index("write") < order.index("post"), order
-        assert CrewStore("s1").queue[0]["state"] == "failed"
+        assert _durable_queue()[0]["state"] == "failed"
 
     @pytest.mark.asyncio
     async def test_steer_is_durable_before_it_reaches_the_run(self) -> None:
@@ -1828,7 +1985,7 @@ class TestGptRoundFive:
 
         async def _steer(rid, text):  # type: ignore[no-untyped-def]
             # What a crash at this instant would leave behind on disk.
-            seen_state.append((CrewStore("s1").entry(e["msg_id"]) or {}).get("state"))
+            seen_state.append((_durable_entry("s1", e["msg_id"]) or {}).get("state"))
             return True, ""
 
         orch._subagents.steer_run = AsyncMock(side_effect=_steer)
@@ -1933,7 +2090,7 @@ class TestGptRoundFive:
         orch._subagents.continue_conversation = MagicMock(
             side_effect=lambda cid, task, **kw: _spawn_info(kw["_preassigned_id"]))
         await orch._dispatch_continue(slot, st, t, e)
-        assert CrewStore("s1").entry(e["msg_id"])["topic_id"] == "t1"
+        assert _durable_entry("s1", e["msg_id"])["topic_id"] == "t1"
 
     @pytest.mark.asyncio
     async def test_the_fallback_respawn_carries_a_durable_id(self) -> None:
@@ -1953,7 +2110,7 @@ class TestGptRoundFive:
 
         def _spawn(task, **kw):
             # The identity must be readable from a FRESH store at spawn time.
-            on_disk.append((CrewStore("s1").entry(e["msg_id"]) or {}).get("dispatch_id"))
+            on_disk.append((_durable_entry("s1", e["msg_id"]) or {}).get("dispatch_id"))
             assert kw.get("_preassigned_id"), "respawn must carry the id it persisted"
             return _spawn_info(kw["_preassigned_id"])
 
@@ -1978,8 +2135,9 @@ class TestGptRoundFive:
         orch._owned["r1"] = "s1"
         orch._state.get_slot = MagicMock(return_value=None)      # tab closed
         await orch.on_subagent_done(_spawn_info("r1", done=True, result="the result body"))
-        # Read from a FRESH store: the forward must already be on disk.
-        assert any("the result body" in f["body"] for f in CrewStore("s1").forwards)
+        # Read the FILE, not a store: awaiting here would prove nothing, since the
+        # property under test is that the PRODUCT awaited before returning.
+        assert any("the result body" in f["body"] for f in _durable_forwards("s1"))
 
 
 class TestLiveRunIsReOwned:
@@ -2099,8 +2257,7 @@ class TestContinuationIdentity:
         def _continue(conv_id, task, **kw):
             # At the moment of the side effect, the id must already be readable
             # from a FRESH store — i.e. it reached the file, not just the object.
-            fresh = CrewStore("s1")
-            on_disk.append((fresh.entry(e["msg_id"]) or {}).get("dispatch_id"))
+            on_disk.append((_durable_entry("s1", e["msg_id"]) or {}).get("dispatch_id"))
             assert kw.get("_preassigned_id"), "the caller must supply the id it persisted"
             return _spawn_info(kw["_preassigned_id"])
 
@@ -2476,13 +2633,13 @@ class TestGatewayCrewInit:
         st.queue[0]["text"] = "final"
         st.save()
         await st.wait_writes()
-        assert CrewStore("s1").queue[0]["text"] == "final"
+        assert _durable_queue()[0]["text"] == "final"
 
     def test_save_writes_inline_without_loop(self) -> None:
         # Sync callers (boot reconcile, tests) still get immediate durability.
         st = CrewStore("s1")
         st.add_msg("hello")
-        assert CrewStore("s1").entry(st.queue[0]["msg_id"]) is not None
+        assert _durable_entry("s1", st.queue[0]["msg_id"]) is not None
 
     def test_post_appends_without_implicit_broadcast(self) -> None:
         # GPT finding on 120fd95e: the explicit chat_message frame is the
@@ -2508,7 +2665,7 @@ class TestGatewayCrewInit:
         on_disk_at_ack: list[list[str]] = []
 
         def _ack(*a: object, **k: object) -> bool:
-            on_disk_at_ack.append([e["text"] for e in CrewStore("s1").queue])
+            on_disk_at_ack.append([e["text"] for e in _durable_queue()])
             return True
 
         with patch.object(orch, "_post", side_effect=_ack), \
@@ -2517,7 +2674,7 @@ class TestGatewayCrewInit:
             await orch.ingest(slot, "important request")
             await asyncio.sleep(0)
         assert on_disk_at_ack == [["important request"]]
-        assert CrewStore("s1").queue[0]["text"] == "important request"
+        assert _durable_queue()[0]["text"] == "important request"
 
     @pytest.mark.asyncio
     async def test_failed_steer_on_idle_topic_dispatches(self) -> None:
@@ -2545,14 +2702,18 @@ class TestGatewayCrewInit:
         # GPT finding on 85f8fbe2: a failed durable write must surface, and
         # the generation must stay retryable (not recorded as landed).
         st = CrewStore("s1")
-        with patch("pathlib.Path.replace", side_effect=OSError("disk full")):
+        # Faulted at `os.replace`, the call the store's rename actually makes
+        # since it moved onto `replace_with_retry`. A bare `OSError` is not the
+        # Windows sharing violation that helper retries, so it still propagates
+        # on the first attempt — which is what this test is about.
+        with patch("os.replace", side_effect=OSError("disk full")):
             st.add_msg("doomed")
             with pytest.raises(OSError):
                 await st.wait_writes()
         assert st._written_seq.get("queue.json", 0) == 0  # still retryable
         st.save()  # retry with healthy disk
         await st.wait_writes()
-        assert CrewStore("s1").queue[0]["text"] == "doomed"
+        assert _durable_queue()[0]["text"] == "doomed"
 
 
 class TestGptRoundSixteen:
@@ -2603,3 +2764,217 @@ class TestGptRoundSixteen:
             "ingest returned without forcing the slot to disk — the echoed user "
             "message and the acknowledgement were memory-only"
         )
+
+
+def _crew_config(mapping: dict[str, str]) -> MagicMock:
+    """A config whose `agents` maps crew name -> kiro_agent template."""
+    cfg = MagicMock()
+    cfg.agents = {
+        name: MagicMock(kiro_agent=template) for name, template in mapping.items()
+    }
+    return cfg
+
+
+def _bindings(mapping: dict[str, str]):
+    """`resolve_agent_bindings` stand-in honouring *mapping*, else passthrough."""
+
+    def _resolve(_cfg, agent_name=None, project_dir=None):  # type: ignore[no-untyped-def]
+        del project_dir
+        return MagicMock(kiro_agent=mapping.get(agent_name or "", agent_name or ""))
+
+    return _resolve
+
+
+class TestCrewNameResolvesToTemplate:
+    """`slot.agent` is a CREW name; `spawn(agent=)` validates TEMPLATE names.
+
+    They coincide for every crew whose `kiro_agent` repeats its own name, so the
+    defect only ever showed on the default crew (`default` -> `kirocrew`) — which
+    is the crew every session starts on, making crew mode unusable by default.
+    """
+
+    def _patches(self, mapping: dict[str, str]):
+        return (
+            patch.object(crew_mod.KiroCrewConfig, "load", staticmethod(
+                lambda: _crew_config(mapping))),
+            patch.object(crew_mod, "resolve_agent_bindings", _bindings(mapping)),
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_crew_dispatches_as_its_template(self) -> None:
+        cfg_patch, bind_patch = self._patches({"default": "kirocrew"})
+        subagents = MagicMock()
+        subagents.spawn = MagicMock(return_value=_spawn_info("r1"))
+        orch = _orch(subagents=subagents)
+        slot = _slot(agent="default")
+        st = orch._store("s1")
+        e = st.add_msg("build X")
+        with cfg_patch, bind_patch, patch.object(orch, "_post"):
+            await orch._apply(slot, st, {"do": "spawn", "msg_id": e["msg_id"], "title": "X"})
+        # The crew name would be refused by _validate_agent: no template is named
+        # "default".
+        assert subagents.spawn.call_args.kwargs["agent"] == "kirocrew"
+
+    @pytest.mark.asyncio
+    async def test_crew_whose_name_matches_its_template_is_unchanged(self) -> None:
+        cfg_patch, bind_patch = self._patches({"cr-analyst": "cr-analyst"})
+        subagents = MagicMock()
+        subagents.spawn = MagicMock(return_value=_spawn_info("r1"))
+        orch = _orch(subagents=subagents)
+        st = orch._store("s1")
+        e = st.add_msg("review this")
+        with cfg_patch, bind_patch, patch.object(orch, "_post"):
+            await orch._apply(_slot(agent="cr-analyst"), st,
+                              {"do": "spawn", "msg_id": e["msg_id"], "title": "X"})
+        assert subagents.spawn.call_args.kwargs["agent"] == "cr-analyst"
+
+    @pytest.mark.asyncio
+    async def test_empty_agent_resolves_to_the_default_binding(self) -> None:
+        # Empty must NOT pass "" through to spawn(): the governance agent-scope
+        # check (capabilities.spawn.scopes.agents) only vets a NAMED agent, so
+        # agent="" would run the default agent outside the administrator's
+        # allowlist. Resolving as None pins the default binding's template.
+        def _resolve(_cfg, agent_name=None, project_dir=None):  # type: ignore[no-untyped-def]
+            del project_dir
+            assert agent_name is None  # empty crew resolves as the default
+            return MagicMock(kiro_agent="kirocrew", requested_resolved=True)
+
+        cfg_patch = patch.object(crew_mod.KiroCrewConfig, "load", staticmethod(
+            lambda: _crew_config({"default": "kirocrew"})))
+        bind_patch = patch.object(crew_mod, "resolve_agent_bindings", _resolve)
+        subagents = MagicMock()
+        subagents.spawn = MagicMock(return_value=_spawn_info("r1"))
+        orch = _orch(subagents=subagents)
+        st = orch._store("s1")
+        e = st.add_msg("build X")
+        with cfg_patch, bind_patch, patch.object(orch, "_post"):
+            await orch._apply(_slot(agent=""), st,
+                              {"do": "spawn", "msg_id": e["msg_id"], "title": "X"})
+        assert subagents.spawn.call_args.kwargs["agent"] == "kirocrew"
+
+    @pytest.mark.asyncio
+    async def test_resolution_failure_falls_back_to_the_crew_name(self) -> None:
+        # A broken config must degrade to the previous behaviour, not lose the
+        # dispatch: the crew name still resolves for the 40 crews where name ==
+        # template.
+        subagents = MagicMock()
+        subagents.spawn = MagicMock(return_value=_spawn_info("r1"))
+        orch = _orch(subagents=subagents)
+        st = orch._store("s1")
+        e = st.add_msg("build X")
+        boom = patch.object(crew_mod.KiroCrewConfig, "load", staticmethod(
+            MagicMock(side_effect=RuntimeError("unreadable config"))))
+        with boom, patch.object(orch, "_post"):
+            await orch._apply(_slot(agent="cr-analyst"), st,
+                              {"do": "spawn", "msg_id": e["msg_id"], "title": "X"})
+        assert subagents.spawn.call_args.kwargs["agent"] == "cr-analyst"
+
+    @pytest.mark.asyncio
+    async def test_warm_still_runs_before_resolution(self) -> None:
+        # The resolved template may itself be a project agent, which
+        # _validate_agent only ever sees through the warmed cache.
+        cfg_patch, bind_patch = self._patches({"default": "kirocrew"})
+        orch = _orch()
+        with cfg_patch, bind_patch, patch.object(
+            orch, "_warm_agent_cache", new=AsyncMock()
+        ) as warm:
+            resolved = await orch._dispatch_agent(_slot(agent="default"))
+        assert resolved == "kirocrew"
+        warm.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_continuation_dispatches_as_the_template(self) -> None:
+        cfg_patch, bind_patch = self._patches({"default": "kirocrew"})
+        orch = _orch()
+        st = orch._store("s1")
+        slot = _slot(agent="default")
+        e = st.add_msg("first")
+        info0 = _spawn_info("r1")
+        orch._subagents.spawn = MagicMock(return_value=info0)
+        with cfg_patch, bind_patch, patch.object(orch, "_post"):
+            await orch._apply(slot, st, {"do": "spawn", "msg_id": e["msg_id"], "title": "T"})
+        t = st.topic("r1")
+        t["status"] = "idle"
+        follow = st.add_msg("follow up")
+        orch._subagents.continue_conversation = MagicMock(return_value=_spawn_info("r2"))
+        with cfg_patch, bind_patch, patch.object(orch, "_post"):
+            await orch._apply(slot, st, {"do": "route", "msg_id": follow["msg_id"],
+                                         "topic_id": t["topic_id"]})
+        kwargs = orch._subagents.continue_conversation.call_args.kwargs
+        assert kwargs["agent"] == "kirocrew"
+
+
+class TestUnknownCrewNameStaysFailClosed:
+    """An UNKNOWN crew name must not dispatch as the default agent.
+
+    `resolve_agent_bindings` answers an unknown name with the DEFAULT binding
+    and signals it via `requested_resolved=False`. Dispatching that binding
+    would silently run the default agent under a stale/unknown crew name —
+    `_dispatch_agent` must return the raw crew name instead, which
+    `_validate_agent` refuses because no template carries it.
+    """
+
+    @staticmethod
+    def _unknown_bindings(default_template: str):
+        """Resolver stub: unknown names fall back to the default binding."""
+
+        def _resolve(_cfg, agent_name=None, project_dir=None):  # type: ignore[no-untyped-def]
+            del project_dir
+            return MagicMock(
+                kiro_agent=default_template,
+                requested_resolved=False,
+            )
+
+        return _resolve
+
+    @pytest.mark.asyncio
+    async def test_unknown_crew_returns_the_raw_name_not_the_default(self) -> None:
+        cfg_patch = patch.object(
+            crew_mod.KiroCrewConfig, "load",
+            staticmethod(lambda: _crew_config({"default": "kirocrew"})))
+        bind_patch = patch.object(
+            crew_mod, "resolve_agent_bindings", self._unknown_bindings("kirocrew"))
+        orch = _orch()
+        with cfg_patch, bind_patch:
+            resolved = await orch._dispatch_agent(_slot(agent="ghost-crew"))
+        # NOT "kirocrew": the default binding must not be dispatched under an
+        # unknown name. The raw name is what _validate_agent refuses.
+        assert resolved == "ghost-crew"
+
+    @pytest.mark.asyncio
+    async def test_unknown_crew_spawn_is_refused_downstream(self) -> None:
+        # End-to-end through _apply: the unknown name reaches spawn(agent=)
+        # unchanged, so _validate_agent (which only accepts real template
+        # names) refuses the dispatch instead of silently running the default
+        # agent.
+        cfg_patch = patch.object(
+            crew_mod.KiroCrewConfig, "load",
+            staticmethod(lambda: _crew_config({"default": "kirocrew"})))
+        bind_patch = patch.object(
+            crew_mod, "resolve_agent_bindings", self._unknown_bindings("kirocrew"))
+        subagents = MagicMock()
+        subagents.spawn = MagicMock(return_value=_spawn_info("r1"))
+        orch = _orch(subagents=subagents)
+        st = orch._store("s1")
+        e = st.add_msg("build X")
+        with cfg_patch, bind_patch, patch.object(orch, "_post"):
+            await orch._apply(_slot(agent="ghost-crew"), st,
+                              {"do": "spawn", "msg_id": e["msg_id"], "title": "X"})
+        assert subagents.spawn.call_args.kwargs["agent"] == "ghost-crew"
+
+    @pytest.mark.asyncio
+    async def test_known_crew_is_unaffected_by_the_guard(self) -> None:
+        # requested_resolved defaults True for constructions predating the
+        # field; a known crew keeps resolving to its template.
+        def _resolve(_cfg, agent_name=None, project_dir=None):  # type: ignore[no-untyped-def]
+            del project_dir
+            return MagicMock(kiro_agent="kirocrew", requested_resolved=True)
+
+        cfg_patch = patch.object(
+            crew_mod.KiroCrewConfig, "load",
+            staticmethod(lambda: _crew_config({"default": "kirocrew"})))
+        bind_patch = patch.object(crew_mod, "resolve_agent_bindings", _resolve)
+        orch = _orch()
+        with cfg_patch, bind_patch:
+            resolved = await orch._dispatch_agent(_slot(agent="default"))
+        assert resolved == "kirocrew"

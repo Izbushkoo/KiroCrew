@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import threading
 import time
 import traceback
@@ -31,6 +32,7 @@ from kiro_crew.constants import (
 )
 from kiro_crew.dashboard.chat_compaction_notice import deliver_channel_compaction_notice
 from kiro_crew.dashboard.side_state import SideState
+from kiro_crew.dashboard.system_notices import is_system_notice
 from kiro_crew.history import latest_transcript_ts, monotonic_transcript_ts
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.messaging.link import (
@@ -92,6 +94,22 @@ _CHANNEL_LABELS = {
     "wecom": "WeCom",
     "weixin": "WeChat",
 }
+
+
+def _safe_folder_tree(folders: object) -> list[dict[str, Any]]:
+    """Well-formed folder entries safe to ship on the slots broadcast frame.
+
+    ``load_folders`` does a bare ``json.loads`` with no shape validation, so a
+    corrupt ``folders.json`` can leave ``_folders`` as a non-list (``list()``
+    would then raise ``TypeError`` on the broadcast hot path) or a list holding
+    non-dicts / dicts without an ``id`` (which the client's grouping keys on).
+    Keep only dict entries carrying a string ``id`` so a corrupt store degrades
+    to a smaller/empty tree rather than crashing every slot push. A non-list
+    (including ``None`` from an unset/partially-constructed state) yields ``[]``.
+    """
+    if not isinstance(folders, list):
+        return []
+    return [f for f in folders if isinstance(f, dict) and isinstance(f.get("id"), str)]
 
 
 def _split_namespaced_channel_id(channel_id: str | None) -> tuple[str, str] | None:
@@ -306,6 +324,244 @@ _UNSAFE_SHELL_RE = re.compile(r">|`|\$\(|<\(|(?<!&)&(?!&)")
 # a sink, smuggling a real-file write past the unsafe-shell check.
 _DEVNULL_REDIR_RE = re.compile(r"(?:\d*>>?|&>)\s*/dev/null(?![\w./-])|\d*>&\d+")
 
+# A trailing `--help` is only meaningful for a program that treats it as
+# "print usage and exit". These programs instead treat their operands as code
+# or a target to act on, so `--help` lands as a positional argument and the
+# real work still happens: `sh evil.sh --help` runs evil.sh with $1=--help.
+# The classifier cannot know which behaviour a given program has, so the
+# executors are named explicitly and the shape of the command is constrained
+# below.
+_HELP_PROBE_DENIED_PROGRAMS: frozenset[str] = frozenset(
+    (
+        # Shell builtins that run their operand in the current shell. These are
+        # not programs on PATH, so the PATH-name requirement below does not
+        # reach them on its own: `source payload --help` reads `payload` from
+        # the workspace and executes it, with `--help` landing as $1.
+        "source",
+        ".",
+        "exec",
+        "eval",
+        "command",
+        "builtin",
+        "trap",
+        # Shells and interpreters — operands are code.
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "ksh",
+        "fish",
+        "csh",
+        "tcsh",
+        "ash",
+        "busybox",
+        "python",
+        "python2",
+        "python3",
+        "perl",
+        "ruby",
+        "node",
+        "deno",
+        "bun",
+        "php",
+        "lua",
+        "tclsh",
+        "osascript",
+        "pwsh",
+        "powershell",
+        "cmd",
+        # Wrappers that hand off to another program.
+        "env",
+        "sudo",
+        "doas",
+        "nohup",
+        "setsid",
+        "nice",
+        "ionice",
+        "time",
+        "timeout",
+        "xargs",
+        "watch",
+        "script",
+        "stdbuf",
+        "unbuffer",
+        "ssh",
+        "scp",
+        "rsync",
+        "docker",
+        "podman",
+        "kubectl",
+        "make",
+        "cmake",
+        # Package managers that run a project-defined script. The subcommand form
+        # reads as `<program> <subcommand> --help`, but the "subcommand" is a name
+        # from the project's own manifest: `yarn clean --help` runs the `clean`
+        # script (deleting `dist` and `node_modules` in this repo) and passes
+        # `--help` to it. There is no way to tell a real subcommand from a script
+        # name from here, so the whole program is refused.
+        "yarn",
+        "yarnpkg",
+        "npm",
+        "npx",
+        "pnpm",
+        "bunx",
+        # Network tools — operands establish a connection.
+        "nc",
+        "ncat",
+        "netcat",
+        "socat",
+        "curl",
+        "wget",
+        "telnet",
+        "ftp",
+    )
+)
+
+# Only the unambiguous long spellings. `-v` and `-V` are excluded: for many
+# programs they mean verbose, not version, so `rm victim -v` would read as a
+# probe and delete the operand. `-h` is excluded: it collides with real options
+# (`head -h`, `ln -h`) and for shutdown/halt/reboot it means HALT, not help.
+# `java -version` and `python --version` keep working through their explicit
+# `_READ_ONLY_BASH_PREFIXES` entries rather than the probe rule.
+_HELP_FLAGS: frozenset[str] = frozenset(("--help", "--version"))
+
+# A subcommand between the program and the flag, e.g. `git log --help`. Bare
+# words only: no path separator, no dot, no leading dash. This is what keeps
+# `sh /tmp/evil.sh --help` (path) and `rm -rf ./proj --help` (option) out,
+# while `docker compose --help` and `git rev-parse --help` stay in.
+_HELP_PROBE_SUBCOMMAND_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+# Programs whose `<program> <subcommand> --help` really is a usage probe.
+#
+# An ALLOWLIST, because the three-token form is the dangerous one: the middle
+# token is indistinguishable from an operand here, so a program that treats it as
+# a script RUNS it (`python3.12 payload --help`). The denied-program table cannot
+# answer that — it matches exactly, and the spellings a real system installs
+# (`python3.12`, `perl5.36`, `node20`, `sh.exe`, `g++-13`) are unbounded.
+#
+# Membership means: this program's subcommands are a fixed vocabulary it parses
+# itself, so an unknown one is an error rather than a file to execute. A program
+# missing from here is not blocked — its two-token probe still works, and the
+# three-token form falls through to the human prompt.
+_HELP_PROBE_SUBCOMMAND_PROGRAMS: frozenset[str] = frozenset(
+    (
+        "git",
+        "cargo",
+        "go",
+        "terraform",
+        "gh",
+        "glab",
+        "aws",
+        "gcloud",
+        "az",
+        "brew",
+        "apt",
+        "apt-get",
+        "dnf",
+        "yum",
+        "pacman",
+        "pip",
+        "pip3",
+        "poetry",
+        "uv",
+        "rustup",
+        "systemd-analyze",
+        # NOT archivers or `openssl`: their "subcommand" is a mode letter whose
+        # operands are files it reads or WRITES, so the three-token form is not a
+        # usage probe at all — `tar xf …` extracts, `zip …` creates, and `openssl
+        # <cmd>` reads a key. Membership here has to mean "an unknown subcommand
+        # is an error", and for these it means "a file to act on".
+    )
+)
+
+# The program must BE a bare command name, stated positively. The denied-program
+# table only knows the executors it lists, so anything it cannot recognise must
+# not be vouched for — and a rejection list cannot express that, because the
+# spellings the shell resolves at run time are unbounded:
+#
+#     $SHELL payload --help      ${SHELL} payload --help      $0 payload --help
+#
+# all name a shell that then RUNS `payload`, and all of them satisfied the
+# previous rule, which only asked "does the token contain a path separator?".
+# Requiring `[A-Za-z0-9][A-Za-z0-9._+-]*` refuses every one of them by
+# construction, along with `./payload`, `/tmp/x` and `../build/tool` that the
+# separator check was there for — a name this pattern accepts has to resolve
+# through PATH to something installed. Dots are allowed because real programs
+# carry them (`python3.12`, `apt-get`, `g++`).
+_HELP_PROBE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
+
+
+def _is_help_probe(segment: str) -> bool:
+    """True only when *segment* is a genuine usage/version probe.
+
+    Accepts ``<program> --help`` and ``<program> <subcommand> --help``. The
+    check is deliberately shaped as "only vouch for what is recognisably a
+    probe" rather than "reject the executors we know about": the denied-program
+    table cannot enumerate an arbitrary binary, so anything it does not
+    recognise must fail on the shape instead.
+
+    Rejected, each for its own reason:
+
+    * a flag other than ``--help`` / ``--version``, so ``rm victim -v``
+      is an operand plus verbose, not a probe;
+    * a program named by path (``./payload``, ``/tmp/x``), which the table has
+      no knowledge of and which may ignore ``--help`` entirely;
+    * a known code executor or hand-off wrapper (``sh``, ``python``, ``sudo``);
+    * a ``VAR=value`` prefix, which assigns into the command's environment;
+    * anything but a bare word between program and flag, which keeps file paths
+      and options out;
+    * unbalanced quotes, where argv cannot be established at all.
+
+    A rejected segment falls through to the read-only allowlist and, failing
+    that, to the human approval prompt — nothing is newly blocked.
+
+    The old rule was ``segment.endswith("--help")``, which auto-approved any
+    command at all once the token was appended.
+    """
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        # Unbalanced quotes: cannot establish the argv, so do not vouch for it.
+        return False
+    if len(tokens) < 2 or len(tokens) > 3:
+        return False
+    flag = tokens[-1]
+    if flag not in _HELP_FLAGS:
+        return False
+    program_token = tokens[0]
+    # A `VAR=value cmd --help` prefix assigns into the command's environment;
+    # shlex keeps it as one token, and it is not a usage probe.
+    if "=" in program_token:
+        return False
+    # Must BE a bare command name. Anything carrying a path separator, a shell
+    # expansion, or any other punctuation the shell resolves at run time is a
+    # program this classifier cannot identify, so it is not vouched for.
+    if not _HELP_PROBE_NAME_RE.match(program_token):
+        return False
+    if not program_token or program_token in _HELP_PROBE_DENIED_PROGRAMS:
+        return False
+    if len(tokens) == 3:
+        # The subcommand form only accepts the long spellings — short flags like
+        # `-h` collide with real options when an operand is present.
+        if flag not in _HELP_FLAGS:
+            return False
+        if not _HELP_PROBE_SUBCOMMAND_RE.match(tokens[1]):
+            return False
+        # The three-token form is ALLOWLISTED, not merely un-denied. In this shape
+        # the middle token is an operand as far as this classifier can tell, so an
+        # interpreter reached by a spelling the denylist does not carry runs it:
+        #
+        #     python3.12 payload --help      perl5.36 payload --help
+        #     node20 payload --help          g++-13 payload --help
+        #
+        # `_HELP_PROBE_DENIED_PROGRAMS` matches EXACTLY, and the variants a real
+        # system installs — version suffixes, `.exe`, `-13` — are unbounded, so no
+        # list of rejects closes this. Naming the programs whose subcommand form is
+        # known to be a usage probe does, and costs only that a program not yet
+        # listed falls through to the human prompt.
+        if program_token not in _HELP_PROBE_SUBCOMMAND_PROGRAMS:
+            return False
+    return True
+
 
 def _classify_bash(cmd: str) -> str:
     """Single source of truth for read-only bash classification.
@@ -332,8 +588,7 @@ def _classify_bash(cmd: str) -> str:
             return "unsafe shell pattern"
         first = pipe_parts[0].strip().lower()
         if not (
-            first.endswith("--help")
-            or first.endswith("--version")
+            _is_help_probe(first)
             or any(first == p or first.startswith(p + " ") for p in _READ_ONLY_BASH_PREFIXES)
         ):
             base = first.split()[0] if first.split() else first
@@ -474,7 +729,7 @@ def is_turn_interrupted(messages: list[dict]) -> bool:
         # is never scanned, because a later user/assistant row returns first.
         if is_stop_event_row(m):
             return False
-        if role == "assistant" and meta.get("kind") == "compaction":
+        if is_system_notice(role, meta):
             continue
         if role in ("user", "assistant") and m.get("content"):
             return True if role == "user" else saw_trailing_error
@@ -622,9 +877,44 @@ def _budgeted_source_links(links: list[dict]) -> list[dict]:
     Budgeting per kind keeps pre-existing pull-request behaviour unchanged and
     makes issues purely additive.
     """
+    changes, issues = _source_links_by_kind(links)
+    return changes[:_SERIALIZED_SOURCE_LINKS_PER_SLOT] + issues[:_SERIALIZED_SOURCE_LINKS_PER_SLOT]
+
+
+def _source_links_by_kind(links: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split links into (changes, issues), preserving discovery order in each.
+
+    ``kind`` is absent on older payloads and means ``"change"`` there, so the
+    default keeps a pre-``kind`` link rendering as the pull request it always
+    was.
+    """
     changes = [link for link in links if link.get("kind", "change") == "change"]
     issues = [link for link in links if link.get("kind", "change") == "issue"]
-    return changes[:_SERIALIZED_SOURCE_LINKS_PER_SLOT] + issues[:_SERIALIZED_SOURCE_LINKS_PER_SLOT]
+    return changes, issues
+
+
+def _project_source_links(links: list[dict], include_check_status: bool) -> list[dict]:
+    """Attach cached chip status to each link, gated on kind and on the caller.
+
+    The chip-status cache is pull-request-only: it holds a {ci, state}
+    projection of a PR/MR lifecycle. Consulting it for an issue would key on a
+    URL it never stores -- and if a PR and an issue ever normalized to the same
+    key, the issue chip would inherit the PR's CI glyph. Gate on kind.
+
+    Shared by the budgeted slots payload and the unbudgeted overflow-expand
+    read so the two cannot decorate the same link differently.
+    """
+    return [
+        {
+            **link,
+            **(
+                (_cached_check_status(link["url"]) or {})
+                if include_check_status and link.get("kind", "change") == "change"
+                else {}
+            ),
+        }
+        for link in links
+    ]
 
 
 _NON_DURABLE_SOURCE_LINK_ROLES = frozenset({"chunk", "done", "streaming", "queued", "permission"})
@@ -724,6 +1014,24 @@ EMPTY_RESPONSE_RECOVERY_PREFIX = "[Empty response — automatic recovery]"
 # say "automatic recovery" like the five above: a person pressed the button, and
 # the card must not claim the system recovered by itself.
 MANUAL_RESUME_RECOVERY_PREFIX = "[Continue — requested by the user]"
+# Prefix on the continuation injected when a Stop hook returns a block decision
+# (`{"decision": "block", "reason": ...}` on exit-0 stdout). The reason IS the
+# instruction, handed back as the next turn so a hook can steer the session
+# without a round-trip to the user. Named into the *_RECOVERY_PREFIX family so
+# test_recovery_card_prefixes.py's drift guard sees it — a marker outside the
+# family renders as a full-width bubble instead of a card. The VALUE deliberately
+# does not say "recovery": the turn completed and a hook asked for another, so
+# nothing failed and nothing was recovered.
+HOOK_CONTINUATION_RECOVERY_PREFIX = "[Hook continuation — automatic]"
+# Prefix on the informational row surfaced when a Stop-hook continuation run hits
+# the `agent.max_stop_hook_nudges` cap: the next block decision is refused, no
+# turn is dispatched, and this row is appended instead so the transcript shows
+# the loop was force-stopped (with the reached depth as "#N"). Named into the
+# *_RECOVERY_PREFIX family so test_recovery_card_prefixes.py's drift guard sees
+# it — a marker outside the family renders as a full-width bubble, not a card.
+# The VALUE does not say "recovery": nothing failed or recovered, a safety cap
+# fired.
+HOOK_HALTED_RECOVERY_PREFIX = "[Stop-hook nudge cap reached]"
 
 
 def should_queue_refusal_recovery(
@@ -743,6 +1051,43 @@ def should_queue_refusal_recovery(
         and not needs_reset
         and stop_reason != STOP_REASON_CANCELLED
     )
+
+
+def should_queue_hook_continuation(stopping: bool, needs_reset: bool, stop_reason: str) -> bool:
+    """Decide whether a Stop hook's block decision may inject a continuation.
+
+    Mirrors :func:`should_queue_refusal_recovery`'s suppression set so a hook can
+    never override the Stop button: a stop in progress, a pending session reset,
+    or a user-cancelled turn all win over the hook.
+    """
+    return bool(not stopping and not needs_reset and stop_reason != STOP_REASON_CANCELLED)
+
+
+def parse_hook_continuations(stdouts: list[str]) -> list[str]:
+    """Extract continuation instructions from Stop-hook exit-0 stdout texts.
+
+    ``stdouts`` is what ``_fire`` returns for the Stop event: one entry per exit-0
+    hook, plus ``BLOCKED:`` markers for exit-2 denials. Only a well-formed block
+    decision carrying a non-blank ``reason`` contributes, because ``reason`` is
+    the message that gets injected — a block without one has nothing to say, so
+    the turn stops normally. Every other string is ignored, which is what keeps an
+    ordinary Stop hook that merely logs from continuing the session.
+    """
+    reasons: list[str] = []
+    for stdout in stdouts:
+        try:
+            decision = json.loads(stdout)
+        except (ValueError, TypeError, RecursionError):
+            # RecursionError is a RuntimeError, not a ValueError: json.loads
+            # raises it on deeply-nested input, and a pathological hook must not
+            # error an otherwise-successful turn.
+            continue
+        if not isinstance(decision, dict) or decision.get("decision") != "block":
+            continue
+        reason = decision.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            reasons.append(reason)
+    return reasons
 
 
 def build_refusal_recovery_prompt(refusals: list[tuple[str, str]]) -> str:
@@ -1034,6 +1379,7 @@ class _ChatSlot:
         "_artifact",
         "_channel_folder_filed",
         "_resumed_count",
+        "_hook_continuation_depth",
         "_todo",
         "_on_message",
         "_on_question_retired",
@@ -1085,6 +1431,7 @@ class _ChatSlot:
         "_compaction_fail_streak",
         "_compaction_fail_cooldown_until",
         "color_index",
+        "color_hex",
         "color_theme",
         "theme_consent",
         "theme_consent_sha",
@@ -1110,6 +1457,8 @@ class _ChatSlot:
         "_active_turn_session_key",
         "_side",
         "_acp_client",
+        "_last_turn_awaiting_permission",
+        "_last_turn_children_announced",
         "_steer_segment_cut",
         "_native_subagent_tracker",
         "_native_subagent_output",
@@ -1232,6 +1581,11 @@ class _ChatSlot:
         # Default filing is a first-surface action, not a recurring one.
         self._channel_folder_filed: bool = False
         self._resumed_count: int = 0  # messages loaded from history on resume
+        # Depth of the current unbroken Stop-hook continuation run: 0 on a normal
+        # turn, incremented on each consecutive hook-continuation turn, reset by
+        # any turn that is not a hook continuation. Surfaced to Stop hooks as
+        # `hook_continuation_count` for diagnostics or stricter hook-owned limits.
+        self._hook_continuation_depth: int = 0
         # Agent-authored TODO list, replaced wholesale from each todo_list tool
         # result (every command echoes the full list, so there is nothing to
         # merge). Shape: {description: str, tasks: [{id, text, completed}]}.
@@ -1395,6 +1749,13 @@ class _ChatSlot:
         self._compaction_fail_streak: int = 0
         self._compaction_fail_cooldown_until: float = 0.0
         self.color_index: int | None = None
+        # Custom per-session color (#rrggbb, lowercase). Mutually exclusive
+        # with color_index: the PATCH handler clears one when the other is
+        # set, and the frontend renders color_hex with priority. Unlike
+        # color_index (resolved against the viewer's generated palette, so it
+        # follows theme/palette switches), a custom hex is deliberately
+        # frozen.
+        self.color_hex: str | None = None
         self.color_theme: str = ""
         # Explicit user consent for the active INSTALLED theme's experience
         # layer (persona injection is gated on this; fail-closed default).
@@ -1511,6 +1872,11 @@ class _ChatSlot:
         # dashboard steer handler) reach the running session's client to inject
         # a mid-turn steer. None when idle.
         self._acp_client = None
+        # Hang-attribution snapshot stashed by _run_chat's finally just before
+        # _acp_client is dropped; read by finish_turn_task when the dashboard
+        # ceiling cut the turn (kirocrew.turn.timeout.cause).
+        self._last_turn_awaiting_permission = False
+        self._last_turn_children_announced = False
         # Sync callable published by _run_chat alongside _acp_client (cleared in
         # the same finally): flushes the turn's accumulated text as a finalized
         # assistant segment NOW. The steer handler calls it right BEFORE
@@ -2240,6 +2606,24 @@ class _ChatSlot:
         self._source_links_cache = (cache_key, links)
         return links
 
+    def source_links_payload(self, *, include_check_status: bool = False) -> dict:
+        """Every source link this slot carries — the unbudgeted read.
+
+        ``to_dict`` serializes at most ``_SERIALIZED_SOURCE_LINKS_PER_SLOT`` per
+        kind, so the sidebar's "+N" overflow chip has nothing on the client to
+        expand into. This is what that expand fetches.
+
+        Ordering repeats the budgeted slice's grouping (changes, then issues) so
+        the chips already on screen keep their positions and the revealed ones
+        append inside their own group instead of shuffling the row.
+        """
+        links = self._pr_source_links()
+        changes, issues = _source_links_by_kind(links)
+        return {
+            "links": _project_source_links(changes + issues, include_check_status),
+            "total": len(links),
+        }
+
     def to_dict(self, *, include_check_status: bool = False) -> dict:
         last_ts = self.messages[-1].get("ts", "") if self.messages else ""
         # Single reverse scan for last_msg, options, and last_activity_ts.
@@ -2252,26 +2636,27 @@ class _ChatSlot:
         found_conv = False
         for m in reversed(self.messages):
             role = m.get("role")
-            # Compute meta/compaction flag once for both guards below
+            # Compute meta/system-notice flag once for both guards below
             msg_meta = m.get("meta") or {}
-            is_compaction = role == "assistant" and msg_meta.get("kind") == "compaction"
+            is_notice = is_system_notice(role, msg_meta)
             # Capture last_activity_ts from the most recent actionable message
             if (
                 not last_activity_ts
                 and role in ("tool_call", "tool_result", "assistant")
-                and not is_compaction
+                and not is_notice
             ):
                 last_activity_ts = m.get("ts") or ""
             # Capture the last conversational message (role/options once, and
-            # the newest non-empty preview). Skip compaction
-            # notices: assistant-role system messages tagged
-            # meta.kind == "compaction" — the auto-compact notice
-            # ("Auto-compacted at N%.", _AUTO_COMPACT_NOTICE) and the
-            # /compact result banner (chat_utils._append_compaction_notice).
+            # the newest non-empty preview). Skip system notices:
+            # assistant-role status rows tagged with a kind in
+            # SYSTEM_NOTICE_KINDS — the auto-compact notice
+            # ("Auto-compacted at N%.", _AUTO_COMPACT_NOTICE), the /compact
+            # result banner (chat_utils._append_compaction_notice), and the
+            # session-reload confirmation (api_chat_slot_reload).
             # This keeps the sidebar showing the last real message and mirrors
             # the frontend's deriveFollowUpOptions skip so preview/options
             # stay consistent.
-            if role in ("user", "assistant") and not is_compaction:
+            if role in ("user", "assistant") and not is_notice:
                 txt = m.get("content") or ""
                 if txt:
                     if not found_conv:
@@ -2447,22 +2832,9 @@ class _ChatSlot:
             "last_ts": last_ts,
             "last_turn_ts": last_turn_ts,
             "last_message": last_msg,
-            "source_links": [
-                {
-                    **link,
-                    # The chip-status cache is pull-request-only: it holds a
-                    # {ci, state} projection of a PR/MR lifecycle. Consulting it
-                    # for an issue would key on a URL it never stores -- and if a
-                    # PR and an issue ever normalized to the same key, the issue
-                    # chip would inherit the PR's CI glyph. Gate on kind.
-                    **(
-                        (_cached_check_status(link["url"]) or {})
-                        if include_check_status and link.get("kind", "change") == "change"
-                        else {}
-                    ),
-                }
-                for link in _budgeted_source_links(source_links)
-            ],
+            "source_links": _project_source_links(
+                _budgeted_source_links(source_links), include_check_status
+            ),
             "source_links_total": len(source_links),
             # Agent TODO list. Absent-vs-empty is load-bearing: None means the
             # agent never used its todo tool (no pill), [] means it cleared the
@@ -2483,6 +2855,7 @@ class _ChatSlot:
             "pinned": self.pinned,
             "tags": list(self.tags),
             "color_index": self.color_index,
+            "color_hex": self.color_hex,
             "color_theme": self.color_theme,
             "theme_consent": self.theme_consent,
             "theme_consent_sha": self.theme_consent_sha,
@@ -2579,6 +2952,7 @@ class DashboardState:
         self._mcp_gateway_manager: Any = None  # GatewayManager | None
         self._mcp_gateway_apply: Any = None  # async (enabled: bool) -> dict
         self._mcp_gateway_apply_stub: Any = None  # async () -> dict
+        self._mcp_resolve_refresh: Any = None  # async () -> dict
         # Secretary subsystem removed; kept as permanent None for apps/routes.py
         # builtin-service restart lookup (getattr-based, no-op when None).
         self._secretary_restart: Any = None  # restart callback (always None — service removed)
@@ -5707,6 +6081,17 @@ class DashboardState:
         # ['dashboardConfig'] query only when the GitLab-hosts allowlist actually
         # changed -- an event-driven refresh that replaces a constant 30s poll
         # (which multiplied audit-log writes across every same-key observer).
+        #
+        # Piggyback the folder tree (the in-memory ``_folders`` list, WITHOUT the
+        # per-folder ``history_count`` that ``GET /api/chat/folders`` computes via
+        # a synchronous session scan) so the sidebar can group sessions correctly
+        # on the FIRST paint. Sessions arrive on this WS frame the instant the
+        # socket connects; folders otherwise arrive only via a separate HTTP GET,
+        # so the sidebar would render every session ungrouped (Unfiled bucket)
+        # until that GET resolved, then visibly re-shuffle them into folders. The
+        # HTTP query still runs to backfill ``history_count``; grouping no longer
+        # waits on it. Slicing to the fields the client's grouping needs keeps
+        # this hot-path frame small and never touches the filesystem.
         self._broadcast(
             {
                 "_type": "slots",
@@ -5715,6 +6100,23 @@ class DashboardState:
                 "slots": json.dumps(slots_data),
                 "channelTrusted": ch_trusted,
                 "gitlabHostsGeneration": gitlab_hosts_generation(),
+                # getattr, not self._folders: this read path runs on EVERY slots
+                # push, including on a __new__-built DashboardState that seeded only
+                # the push essentials and never ran __init__ (several endpoint
+                # suites build their fixture that way). _folders is an __init__-only
+                # assignment, so a bare attribute access would AttributeError there
+                # — the exact break test_push_slots_update_survives_a_partially_
+                # constructed_state pins against. An absent/None folder store is an
+                # empty tree.
+                #
+                # Coerce to well-formed dict entries rather than `list(_folders)`:
+                # load_folders() does a bare json.loads with no shape check, so a
+                # corrupt folders.json can leave _folders as a non-list (crashing
+                # list() with TypeError on this hot path) or a list of non-dicts /
+                # dicts without an "id" (which the client's grouping keys on). Filter
+                # to dict entries carrying a string "id" so a corrupt store degrades
+                # to a smaller/empty tree instead of crashing the broadcast.
+                "folders": _safe_folder_tree(getattr(self, "_folders", None)),
             }
         )
         owner_ws_clients = getattr(self, "_owner_ws_clients", None)
@@ -5840,6 +6242,13 @@ class DashboardState:
                         # so anything not named here is silently dropped. The client
                         # invalidates its cached dashboard config when this changes.
                         "gitlabHostsGeneration": note.get("gitlabHostsGeneration"),
+                        # Folder tree (no history_count) so the sidebar groups
+                        # sessions on first paint without waiting for the separate
+                        # GET /api/chat/folders. Only the dashboard-user frame
+                        # (default_msg) carries it; app-token frames are rebuilt in
+                        # the scope chokepoint and deliberately omit it (apps do not
+                        # render the chat folder tree).
+                        "folders": note.get("folders"),
                     }
                 )
             elif msg_type == "slot_title":

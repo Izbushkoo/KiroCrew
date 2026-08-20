@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as _dt
 import errno
 import hashlib
 import json
 import logging
 import mimetypes
+import ntpath
 import os
 import re
 import stat as _stat_mod
@@ -1485,23 +1487,18 @@ async def api_file_read(request: web.Request) -> web.Response:
 
     raw_path = request.query.get("path", "")
     # Resolve relative paths against project dir when resolve=1
-    if request.query.get("resolve") == "1" and raw_path and not raw_path.startswith(("/", "~")):
-        proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
-        if not proj:
+    if request.query.get("resolve") == "1":
+        raw_path, _resolve_err = _resolve_project_relative(raw_path)
+        if _resolve_err == "cannot_resolve":
             return web.json_response(
                 {"error": "cannot resolve: no project dir configured"},
                 status=400,
             )
-        raw_path = os.path.join(proj, raw_path)
-        # Ensure resolved path stays within project directory
-        resolved = os.path.realpath(raw_path)
-        resolved_proj = os.path.realpath(proj)
-        if not (resolved == resolved_proj or resolved.startswith(resolved_proj + os.sep)):
+        if _resolve_err == "outside_project":
             return web.json_response(
                 {"error": "path outside project directory"},
                 status=400,
             )
-        raw_path = resolved
 
     try:
         validate_tool_args({"path": raw_path}, FILE_READ_SCHEMA)
@@ -1621,20 +1618,16 @@ async def api_file_download(request: web.Request) -> web.Response:
 
     raw_path = request.query.get("path", "")
     # Resolve relative paths against project dir when resolve=1 (mirrors api_file_read)
-    if request.query.get("resolve") == "1" and raw_path and not raw_path.startswith(("/", "~")):
-        proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
-        if not proj:
+    if request.query.get("resolve") == "1":
+        raw_path, _resolve_err = _resolve_project_relative(raw_path)
+        if _resolve_err == "cannot_resolve":
             return web.json_response(
                 {"error": "cannot resolve: no project dir configured"}, status=400,
             )
-        raw_path = os.path.join(proj, raw_path)
-        resolved = os.path.realpath(raw_path)
-        resolved_proj = os.path.realpath(proj)
-        if not (resolved == resolved_proj or resolved.startswith(resolved_proj + os.sep)):
+        if _resolve_err == "outside_project":
             return web.json_response(
                 {"error": "path outside project directory"}, status=400,
             )
-        raw_path = resolved
 
     try:
         validate_tool_args({"path": raw_path}, FILE_READ_SCHEMA)
@@ -1819,6 +1812,319 @@ async def api_file_raw(request: web.Request) -> web.Response:
     return web.Response(body=data, headers=headers)
 
 
+# ── /api/file-stream: Range-capable audio/video serving ─────────────────────
+# The media cap is deliberately larger than _MAX_UPLOAD_BYTES: screen
+# recordings routinely exceed 50 MB, and unlike file-raw this endpoint never
+# materializes the file in memory -- Range streaming reads bounded chunks, so
+# the cap only bounds what one URL can address, not per-request memory.
+_STREAM_MAX_BYTES = 2 * 1024 * 1024 * 1024
+_STREAM_CHUNK_BYTES = 256 * 1024
+# Text-exfiltration probe window. Real media is binary within the first
+# bytes; content that decodes as UTF-8 text this deep is a text file wearing
+# a media magic, which the redaction scan below must see.
+_STREAM_TEXT_PROBE_BYTES = 64 * 1024
+
+
+def _resolve_project_relative(raw: str) -> tuple[str, str | None]:
+    """Resolve a relative path against KIROCREW_PROJECT_DIR (resolve=1).
+
+    Returns (path, None) on success -- absolute and ~-paths pass through
+    unchanged -- or ("", error_code) with "cannot_resolve" (no project dir
+    configured) or "outside_project" (the joined path escapes the project
+    directory after realpath).
+    """
+    if not raw or raw.startswith(("/", "~")):
+        return raw, None
+    # Windows-absolute shapes (UNC \\server\share, drive C:\...) are not
+    # project-relative: pass them to the validator unchanged. Joining them
+    # would let os.path.realpath contact the named host (SMB round-trip)
+    # before any validation runs; the validator's own network-path gate
+    # sits BEFORE its realpath, so it is the safe place for these.
+    if raw.startswith("\\") or ntpath.splitdrive(raw)[0]:
+        return raw, None
+    proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
+    if not proj:
+        return "", "cannot_resolve"
+    candidate = os.path.realpath(os.path.join(proj, raw))
+    resolved_proj = os.path.realpath(proj)
+    if not (candidate == resolved_proj or candidate.startswith(resolved_proj + os.sep)):
+        return "", "outside_project"
+    return candidate, None
+
+
+# Container signature -> Content-Type. Sniffed from the file's first bytes so
+# the endpoint serves media by CONTENT, not by extension claim (CWE-434 shape,
+# same posture as file-raw's image allowlist). Entries are (offset, magic,
+# mime). MP4-family uses the ftyp box at offset 4 (bytes 0-3 are the box
+# size); WebM and Matroska share the EBML magic and both play in <video>.
+_MEDIA_MAGIC: tuple[tuple[int, bytes, str], ...] = (
+    (4, b"ftyp", "video/mp4"),          # mp4 / m4v / m4a / mov (BMFF family)
+    (0, b"\x1a\x45\xdf\xa3", "video/webm"),  # webm / mkv (EBML)
+    (0, b"OggS", "audio/ogg"),          # ogg audio or video; <audio>/<video> both accept
+    (0, b"fLaC", "audio/flac"),
+    (0, b"ID3", "audio/mpeg"),          # mp3 with ID3v2 tag
+    (0, b"\xff\xfb", "audio/mpeg"),     # bare mp3 frame sync (MPEG1 layer3)
+    (0, b"\xff\xf3", "audio/mpeg"),
+    (0, b"\xff\xf2", "audio/mpeg"),
+)
+
+
+def _sniff_media_type(header: bytes) -> str | None:
+    """Return the media Content-Type for ``header`` bytes, or None."""
+    for offset, magic, mime in _MEDIA_MAGIC:
+        if header[offset:offset + len(magic)] == magic:
+            return mime
+    # WAV: RIFF....WAVE compound signature (offset 8 discriminates from WebP)
+    if header[:4] == b"RIFF" and header[8:12] == b"WAVE":
+        return "audio/wav"
+    return None
+
+
+def _parse_range_header(value: str, size: int) -> tuple[int, int] | None:
+    """Parse a single-range ``bytes=`` header against ``size``.
+
+    Returns (start, end) inclusive, or None for an unsatisfiable or
+    malformed header. Multi-range requests are treated as malformed --
+    <audio>/<video> elements only ever issue single ranges, and multipart
+    responses would complicate the reader for no consumer.
+    """
+    if not value.startswith("bytes="):
+        return None
+    spec = value[len("bytes="):]
+    if "," in spec or "-" not in spec:
+        return None
+    start_s, _, end_s = spec.partition("-")
+    try:
+        if start_s == "":
+            # suffix form: last N bytes
+            suffix = int(end_s)
+            if suffix <= 0:
+                return None
+            start = max(0, size - suffix)
+            end = size - 1
+        else:
+            start = int(start_s)
+            end = int(end_s) if end_s else size - 1
+    except ValueError:
+        return None
+    if start < 0 or start >= size or end < start:
+        return None
+    return start, min(end, size - 1)
+
+
+async def api_file_stream(request: web.Request) -> web.StreamResponse:
+    """GET /api/file-stream?path=... -- serve audio/video with Range support.
+
+    Powers inline <video>/<audio> playback in the file viewer. file-raw is
+    unsuitable for media: it whole-reads the file into memory, rejects
+    anything over the upload cap, and ignores Range headers -- and seeking in
+    a media element requires 206 Partial Content. This endpoint follows the
+    same security pattern (dashboard path validation, sensitive-path block,
+    symlink-refusing open, content sniffing before serving) but streams
+    bounded chunks off the event loop, so memory stays constant regardless
+    of file size. All reads go through the SAME fd the header was sniffed
+    from, so the served bytes cannot be swapped after the check.
+
+    Accepted gap (documented, not a defect): the redaction probe covers the
+    first 64 KiB. Complete coverage is unreachable for a Range endpoint --
+    the client controls byte offsets, so any pattern scan can be split
+    across range boundaries -- and the sibling binary-serving endpoint
+    (file-raw) performs no content scan at all. The probe exists to catch
+    the honest-mistake shape: a text file wearing a forged media magic.
+    """
+    import kiro_crew.dashboard.handlers as _h  # noqa: F811
+
+    def _log(outcome: str, res: str) -> None:
+        _sel().log_tool_invocation(
+            session_key="dashboard", tool_name="file_stream", outcome=outcome, resources=res,
+        )
+
+    raw_path = request.query.get("path", "")
+    resolve_requested = request.query.get("resolve") == "1"
+
+    def _open_media(raw: str) -> tuple:
+        """Validate, open, and sniff the media file. Runs on a worker thread.
+
+        Everything filesystem-touching lives here: relative-path resolution
+        against the project dir (the resolve=1 contract shared with
+        file-read/file-download), realpath resolution inside the validator,
+        the sensitive-path check, existence probe, the symlink-refusing open,
+        fstat, and the header read. Returns either
+        ("ok", file_object, size, content_type, path) or a refusal tuple
+        ("refused", code, path_for_log). A malformed path (embedded NUL
+        makes realpath raise ValueError) is an invalid path, not a crash.
+        """
+        try:
+            if resolve_requested:
+                raw, resolve_err = _resolve_project_relative(raw)
+                if resolve_err:
+                    return ("refused", resolve_err, raw)
+            validated = _h._validate_dashboard_path(raw)
+        except ValueError:
+            validated = None
+        if not validated:
+            return ("refused", "invalid_path", raw)
+        from kiro_crew.security import is_sensitive_path as _isp  # noqa: F811
+        if _isp(validated):
+            return ("refused", "sensitive_path", validated)
+        if not os.path.isfile(validated):
+            return ("refused", "not_found", validated)
+        try:
+            fd = _open_rb_nofollow(validated)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                return ("refused", "symlink_refused", validated)
+            return ("refused", "read_failed", validated)
+        fobj = os.fdopen(fd, "rb")
+        try:
+            size = os.fstat(fobj.fileno()).st_size
+            # fstat is authoritative for THIS fd; a file that grows afterwards
+            # only extends past the size we announce, never past the cap check.
+            if size > _STREAM_MAX_BYTES:
+                fobj.close()
+                return ("refused", "file_too_large", validated)
+            header = fobj.read(16)
+            content_type = _sniff_media_type(header)
+            if not content_type:
+                fobj.close()
+                return ("refused", "not_media", validated)
+            # Sibling-control parity: file-download refuses text content that
+            # redact() flags. Media magics can be weak (the bare mp3 frame
+            # sync is two bytes), so a credential-bearing TEXT file with a
+            # forged prefix must not stream out here. Decode with
+            # errors="replace" -- exactly as the download scan does -- so an
+            # invalid byte (including the forged magic itself) cannot skip
+            # the credential pass; replacement chars break no real credential
+            # pattern, and genuine binary media decodes to replacement-dense
+            # junk that redact() leaves unchanged. The scan is bounded to the
+            # probe window; the full-file scan remains the download path's.
+            probe = header + fobj.read(_STREAM_TEXT_PROBE_BYTES - len(header))
+            probe_text = probe.decode("utf-8", errors="replace")
+            if redact(probe_text) != probe_text:
+                fobj.close()
+                return ("refused", "content_redacted", validated)
+            fobj.seek(0)
+        except Exception:
+            with contextlib.suppress(Exception):
+                fobj.close()
+            return ("refused", "read_failed", validated)
+        return ("ok", fobj, size, content_type, validated)
+
+    result = await asyncio.to_thread(_open_media, raw_path)
+    if result[0] == "refused":
+        _, code, res = result
+        if code == "not_found":
+            outcome = "not_found"
+        elif code == "read_failed":
+            outcome = "failure"
+        else:
+            outcome = "denied"
+        _log(outcome, res)
+        # One literal response per refusal class: the error-response contract
+        # requires the {"error", "code"} body and the status to be statically
+        # checkable at each call site.
+        if code == "invalid_path":
+            return web.json_response(
+                {"error": "invalid or forbidden path", "code": "invalid_path"}, status=400
+            )
+        if code == "cannot_resolve":
+            return web.json_response(
+                {"error": "cannot resolve: no project dir configured", "code": "cannot_resolve"},
+                status=400,
+            )
+        if code == "outside_project":
+            return web.json_response(
+                {"error": "path outside project directory", "code": "outside_project"},
+                status=400,
+            )
+        if code == "sensitive_path":
+            return web.json_response(
+                {"error": "sensitive path blocked", "code": "sensitive_path"}, status=403
+            )
+        if code == "not_found":
+            return web.json_response({"error": "not found", "code": "not_found"}, status=404)
+        if code == "symlink_refused":
+            return web.json_response(
+                {"error": "symlinks not allowed", "code": "symlink_refused"}, status=403
+            )
+        if code == "file_too_large":
+            return web.json_response(
+                {"error": "file too large", "code": "file_too_large"}, status=413
+            )
+        if code == "not_media":
+            return web.json_response(
+                {"error": "file content is not a supported media format", "code": "not_media"},
+                status=415,
+            )
+        if code == "content_redacted":
+            return web.json_response(
+                {"error": "file content was redacted; stream aborted",
+                 "code": "content_redacted"},
+                status=400,
+            )
+        return web.json_response(
+            {"error": "cannot read file", "code": "read_failed"}, status=500
+        )
+    _, f, size, content_type, path = result
+
+    try:
+        start, end = 0, size - 1
+        status = 200
+        range_header = request.headers.get("Range")
+        if range_header:
+            parsed = _parse_range_header(range_header, size)
+            if parsed is None:
+                _log("denied", path)
+                return web.json_response(
+                    {"error": "range not satisfiable", "code": "bad_range"},
+                    status=416,
+                    headers={"Content-Range": f"bytes */{size}"},
+                )
+            start, end = parsed
+            status = 206
+
+        resp = web.StreamResponse(status=status)
+        resp.content_type = content_type
+        resp.content_length = end - start + 1
+        resp.headers["Accept-Ranges"] = "bytes"
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        if status == 206:
+            resp.headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+        # SEL: record the ALLOW decision before any bytes move. prepare() and
+        # the write loop can be cancelled by a client disconnect, and a
+        # permitted read must never leave the audit trail empty because the
+        # client hung up first.
+        _log("success", path)
+        await resp.prepare(request)
+
+        await asyncio.to_thread(f.seek, start)
+        remaining = end - start + 1
+        while remaining > 0:
+            try:
+                chunk = await asyncio.to_thread(f.read, min(_STREAM_CHUNK_BYTES, remaining))
+            except OSError:
+                # A mid-stream filesystem error must leave a SEL outcome; the
+                # response is already streaming so all we can do is stop short.
+                _log("failure", path)
+                raise
+            if not chunk:
+                break  # file truncated under us; the announced length just ends short
+            remaining -= len(chunk)
+            try:
+                await resp.write(chunk)
+            except (ConnectionResetError, ConnectionError):
+                break  # client hung up (scrubbing, tab close) -- normal for media
+        with contextlib.suppress(Exception):
+            await resp.write_eof()
+        return resp
+    finally:
+        # close() can wait on the buffered-file lock while a worker-thread
+        # read is in flight (task cancellation), so it must not run on the
+        # event loop either.
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(f.close)
+
+
 async def api_file_write(request: web.Request) -> web.Response:
     """POST /api/file-write — write file content from the markdown panel."""
     from kiro_crew.validation import (  # noqa: F811
@@ -1893,6 +2199,31 @@ async def api_file_write(request: web.Request) -> web.Response:
         return web.json_response({"error": "failed to write file"}, status=500)
 
 
+def _subsequence_run(q: str, haystack: str) -> tuple[int, int]:
+    """Greedily match ``q`` as a subsequence of ``haystack``.
+
+    Returns how many of ``q``'s characters were consumed in order, and the
+    longest run of matches that landed on consecutive ``haystack`` positions
+    within that single greedy pass -- NOT the longest contiguous occurrence of
+    ``q``, since the scan never backtracks over an earlier isolated match
+    (``q="ab"`` against ``"axxab"`` consumes both chars but reports a run of
+    1). A consumed count below ``len(q)`` means ``haystack`` does not contain
+    ``q`` as a subsequence at all; the caller normalizes the run length by
+    ``len(q)`` into the contiguity term of the fuzzy score.
+    """
+    qi = 0
+    consecutive = 0
+    max_run = 0
+    for ch in haystack:
+        if qi < len(q) and ch == q[qi]:
+            qi += 1
+            consecutive += 1
+            max_run = max(max_run, consecutive)
+        else:
+            consecutive = 0
+    return qi, max_run
+
+
 def _fuzzy_score(q: str, name: str, rel: str) -> float:
     """Score a file match. Higher = better. Returns 0 for no match."""
     nl = name.lower()
@@ -1910,31 +2241,14 @@ def _fuzzy_score(q: str, name: str, rel: str) -> float:
     elif q in rl:
         score += 10.0
     else:
-        # Fuzzy: check if query chars appear in order in filename
+        # Fuzzy: check whether the query chars appear in order in the
+        # filename, falling back to the search-root-relative path when the
+        # filename alone does not carry the query as an in-order subsequence.
         matched_on_name = True
-        qi = 0
-        consecutive = 0
-        max_run = 0
-        for ch in nl:
-            if qi < len(q) and ch == q[qi]:
-                qi += 1
-                consecutive += 1
-                max_run = max(max_run, consecutive)
-            else:
-                consecutive = 0
+        qi, max_run = _subsequence_run(q, nl)
         if qi < len(q):
-            # Try path if filename didn't match all chars
             matched_on_name = False
-            qi = 0
-            consecutive = 0
-            max_run = 0
-            for ch in rl:
-                if qi < len(q) and ch == q[qi]:
-                    qi += 1
-                    consecutive += 1
-                    max_run = max(max_run, consecutive)
-                else:
-                    consecutive = 0
+            qi, max_run = _subsequence_run(q, rl)
         if qi < len(q):
             return 0.0  # not all query chars found
         # Score based on coverage ratio and longest consecutive run
@@ -2861,6 +3175,332 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
     )
 
 
+# ── /api/file-sheet: xlsx → JSON cell grid ───────────────────────────────────
+# Caps bound what one request can materialize server-side and ship to the
+# browser. 500 rows matches CsvViewer's display cap so the two table viewers
+# truncate consistently. The member/expansion caps bound zip inflation: the
+# on-disk size cap only limits the COMPRESSED archive, and a crafted workbook
+# can expand orders of magnitude larger than it stores.
+_SHEET_MAX_SHEETS = 20
+_SHEET_MAX_ROWS = 500
+_SHEET_MAX_COLS = 100
+_SHEET_MAX_MEMBERS = 4096
+_SHEET_MAX_EXPANDED_BYTES = 200 * 1024 * 1024
+# Text amplification caps. Shared strings are stored once in the archive but
+# referenced per cell, so the expansion cap above does not bound the RESPONSE:
+# one 32 KiB string referenced by every cell would amplify into gigabytes of
+# JSON. Cells truncate individually, and the whole workbook gets a cumulative
+# text budget past which the preview refuses (the frontend degrades to the
+# download card).
+_SHEET_MAX_CELL_CHARS = 2000
+_SHEET_MAX_TEXT_CHARS = 5 * 1000 * 1000
+
+
+class _SheetRefusal(Exception):
+    """Deliberate refusal carrying its HTTP status and machine-readable code;
+    raised on the worker thread and mapped to a response by api_file_sheet."""
+
+    def __init__(self, status: int, message: str, code: str):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+
+
+def _sheet_cell_json(value: object) -> object:
+    """Serialize one workbook cell value into a JSON-safe primitive."""
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, str):
+        # Workbook text is file content leaving the host through the dashboard
+        # — same egress class as api_file_read, so the same redaction applies.
+        # Redact BEFORE truncating so the scan always sees the complete text,
+        # then cap the cell so one shared string cannot bloat every row.
+        value = redact(value)
+        if len(value) > _SHEET_MAX_CELL_CHARS:
+            return value[:_SHEET_MAX_CELL_CHARS] + "…"
+        return value
+    if isinstance(value, float):
+        # NaN/Infinity are rejected by JSON.parse in the browser; the stdlib
+        # encoder would happily emit the JS-only tokens.
+        if value != value or value in (float("inf"), float("-inf")):
+            return str(value)
+        return value
+    if isinstance(value, _dt.datetime):
+        return value.isoformat(sep=" ")
+    if isinstance(value, (_dt.date, _dt.time)):
+        return value.isoformat()
+    return redact(str(value))
+
+
+def _sheet_formula_text(value: object) -> str | None:
+    """Return the formula source ("=…") for a formula-pass cell value, else None."""
+    text: object = value
+    if not (isinstance(text, str) and text.startswith("=")):
+        # Array formulas come back as openpyxl ArrayFormula objects carrying .text.
+        text = getattr(value, "text", None)
+    if isinstance(text, str) and text.startswith("="):
+        text = redact(text)
+        if len(text) > _SHEET_MAX_CELL_CHARS:
+            return text[:_SHEET_MAX_CELL_CHARS] + "…"
+        return text
+    return None
+
+
+def _load_sheet_payload(path: str) -> dict:
+    """Open, vet, and parse the workbook into the sheet-grid payload.
+
+    Runs ENTIRELY on a worker thread (via asyncio.to_thread) so filesystem
+    latency, the first (heavy) openpyxl import, and parse time never stall the
+    gateway event loop. The open goes through _open_rb_nofollow: atomic
+    O_NOFOLLOW on POSIX, and the lstat-based symlink/reparse guard on Windows,
+    where os.O_NOFOLLOW does not exist. openpyxl is a soft import: absence
+    surfaces as ImportError from this thread and the handler maps it to 501.
+    """
+    import io
+
+    import openpyxl  # noqa: F401  (probe here, off-loop; parse imports lazily too)
+
+    fd = _open_rb_nofollow(path)
+    with os.fdopen(fd, "rb") as f:
+        # Bounded read is the size guard: a pre-check via fstat would race a
+        # concurrent writer (the file can grow between the stat and the read,
+        # e.g. an agent still generating the workbook), while reading at most
+        # cap+1 bytes bounds memory unconditionally.
+        data = f.read(_MAX_UPLOAD_BYTES + 1)
+    if len(data) > _MAX_UPLOAD_BYTES:
+        raise _SheetRefusal(413, "file too large", "file_too_large")
+    header = data[:4]
+    # OOXML spreadsheets are ZIP containers; refuse anything else before
+    # openpyxl touches the bytes.
+    if not header.startswith(b"PK\x03\x04"):
+        raise _SheetRefusal(415, "not an OOXML spreadsheet", "not_a_spreadsheet")
+    # Vet the archive's declared inventory before anything inflates it --
+    # including ZipFile construction itself, which materializes one ZipInfo
+    # per central-directory entry. The EOCD preflight bounds that allocation
+    # from the raw bytes; the infolist() pass then bounds what openpyxl can
+    # actually expand (zipfile truncates each member at its declared
+    # file_size, so the central directory's numbers are authoritative).
+    _vet_zip_eocd(data)
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        infos = zf.infolist()
+        if (
+            len(infos) > _SHEET_MAX_MEMBERS
+            or sum(i.file_size for i in infos) > _SHEET_MAX_EXPANDED_BYTES
+        ):
+            raise _SheetRefusal(413, "workbook expands too large", "workbook_expands_too_large")
+    return _parse_workbook_grid(data)
+
+
+# Generous per-entry allowance for the central-directory size preflight: a
+# record is 46 bytes plus name/extra/comment, and OOXML part names are short.
+_SHEET_MAX_CDIR_ENTRY_BYTES = 512
+
+
+def _vet_zip_eocd(data: bytes) -> None:
+    """Refuse archives whose end-of-central-directory record declares an
+    oversized inventory, BEFORE zipfile.ZipFile is constructed.
+
+    ZipFile.__init__ walks the whole central directory and allocates a
+    ZipInfo per entry, so a crafted archive with hundreds of thousands of
+    entries exhausts memory during construction -- ahead of any infolist()
+    check. The EOCD carries both the entry count and the central-directory
+    byte size; capping both bounds that allocation regardless of which field
+    lies (zipfile itself iterates the directory by its byte size).
+    """
+    # EOCD (PK\x05\x06) sits within the last 22 + 65535 bytes (fixed record
+    # plus maximum comment length).
+    tail_start = max(0, len(data) - (22 + 65535))
+    eocd = data.rfind(b"PK\x05\x06", tail_start)
+    if eocd < 0 or len(data) < eocd + 22:
+        raise _SheetRefusal(415, "not an OOXML spreadsheet", "not_a_spreadsheet")
+    count = int.from_bytes(data[eocd + 10 : eocd + 12], "little")
+    cdir_size = int.from_bytes(data[eocd + 12 : eocd + 16], "little")
+    if count == 0xFFFF or cdir_size == 0xFFFFFFFF:
+        # Saturated classic fields mean the archive declares >= 65535 entries
+        # or a >= 4 GiB central directory -- both orders of magnitude past
+        # this endpoint's caps, so the ZIP64 records that would carry the
+        # real numbers can never change the verdict. Refusing outright keeps
+        # the vet free of a second record-location protocol to get right.
+        raise _SheetRefusal(413, "workbook expands too large", "workbook_expands_too_large")
+    if (
+        count > _SHEET_MAX_MEMBERS
+        or cdir_size > _SHEET_MAX_MEMBERS * _SHEET_MAX_CDIR_ENTRY_BYTES
+    ):
+        raise _SheetRefusal(413, "workbook expands too large", "workbook_expands_too_large")
+
+
+def _parse_workbook_grid(data: bytes) -> dict:
+    """Parse xlsx bytes into a JSON-safe sheet grid. Runs on a worker thread.
+
+    The workbook is loaded twice in read-only streaming mode: once with
+    data_only=True (formula cells yield the value cached by the writing
+    application) and once with data_only=False (formula cells yield the
+    formula source). Cells prefer the cached value; when a file carries no
+    cache — typical for openpyxl-generated workbooks — the formula text is
+    shown instead of an empty cell. Both loads stream the same bytes, so the
+    row structures are identical and can be zipped in lockstep.
+    """
+    import io
+    import itertools
+
+    from openpyxl import load_workbook
+
+    wb_vals = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    wb_form = load_workbook(io.BytesIO(data), read_only=True, data_only=False)
+    try:
+        names = wb_vals.sheetnames
+        sheets: list[dict] = []
+        # Cumulative post-truncation text budget across the whole workbook:
+        # shared strings are stored once but referenced per cell, so archive
+        # size caps alone do not bound the JSON response this grid becomes.
+        text_chars = 0
+        for name in names[:_SHEET_MAX_SHEETS]:
+            ws_v, ws_f = wb_vals[name], wb_form[name]
+            if not hasattr(ws_v, "iter_rows"):  # chartsheets have no cell grid
+                continue
+            # Dimension records can lie (some writers emit a stale ref such as
+            # A1:A1 for a populated sheet); read-only mode trusts them, so
+            # iter_rows would stop early and silently truncate the preview.
+            # Force a real scan of each sheet instead.
+            if hasattr(ws_v, "reset_dimensions"):
+                ws_v.reset_dimensions()
+                ws_f.reset_dimensions()
+            raw: list[list[object]] = []
+            rows_truncated = False
+            cols_truncated = False
+            paired = zip(ws_v.iter_rows(values_only=True), ws_f.iter_rows(values_only=True))
+            for vrow, frow in itertools.islice(paired, _SHEET_MAX_ROWS + 1):
+                if len(raw) >= _SHEET_MAX_ROWS:
+                    rows_truncated = True
+                    # No total is reported: any count derived from workbook
+                    # geometry is attacker-influenced (a single sparse row at
+                    # index 1e9 makes the read-only reader synthesize a
+                    # billion empties), so nothing here iterates past the cap.
+                    break
+                if len(vrow) > _SHEET_MAX_COLS:
+                    cols_truncated = True
+                out: list[object] = []
+                for vv, fv in list(zip(vrow, frow))[:_SHEET_MAX_COLS]:
+                    ftxt = _sheet_formula_text(fv)
+                    cell = ftxt if (vv is None and ftxt) else _sheet_cell_json(vv)
+                    if isinstance(cell, str):
+                        text_chars += len(cell)
+                        if text_chars > _SHEET_MAX_TEXT_CHARS:
+                            raise _SheetRefusal(
+                                413, "workbook text too large to preview",
+                                "workbook_text_too_large",
+                            )
+                    out.append(cell)
+                raw.append(out)
+            # Trim trailing all-empty rows, then normalize every row to the
+            # widest non-empty extent so the client renders a rectangle.
+            while raw and all(c is None or c == "" for c in raw[-1]):
+                raw.pop()
+            width = 0
+            for r in raw:
+                w = len(r)
+                while w and (r[w - 1] is None or r[w - 1] == ""):
+                    w -= 1
+                width = max(width, w)
+            rows = [r[:width] + [None] * (width - len(r[:width])) for r in raw] if width else []
+            sheets.append({
+                # Names take the same redact+truncate path as cell text — a
+                # crafted workbook.xml can carry arbitrarily long sheet names.
+                "name": _sheet_cell_json(name),
+                "rows": rows,
+                "truncated_rows": rows_truncated,
+                "truncated_cols": cols_truncated,
+            })
+        return {
+            "sheets": sheets,
+            "total_sheets": len(names),
+            "truncated_sheets": len(names) > _SHEET_MAX_SHEETS,
+        }
+    finally:
+        wb_vals.close()
+        wb_form.close()
+
+
+async def api_file_sheet(request: web.Request) -> web.Response:
+    """GET /api/file-sheet?path=… — parse an OOXML spreadsheet into a JSON cell grid.
+
+    Powers the file viewer's inline xlsx preview. Follows the api_file_raw
+    security pattern: dashboard path validation, sensitive-path block, a
+    symlink-refusing open (_open_rb_nofollow: atomic O_NOFOLLOW on POSIX,
+    lstat guard on Windows), size and zip-expansion caps, and a ZIP magic-byte
+    check before openpyxl touches the bytes. All file IO and parsing runs on a
+    worker thread so a large workbook cannot stall the event loop, and cell
+    text is credential-redacted like every other dashboard egress. openpyxl is
+    soft-imported: without it the endpoint answers 501 and the frontend
+    degrades to the download card.
+    """
+    import kiro_crew.dashboard.handlers as _h  # noqa: F811
+
+    def _log(outcome: str, res: str) -> None:
+        _sel().log_tool_invocation(
+            session_key="dashboard", tool_name="file_sheet", outcome=outcome, resources=res,
+        )
+
+    raw_path = request.query.get("path", "")
+    path = _h._validate_dashboard_path(raw_path)
+    if not path:
+        _log("denied", raw_path)
+        return web.json_response(
+            {"error": "invalid or forbidden path", "code": "invalid_path"}, status=400
+        )
+    from kiro_crew.security import is_sensitive_path as _isp  # noqa: F811
+    if _isp(path):
+        _log("denied", path)
+        return web.json_response(
+            {"error": "sensitive path blocked", "code": "sensitive_path"}, status=403
+        )
+    if not os.path.isfile(path):
+        _log("not_found", path)
+        return web.json_response({"error": "not found", "code": "not_found"}, status=404)
+    try:
+        payload = await asyncio.to_thread(_load_sheet_payload, path)
+    except asyncio.CancelledError:
+        # Shutdown or client disconnect mid-parse: the file was already
+        # opened, so the access must not vanish from the audit trail.
+        _log("cancelled", path)
+        raise
+    except ImportError:
+        # openpyxl absent: the preview is unavailable, not broken. The probe
+        # runs inside the worker thread so even the first heavy import never
+        # touches the event loop.
+        _log("failure", path)
+        return web.json_response(
+            {"error": "spreadsheet preview unavailable", "code": "preview_unavailable"},
+            status=501,
+        )
+    except _SheetRefusal as refusal:
+        # Both refusal kinds map to literal statuses so the response shape
+        # stays statically checkable; the carried code names the exact cause.
+        _log("denied", path)
+        if refusal.status == 415:
+            return web.json_response({"error": str(refusal), "code": refusal.code}, status=415)
+        return web.json_response({"error": str(refusal), "code": refusal.code}, status=413)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:  # symlink, from _open_rb_nofollow on any OS
+            _log("denied", path)
+            return web.json_response(
+                {"error": "symlinks not allowed", "code": "symlink_refused"}, status=403
+            )
+        _log("failure", path)
+        return web.json_response({"error": "cannot read file", "code": "read_failed"}, status=500)
+    except Exception:
+        # openpyxl's failure surface is wide (bad zip members, malformed XML,
+        # unexpected workbook parts). Every parse failure degrades to the same
+        # client answer, and the frontend falls back to the download card.
+        logger.warning("file-sheet: cannot parse workbook %s", path, exc_info=True)
+        _log("failure", path)
+        return web.json_response(
+            {"error": "cannot parse workbook", "code": "parse_failed"}, status=422
+        )
+    _log("success", path)
+    return web.json_response(payload)
+
+
 # ── Git status & log endpoints ──────────────────────────────────────────────
 
 
@@ -3232,6 +3872,143 @@ async def api_project_git_status(request: web.Request) -> web.Response:
         result["branch"] = redact(result["branch"])
     for f in result.get("files", []):
         f["path"] = redact(f["path"])
+    return web.json_response(result)
+
+
+# Cap on entries returned by api_project_tree. The dashboard tree virtualizes
+# rendering, so the cap bounds response size and walk time, not the UI.
+_PROJECT_TREE_MAX_ENTRIES = 10_000
+
+# Directories never worth listing in a workspace tree. Applied only on the
+# non-git fallback walk — git listings already honor .gitignore.
+_PROJECT_TREE_SKIP_DIRS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        "dist",
+        "build",
+        ".next",
+        ".cache",
+        "target",
+        ".gradle",
+        ".idea",
+    }
+)
+
+
+async def api_project_tree(request: web.Request) -> web.Response:
+    """GET /api/project/tree?path=... - workspace file listing for a project dir.
+
+    Returns project-relative POSIX file paths for rendering a workspace tree.
+    Inside a git repository the listing is ``git ls-files --cached --others
+    --exclude-standard`` scoped to the project dir (tracked + untracked,
+    .gitignore honored); outside one it is a bounded directory walk. Path must
+    match a known project directory (same allow-list as api_project_git).
+    """
+    state: DashboardState = request.app["state"]
+    caller = request.get("user", "dashboard")
+    raw = request.query.get("path", "").strip()
+    if not raw:
+        return web.json_response({"error": "path required", "code": "path_required"}, status=400)
+    project = await asyncio.to_thread(
+        _match_known_project_for, _slot_project_snapshot(state), raw
+    )
+    if project is None:
+        _sel().log_api_access(
+            caller=caller,
+            operation="project_tree",
+            outcome="denied",
+            resources=raw,
+            error="not a known project directory",
+        )
+        return web.json_response(
+            {"error": "Unknown project directory", "code": "unknown_project_dir"}, status=403
+        )
+
+    base = await asyncio.to_thread(
+        lambda: os.path.realpath(os.path.expanduser(project))
+    )
+    if await asyncio.to_thread(is_sensitive_path, base):
+        _sel().log_api_access(
+            caller=caller,
+            operation="project_tree",
+            outcome="denied",
+            resources=base,
+            error="sensitive path",
+        )
+        return web.json_response({"error": "Access denied", "code": "access_denied"}, status=403)
+    _sel().log_api_access(
+        caller=caller, operation="project_tree", outcome="allowed", resources=base
+    )
+    if not await asyncio.to_thread(os.path.isdir, base):
+        return web.json_response({"root": redact(base), "paths": [], "repo": False})
+
+    def _run() -> dict:
+        # git listing first: honors .gitignore, includes tracked-but-deleted
+        # files (they render with a deleted status lane), and with cwd=base a
+        # project dir that is a repo SUBDIRECTORY lists only its own subtree.
+        # -z: NUL separation, so no C-quoting and exotic names survive intact.
+        probe_rc, _probe_out, _ = _run_git_bounded(
+            ["git", "rev-parse", "--git-dir"], cwd=base, env=os.environ.copy(), timeout=5,
+        )
+        if probe_rc == 0:
+            ls_rc, ls_out, _ = _run_git_bounded(
+                # `core.fsmonitor=` disables the filesystem-monitor hook: it names a
+                # command git would SPAWN, and it is repository-writable, so an agent
+                # that can write `.git/config` could otherwise have a tree listing
+                # execute it. Empty rather than `false` to match the sibling git
+                # invocations in this module. The `rev-parse` probe above needs no
+                # such guard — it reads no index and walks no working tree.
+                [
+                    "git", "-c", "core.fsmonitor=",
+                    "ls-files", "-z", "--cached", "--others", "--exclude-standard",
+                ],
+                cwd=base,
+                env=os.environ.copy(),
+                timeout=15,
+            )
+            if ls_rc == 0:
+                listed = [p for p in ls_out.split("\0") if p]
+                truncated = len(listed) > _PROJECT_TREE_MAX_ENTRIES
+                return {
+                    "root": base,
+                    "paths": listed[:_PROJECT_TREE_MAX_ENTRIES],
+                    "repo": True,
+                    "truncated": truncated,
+                }
+
+        # Fallback: bounded filesystem walk (non-repo project dirs).
+        paths: list[str] = []
+        truncated = False
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = sorted(
+                d for d in dirnames if d not in _PROJECT_TREE_SKIP_DIRS and not d.startswith(".")
+            )
+            rel_dir = os.path.relpath(dirpath, base)
+            prefix = "" if rel_dir == "." else rel_dir.replace(os.sep, "/") + "/"
+            for name in sorted(filenames):
+                paths.append(prefix + name)
+                if len(paths) >= _PROJECT_TREE_MAX_ENTRIES:
+                    truncated = True
+                    break
+            if truncated:
+                break
+        return {"root": base, "paths": paths, "repo": False, "truncated": truncated}
+
+    result = await asyncio.to_thread(_run)
+    # Egress redaction, same rationale as api_project_git_status: listed names
+    # are repo content and this body is rendered by the dashboard.
+    result["root"] = redact(result["root"])
+    result["paths"] = [redact(p) for p in result["paths"]]
     return web.json_response(result)
 
 

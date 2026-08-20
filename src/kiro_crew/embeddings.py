@@ -268,7 +268,7 @@ def verify_vendored_libs(root: Path | None = None) -> dict[str, list[str]]:
     running one. ``root`` defaults to the installed ``_vendor`` directory, so
     the same check runs against a source tree, an unpacked sdist, or an
     installed wheel — that cross-lane reuse is the point, since each packaging
-    lane (sdist rules, wheel package_data, PyInstaller spec) selects these
+    lane (sdist rules, wheel package_data) selects these
     files by a different mechanism and can therefore drop them independently.
 
     A platform dir that is entirely absent is reported as missing all of its
@@ -1641,7 +1641,7 @@ _SSL_CA_PATHS = (
 def _make_ssl_context() -> ssl.SSLContext:
     """Create an SSL context that finds system CA certs on all supported platforms.
 
-    Bundled Python runtimes (like the PyInstaller desktop backend) may not ship
+    Bundled Python runtimes (like the desktop backend's interpreter) may not ship
     their own CA bundle and rely on ``ssl.SSLContext.load_default_certs()`` which
     calls OpenSSL's defaults — those can miss when the compiled-in cert path
     doesn't match the host OS (common on AL2 with cross-compiled Python).

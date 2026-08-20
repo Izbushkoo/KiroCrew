@@ -30,6 +30,19 @@ from kiro_crew.apps.builtins.auto_improvement.backend import runner as R
 from kiro_crew.apps.builtins.auto_improvement.backend import store
 from kiro_crew.apps.builtins.auto_improvement.spine.driver import BudgetCaps
 
+#: Windows' extended-length path prefix. ``os.readlink`` returns an absolute target with
+#: it attached, and ``pathlib`` reads the prefix as part of the drive, so it survives
+#: ``resolve()`` too -- it has to be stripped explicitly to compare paths across
+#: platforms.
+_EXTENDED_LENGTH_PREFIX = "\\\\?\\"
+
+
+def _without_extended_prefix(target: str) -> str:
+    """*target* with the Windows extended-length prefix removed; unchanged elsewhere."""
+    if target.startswith(_EXTENDED_LENGTH_PREFIX):
+        return target[len(_EXTENDED_LENGTH_PREFIX) :]
+    return target
+
 
 class TestMetricDirectionIsPlumbed:
     """The keeper accepts ``direction`` — but a parameter nobody passes is dead code."""
@@ -707,7 +720,7 @@ class TestSubprocessFallbackIsAudited:
         def _no_spawn(*a, **kw):  # pragma: no cover - reaching this IS the failure
             raise AssertionError("spawned a permissionless agent without an audit trail")
 
-        monkeypatch.setattr(ar.subprocess, "Popen", _no_spawn)
+        monkeypatch.setattr(ar, "popen_limited", _no_spawn)
         result = ar.AgentRunner().run("do a thing", cwd=str(tmp_path))
         assert result.ok is False
         assert "audited" in result.error
@@ -1442,7 +1455,7 @@ class TestFallbackAgentCannotSeeCredentials:
         # module scope, so it is bound here at import time and patching
         # `kiro_crew.sandbox` would not affect the already-bound reference.
         monkeypatch.setattr(ar, "sandboxed_spawn_argv", _fake_spawn)
-        monkeypatch.setattr(ar.subprocess, "Popen", lambda *a, **k: object())
+        monkeypatch.setattr(ar, "popen_limited", lambda *a, **k: object())
         ar.AgentRunner()._spawn_sandboxed_agent(["/bin/true"], str(tmp_path))
 
         assert seen["mode"] == "strict", "the unattended agent must not see credential dirs"
@@ -3330,6 +3343,7 @@ class TestOneClickCommitWorksInAPushDisabledClone:
 
         Raised by the Opus 5 review of this branch.
         """
+        import contextlib
         import threading
 
         monkeypatch.setattr(store, "data_dir", lambda: tmp_path / "data")
@@ -3372,18 +3386,44 @@ class TestOneClickCommitWorksInAPushDisabledClone:
         # two-thread race reproduced the bug only ~1 run in 3 (measured with the lock
         # removed), which is too flaky to be a regression test. `A` parks *after* staging its
         # diff — the exact window where B's `checkout -B` used to carry A's change into B's
-        # commit — and releases once B has finished. With the lock held, B cannot enter that
-        # window at all, so `_gate` is never waited on and the test still completes.
+        # commit.
+        #
+        # A's park ends when B has PROVED the clone lock is contended, not when B
+        # finishes: B cannot finish while A holds the lock, so waiting for B's
+        # completion parks A against the very lock under test and always burns the
+        # whole timeout. Anything that lets B past the gate — no lock, or a lock
+        # that is not actually shared — leaves `b_blocked` unset, so A stays parked
+        # in the window for the full timeout and the interleaving reproduces.
         results: dict[str, dict] = {}
         staged_a = threading.Event()
-        b_done = threading.Event()
+        b_blocked = threading.Event()
+        contended: list[str] = []
+        b_thread_name = "committer-B"
         real_apply = commit_mod.materialize_queued_diff
+        real_clone_lock = commit_mod.clone_lock
+
+        @contextlib.contextmanager
+        def _clone_lock_reporting_contention():
+            lock = real_clone_lock()
+            if threading.current_thread().name == b_thread_name:
+                # A non-blocking acquire that FAILS is proof A still holds this
+                # exact lock. One that succeeds means the lock is not shared, so
+                # say nothing and let A keep the window open.
+                if lock.acquire(blocking=False):
+                    lock.release()
+                else:
+                    contended.append(b_thread_name)
+                    b_blocked.set()
+            with lock:
+                yield
+
+        monkeypatch.setattr(commit_mod, "clone_lock", _clone_lock_reporting_contention)
 
         def _apply_with_park(**kwargs):
             out = real_apply(**kwargs)
             if kwargs.get("diff_text", "").find("FINDING_A") >= 0:
                 staged_a.set()
-                b_done.wait(timeout=30)
+                b_blocked.wait(timeout=30)
             return out
 
         monkeypatch.setattr(commit_mod, "materialize_queued_diff", _apply_with_park)
@@ -3393,16 +3433,16 @@ class TestOneClickCommitWorksInAPushDisabledClone:
                 results[fp] = commit_mod.commit_finding(fp)
             finally:
                 if fp == "fpB":
-                    b_done.set()
+                    b_blocked.set()
 
         t_a = threading.Thread(target=_run, args=("fpA",))
-        t_b = threading.Thread(target=_run, args=("fpB",))
+        t_b = threading.Thread(target=_run, args=("fpB",), name=b_thread_name)
         t_a.start()
         staged_a.wait(timeout=30)  # A is now parked mid-mutation (or already done)
         t_b.start()
         for t in (t_b, t_a):
             t.join(timeout=90)
-        b_done.set()
+        b_blocked.set()
 
         # Whatever landed, no single commit may contain BOTH findings.
         log = subprocess.run(
@@ -3419,6 +3459,10 @@ class TestOneClickCommitWorksInAPushDisabledClone:
             assert not (
                 "FINDING_A" in body and "FINDING_B" in body
             ), f"commit {sha[:8]} published both findings — the mutations interleaved"
+
+        # And it held because B queued behind A, not because the scheduler happened
+        # to keep them apart: A's park only ends once B has proved the lock is held.
+        assert contended == [b_thread_name], "B never had to wait for A's clone lock"
 
     def test_the_clone_mutations_share_one_lock(self) -> None:
         """Structural: the draft route must hold the lock across its WHOLE sequence.
@@ -4846,7 +4890,17 @@ class TestRepoControlledGitHooksDoNotExecuteHostSide:
         )
         # Copied verbatim as a link (its stored target is the original path), NOT resolved
         # into a real file that materialized the secret bytes inside the RED tree.
-        assert os.readlink(staged_link) == str(secret), "the staged link's target was rewritten"
+        #
+        # Compared as PATHS with the Windows extended-length prefix stripped, not as the
+        # raw string `os.readlink` returns. Windows stores an absolute symlink target as
+        # `\\?\C:\...`, and neither a string comparison nor `Path.resolve()` closes that
+        # gap -- `pathlib` reads `\\?\C:` as the drive and keeps it. Comparing `Path`
+        # objects also gets Windows' case-insensitivity for free. The assertion still says
+        # what it did: a target rewritten to point inside the RED tree is a different path,
+        # and the sibling `is_symlink()` check above is what catches a dereferenced copy.
+        assert Path(_without_extended_prefix(os.readlink(staged_link))) == secret, (
+            "the staged link's target was rewritten"
+        )
 
 
 class TestANestedProcessCannotAuthenticateToGitHub:

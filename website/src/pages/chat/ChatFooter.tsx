@@ -60,7 +60,7 @@ const prefersReducedMotion = () =>
  * usable without a ThemeProvider. `applyTheme` composes that attribute as
  * `<slug>-<mode>` (and bare `<mode>` for the base 'emerald' theme), so the mode
  * suffix is stripped back off to recover the slug the themeBranding registry is
- * keyed by. Mirrors the MonacoCodeBlock / CliPanel MutationObserver pattern, so
+ * keyed by. Mirrors the CliPanel MutationObserver pattern, so
  * a mid-turn theme switch swaps the artwork without needing a remount.
  */
 function useThemeSlug(): string {
@@ -229,8 +229,11 @@ const ChatFooter = memo(function ChatFooter({ running, stopping, state, lastRole
   if (!regenerating && streamingText && !streamQuiet && stopState !== 'soft_pending' && stopState !== 'killing') return null
   // width from CSS var --mc-content-width
   return (
-    <div data-testid="chat-footer" className={`px-5 mx-auto w-full py-1${regenerating ? '' : ' animate-slide-up'}`} style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
-      <div className="px-3.5 py-2.5">
+    <div data-testid="chat-footer" className={`px-4 mx-auto w-full py-1${regenerating ? '' : ' animate-slide-up'}`} style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
+      {/* Vertical breathing room only. A horizontal pad here would stack on the
+          row wrapper's own `px-4` gutter and inset the indicator 14px right of
+          every message, tool and card row it sits under. */}
+      <div className="py-2.5">
         {stopState === 'soft_pending' ? (
           <motion.span
             className="text-danger text-[13px] font-mono"

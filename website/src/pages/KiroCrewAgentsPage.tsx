@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { Boxes, FolderOpen, Database, Sparkles, Plus, MessageSquare, Users, Star, LayoutGrid, Rows3 } from 'lucide-react'
 import Clickable from '../components/Clickable'
 import { useQuery, useMutation } from '@tanstack/react-query'
-import { useAppSelector, useAppDispatch } from '../store'
+import { useAppDispatch } from '../store'
 import { createSlot } from '../store/chatSlice'
 import { api } from '../api/client'
 import { useProvider } from '../providers'
@@ -271,11 +271,20 @@ function BindingFields({
   memoryStoreOptions: string[]; memoryStore: string; setMemoryStore: (v: string) => void
   modelOptions?: string[]; model?: string; setModel?: (v: string) => void
 }) {
-  const withCurrent = (opts: string[], cur: string) => (opts.includes(cur) ? opts : [...opts, cur])
+  // An EMPTY current value means "nothing selected" and must NOT be appended as
+  // an option: SimpleSelect treats an options list containing '' as making empty
+  // selectable, which suppresses the trigger placeholder and adds a blank row.
+  const withCurrent = (opts: string[], cur: string) => (!cur || opts.includes(cur) ? opts : [...opts, cur])
   return (
     <>
       <Field label={templateLabel} hint={i18nT('pages.kiroCrewAgentsPage.the_agent_definition_it_boots_from_tools_mcp_ser')}>
-        <SimpleSelect options={withCurrent(kiroAgentOptions, kiroAgent)} value={kiroAgent} onChange={setKiroAgent} aria-label={templateLabel} />
+        <SimpleSelect
+          options={withCurrent(kiroAgentOptions, kiroAgent)}
+          value={kiroAgent}
+          onChange={setKiroAgent}
+          triggerFallback={i18nT('pages.kiroCrewAgentsPage.select_an_agent_template')}
+          aria-label={templateLabel}
+        />
       </Field>
       <Field
         label={i18nT('pages.kiroCrewAgentsPage.workspace_2')}
@@ -488,29 +497,27 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   const provider = useProvider()
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
-  const refreshTrigger = useAppSelector(s => s.dashboard.refreshTrigger)
-
   const { data: agentsData, refetch: refetchAgents } = useQuery({
-    queryKey: ['kirocrew-agents', refreshTrigger],
+    queryKey: ['kirocrew-agents'],
     queryFn: () => api.kirocrewAgents(),
   })
   const agents: KiroCrewAgent[] = agentsData?.agents || []
   const defaultAgent = agentsData?.default_agent || ''
 
   const { data: installedAgents } = useQuery({
-    queryKey: ['agents-installed', refreshTrigger],
+    queryKey: ['agents-installed'],
     queryFn: () => api.agentsInstalled(),
   })
   const kiroAgentOptions = Array.isArray(installedAgents) ? installedAgents.map((x: { name: string }) => x.name).filter(Boolean) : ['kirocrew']
 
   const { data: workspacesData, refetch: refetchWorkspaces } = useQuery({
-    queryKey: ['workspaces', refreshTrigger],
+    queryKey: ['workspaces'],
     queryFn: () => api.workspaces(),
   })
   const workspaceOptions = workspacesData?.workspaces?.map((w: { name: string }) => w.name) || ['default']
 
   const { data: kirocrewCfg } = useQuery({
-    queryKey: ['kirocrewConfig', refreshTrigger],
+    queryKey: ['kirocrewConfig'],
     queryFn: () => api.kirocrewConfig(),
   })
   const memoryStoreOptions = kirocrewCfg?.memory_stores ? Object.keys(kirocrewCfg.memory_stores) : ['default']
@@ -529,7 +536,13 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   const [error, setError] = useState('')
   const [sheet, setSheet] = useState<SheetTarget>(null)
   const [name, setName] = useState('')
-  const [kiroAgent, setKiroAgent] = useState('kirocrew')
+  // Starts UNSELECTED, not at the built-in 'kirocrew'. Pre-filling the built-in
+  // made every crew created without touching this field an alias for the DEFAULT
+  // agent: the crew is offered in the chat picker, then dispatch flattens the
+  // alias to its `kiro_agent` pointer and the default answers — indistinguishable
+  // from "the picker reverted to default" (#1684). An empty value forces the
+  // choice to be explicit and is rejected by `create()` below.
+  const [kiroAgent, setKiroAgent] = useState('')
   const [workspace, setWorkspace] = useState('default')
   const [memoryStore, setMemoryStore] = useState('default')
   const [triggers, setTriggers] = useState('')
@@ -567,7 +580,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     sheetEpoch.current += 1
     setError('')
     setConfirmDelete(false)
-    setName(''); setKiroAgent('kirocrew'); setWorkspace('default'); setMemoryStore('default')
+    setName(''); setKiroAgent(''); setWorkspace('default'); setMemoryStore('default')
     setTriggers('')
     setSheet({ mode: 'create' })
   }, [])
@@ -642,6 +655,10 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     setError('')
     const n = name.trim()
     if (!n) { setError(i18nT('pages.kiroCrewAgentsPage.name_is_required')); return }
+    // Refuse an unset template rather than letting the server apply its
+    // 'kirocrew' default: that default is what silently turns a new crew into an
+    // alias for the DEFAULT agent (#1684).
+    if (!kiroAgent) { setError(i18nT('pages.kiroCrewAgentsPage.agent_template_is_required')); return }
     createMut.mutate({ name: n, kiro_agent: kiroAgent, workspace, memory_store: memoryStore, triggers, epoch: sheetEpoch.current })
   }
 
@@ -734,7 +751,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   return (
     <>
       {!embedded && <PageHeader title={i18nT('pages.kiroCrewAgentsPage.agents')} subtitle={i18nT('pages.kiroCrewAgentsPage.manage_agent_workspace_memory_store_bindings')} />}
-      <div className={`${embedded ? '' : 'px-2 md:px-6'} pb-8 overflow-y-auto flex-1 min-h-0`}>
+      <div className={`${embedded ? '' : 'px-4 md:px-6'} pb-8 overflow-y-auto flex-1 min-h-0`}>
         {/* Says out loud what the bindings below cannot: a crew's workspace and
             memory store are shown and editable, but the isolation they imply is
             only partly built — every crew still reads one shared semantic

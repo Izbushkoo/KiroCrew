@@ -1,7 +1,7 @@
 /**
  * Transcript row geometry is the HOST's job, never the row component's.
  *
- * The column gutter (`px-5`), the centring (`mx-auto w-full`) and the width
+ * The column gutter (`px-4`), the centring (`mx-auto w-full`) and the width
  * clamp (`maxWidth: var(--mc-content-width, …)`) are applied once, by the row
  * wrapper that the host puts around every rendered message: ChatPage's own row
  * div and `ChatMessageList`'s `ctx.row` / `ctx.wrapper`.
@@ -30,9 +30,10 @@ import WorkflowRunCard from '../pages/chat/WorkflowRunCard'
 import SubagentRunCard from '../pages/chat/SubagentRunCard'
 import WorkflowCompletionCard from '../pages/chat/WorkflowCompletionCard'
 import SubagentCompletionCard from '../pages/chat/SubagentCompletionCard'
+import ChatFooter from '../pages/chat/ChatFooter'
 import type { ChatMessage } from '../types'
 
-const GUTTER = 'px-5'
+const GUTTER = 'px-4'
 const CENTRE = 'mx-auto'
 const CLAMP = '--mc-content-width'
 
@@ -110,5 +111,28 @@ describe('transcript row geometry belongs to the host', () => {
         `<${card}> in ${rel} is returned without ctx.row, so no host supplies its gutter`,
       ).toBe(true)
     }
+  })
+
+  /**
+   * ChatFooter is the mirror-image case. It is rendered RAW by ChatPage — as a
+   * sibling of the row wrappers, not inside one — so it supplies the gutter
+   * itself, and the contract is that it supplies it exactly ONCE. An inner
+   * `px-3.5` stacked on that root gutter and pushed the running indicator 14px
+   * right of every row above it, which is the only left edge the reader has to
+   * compare it against.
+   */
+  it('ChatFooter applies the column gutter once and adds no inner inset', () => {
+    const { container } = renderWithProviders(
+      <ChatFooter running stopping={false} state="running" lastRole="assistant" />,
+    )
+    const root = container.querySelector('[data-testid="chat-footer"]') as HTMLElement
+    expect(root).toBeTruthy()
+    expect(root.classList.contains(GUTTER)).toBe(true)
+
+    // Every horizontal-padding utility in the subtree, root excluded.
+    const insets = [...root.querySelectorAll<HTMLElement>('*')]
+      .flatMap(el => [...el.classList])
+      .filter(c => /^(px|pl|pr)-/.test(c))
+    expect(insets, `inner horizontal padding stacks on the root ${GUTTER}`).toEqual([])
   })
 })

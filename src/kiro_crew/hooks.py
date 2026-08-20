@@ -13,6 +13,7 @@ import fnmatch
 import json
 import logging
 import os
+import re
 import stat as _stat
 import tempfile
 import threading
@@ -37,6 +38,7 @@ from kiro_crew.security import (
     is_sensitive_path,
     is_sensitive_write_path,
 )
+from kiro_crew.sel import sel
 from kiro_crew.validation import _bounded_pattern_search
 
 logger = logging.getLogger(__name__)
@@ -1570,8 +1572,12 @@ def _context_matches(matcher: str, mode: str, context: str) -> bool:
     - ``contains``: pipe-delimited substrings, case-insensitive OR.
     """
     if mode == "regex":
-        # Prepend (?i) for case-insensitive matching (the subprocess runs raw re.search)
-        pattern = f"(?i){matcher}" if not matcher.startswith("(?") else matcher
+        # Prepend (?i) for case-insensitive matching (the subprocess runs raw re.search).
+        # Only skip the prepend when the pattern already starts with an inline-flag
+        # group (e.g. (?i), (?im), (?aiLmsux)).  Non-flag groups like (?:, (?=, (?<,
+        # (?P must still get the (?i) prefix.
+        _has_inline_flags = re.match(r"^\(\?[aiLmsux]+[):]", matcher) is not None
+        pattern = matcher if _has_inline_flags else f"(?i){matcher}"
         result = _bounded_pattern_search(pattern, context)
         if result is None:
             # Timeout, oversized, or invalid pattern — fail closed (no match)
@@ -2793,6 +2799,26 @@ def _script_hooks_capability_denied(session_key: str = "") -> str | None:
         return None
 
 
+def _audit_governance_hook_decision(
+    session_key: str, hook_label: str, outcome: str, reason: str
+) -> None:
+    """Best-effort SEL audit for a script/skills-only hook governance decision.
+
+    Shared by both ``run_script_hook`` and the skills-only path in ``fire()`` to
+    avoid duplicating the try/import/call pattern at every call site.
+    """
+    try:
+        sel().log_governance_decision(
+            session_key=session_key,
+            tool_name=hook_label,
+            scope="capabilities.script_hooks",
+            outcome=outcome,
+            reason=reason,
+        )
+    except Exception:
+        logger.debug("hook governance audit (%s) failed", outcome, exc_info=True)
+
+
 async def run_script_hook(
     hook: ScriptHook, context: str = "", hook_event: dict | None = None
 ) -> ScriptHookResult:
@@ -2813,18 +2839,9 @@ async def run_script_hook(
         hook.last_run = time.time()
         hook.last_status = "blocked"
         hook.run_count += 1
-        try:
-            from kiro_crew.sel import sel
-
-            sel().log_governance_decision(
-                session_key=sk,
-                tool_name=f"run_script_hook:{hook.name or hook.id}",
-                scope="capabilities.script_hooks",
-                outcome="denied",
-                reason=gov_denied,
-            )
-        except Exception:
-            logger.debug("script_hook deny audit failed", exc_info=True)
+        _audit_governance_hook_decision(
+            sk, f"run_script_hook:{hook.name or hook.id}", "denied", gov_denied
+        )
         return ScriptHookResult(
             hook_id=hook.id,
             hook_name=hook.name,
@@ -3106,6 +3123,32 @@ class ScriptHookStore:
             if "skills" in data:
                 skills_raw = data["skills"]
                 hook.skills = [str(s) for s in skills_raw if isinstance(s, str)] if isinstance(skills_raw, list) else []
+            # Post-merge validation on the merged hook: skills injection only
+            # fires for a standalone skills hook (no command) on
+            # UserPromptSubmit/AgentSpawn (see fire()). Reject any other pairing
+            # so a partial update can't leave a config that saves but never fires.
+            if hook.skills:
+                if hook.command:
+                    raise ValueError(
+                        "skills cannot be combined with a command — the skills "
+                        "would never fire; use a skills-only hook or drop the skills"
+                    )
+                if hook.event in (
+                    HOOK_EVENT_PRE_TOOL_USE, HOOK_EVENT_POST_TOOL_USE, HOOK_EVENT_STOP,
+                ):
+                    raise ValueError(
+                        f"skills hooks cannot fire on {hook.event} events — "
+                        "choose UserPromptSubmit or AgentSpawn"
+                    )
+            # Post-merge validation: reject invalid regex on the merged state
+            # (a partial update sending only matcher without matcher_mode would
+            # bypass the schema-level regex check which sees the request, not
+            # the merged hook).
+            if hook.matcher_mode == "regex" and hook.matcher:
+                try:
+                    re.compile(hook.matcher)
+                except re.error as exc:
+                    raise ValueError(f"invalid regex: {exc}") from None
             self._save()
         return hook
 
@@ -3136,6 +3179,7 @@ class ScriptHookStore:
         subagent_id: str | None = None,
         parent_session_key: str | None = None,
         agent_role: str | None = None,
+        hook_continuation_count: int = 0,
     ) -> list[ScriptHookResult]:
         """Fire all enabled hooks matching the given event. Returns results.
 
@@ -3165,6 +3209,15 @@ class ScriptHookStore:
             # Unconditional (even when "") so an empty/no-output Stop turn still
             # carries the key and a hook that always reads it never KeyErrors.
             hook_event["assistant_text"] = context
+            # Advisory self-limiting signals: hook_continuation_count is the depth
+            # of the current unbroken continuation run (0 on a normal turn), and
+            # stop_hook_active is its boolean shorthand (count > 0). Kiro's Stop
+            # contract defines no cap and neither field, so these are additive: a
+            # hook may self-limit, diagnose, or surface the count to the model,
+            # while a real gate hook checks its own condition and ignores them.
+            # Stamped unconditionally so the keys are always present.
+            hook_event["hook_continuation_count"] = hook_continuation_count
+            hook_event["stop_hook_active"] = hook_continuation_count > 0
         if tool_name:
             hook_event["tool_name"] = tool_name
         if tool_input is not None:
@@ -3209,36 +3262,19 @@ class ScriptHookStore:
                     hook.last_run = time.time()
                     hook.last_status = "blocked"
                     hook.run_count += 1
-                    try:
-                        from kiro_crew.sel import sel
-
-                        sel().log_governance_decision(
-                            session_key=sk,
-                            tool_name=f"skills_only_hook:{hook.name or hook.id}",
-                            scope="capabilities.script_hooks",
-                            outcome="denied",
-                            reason=gov_denied,
-                        )
-                    except Exception:
-                        logger.debug("skills_only_hook deny audit failed", exc_info=True)
+                    _audit_governance_hook_decision(
+                        sk, f"skills_only_hook:{hook.name or hook.id}", "denied", gov_denied
+                    )
                     logger.info(
                         "Hook %s (%s): skills-only blocked by governance: %s",
                         hook.name, event, gov_denied,
                     )
                     continue
                 # Audit the allow decision before proceeding.
-                try:
-                    from kiro_crew.sel import sel
-
-                    sel().log_governance_decision(
-                        session_key=sk,
-                        tool_name=f"skills_only_hook:{hook.name or hook.id}",
-                        scope="capabilities.script_hooks",
-                        outcome="allowed",
-                        reason="skills-only hook permitted",
-                    )
-                except Exception:
-                    logger.debug("skills_only_hook allow audit failed", exc_info=True)
+                _audit_governance_hook_decision(
+                    sk, f"skills_only_hook:{hook.name or hook.id}", "allowed",
+                    "skills-only hook permitted",
+                )
                 skills_directive = " ".join(f"${s.split('/')[-1]}" for s in hook.skills)
                 hook.last_run = time.time()
                 hook.last_status = "ok"

@@ -11,7 +11,8 @@ import ChatInput from './ChatInput'
 import PendingQuestionCard from './PendingQuestionCard'
 import QueueStack, { SubagentDeliveryProgress, splitPaneMessages } from './QueueStack'
 import SubagentProgressBar from '../pages/chat/SubagentProgressBar'
-import AgentDropdownList, { ManageAgentsFooter } from './AgentDropdownList'
+import AgentDropdownList, { DefaultAgentRow, ManageAgentsFooter } from './AgentDropdownList'
+import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
 import ModelDropdownList from './ModelDropdownList'
 import { SlotProvider } from '../providers/SlotContext'
 import { useProvider } from '../providers'
@@ -21,8 +22,8 @@ import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
 import { useAvailableModels } from '../hooks/useAvailableModels'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useAppSelector, useAppDispatch, store } from '../store'
-import { retireStatelessQuestion, captureStatelessCard, capturePendingAskId, selectSlotMessages, selectSlotStreamState, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, cancelQueuedMessage, setAgentSwitchNotice } from '../store/chatSlice'
-import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
+import { retireStatelessQuestion, captureStatelessCard, capturePendingAskId, confirmOptimisticSend, selectSlotMessages, selectSlotStreamState, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, cancelQueuedMessage, setAgentSwitchNotice } from '../store/chatSlice'
+import { confirmedDelivered } from '../utils/sendDelivery'
 import { triggerRefresh } from '../store/dashboardSlice'
 import { api } from '../api/client'
 import { resolveAskAfterSend } from '../lib/resolveAskAfterSend'
@@ -32,6 +33,12 @@ import { displayModel } from '../lib/model'
 
 
 import { i18nT } from '../i18n/t'
+/** Stop waiting on a pane send's response. Mirrors the same bound in
+ *  `ChatPage.send`, and carries its meaning too: reaching it means the request
+ *  was received and only the reply is late, so the turn's output arrives over
+ *  the socket rather than through this promise. It is NOT a failure signal. */
+const SEND_ABORT_MS = 10_000
+
 /**
  * ChatPane — one live chat session in the native session grid.
  *
@@ -78,6 +85,9 @@ export default function ChatPane({
   const contextPct = useAppSelector((s) => s.chat.slotContextPct[slotKey] ?? 0)
   const contextTokens = useAppSelector((s) => s.chat.slotContextTokens?.[slotKey])
   const paneSlot = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey))
+  // One source for both same-meaning markers in the agent pop-up: the row's check and
+  // the default-agent row's label.
+  const paneAgentName = paneSlot?.agent || 'default'
   // Shared composer-busy rule (chatSlice.selectComposerBusy): main turn
   // streaming OR sub-agents running (dual signal). Drives the queue affordance
   // and skips the optimistic user bubble (the backend returns a "queued"
@@ -112,7 +122,10 @@ export default function ChatPane({
   // Subscribes to the store's global refresh so a default-agent write in ANY pane (or
   // in single chat) lands here too; a per-hook refresh would leave sibling pickers stale.
   const agentsRefreshTrigger = useAppSelector((s) => s.dashboard.refreshTrigger ?? 0)
-  const { agents: installedAgents, defaultAgent } = useAgents(agentsRefreshTrigger, slotKey)
+  // This pane takes no project prop, so read THIS slot's project from the store:
+  // it scopes which project-local agents exist, so a project change must refetch.
+  const paneProject = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey)?.project || undefined)
+  const { agents: installedAgents, defaultAgent } = useAgents(agentsRefreshTrigger, slotKey, paneProject)
   const navigate = useNavigate()
   const [defaultAgentFailed, setDefaultAgentFailed] = useState(false)
   // Same contract as ChatPage: set-only, clearing lives on the Templates page.
@@ -231,6 +244,28 @@ export default function ChatPane({
     if (files.length) uploadFiles(files)
   }, [uploadFiles])
 
+  /** Put a payload the server never accepted back into the composer.
+   *
+   *  APPEND, never replace and never DROP: a send is in flight for seconds and
+   *  the user can type a fresh message in that window, so neither payload may
+   *  overwrite the other — preferring the newer one silently discards the message
+   *  the error row is telling them to retry, preferring the older one loses work
+   *  they just did. Identical text is not duplicated, and attachments merge as a
+   *  set union so a file re-picked mid-flight is not double-attached. Joined
+   *  rather than interpolated: the blank line is message structure, not copy.
+   *
+   *  Shared by both recovery sites in this pane (a failed `doSend` and a failed
+   *  question-card fallback) so the pane has ONE spelling of it. */
+  const restoreIntoComposer = useCallback((text: string, files: string[] = []) => {
+    setInput(prev => {
+      const keep = prev.replace(/\s+$/, '')
+      if (!keep.trim()) return text
+      if (keep.trim() === text.trim()) return prev
+      return [keep, text].join('\n\n')
+    })
+    if (files.length) setPendingFiles(prev => [...prev, ...files.filter(f => !prev.includes(f))])
+  }, [])
+
   const doSend = useCallback(() => {
     const text = input.trim()
     if (!text && !pendingFiles.length) return
@@ -273,17 +308,76 @@ export default function ChatPane({
         message: { role: 'user', content: text, cls: 'msg msg-u', ts: new Date().toISOString(), ...(meta ? { meta } : {}) },
       }))
     }
-    api.sendChat(llm, slotKey, undefined, undefined, meta)
+    // A failed send has to say so on the pane it was typed into. This path
+    // reported nothing at all: the composer had already cleared and a rejected
+    // fetch was swallowed by `.catch(() => undefined)`, so an undelivered
+    // message stayed on screen looking sent. `ChatPage` has always appended an
+    // error row and handed the text back; the pane now does the same, addressed
+    // to the slot that OWNS the message rather than the active one — the user
+    // can switch panes while the POST is in flight.
+    //
+    // `reason` is the server's own explanation when there is one (a 409 "slot
+    // agent mismatch" is actionable; "check your connection" is not). Absent on
+    // the transport-reject path, where no body exists.
+    const reportFailedSend = (reason?: string) => {
+      dispatch(appendSlotMessage({
+        slot: slotKey,
+        message: {
+          role: 'error',
+          content: reason || (i18nT('pages.chatPage.send_failed') as string),
+          cls: '',
+        },
+      }))
+      restoreIntoComposer(text, files)
+    }
+    // Same 10s abort `ChatPage.send` uses. Without it a HUNG (not refused) POST
+    // settles neither way until the browser's own network timeout, so the
+    // message sits on screen looking sent for minutes with the composer already
+    // cleared — the exact window this change exists to close, and the one place
+    // the removed 30s notice used to speak sooner.
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), SEND_ABORT_MS)
+    api.sendChat(llm, slotKey, undefined, controller.signal, meta)
       .then(async (r) => {
-        if (!cardAtSend && !askAtSend) return
+        clearTimeout(timeout)
         const body = await r.json().catch(() => ({}))
+        // The server accepted neither `ok` nor `queued`, so nothing was sent.
+        // Reported before the card logic below, which only runs on acceptance.
+        if (!body.ok && !body.queued) { reportFailedSend(body.error as string | undefined); return }
+        // A `queued` acceptance with no wire text is not an acceptance at all.
+        // `chat_handlers` queues `if message:` but returns `{ok, queued}`
+        // unconditionally, so an attachment-only send that raced the slot into
+        // the busy state was neither queued nor broadcast — nothing carries the
+        // attachment, and the composer has already cleared. Reported so the file
+        // comes back rather than vanishing. (The same request answers 400 when
+        // the slot is idle, which the branch above already handles.)
+        if (body.queued && !llm.trim()) { reportFailedSend(); return }
+        // The response is the delivery receipt for this pane's optimistic bubble
+        // (#4131) — see the same dispatch in ChatPage.send for why no `chat_message`
+        // echo is coming. Parsed unconditionally now: the previous early return on
+        // "no card and no ask" skipped the body entirely, which would have skipped
+        // this confirmation too. `confirmedDelivered` accepts only an IMMEDIATE
+        // dispatch: a queued acceptance is not a receipt for this bubble.
+        if (confirmedDelivered(body)) dispatch(confirmOptimisticSend({ slot: slotKey, sendId }))
+        if (!cardAtSend && !askAtSend) return
         // `ok` only: a QUEUED acceptance is still cancellable — the queued
         // path retires at its queue_pop instead (removeQueuedMessage).
         if (body.ok && !body.queued && cardAtSend) dispatch(retireStatelessQuestion({ slot: slotKey, expected: cardAtSend }))
         void resolveAskAfterSend(body, askAtSend, dispatch)
       })
-      .catch(() => undefined)
-  }, [input, pendingFiles, busy, slotKey, dispatch])
+      .catch((e: unknown) => {
+        clearTimeout(timeout)
+        // An abort means the request WAS received and only the RESPONSE is late,
+        // which is what `ChatPage` records at its own timeout ("message was
+        // received, WS will deliver response") — the turn is running and its
+        // output arrives over the socket. Reporting that as a failure would hand
+        // the payload back and invite a retry that duplicates a turn already in
+        // flight, side effects included. Only a rejection that is NOT an abort
+        // means the send never left.
+        if (e instanceof DOMException && e.name === 'AbortError') return
+        reportFailedSend()
+      })
+  }, [input, pendingFiles, busy, slotKey, dispatch, restoreIntoComposer])
 
   const onStop = useCallback(() => { dispatch(requestStop({ slotId: slotKey, force: false })) }, [dispatch, slotKey])
   const onCancelQueued = useCallback((queueId: string) => {
@@ -343,12 +437,28 @@ export default function ChatPane({
     [slotKey, toolDisclosure, setToolDisclosureFor],
   )
 
-  const ddInputCls = 'w-full px-2 py-1 text-[13px] font-body bg-bg border border-border rounded text-text outline-none focus:border-accent'
+  const ddInputCls = 'w-full px-2 py-1 text-[13px] font-body bg-bg border border-border rounded text-text outline-none focus-visible:border-accent'
 
   return (
     <SlotProvider slotId={slotKey}>
       <div
         onMouseDownCapture={onFocus}
+        /* Focus capture keeps the grid's focused-pane state true under
+           KEYBOARD navigation: tabbing into a pane (or into its portaled
+           pickers, whose React events propagate through this component tree
+           even though their DOM lives under document.body) claims grid focus
+           exactly like a click. Without it only mousedown moved the marker,
+           and a keyboard user could type into one pane while another stayed
+           marked focused. */
+        onFocusCapture={onFocus}
+        /* Stable pane boundary for focus scoping: `queryComposer()` resolves
+           the composer inside the pane that owns `document.activeElement` via
+           this attribute, and falls back to the value "focused" — the grid's
+           focused pane — when the active element has no pane ancestor (the
+           pane's pickers portal to document.body). A data hook, not a class
+           name: classes here are styling and can churn without anyone
+           auditing focus behaviour. */
+        data-chat-pane={focused ? 'focused' : ''}
         className={`flex flex-col h-full min-h-0 rounded-lg overflow-hidden bg-bg border transition-colors ${focused ? 'border-accent' : 'border-border'}`}
         style={{ '--mc-content-width': '100%' } as React.CSSProperties}
       >
@@ -415,7 +525,7 @@ export default function ChatPane({
              rather than rejecting — both have to be checked. The card is already
              cleared by the time this runs, so a swallowed failure would destroy
              the user's answer outright; on any failure it goes back into the
-             composer instead. */
+             composer through the same recovery `doSend` uses. */
           onFallbackSend={(text) => {
             api
               .sendChat(text, slotKey)
@@ -423,7 +533,7 @@ export default function ChatPane({
                 if (!res || !res.ok) throw new Error(`send failed (${res?.status ?? 'no response'})`)
               })
               .catch(() => {
-                setInput((prev) => (prev.trim() ? `${prev}\n${text}` : text))
+                restoreIntoComposer(text)
               })
           }}
         />
@@ -475,8 +585,9 @@ export default function ChatPane({
               />
             </div>
             <div role="listbox" aria-label={i18nT('components.chatPane.agent_list')} className="overflow-y-auto max-h-[280px]">
-              <AgentDropdownList agents={agentDD.filtered} activeAgent={paneSlot?.agent || 'default'} defaultAgent={defaultAgent} onSelect={(name) => { switchAgent(name); agentDD.setOpen(false) }} onSetDefault={toggleDefaultAgent} />
+              <AgentDropdownList agents={agentDD.filtered} activeAgent={paneAgentName} defaultAgent={defaultAgent} onSelect={(name) => { switchAgent(name); agentDD.setOpen(false) }} />
             </div>
+            <DefaultAgentRow agentName={paneAgentName} isDefault={paneAgentName === defaultAgent} onSetDefault={() => toggleDefaultAgent(paneAgentName)} />
             <ManageAgentsFooter error={defaultAgentFailed} onManage={() => { agentDD.setOpen(false); navigate('/capabilities?tab=templates') }} />
           </div>,
           document.body,

@@ -100,7 +100,18 @@ class TestHumanOverrideHandler:
         assert "issue_comment:" in workflow
         assert "pull_request_target:" not in workflow
         assert "actions/checkout@" not in workflow
-        assert "/ai-review override <fable|gpt|all> <current-sha>: <reason>" in workflow
+        assert "/ai-review override <fable|gpt|design|ux|first-principles|all> <current-sha>: <reason>" in workflow
+
+    def test_handler_covers_the_design_family_lanes(self) -> None:
+        # Promoting UX / First Principles to blocking is only safe if a false
+        # BLOCK has a human escape hatch. The override handler must accept the
+        # design-family targets and re-run those lanes -- the re-run's
+        # human-override step then skips the model and the gate passes.
+        workflow = _workflow("ai-review-human-override.yml")
+        assert "(fable|gpt|design|ux|first-principles|all)" in workflow
+        assert 'rerun_reviewer "design-review.yml"' in workflow
+        assert 'rerun_reviewer "ux-review.yml"' in workflow
+        assert 'rerun_reviewer "first-principles-review.yml"' in workflow
 
     def test_handler_requires_write_permission_fresh_sha_and_reason(self) -> None:
         workflow = _workflow("ai-review-human-override.yml")
@@ -141,6 +152,34 @@ class TestLineReviewHumanOverrides:
         assert "✅ human override accepted" in workflow
         assert "Human judgment by $OVERRIDE_ACTOR overrides Opus 4.8" in workflow
         assert "/ai-review override fable $HEAD:" in workflow
+
+    @pytest.mark.parametrize(
+        "name,target,lane",
+        [
+            ("design-review.yml", "design", "Design Review"),
+            ("ux-review.yml", "ux", "UX Review"),
+            ("first-principles-review.yml", "first-principles", "First Principles Review"),
+        ],
+    )
+    def test_design_family_consumes_a_bot_authored_sha_scoped_record(self, name, target, lane) -> None:
+        # The newly-blocking lanes mirror the fable/gpt override contract: a
+        # bot-authored, SHA-scoped record skips the model review and passes the
+        # gate, so a false BLOCK is clearable without a code change.
+        workflow = _workflow(name)
+        assert f"target={target} head=$HEAD" in workflow
+        assert '.user.login == "github-actions[bot]"' in workflow
+        assert "steps.human_override.outputs.active != 'true'" in workflow
+        assert "✅ human override accepted" in workflow
+        assert f"overrides {lane} for $HEAD. Passing gate." in workflow
+        # The resolver MUST run before the OIDC/credentials step, and that step
+        # must itself be gated on the override -- otherwise an OIDC failure
+        # skips the resolver and the override can never clear an infra-failed
+        # lane (regression guard for the round-2 ordering finding).
+        assert workflow.index("name: Resolve human override") < workflow.index(
+            "uses: aws-actions/configure-aws-credentials"
+        )
+        creds_if = workflow.split("uses: aws-actions/configure-aws-credentials")[1].split("with:")[0]
+        assert "steps.human_override.outputs.active != 'true'" in creds_if
 
     def test_gpt_has_clear_verdict_banner_and_human_override(self) -> None:
         workflow = _workflow("codex-review.yml")
@@ -1004,7 +1043,13 @@ class TestPreparePrPreSubmitReview:
         assert disposition < next_review
         assert "<!-- ai-review-disposition target=gpt head=<prior-reviewed-sha> -->" in skill
         assert "scopes the ruling to the commit it judged" in skill
-        assert "`fixed`/`rebutted`/`accepted`" in skill
+        # All four dispositions, in the step that actually writes the comment.
+        # A shorter copy here is what the agent follows in the moment, so
+        # `accepted-and-deferred` and `needs-a-decision` collapse into a bare
+        # `accepted` -- see test_deferred_disposition_ratchet.py, which owns the
+        # vocabulary ratchet across every surface.
+        for word in ("`fixed`", "`rebutted`", "`accepted-and-deferred`", "`needs-a-decision`"):
+            assert word in skill
         # A writer-authored disposition feeds the reviewer's adjudication
         # ledger: it may downgrade the REPEAT of an adjudicated finding, but it
         # never waives a new defect and never substitutes for an override.
@@ -1348,6 +1393,23 @@ class TestClaudeReviewQualityDimensions:
         assert "Style, formatting, naming, import order" in disco
         assert "flake8, mypy, isort, eslint" in disco
         assert "Judge" in disco and "behaviour, not form" in disco
+
+    def test_retired_single_user_premise_is_gone(self) -> None:
+        """Regression for #3484: both opus lanes carried a variant of the
+        retired 'single-user tool ... proportional to that shape' premise
+        that a prior fix (#3451) replaced with deployment-neutral framing in
+        the four workflow-inline reviewer prompts, but left these two shared
+        prompt files untouched -- a contradiction between the lanes reading
+        the same repo. The replacement text still quotes "single-user tool"
+        once, as an example of forbidden reasoning -- that is intentional and
+        not the retired premise.
+        """
+        for stage in ("opus-discovery", "opus-validate"):
+            text = _flat(_review_prompt(stage))
+            assert "proportional to that shape" not in text, stage
+            assert "Judge reachability against that shape" not in text, stage
+            assert "DO NOT REASON FROM AN ASSUMED USER COUNT" in text, stage
+            assert "DERIVED rather than speculative" in text, stage
 
 
 class TestGptPrIntentGrounding:

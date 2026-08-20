@@ -58,6 +58,9 @@ def register(app: web.Application) -> None:
     # Same path, POST: reading a summary must stay free of side effects, so
     # generating one is a separate verb rather than a query flag on the GET.
     app.router.add_post("/api/chat/slots/{slot}/summary", chat.api_chat_slot_summary_generate)
+    app.router.add_get(
+        "/api/chat/slots/{slot}/source-links", chat.api_chat_slot_source_links
+    )
     app.router.add_post("/api/chat/slots/{slot}/stop", chat.api_chat_slot_stop)
     app.router.add_post("/api/chat/slots/{slot}/interrupt", chat.api_chat_slot_interrupt)
     app.router.add_post("/api/chat/slots/{slot}/end-wait", chat.api_chat_slot_end_wait)
@@ -79,6 +82,7 @@ def register(app: web.Application) -> None:
         "/api/chat/slots/{slot}/reasoning-effort", chat.api_chat_slot_reasoning_effort
     )
     app.router.add_post("/api/chat/slots/{slot}/workspace", chat.api_chat_slot_workspace)
+    app.router.add_post("/api/chat/slots/{slot}/reload", chat.api_chat_slot_reload)
     app.router.add_post("/api/chat/slots/{slot}/project", chat.api_chat_slot_project)
     # Follow-up suggestion card (suggest_followup MCP tool -> card below composer)
     app.router.add_post("/api/chat/slots/{slot}/followup", chat.api_chat_slot_followup)

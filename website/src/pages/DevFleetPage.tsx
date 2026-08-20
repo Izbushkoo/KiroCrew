@@ -1132,12 +1132,17 @@ export default function DevFleetPage() {
         let st: { running?: boolean; done?: number; items?: Record<string, { status?: string; error?: string | null }> } | null = null
         try { st = await api.get('/prune-status') } catch { continue }
         if (!st) continue
-        // Rebuild the item map in the ORIGINAL selection order; fall back to
-        // the pending seed for any name the backend has not populated yet.
+        // Rebuild the item map in the ORIGINAL selection order over the FULL
+        // regular-plus-forced set: the checklist, denominator, and success
+        // tally must all cover every name the backend tracks, forced worktrees
+        // included. Counting over ``names`` alone drops the forced worktrees
+        // from the denominator and the tally, restoring the ``1/0`` counter and
+        // the false failure toast. Fall back to the pending seed for any name
+        // the backend has not populated yet.
         const raw = st.items || {}
-        const backendTotal = Object.keys(raw).length || names.length
+        const backendTotal = Object.keys(raw).length || allNames.length
         const items: Record<string, { status: string; error?: string | null }> =
-          Object.fromEntries(names.map((n) => [n, {
+          Object.fromEntries(allNames.map((n) => [n, {
             status: raw[n]?.status || 'pending',
             error: raw[n]?.error ?? null,
           }]))
@@ -1146,14 +1151,14 @@ export default function DevFleetPage() {
           // A name the backend never tracked (filtered server-side, e.g. the
           // worktree vanished between preview and execute) must terminate as
           // an explained failure, not sit "Pending" in a finished checklist.
-          for (const n of names) {
+          for (const n of allNames) {
             if (!raw[n]) items[n] = { status: 'failed', error: 'not processed (unknown or no longer a worktree)' }
           }
         }
-        setPruneProgress({ names, items, done: st.done || 0, total: names.length, running })
+        setPruneProgress({ names: allNames, items, done: st.done || 0, total: allNames.length, running })
         if (!running) {
-          const removed = names.filter((n) => items[n]?.status === 'done').length
-          const failed = names.filter((n) => items[n]?.status === 'failed').length
+          const removed = allNames.filter((n) => items[n]?.status === 'done').length
+          const failed = allNames.filter((n) => items[n]?.status === 'failed').length
           notify(removed > 0 ? `Pruned ${removed} worktree(s)` + (failed > 0 ? ` (${failed} failed)` : '') : `Prune: ${failed} failed`, { type: removed > 0 ? 'success' : 'error' })
           invalidateAll()
           setTimeout(() => setPruneProgress(null), 5000)
@@ -1806,11 +1811,11 @@ export default function DevFleetPage() {
       <div className="flex flex-1 min-h-0 overflow-hidden">
         <div className="flex-1 min-w-0 flex flex-col min-h-0">
           <PageHeader title={i18nT('pages.devFleetPage.dev_fleet')} subtitle={i18nT('pages.devFleetPage.manage_the_git_worktrees_of_your_main_checkout_s')} />
-          <div className="flex-1 overflow-y-auto px-2 md:px-6 pb-8 min-h-0">
+          <div className="flex-1 overflow-y-auto px-4 md:px-6 pb-8 min-h-0">
             {/* The how-to describes row actions; with no readable fleet there are
                 no rows, and instructions for absent controls read as a broken page. */}
             {!noFleet && (
-            <p className="text-[12.5px] text-muted leading-relaxed mt-3 mb-1 max-w-[860px]">
+            <p className="text-[12.5px] text-muted leading-relaxed mt-3 mb-1">
               {i18nT('pages.devFleetPage.each_row_below_is_a_git_worktree_discovered_from')}{' '}
               <span className="text-text-strong">{i18nT('pages.devFleetPage.pull_build')}</span> {i18nT('pages.devFleetPage.on_the_main_row_to_fast_forward_it_from_origin_a')} <span className="text-text-strong">{i18nT('pages.devFleetPage.pod_2')}</span> {i18nT('pages.devFleetPage.boots_any_worktree_as_an_isolated_throwaway_gate')}{' '}
               <span className="text-text-strong">{i18nT('pages.devFleetPage.rebase')}</span> {i18nT('pages.devFleetPage.moves_a_feature_branch_onto_the_latest_main_and')}{' '}
@@ -1821,7 +1826,7 @@ export default function DevFleetPage() {
               <div
                 role="note"
                 data-testid="inferred-main-checkout"
-                className="flex items-center gap-2 mt-2 max-w-[860px] text-[12px] leading-relaxed text-text-strong"
+                className="flex items-center gap-2 mt-2 text-[12px] leading-relaxed text-text-strong"
               >
                 <Info size={13} className="lucide-inline shrink-0" />
                 <span>{i18nT('pages.devFleetPage.the_primary_checkout_this_fleet_is_discovered_fr')}:</span>
@@ -1832,7 +1837,7 @@ export default function DevFleetPage() {
               <div
                 role="alert"
                 data-testid="gateway-restart-error"
-                className="flex items-start gap-2 rounded-md border border-danger/40 bg-danger-subtle px-3 py-2.5 mt-3 max-w-[860px] text-[12.5px] leading-relaxed text-danger"
+                className="flex items-start gap-2 rounded-md border border-danger/40 bg-danger-subtle px-3 py-2.5 mt-3 text-[12.5px] leading-relaxed text-danger"
               >
                 <AlertTriangle size={14} className="lucide-inline shrink-0 mt-0.5" />
                 {/* select-text + break-words: the message can be a pair of
@@ -1852,7 +1857,7 @@ export default function DevFleetPage() {
               <div
                 role="alert"
                 data-testid="serving-install-warning"
-                className="flex items-start gap-2 rounded-md border border-warn/40 bg-warn-subtle px-3 py-2.5 mt-3 max-w-[860px] text-[12.5px] leading-relaxed text-warn"
+                className="flex items-start gap-2 rounded-md border border-warn/40 bg-warn-subtle px-3 py-2.5 mt-3 text-[12.5px] leading-relaxed text-warn"
               >
                 <AlertTriangle size={14} className="lucide-inline shrink-0 mt-0.5" />
                 <div className="min-w-0">
@@ -1865,7 +1870,7 @@ export default function DevFleetPage() {
             {!podsAvailable && (
               <div
                 role="note"
-                className="flex items-start gap-2 rounded-md border border-border bg-bg-elevated px-3 py-2.5 mt-3 max-w-[860px] text-[12.5px] leading-relaxed"
+                className="flex items-start gap-2 rounded-md border border-border bg-bg-elevated px-3 py-2.5 mt-3 text-[12.5px] leading-relaxed"
               >
                 <Info size={14} className="lucide-inline shrink-0 mt-0.5 text-muted" />
                 <div className="min-w-0">
@@ -1878,7 +1883,7 @@ export default function DevFleetPage() {
             {gatewayReason && (
               <div
                 role="note"
-                className="flex items-start gap-2 rounded-md border border-border bg-bg-elevated px-3 py-2.5 mt-3 max-w-[860px] text-[12.5px] leading-relaxed"
+                className="flex items-start gap-2 rounded-md border border-border bg-bg-elevated px-3 py-2.5 mt-3 text-[12.5px] leading-relaxed"
               >
                 <Info size={14} className="lucide-inline shrink-0 mt-0.5 text-muted" />
                 <div className="min-w-0">

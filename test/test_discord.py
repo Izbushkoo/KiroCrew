@@ -83,6 +83,7 @@ class FakeClient:
         self.acked: list[str] = []
         self.reactions: list[tuple[str, str]] = []
         self.thread_channels: set[str] = set()
+        self.created_threads: list[tuple[str, str, str]] = []
         self.attachment_bodies: dict[str, bytes] = {}
         self.attachment_downloads: list[str] = []
         self._mid = 100
@@ -131,6 +132,14 @@ class FakeClient:
 
     async def create_dm_channel(self, user_id: str) -> str:
         return f"dm-{user_id}"
+
+    async def create_thread_from_message(
+        self, channel_id: str, message_id: str, name: str
+    ) -> str:
+        thread_id = f"thread-{message_id}"
+        self.created_threads.append((channel_id, message_id, name))
+        self.thread_channels.add(thread_id)
+        return thread_id
 
     async def download_attachment(self, url: str, dest: str) -> None:
         self.attachment_downloads.append(url)
@@ -202,6 +211,9 @@ class FakeProvider:
 
 
 class FakeSessions:
+    async def aflush(self) -> None:  # in-memory double: already durable
+        pass
+
     def __init__(self, raise_on_get: bool = False) -> None:
         self.released: list[str] = []
         self.acquired: list[str] = []
@@ -1089,7 +1101,10 @@ class TestConfiguredTargets:
 
 class TestTransportReceive:
     def _transport(
-        self, allowed: list[str], allowed_threads: list[str] | None = None
+        self,
+        allowed: list[str],
+        allowed_threads: list[str] | None = None,
+        allowed_channels: list[str] | None = None,
     ) -> tuple[DiscordTransport, list[InboundMessage], FakeClient]:
         dispatched: list[InboundMessage] = []
 
@@ -1102,6 +1117,7 @@ class TestTransportReceive:
             client,  # type: ignore[arg-type]
             allowed_user_ids=allowed,
             allowed_thread_ids=allowed_threads or [],
+            allowed_channel_ids=allowed_channels or [],
             dispatch=_dispatch,
         )
         return t, dispatched, client
@@ -1152,6 +1168,99 @@ class TestTransportReceive:
         await t.receive(DiscordInbound(channel_id="t1", user_id="u1", text="hello", guild_id="g1"))
         assert len(dispatched) == 1
         assert dispatched[0].thread_id == "t1"
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_channel_creates_thread_before_dispatch(self) -> None:
+        t, dispatched, client = self._transport(["u1"], allowed_channels=["c1"])
+        await t.receive(
+            DiscordInbound(
+                channel_id="c1",
+                user_id="u1",
+                text="Plan the release",
+                message_id="m1",
+                guild_id="g1",
+            )
+        )
+
+        assert client.created_threads == [("c1", "m1", "Plan the release")]
+        assert len(dispatched) == 1
+        assert dispatched[0].conversation_id == "thread-m1"
+        assert dispatched[0].thread_id == "thread-m1"
+
+    @pytest.mark.asyncio
+    async def test_followup_message_in_auto_created_thread_dispatches(self) -> None:
+        """The thread the transport just created must be immediately valid for
+        the same user's next message, not just for button interactions -- a
+        frozen ``_allowed_threads`` would silently strand every reply."""
+        t, dispatched, _ = self._transport(["u1"], allowed_channels=["c1"])
+        await t.receive(
+            DiscordInbound(
+                channel_id="c1",
+                user_id="u1",
+                text="Plan the release",
+                message_id="m1",
+                guild_id="g1",
+            )
+        )
+        assert len(dispatched) == 1
+        created_thread_id = dispatched[0].conversation_id
+
+        await t.receive(
+            DiscordInbound(
+                channel_id=created_thread_id,
+                user_id="u1",
+                text="Here's a follow-up",
+                message_id="m2",
+                guild_id="g1",
+            )
+        )
+
+        assert len(dispatched) == 2
+        assert dispatched[1].conversation_id == created_thread_id
+        assert dispatched[1].thread_id == created_thread_id
+        assert dispatched[1].text == "Here's a follow-up"
+
+    @pytest.mark.asyncio
+    async def test_channels_governance_denial_blocks_thread_creation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A runtime channels-governance deny must stop the REST thread-create
+        call itself -- not just the turn that would have followed it -- since
+        creating the thread is a visible, irreversible side effect."""
+
+        async def _denied(_channel_type: str) -> bool:
+            return False
+
+        monkeypatch.setattr("kiro_crew.discord.transport.channel_inbound_permitted", _denied)
+        t, dispatched, client = self._transport(["u1"], allowed_channels=["c1"])
+        await t.receive(
+            DiscordInbound(
+                channel_id="c1",
+                user_id="u1",
+                text="Plan the release",
+                message_id="m1",
+                guild_id="g1",
+            )
+        )
+
+        assert client.created_threads == []
+        assert dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_channel_rejects_unapproved_user_without_thread(self) -> None:
+        t, dispatched, client = self._transport(["u1"], allowed_channels=["c1"])
+        await t.receive(
+            DiscordInbound(
+                channel_id="c1",
+                user_id="u2",
+                text="hello",
+                message_id="m1",
+                guild_id="g1",
+            )
+        )
+
+        assert client.created_threads == []
+        assert dispatched == []
 
     @pytest.mark.asyncio
     async def test_normal_channel_denied_even_if_id_is_allowlisted(self) -> None:
@@ -1610,6 +1719,56 @@ class TestApprovalDecider:
     async def test_resolve_unknown_key_returns_false(self) -> None:
         assert not DiscordApprovalDecider.resolve_global("sk:none", True, nonce="x")
 
+    @pytest.mark.asyncio
+    async def test_timeout_records_the_stall_for_a_bound_loop(self, monkeypatch) -> None:
+        """A Discord nudge cycle stalls here, not in the dashboard runner.
+
+        Without this the loop keeps waking, is denied by default, and spends its
+        whole cycle cap accomplishing nothing.
+        """
+        from kiro_crew import autonudge as _an
+        from kiro_crew.discord import renderer as _rend
+
+        recorded: list[str] = []
+        monkeypatch.setattr(
+            _an,
+            "get_instance",
+            lambda: SimpleNamespace(notify_approval_stalled=recorded.append),
+        )
+        monkeypatch.setattr(_rend, "_APPROVAL_TIMEOUT_S", 0.01)
+
+        decider = DiscordApprovalDecider(session_key="discord:a:direct:7")
+        assert await decider(SimpleNamespace(request_id="r-timeout")) is False
+
+        assert recorded == ["discord:a:direct:7"], "the stall was not recorded"
+
+    @pytest.mark.asyncio
+    async def test_a_pressed_deny_is_not_recorded_as_a_stall(self, monkeypatch) -> None:
+        """An explicit deny is a decision, not evidence that nobody is present.
+
+        Recording it would stop a loop whose operator is right there declining
+        one tool.
+        """
+        from kiro_crew import autonudge as _an
+
+        recorded: list[str] = []
+        monkeypatch.setattr(
+            _an,
+            "get_instance",
+            lambda: SimpleNamespace(notify_approval_stalled=recorded.append),
+        )
+
+        decider = DiscordApprovalDecider(session_key="discord:a:direct:7")
+        ev = SimpleNamespace(request_id="r-deny")
+        task = asyncio.ensure_future(decider(ev))
+        await asyncio.sleep(0)
+        key = DiscordApprovalDecider.key("discord:a:direct:7", "r-deny")
+        nonce = DiscordApprovalDecider.register_nonce(key)
+        assert DiscordApprovalDecider.resolve_global(key, False, nonce=nonce)
+
+        assert await task is False
+        assert recorded == [], "a pressed deny must not count as an unanswered prompt"
+
 
 # ── transport_dispatch.py ────────────────────────────────────────────────
 
@@ -1928,9 +2087,14 @@ class TestDispatcher:
         assert cli.attachment_downloads == []
         assert sess.queued[0][2]["attachments"] == [attachment]
         sess._busy = False
-        await d._drain_queue(d._session_key("u1"), "u1", "c1")
+        native_key = d._session_key("u1")
+        sess.set_mirror_link(
+            "dashboard:chat-1", ChannelLink("discord", channel_id="c1"), accepts_inbound=True
+        )
+        await d._drain_queue(native_key, "u1", "c1")
         await asyncio.sleep(0)
 
+        assert sess.get_origin_link(native_key) == ChannelLink("discord", channel_id="c1")
         prompt_path = d.ctx_builder.messages[-1].splitlines()[0]
         assert cli.attachment_downloads == [url]
         assert prompt_path.endswith(".png")
@@ -2150,25 +2314,34 @@ class TestDispatcher:
         ``batched_save`` writes on the way out even when the block raises, so a
         refusal raised AFTER the opt-out withdrawal would persist that withdrawal
         for a link that never happened — silently turning mirroring back on. The
-        claim is refused before it mutates anything, so it goes first.
+        claim is refused before it mutates anything, so it goes first. Two owners now
+        also make the routing decision refuse `!link` ahead of the handler; either
+        way nothing is persisted for a link that did not happen.
         """
         d, cli, sess = _dispatcher({"u1"})
         await d.handle_message(self._msg("!unlink"))
         self._occupy_ambiguously(sess)
         await d.handle_message(self._msg("!link"))
-        assert any("already linked here" in t for t, _ in cli.sent)
+        assert any("`!unlink`" in t for t, _ in cli.sent)
         assert sess.mirror_opt_outs == {_opt_out_key(d._session_key("u1"))}, (
             "a refused link must not withdraw the refusal"
         )
 
     @pytest.mark.asyncio
-    async def test_a_refused_bind_still_answers_the_turn(self) -> None:
-        # An uncaught raise on the turn path would drop the turn and answer the
-        # user nothing.
+    async def test_an_ambiguous_conversation_is_answered_but_not_processed(self) -> None:
+        """Two owners deny routing, so the turn must be refused — and answered.
+
+        Falling through to this conversation's own session would answer from a
+        session holding none of the context the user is looking at; an uncaught
+        raise here would answer nothing at all. So: a reply, and no turn.
+        """
         d, cli, sess = _dispatcher({"u1"})
         self._occupy_ambiguously(sess)
         await d.handle_message(self._msg("hello world"))
-        assert "Answer: hello world" in (cli.final_text() or "")
+        assert "Ambiguous link" in (cli.final_text() or "")
+        assert "Answer: hello world" not in (cli.final_text() or ""), (
+            "the message was processed while routing was denied"
+        )
         assert d._session_key("u1") not in sess.mirror_links
 
     @pytest.mark.asyncio
@@ -2319,11 +2492,9 @@ class TestDispatcher:
 
     @pytest.mark.asyncio
     async def test_unlink_repairs_duplicate_inbound_bindings(self) -> None:
-        # Duplicate inbound bindings make the resume resolver fail closed
-        # (routing denied), so the resumed-session path cannot release them —
-        # the dispatcher sweep is the repair, and the reply says how much it
-        # cleared instead of a bare ✅ that reads as "just yours". The rows go in
-        # directly because `set_mirror_link` refuses to create this state.
+        # Duplicate inbound bindings make the resolver fail closed. `!unlink`
+        # repairs and settles them in the resume layer instead of falling through
+        # to native unlink. Rows go in directly because the writer refuses them.
         d, cli, sess = _dispatcher({"u1"})
         loc = ChannelLink("discord", channel_id="c1")
         for wedged in ("dashboard:wedged-a", "dashboard:wedged-b"):
@@ -2331,7 +2502,7 @@ class TestDispatcher:
             sess.inbound_mirror_keys.add(wedged)
         await d.handle_message(self._msg("!unlink"))
         assert sess.mirror_links == {}
-        assert any("Unlinked (2 bindings)" in t for t, _ in cli.sent)
+        assert any("Left the resumed session" in t for t, _ in cli.sent)
 
     @pytest.mark.asyncio
     async def test_new_frees_whole_location_when_leaving_resumed_session(self) -> None:

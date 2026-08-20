@@ -484,7 +484,7 @@ function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemo
           items-start, not items-end: a chip carrying a resize pill is taller than a
           plain one, and bottom-alignment would spend that difference staggering the
           THUMBNAILS (the thing being compared) instead of letting the pills hang. */}
-      <div ref={attachScroller} data-testid="preview-strip" className="flex gap-2 px-5 py-2 border-t border-border bg-chrome/50 overflow-x-auto items-start" data-image-scope="">
+      <div ref={attachScroller} data-testid="preview-strip" className="flex gap-2 px-4 py-2 border-t border-border bg-chrome/50 overflow-x-auto items-start" data-image-scope="">
       {imgs.map((path, i) => {
         const src = `/api/file-raw?path=${encodeURIComponent(path)}`
         const resize = resizedInfo?.[path]
@@ -913,6 +913,10 @@ function ChatInput({
   // Hover detection layer that shows paste previews on mouseover; scroll-synced
   // identically to the backdrop mirror.
   const hoverRef = useRef<PasteHoverHandle>(null)
+  // Id of the open paste-preview tooltip (or null). Wired to the textarea's
+  // aria-describedby so keyboard/screen-reader users get the preview announced
+  // when the caret enters a token — the AT half of the paste-preview a11y fix.
+  const [pastePreviewPanelId, setPastePreviewPanelId] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   // "+" drop-up menu (upload file / image + browse toggle).
   const [plusOpen, setPlusOpen] = useState(false)
@@ -1822,14 +1826,18 @@ function ChatInput({
     const sendKey = sendOnEnter === 'ctrl-enter'
       ? (e.key === 'Enter' && (e.metaKey || e.ctrlKey))
       : (e.key === 'Enter' && !e.shiftKey)
-    if (sendKey && !e.defaultPrevented && !ime.isComposing(e) && !optimizingRef.current) {
-      // preventDefault always fires when sendKey matches so the textarea's
-      // default Enter behavior (newline insert into draft) doesn't leak
-      // through when the gateway is offline. The action itself is gated on
-      // `connected` to match the disabled-state on the Send button.
+    if (sendKey && !e.defaultPrevented) {
+      // The key is ours as soon as it matches the send binding, so claim it before
+      // deciding what to do with it — `claimEnter` suppresses the default and returns
+      // false for an Enter the IME is committing. Every early return below therefore
+      // leaves the draft untouched instead of gaining a newline, which is what the
+      // browser does with an Enter nobody consumed.
+      // The send itself is gated on `connected` to match the Send button's disabled
+      // state, and skipped while a prompt optimization owns the draft.
       // While the composer is busy, Enter follows the split-button mode:
       // steer (default) acts on the text now; queue defers it.
-      e.preventDefault()
+      if (!ime.claimEnter(e)) return
+      if (optimizingRef.current) return
       if (connected) fireComposer()
       return
     }
@@ -2046,6 +2054,9 @@ function ChatInput({
     if (!ta) return
     const ss = ta.selectionStart ?? 0
     const se = ta.selectionEnd ?? 0
+    // Keyboard/AT peek: a collapsed caret landing inside a token opens the
+    // preview (the handle no-ops for a non-collapsed selection).
+    hoverRef.current?.handleCaret(ss, se)
     // Collapsed caret inside a token is handled by the click expander — skip.
     if (ss === se) return
     const ranges = findTokenRanges(ta.value, pasteBlocks)
@@ -2161,7 +2172,7 @@ function ChatInput({
 
   return (
     // 'input-area' is a stable theming hook — see website/docs/theming-contract.md
-    <div className={`input-area px-5 pb-1 ${hasApproval ? 'pt-0' : 'pt-1'} mx-auto w-full flex flex-col`}
+    <div className={`input-area px-4 pb-1 ${hasApproval ? 'pt-0' : 'pt-1'} mx-auto w-full flex flex-col`}
       style={{ maxWidth: 'var(--mc-input-width, 900px)', ...(manualHeight !== null ? { minHeight: (INPUT_DRAG_MIN_H + stripH) + 'px' } : {}) }}>
 
       {/* Knowledge context chip */}
@@ -2486,6 +2497,8 @@ function ChatInput({
         <textarea
           ref={inputRef}
           aria-label={i18nT('components.chatInput.message_input')}
+          data-composer-input=""
+          aria-describedby={pastePreviewPanelId ?? undefined}
           data-composer-typo
           className={`relative w-full bg-transparent border-none ${INPUT_TYPO} text-text outline-none min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${manualHeight !== null ? 'flex-1' : ''} ${disabled ? 'opacity-40 pointer-events-none' : ''} ${optimizing ? 'opacity-30' : ''}`}
           style={manualHeight !== null ? { height: '100%' } : undefined}
@@ -2515,7 +2528,11 @@ function ChatInput({
             recordCaret()
           }}
           onKeyDown={handleKeyDown}
-          {...ime.composition}
+          {...ime.bindComposition<HTMLTextAreaElement>({
+            // The paste-hover preview dismisses on blur; the guard's latch reset rides
+            // in the binding itself, so this handler only carries what is local here.
+            onBlur: () => { if (hoverRef.current) hoverRef.current.handleMouseLeave() },
+          })}
           onPaste={handlePaste}
           onCopy={handleCopy}
           onCut={handleCut}
@@ -2528,7 +2545,7 @@ function ChatInput({
           onMouseMove={e => { if (pasteBlocks.length && hoverRef.current) hoverRef.current.handleMouseMove(e) }}
           onMouseLeave={() => { if (hoverRef.current) hoverRef.current.handleMouseLeave() }}
         />
-        {pasteBlocks.length > 0 && <PasteHoverLayer ref={hoverRef} value={value} blocks={pasteBlocks} mirrorRef={mirrorRef} />}
+        {pasteBlocks.length > 0 && <PasteHoverLayer ref={hoverRef} value={value} blocks={pasteBlocks} mirrorRef={mirrorRef} onActivePanelChange={setPastePreviewPanelId} />}
         </div>
 
         {/* Bottom icon row */}

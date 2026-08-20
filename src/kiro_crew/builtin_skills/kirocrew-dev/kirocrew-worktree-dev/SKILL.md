@@ -107,9 +107,11 @@ than fixed; if it only fails on your branch, it's yours. Never label a failure
 
 **A confirmed flake is a bug with a root cause, not noise to retry.** Do NOT add a
 rerun, lengthen a `sleep`, or relax an assertion. Read
-`docs/system-specs/common/testing-conventions.md` § Determinism for the four classes
+`docs/system-specs/common/testing-conventions.md` § Determinism for the five classes
 and the one correct fix for each: seed nondeterministic input, poll instead of
-sleeping, `MagicMock` for sync methods, `await` after `cancel()`. To find what is
+sleeping, `MagicMock` for sync methods, `await` after `cancel()`, and assert a
+complexity property structurally (identical invocation trace at `n` and `2n`) rather
+than by a timed duration or a tight timed ratio. To find what is
 actually flaky rather than guessing, mine CI instead of the local suite (a real flake
 often will not reproduce on macOS at all):
 
@@ -126,7 +128,7 @@ a ratchet/contract test failing on feature branches is a TRUE POSITIVE, not a fl
 The Windows shards fail far more than Linux, so expect timer-granularity and
 process-semantics causes there.
 
-**Suite speed: profile, don't guess.** At ~26.5k tests, per-test setup cost dominates
+**Suite speed: profile, don't guess.** At ~56.5k tests, per-test setup cost dominates
 any single slow test. Time one file with `pytest test/test_x.py -n0 -q --no-cov
 --durations=10` and compare a candidate fix **back to back** on the same machine
 (`git stash`, run, pop, run), because a loaded host makes an absolute number

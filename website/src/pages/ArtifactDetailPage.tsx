@@ -1,5 +1,6 @@
 import { safeSetItem } from '../utils/safeStorage'
 import { useIsMobile } from '../hooks/useIsMobile'
+import { useImeGuard } from '../hooks/useImeGuard'
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import WebAppArtifactCard from '../components/WebAppArtifactCard'
 import { useNavigate, useParams } from 'react-router-dom'
@@ -352,6 +353,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   // posts metadata-only (no version bump). Removing a tag works the same way.
   const [addingTag, setAddingTag] = useState(false)
   const [newTag, setNewTag] = useState('')
+  const ime = useImeGuard()
   // ── Inline-comment state (durable via /api/artifacts/:slug/comments) ──
   const commentsQuery = useQuery<{ comments: ArtifactComment[]; remote_sync_error?: string | null }>({
     queryKey: ['artifact-comments', slug],
@@ -1416,7 +1418,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
         <div className="sticky top-0 z-10 bg-bg border-b border-border">
           <PageHeader title={i18nT('pages.artifactDetailPage.artifact')} subtitle={slug} />
         </div>
-        <div className="px-2 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+        <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
           <Card>
             <div className="flex items-start gap-3">
               <AlertTriangle className="lucide-inline text-danger" />
@@ -1485,7 +1487,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
           )}
           subtitle={i18nT('pages.artifactDetailPage.artifact_slug', { slug: artifact.slug })}
         />
-        <div className="px-2 md:px-6 py-2 flex flex-wrap items-center gap-2">
+        <div className="px-4 md:px-6 py-2 flex flex-wrap items-center gap-2">
           {!popout && (
             <Btn onClick={() => {
               if (dirty && !window.confirm(i18nT('pages.artifactDetailPage.discard_unsaved_changes'))) return
@@ -1561,20 +1563,31 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               value={newTag}
               onChange={e => setNewTag(e.target.value)}
               onKeyDown={e => {
-                if (e.key === 'Enter') addTag(newTag)
+                if (e.key === 'Enter') {
+                  // Rule 2 shape: this handler carries more than Enter (comma/space
+                  // also commit), so only the Enter path is gated. Rule 1: single-line
+                  // input, so the guard alone is enough.
+                  if (ime.isComposing(e)) return
+                  addTag(newTag)
+                }
                 if (e.key === ',' || e.key === ' ') {
+                  // Space cycles IME candidates mid-composition; committing here
+                  // would post the composing buffer and kill candidate selection.
+                  if (ime.isComposing(e)) return
                   e.preventDefault()
                   if (newTag.trim()) addTag(newTag)
                 }
-                if (e.key === 'Escape') { setNewTag(''); setAddingTag(false) }
+                if (e.key === 'Escape') { ime.reset(); setNewTag(''); setAddingTag(false) }
               }}
-              onBlur={() => {
-                if (newTag.trim()) addTag(newTag)
-                else setAddingTag(false)
-              }}
+              {...ime.bindComposition({
+                onBlur: () => {
+                  if (newTag.trim()) addTag(newTag)
+                  else setAddingTag(false)
+                },
+              })}
               autoFocus
               placeholder={i18nT('pages.artifactDetailPage.tag')}
-              className="text-[11px] px-1.5 py-0.5 rounded bg-bg-elevated border border-accent text-text outline-none"
+              className="text-[11px] px-1.5 py-0.5 rounded bg-bg-elevated border border-accent text-text outline-none focus-ring"
               style={{ width: '90px' }}
               aria-label={i18nT('pages.artifactDetailPage.add_a_tag')}
             />
@@ -1776,7 +1789,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
         </div>
       </div>
 
-      <div className="px-2 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
         {artifact.description && (
           <div className="mb-3 text-sm text-muted italic">{artifact.description}</div>
         )}

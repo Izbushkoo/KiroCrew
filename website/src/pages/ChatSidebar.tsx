@@ -1,12 +1,12 @@
 import { useState, useRef, useEffect, useLayoutEffect, memo, useMemo, useCallback, Fragment } from 'react'
 import { createPortal } from 'react-dom'
 import { LayoutGroup, AnimatePresence, motion } from 'framer-motion'
-import { Plus, X, Pin, Monitor, Eye, EyeOff, VenetianMask, Droplet, FolderPlus, MessageSquare, MessageSquarePlus, MessagesSquare, Folder, ChevronRight, ChevronDown, Clock, Pencil, BrushCleaning, Link2, Circle, MoreVertical, Tag as TagIcon, Columns3, GripVertical, Zap, Check, Copy, ListFilter, List, Loader, Loader2, Settings, RotateCcw, Bot, ExternalLink, Cpu, GitMerge, Workflow, CircleDot, Users, TriangleAlert, Goal, MessageCircleQuestionMark, ShieldCheck } from 'lucide-react'
+import { Plus, X, Pin, Monitor, Eye, EyeOff, VenetianMask, Droplet, FolderPlus, MessageSquare, MessageSquarePlus, MessagesSquare, Folder, ChevronRight, ChevronDown, ChevronUp, Clock, Pencil, BrushCleaning, Link2, Circle, MoreVertical, Tag as TagIcon, Columns3, GripVertical, Zap, Check, Copy, ListFilter, List, Loader, Loader2, Settings, RotateCcw, Bot, ExternalLink, Cpu, GitMerge, Workflow, CircleDot, Users, TriangleAlert, Goal, MessageCircleQuestionMark, ShieldCheck, Repeat } from 'lucide-react'
 import GithubLogo from '../components/icons/GithubLogo'
 import GitlabLogo from '../components/icons/GitlabLogo'
 import JiraLogo from '../components/icons/JiraLogo'
 import FolderGlyph from '../components/FolderGlyph'
-import { DndContext, closestCenter, pointerWithin, KeyboardSensor, PointerSensor, useSensor, useSensors, useDroppable, DragOverlay, MeasuringStrategy, type DragEndEvent, type DragStartEvent, type DragOverEvent, type CollisionDetection } from '@dnd-kit/core'
+import { DndContext, closestCenter, pointerWithin, KeyboardSensor, MouseSensor, TouchSensor, useSensor, useSensors, useDroppable, DragOverlay, MeasuringStrategy, type DragEndEvent, type DragStartEvent, type DragOverEvent, type CollisionDetection } from '@dnd-kit/core'
 import { SortableContext, verticalListSortingStrategy, useSortable, sortableKeyboardCoordinates } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -23,9 +23,10 @@ import { computeReorderedFolders } from '../utils/reorderFolders'
 import { computeRecentRank, recencyTintShadow, clampTintCount } from '../utils/recencyTint'
 import { computeActiveSubtree, folderIsHidden, folderOffersHide } from '../utils/folderVisibility'
 import { groupHistoryByFolder } from '../utils/groupHistoryByFolder'
+import { boardCollapseKey, boardColumnFromDroppableId, loadBoardFolderCollapse, persistBoardOverride, persistClearFolderOverrides, clearFolderOverrides } from '../utils/boardFolderCollapse'
 import { slotChannelLabel, slotChannelNamespace } from '../utils/channelOrigin'
 import { toolStatusLabel } from '../utils/toolStatusLabel'
-import { sessionRefBlockReason } from '../utils/sessionRefs'
+import { sessionRefBlockReason, type SessionRefBlockReason } from '../utils/sessionRefs'
 import { SearchInput, Input, Btn, IconButton, IconButtonGroup, Badge } from '../components/ui'
 import SimpleSelect from '../components/SimpleSelect'
 import FolderConfigModal from '../components/FolderConfigModal'
@@ -44,8 +45,8 @@ import { platformShortcut } from '../utils/platform'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { usePointerDrag } from '../hooks/usePointerDrag'
-import { isTouchDevice } from '../utils/isTouchDevice'
 import { safeSetItem } from '../utils/safeStorage'
+import { LAYOUT } from '../components/layout'
 import { resolveFolderAgent, resolveFolderProjectDir } from '../utils/folderAgent'
 import FolderMoveSubmenu from '../components/FolderMoveSubmenu'
 import SessionActionsMenu from '../components/SessionActionsMenu'
@@ -56,6 +57,7 @@ import { collectFolderSubtreeIds } from '../utils/folderTree'
 import { runBelongsToSlot } from '../apps/workflows/runModel'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import type { ChatFolder, ChatTag, TagColumn, TagColumnMode, SubagentActivity, SessionLink } from '../types'
+import { SESSION_LANES, inferLane } from './chat/sessionLane'
 import { decideUnreadDrain } from './unreadDrain'
 import {
   type RecentUnit,
@@ -107,6 +109,12 @@ const RENAME_MAX_H = 120
 const ROW_META_CLS = 'text-[10px] leading-[12px]'
 const ROW_TITLE_CLS = 'text-[13px] leading-[20px]'
 const ROW_STATUS_CLS = 'text-[11px] leading-[16px]'
+
+/* A SECOND surface now tracks these three sizes: the Notes app's left rail
+ * (`apps/md-notebook/constants.ts`, `RAIL_TYPE`) mirrors them so the two
+ * sidebars read as one scale. The agreement is by copied value, not a shared
+ * token — nothing goes red if these move. Change a size here and update
+ * `RAIL_TYPE` in the same commit, or the rail silently diverges. */
 
 /** The secondary line's three shapes, as whole class strings. The eight status
  *  branches that render this line each used to spell the type classes out, so a
@@ -262,12 +270,16 @@ const CHAT_PANE_DROP_TYPE = 'chat-pane-ref'
  * resolves collisions from measured rects, not DOM hit-testing, so the zone
  * still receives the drop while the chat underneath stays fully interactive.
  *
- * When the dragged session is incognito/temporary the zone renders a refusal
- * state instead of an invitation. Explaining the block beats silently ignoring
- * the drop — and the drop handler refuses independently, so this is the visible
- * half of a guard that does not depend on the UI being reached.
+ * When the dragged session may not be referenced the zone renders a refusal state
+ * instead of an invitation, and the two refusals are NOT interchangeable:
+ * incognito/temporary is a guard stated plainly, while dropping a session onto
+ * its own pane is a harmless mis-aim answered with a recursive joke rather than a
+ * warning. Explaining the block beats silently ignoring the drop — and the drop
+ * handler refuses independently, so this is the visible half of a guard that does
+ * not depend on the UI being reached.
  */
-function ChatPaneDropZone({ refused }: { refused: boolean }) {
+function ChatPaneDropZone({ refusal }: { refusal: SessionRefBlockReason | null }) {
+  const refused = refusal !== null
   const { setNodeRef, isOver } = useDroppable({ id: 'chat-pane-ref', data: { type: CHAT_PANE_DROP_TYPE } })
   const zoneRef = useRef<HTMLDivElement | null>(null)
   /** The composer's box in zone-local coordinates (plus the zone's own height, so
@@ -300,18 +312,32 @@ function ChatPaneDropZone({ refused }: { refused: boolean }) {
     })
   }, [])
   const active = isOver && !refused
-  const tone = refused
+  // Two refusals, told apart deliberately. 'private' is a GUARD — the user asked
+  // for something the product will not do, so it keeps the warn tone. 'self' is
+  // not a guard at all: dropping a session onto its own pane is a no-op the user
+  // reached by aiming badly, and dressing a harmless gesture in warning colour
+  // teaches them they broke something. It gets the resting neutral tone and a
+  // joke that IS the explanation — the sentence recurses the way the drop would.
+  const tone = refusal === 'private'
     ? 'border-warn bg-bg-elevated/90 text-warn'
-    : active
-      ? 'border-accent bg-bg-elevated/90 text-accent ring-2 ring-accent'
-      : 'border-border bg-bg-elevated/90 text-muted'
+    : refusal === 'self'
+      ? 'border-border bg-bg-elevated/90 text-muted'
+      : active
+        ? 'border-accent bg-bg-elevated/90 text-accent ring-2 ring-accent'
+        : 'border-border bg-bg-elevated/90 text-muted'
   const pill = (
     <div className={`inline-flex items-center gap-2 rounded-lg border border-dashed px-3 py-2 text-[12px] shadow-lg backdrop-blur-sm ${tone}`}>
-      {refused ? <EyeOff size={14} className="shrink-0" /> : <MessagesSquare size={14} className="shrink-0" />}
+      {refusal === 'private'
+        ? <EyeOff size={14} className="shrink-0" />
+        : refusal === 'self'
+          ? <Repeat size={14} className="shrink-0" />
+          : <MessagesSquare size={14} className="shrink-0" />}
       <span>
-        {refused
+        {refusal === 'private'
           ? i18nT('pages.chatSidebar.private_session_cannot_be_referenced')
-          : i18nT('pages.chatSidebar.drop_to_reference_session')}
+          : refusal === 'self'
+            ? i18nT('pages.chatSidebar.session_dropped_into_itself')
+            : i18nT('pages.chatSidebar.drop_to_reference_session')}
       </span>
     </div>
   )
@@ -319,10 +345,10 @@ function ChatPaneDropZone({ refused }: { refused: boolean }) {
     <div
       ref={attach}
       data-testid="chat-pane-drop-zone"
-      data-refused={refused ? '' : undefined}
+      data-refused={refusal ?? undefined}
       aria-hidden="true"
       className={`absolute inset-0 z-30 pointer-events-none transition-colors ${
-        active ? 'bg-accent/[0.06]' : isOver && refused ? 'bg-warn/[0.06]' : 'bg-transparent'
+        active ? 'bg-accent/[0.06]' : isOver && refusal === 'private' ? 'bg-warn/[0.06]' : 'bg-transparent'
       }`}
     >
       {target ? (
@@ -418,8 +444,9 @@ function SortableFolderBlock({ folder, subtree, renderFolderBlock }: { folder: C
   // The whole folder header is the drag handle (pointer + touch): dragging the
   // row reorders the folder — no grip, consistent with session-card drag. Only
   // pointer listeners are forwarded (not attributes) so the header keeps
-  // its inner collapse/action buttons valid. The PointerSensor activation
-  // distance lets clicks through. setNodeRef stays on the block for sortable
+  // its inner collapse/action buttons valid. The MouseSensor activation
+  // distance lets clicks through, and the TouchSensor's press-and-hold delay
+  // lets touch swipes pan the list. setNodeRef stays on the block for sortable
   // positioning. While dragging, the body is force-collapsed so the source
   // shrinks to a single row — the drop-target gap (and the DragOverlay ghost)
   // stay compact.
@@ -506,18 +533,11 @@ interface Slot {
   slack_linked?: boolean
   links?: SessionLink[]
   color_index?: number | null
+  color_hex?: string | null
   memory_mode?: 'persistent' | 'incognito' | 'temporary'
   clean_mode?: boolean
   folder_id?: string
   pinned?: boolean
-  // Derived (not a payload field), like `unread`: true when the slot's last
-  // activity falls inside `RECENT_WINDOW_MS`. Computed in `enrichedSlots`.
-  recent?: boolean
-  // Derived: the RAW per-turn flag, preserved before `running` is widened to
-  // the "in progress" notion (live workflow run / active goal loop) for the
-  // session filter. Subtitle logic reads this to tell mid-turn from idle —
-  // an idle-between-cycles loop must show its last message, not "Thinking…".
-  midTurn?: boolean
   tags?: string[]
   forked_from?: string | null
   source_links?: Array<{
@@ -600,6 +620,263 @@ function chipStatusGlyph(
   if (link.ci === 'running') return 'running'
   if (link.ci === 'passed') return 'passed'
   return null
+}
+
+/** A session row's pull-request / issue chip strip, including the expandable
+ *  "+N" overflow chip.
+ *
+ *  A component rather than a block inside the row's render callback because the
+ *  overflow chip is interactive and therefore needs per-row state. The slots
+ *  payload deliberately serializes at most three links PER KIND (state.py's
+ *  `_SERIALIZED_SOURCE_LINKS_PER_SLOT`) so a broadcast carrying dozens of rows
+ *  stays small, which means the links behind "+N" are not on the client at all
+ *  and expanding has to fetch them. */
+function SessionSourceChips({ slotKey, links, total, connected, isActive, onOpenSource, onActivateSlot }: {
+  slotKey: string
+  /** The budgeted links from the slots payload — what the collapsed strip shows. */
+  links: SidebarSourceLink[]
+  /** `source_links_total`: how many the session actually has, budget aside. */
+  total?: number
+  connected: boolean
+  isActive: boolean
+  onOpenSource?: (slotKey: string, ref: { url: string; kind: 'change' | 'issue' }) => boolean
+  /** Switch to this session — the chip reveals into ITS side panel, so the
+   *  session has to be the active one first. */
+  onActivateSlot: () => void
+}) {
+  const [wantsExpanded, setWantsExpanded] = useState(false)
+
+  /** What the slots payload currently says this row's links are.
+   *
+   *  Part of the query key, so it is the LINK IDENTITY that decides whether a
+   *  fetched list still applies — not the count. A session can drop one pull
+   *  request as it gains another, leaving `total` unchanged, and a count-keyed
+   *  cache would serve that superseded set forever. */
+  const signature = `${total ?? ''}|${links.map(link => link.url).join(' ')}`
+  // React Query rather than useState + fetch (website/AUTOSDE.yaml `use-react-query`):
+  // the same session can be rendered by more than one column, and a shared cache
+  // is what stops each copy issuing its own GET for the same slot. `enabled`
+  // makes the read lazy — nothing is fetched until the row is actually expanded —
+  // and `retry: false` keeps a failed expand immediate, because the user's next
+  // click IS the retry.
+  const { data: fetchedLinks, isFetching, isError, refetch } = useQuery<SidebarSourceLink[]>({
+    queryKey: ['session-source-links', slotKey, signature],
+    queryFn: async () => {
+      const payload = await api.chatSlotSourceLinks(slotKey)
+      // Shape-check rather than trust: a malformed 200 (a proxy, an older
+      // gateway) would otherwise put `undefined` where the render filters an
+      // array, and an exception in render unmounts the whole sidebar.
+      if (!Array.isArray(payload?.links)) throw new Error('malformed source-links response')
+      return payload.links
+    },
+    enabled: wantsExpanded,
+    retry: false,
+    // Owned by the query rather than inherited from the provider: collapsing and
+    // re-expanding within the window must not re-issue the GET, and that
+    // guarantee should not depend on a global default someone may retune.
+    staleTime: 30_000,
+  })
+
+  // Expanded only while a list for THIS payload is in hand. Because the payload
+  // is in the query key, a slots push that changes the links switches to a key
+  // with no data yet: the row falls back to the live budgeted strip and re-offers
+  // "+N" while the new list loads, instead of freezing on a snapshot that
+  // silently omits the new link.
+  const isExpanded = wantsExpanded && fetchedLinks !== undefined
+  const failed = wantsExpanded && isError
+
+  // Toggling REPLACES the button that was activated, so without this the
+  // keyboard user is dropped to the top of the document mid-row. Armed only by
+  // the two click handlers, so a re-render from a slots push never steals focus.
+  const pendingFocus = useRef<'expand' | 'collapse' | null>(null)
+  const expandRef = useRef<HTMLButtonElement>(null)
+  const collapseRef = useRef<HTMLButtonElement>(null)
+  useEffect(() => {
+    const want = pendingFocus.current
+    if (!want) return
+    pendingFocus.current = null
+    ;(want === 'collapse' ? collapseRef : expandRef).current?.focus()
+  }, [isExpanded])
+
+  const shown = isExpanded && fetchedLinks ? fetchedLinks : links
+  // Derived from what is actually on screen, so it lands on 0 once expanded and
+  // self-corrects if a payload ever reports a total below the links it carries.
+  const hidden = typeof total === 'number' ? Math.max(0, total - shown.length) : 0
+  const changeLinks = shown.filter(link => (link.kind ?? 'change') !== 'issue')
+  const issueLinks = shown.filter(link => (link.kind ?? 'change') === 'issue')
+
+  const expand = () => {
+    if (isFetching) return
+    pendingFocus.current = 'collapse'
+    // Already enabled means this is a retry after a failure (or a re-expand of a
+    // key whose fetch never landed): flipping the flag again would not re-issue
+    // the query, so ask for it explicitly.
+    if (wantsExpanded) void refetch()
+    else setWantsExpanded(true)
+  }
+
+  const overflowLabel = issueLinks.length
+    ? i18nT('pages.chatSidebar.more_pull_request_or_issue_in_this_session', { count: hidden })
+    : i18nT('pages.chatSidebar.more_pull_request_in_this_session', { count: hidden })
+  /** Chip tooltip. A plain click now reveals in-panel, so a bare "Open <url>"
+   *  would promise the browser and mislead; naming the modifier is also the only
+   *  way that escape hatch is discoverable rather than found by accident. */
+  const chipTitle = (link: SidebarSourceLink) => i18nT('pages.chatSidebar.open_source_link_in_side_panel', {
+    url: link.url,
+    modifier: platformShortcut('Cmd+click'),
+  })
+  /** Chip click: switch to the session the chip belongs to and reveal its pull
+   *  request / issue in that session's side panel, rather than sending the user
+   *  out to the provider's website.
+   *
+   *  The chip stays a real anchor with a real href, so four cases deliberately
+   *  fall through to plain link navigation instead:
+   *    - `onOpenSource` unset — the surface has no side panel to reveal into
+   *      (the `/embed/sessions` list).
+   *    - a modifier click — the user asked for a new tab/window explicitly, and
+   *      "Copy link address" still yields the PR url.
+   *    - offline — the panel loads a PR through the LOCAL provider CLI, so with
+   *      the gateway down the provider's own page is the only thing that can
+   *      answer at all.
+   *    - `onOpenSource` returning false — the panel could not resolve this url,
+   *      so the provider's page is better than a dead click.
+   *  Middle-click never reaches a click handler (it fires auxclick), so it opens
+   *  a background tab natively without a case here.
+   *
+   *  `preventDefault` comes LAST on purpose: the default action runs only after
+   *  every handler returns, so suppressing navigation after the reveal is still
+   *  effective — and it means the reveal decides, rather than being assumed to
+   *  succeed. */
+  const revealInPanel = (link: SidebarSourceLink) => (e: React.MouseEvent<HTMLAnchorElement>) => {
+    // The row is a click-to-switch button; never let a chip click reach it,
+    // whichever branch we take below.
+    e.stopPropagation()
+    if (!onOpenSource || !connected || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+    if (!isActive) onActivateSlot()
+    if (!onOpenSource(slotKey, { url: link.url, kind: link.kind ?? 'change' })) return
+    e.preventDefault()
+  }
+
+  return (
+    <div className="flex flex-wrap gap-1.5 mt-1">
+      {changeLinks.map(link => (
+        // `link.url` is always an `https://` URL on an allowlisted host
+        // (state.py scans for the literal "https://" then validates via
+        // parse_source_url), so no scheme sanitising is needed for the href.
+        //
+        // The row is a dnd-kit draggable as well as a button, so the anchor also
+        // disables its own native HTML5 drag — that would otherwise put the URL
+        // on the dataTransfer instead of the slot key in the board/flat scopes
+        // that use native drag.
+        <a key={link.url} href={link.url} target="_blank" rel="noopener noreferrer"
+          draggable={false}
+          onClick={revealInPanel(link)}
+          className="inline-flex items-center gap-1 px-1.5 py-[1px] rounded-[4px] text-[10px] leading-none font-medium text-muted no-underline border border-border bg-bg-elevated/60 hover:text-text hover:border-accent"
+          title={chipTitle(link)}>
+          {link.provider === 'github' ? <GithubLogo size={10} className="shrink-0" /> : link.provider === 'jira' ? <JiraLogo size={10} className="shrink-0" /> : <GitlabLogo size={10} className="shrink-0" />}
+          {link.provider === 'github' ? `#${link.number}` : link.provider === 'jira' ? `${link.repo}-${link.number}` : `!${link.number}`}
+          {link.state === 'merged' && (
+            <span className="inline-flex shrink-0 text-aim" aria-label={i18nT('pages.chatSidebar.merged')} title={i18nT('pages.chatSidebar.merged')}>
+              <GitMerge className="lucide-inline" aria-hidden="true" />
+            </span>
+          )}
+          {link.state === 'closed' && <span className="capitalize text-danger">{link.state}</span>}
+          {/* One status glyph, chosen by `chipStatusGlyph` — CI is moot
+              once the PR is terminal (merged or closed), where the
+              lifecycle glyph is the signal, and a merge conflict
+              outranks a pending or passing rollup. */}
+          {/* Pending CI is a STATIC amber dot (the provider's own pending
+              convention), never a spinner: an animated glyph on a session
+              card reads as "the agent is working on this session", which is
+              a stronger claim than "this PR's checks haven't finished".
+              Motion on the card stays reserved for session activity. */}
+          {(() => {
+            switch (chipStatusGlyph(link)) {
+              case 'running':
+                return <Circle className="lucide-inline shrink-0 text-warn scale-75" fill="currentColor" strokeWidth={0} aria-label={i18nT('pages.chatSidebar.checks_running')} />
+              case 'passed':
+                return <Check className="lucide-inline shrink-0 text-ok" aria-label={i18nT('pages.chatSidebar.checks_passed')} />
+              case 'failed':
+                return <X className="lucide-inline shrink-0 text-danger" aria-label={i18nT('pages.chatSidebar.checks_failed')} />
+              case 'conflict':
+                // The panel's own conflict-banner key, reused rather than
+                // duplicated: the chip and the banner describe one pull
+                // request, so they must not word it differently in any
+                // locale.
+                return <TriangleAlert className="lucide-inline shrink-0 text-danger" aria-label={i18nT('components.pullRequestPanel.merge_conflicts')} />
+              default:
+                return null
+            }
+          })()}
+        </a>
+      ))}
+      {issueLinks.map(link => (
+        // Issue chip: the same anchor discipline (reveal in panel, no native
+        // drag) but deliberately NO ci / state / merge decoration — the
+        // chip-status cache is pull-request-only in this phase, so an issue chip
+        // has nothing truthful to colour and a borrowed glyph would assert state
+        // we never fetched. Both providers number issues with '#'.
+        <a key={link.url} href={link.url} target="_blank" rel="noopener noreferrer"
+          data-testid={`session-issue-chip-${link.number}`}
+          draggable={false}
+          onClick={revealInPanel(link)}
+          className="inline-flex items-center gap-1 px-1.5 py-[1px] rounded-[4px] text-[10px] leading-none font-medium text-muted no-underline border border-border bg-bg-elevated/60 hover:text-text hover:border-accent"
+          title={chipTitle(link)}>
+          {link.provider === 'github' ? <GithubLogo size={10} className="shrink-0" /> : link.provider === 'jira' ? <JiraLogo size={10} className="shrink-0" /> : <GitlabLogo size={10} className="shrink-0" />}
+          {link.provider !== 'jira' && <CircleDot className="lucide-inline shrink-0" aria-hidden="true" />}
+          {link.provider === 'jira' ? `${link.repo}-${link.number}` : `#${link.number}`}
+        </a>
+      ))}
+      {hidden > 0 && (
+        // Gated on `hidden`, NOT on the expand intent: a row whose payload moved
+        // under an open expansion renders the live budgeted strip again, and
+        // must re-offer the overflow rather than hide it behind a stale state.
+        //
+        // `onMouseDown` stops the row's drag from claiming the press, matching
+        // the row's other in-place controls; without it a click on the chip can
+        // be swallowed as a drag activation. Deliberately NOT `disabled` while
+        // loading — disabling the focused button blurs it to <body>, and the
+        // `if (loading) return` guard in `expand` already prevents a double
+        // fetch.
+        <button type="button"
+          ref={expandRef}
+          data-testid="session-source-overflow"
+          draggable={false}
+          aria-expanded={false}
+          onMouseDown={e => e.stopPropagation()}
+          onClick={e => { e.stopPropagation(); expand() }}
+          className="inline-flex items-center gap-1 px-1.5 py-[1px] rounded-[4px] text-[10px] leading-none font-medium text-muted border border-border bg-bg-elevated/60 cursor-pointer hover:text-text hover:border-accent"
+          title={failed ? i18nT('pages.chatSidebar.source_links_expand_failed') : overflowLabel}
+          // An aria-label OUTRANKS the title in the accessible-name computation,
+          // so the failure has to be named here too or a screen reader still
+          // announces "2 more pull requests…" on a button that just failed.
+          aria-label={failed ? i18nT('pages.chatSidebar.source_links_expand_failed') : overflowLabel}>
+          {/* This spinner is exempt from the "no motion on a session card" rule
+              that governs the CI glyph above: it is transient feedback for the
+              user's OWN click on this button, not an ambient status claim about
+              the session. It exists only while their expand is in flight. */}
+          {isFetching
+            ? <Loader2 className="lucide-inline shrink-0 animate-spin" aria-hidden="true" />
+            : failed && <RotateCcw className="lucide-inline shrink-0 text-warn" aria-hidden="true" />}
+          +{hidden}
+        </button>
+      )}
+      {isExpanded && (
+        <button type="button"
+          ref={collapseRef}
+          data-testid="session-source-collapse"
+          draggable={false}
+          aria-expanded={true}
+          onMouseDown={e => e.stopPropagation()}
+          onClick={e => { e.stopPropagation(); pendingFocus.current = 'expand'; setWantsExpanded(false) }}
+          className="inline-flex items-center px-1.5 py-[1px] rounded-[4px] text-[10px] leading-none font-medium text-muted border border-border bg-bg-elevated/60 cursor-pointer hover:text-text hover:border-accent"
+          title={i18nT('pages.chatSidebar.collapse_source_links')}
+          aria-label={i18nT('pages.chatSidebar.collapse_source_links')}>
+          <ChevronUp className="lucide-inline shrink-0" aria-hidden="true" />
+        </button>
+      )}
+    </div>
+  )
 }
 
 interface HistoryItem {
@@ -957,6 +1234,34 @@ const FLAT_VIEW_LS_KEY = 'mc-sidebar-flat-view'
 export const SIDEBAR_MIN = 180
 export const SIDEBAR_MAX = 1400
 const SIDEBAR_LS_KEY = 'mc-sidebar-width'
+/** The width the user had before a board auto-widen, so switching back to list
+ *  view restores it instead of stranding the automatic value. */
+const SIDEBAR_PRE_BOARD_LS_KEY = 'mc-sidebar-width-pre-board'
+
+/** Board column geometry, mirrored from the column strip's own classes:
+ *  `min-w-[220px]` per column, `gap-2` between them, `p-2` around the strip. */
+const BOARD_COL_MIN_W = 220
+const BOARD_COL_GAP = 8
+const BOARD_STRIP_PAD = 16
+/** Leave this much for the chat pane when widening the sidebar for a board, so
+ *  a wide board never squeezes the conversation out of the window. */
+const BOARD_CHAT_RESERVE = 520
+
+/** How wide the sidebar must be for `count` board columns to fit without
+ *  horizontal scrolling — clamped to the sidebar's own ceiling and to what the
+ *  viewport can spare once the nav rail and a usable chat pane are subtracted.
+ *  Returns the CURRENT width when nothing wider is available, so the caller can
+ *  only ever widen. On a narrow window the strip keeps a little horizontal
+ *  scroll rather than burying the conversation: four 220px lanes and a readable
+ *  chat pane genuinely do not both fit below roughly 1700px.
+ */
+export function boardSidebarWidth(count: number, current: number, viewport: number): number {
+  if (count <= 0) return current
+  const wanted = count * BOARD_COL_MIN_W + (count - 1) * BOARD_COL_GAP + BOARD_STRIP_PAD
+  const spare = viewport - LAYOUT.NAV_WIDTH - BOARD_CHAT_RESERVE
+  const ceiling = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, spare))
+  return Math.max(current, Math.min(wanted, ceiling))
+}
 /** Reveal-in-sidebar retry budget: ancestor expansion and filter resets land
  *  through mutations and re-renders, so the target row can enter the DOM
  *  several frames after the request is consumed. 20 × 100 ms ≈ 2 s, then the
@@ -970,6 +1275,43 @@ const REVEAL_FLASH_HOLD_MS = 1600
  *  the classes are removed at HOLD + FADE + slack, so shortening this below
  *  the CSS duration snaps the outline off mid-fade. */
 const REVEAL_FLASH_FADE_MS = 500
+/** One filter dimension that can hide a reveal target: whether it hides THIS
+ *  row, and how to drop it. `clear` receives the row because the folder filter
+ *  un-hides that row's own ancestor chain rather than clearing globally. */
+interface RevealBlockingFilter {
+  hides: (slot: Slot) => boolean
+  clear: (slot: Slot) => void
+}
+/** One sidebar filter dimension, declared exactly once (in the component's
+ *  `filterDimensions` memo) and consumed by the three sites that must agree on
+ *  which filters exist: `filteredSlots` (which rows render at all),
+ *  `listNarrowed` (is anything filtering right now), and
+ *  `revealBlockingFilters` (does THIS row fail an active filter). Every field
+ *  is required, so adding a dimension forces a decision for each consumer —
+ *  `null` records "deliberately not consulted here", never an omission. */
+interface FilterDimension {
+  /** Row predicate applied by `filteredSlots`. `null` = this dimension does
+   *  not filter the flat slot list (the folder filter drops whole folder
+   *  blocks/lanes at the render sites instead of filtering rows). */
+  filtersRow: ((slot: Slot) => boolean) | null
+  /** Is this dimension narrowing the list right now? Consulted by
+   *  `listNarrowed`. `null` = deliberately excluded from that question (the
+   *  folder filter: counting it would strand every folder as an empty
+   *  "New chat in <name>" shell while one is hidden). */
+  narrows: (() => boolean) | null
+  /** Does this dimension hide THIS row from a reveal? `excluded` reports list
+   *  membership, for dimensions (search, status) that rank against backend
+   *  state a single row cannot answer for alone. Non-nullable on purpose,
+   *  together with `clear`: every dimension can hide a reveal target today.
+   *  If one ever genuinely cannot, make the PAIR nullable in one move —
+   *  never stub `hides: () => false` beside a real `clear` (or a real
+   *  `hides` beside a no-op `clear`, which is silent reveal breakage). */
+  hides: (slot: Slot, excluded: (slot: Slot) => boolean) => boolean
+  /** Drop this dimension so the reveal target renders. Receives the row
+   *  because the folder filter un-hides that row's own ancestor chain rather
+   *  than clearing globally. */
+  clear: (slot: Slot) => void
+}
 
 function ChatSidebar({
   slots, activeSlot, unreadSlots, history, historyHasMore,
@@ -989,6 +1331,7 @@ function ChatSidebar({
   })
 
   // Sidebar-only state
+  const [seedError, setSeedError] = useState('')
   const [slotFilter, setSlotFilter] = useState('')
   const [historyFilter, setHistoryFilter] = useState('')
   // Digest of session keys + titles (NOT status), fed to both searches as their
@@ -1334,7 +1677,7 @@ function ChatSidebar({
   const unreadSet = useMemo(() => new Set(unreadSlots), [unreadSlots])
   // Heartbeat that re-evaluates recency even when nothing else re-renders.
   // Sidebar interactions (new messages, status changes, opening the menu) all
-  // recompute `enrichedSlots` for free, so this only matters when the sidebar
+  // recompute the recency lookup for free, so this only matters when the sidebar
   // sits idle with the Recent filter on — without it a stale session would
   // never age out of the list. Gated on the filter being active so we don't
   // wake an idle tab needlessly, mirroring the `staleTick` pattern in App.tsx.
@@ -1379,40 +1722,45 @@ function ChatSidebar({
     const id = setInterval(() => setRecentTick(t => t + 1), recentTickIntervalMs(recentWindowMs))
     return () => clearInterval(id)
   }, [recentFilterActive, recentWindowMs])
-  const enrichedSlots = useMemo<Slot[]>(() => {
-    // Snapshot `now` once per recompute so every slot's recency is measured
-    // against the same instant. The last-activity timestamp mirrors the
-    // date-sort comparator (`slotActivityTs`).
-    const now = Date.now()
-    return slots.map(s => {
-      // A running turn is recent BY DEFINITION, whatever its settled instant
-      // says. The ordering key deliberately stops advancing mid-turn, so a turn
-      // outliving the window — routine for unattended multi-step work — would
-      // otherwise age out of the Recent list while it is the busiest session on
-      // screen. `workflowActive` / `looping` below extend "running" the same way,
-      // hence the OR against the computed flag rather than `s.running`.
-      const recentByTs = isWithinRecentWindow(slotActivityTs(s), now, recentWindowMs)
-      // A slot with a live dynamic-workflow run counts as running so the
-      // "In progress" filter (and its count) surfaces it, even though the
-      // parent turn has ended while the run executes in the background.
-      // An active goal loop (auto-nudge) counts too: a looping session idles
-      // between cycles with running=false, but it is still mid-mission — its
-      // row shows "Loop N/M", so dropping it from "In progress" undercounts.
-      // Own-property read, matching the row renderer: the store normalizes
-      // writes through `safeKey`, so a bare index read could resolve a
-      // `__proto__`-like key to a truthy `Object.prototype`.
+  // Wider than the payload's `s.running`: a live workflow run or an active goal
+  // loop counts as in progress, so neither drops out of the filter or its count.
+  const runningSet = useMemo<Set<string>>(() => {
+    const out = new Set<string>()
+    for (const s of slots) {
+      // Own-property read: the store normalizes writes through `safeKey`, so a
+      // bare index read could resolve a `__proto__`-like key to a truthy value.
       const looping = Object.prototype.hasOwnProperty.call(goalLoops ?? {}, s.key)
-      const running = s.running || !!workflowActive[s.key] || looping
-      return { ...s, running, midTurn: s.running, unread: unreadSet.has(s.key), recent: running || recentByTs }
-    })
+      if (s.running || !!workflowActive[s.key] || looping) out.add(s.key)
+    }
+    return out
+  }, [slots, workflowActive, goalLoops])
+  // A running turn is recent BY DEFINITION: the ordering key stops advancing
+  // mid-turn, so a long turn would age out while it is the busiest row on screen.
+  const recentSet = useMemo<Set<string>>(() => {
+    // One `now` per recompute, so every slot is measured against the same instant.
+    // The last-activity timestamp mirrors the date-sort comparator.
+    const now = Date.now()
+    const out = new Set<string>()
+    for (const s of slots) {
+      if (runningSet.has(s.key) || isWithinRecentWindow(slotActivityTs(s), now, recentWindowMs)) out.add(s.key)
+    }
+    return out
     // `recentTick` is an intentional dep: it forces recency to re-evaluate on
     // the heartbeat above so idle sessions age out of the Recent filter.
-  }, [slots, unreadSet, recentWindowMs, recentTick, workflowActive, goalLoops]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [slots, runningSet, recentWindowMs, recentTick]) // eslint-disable-line react-hooks/exhaustive-deps
+  // Exhaustive over `SessionFilterKey` on purpose: a new filter key becomes a
+  // type error here instead of a predicate that silently matches nothing.
+  const _derivedLookup = useMemo<Record<SessionFilterKey, (slot: Slot) => boolean>>(() => ({
+    unread: slot => unreadSet.has(slot.key),
+    running: slot => runningSet.has(slot.key),
+    pinned: slot => !!slot.pinned,
+    recent: slot => recentSet.has(slot.key),
+  }), [unreadSet, runningSet, recentSet])
   const filterCounts = useMemo(() => {
     const counts = {} as Record<SessionFilterKey, number>
-    for (const filterDef of SESSION_FILTERS) counts[filterDef.key] = enrichedSlots.filter(slot => slot[filterDef.key]).length
+    for (const filterDef of SESSION_FILTERS) counts[filterDef.key] = slots.filter(_derivedLookup[filterDef.key]).length
     return counts
-  }, [enrichedSlots])
+  }, [slots, _derivedLookup])
   // Ref mirror of `activeFilters` so the auto-drain effect can read the
   // current toggle state without depending on it. Keeps the effect from
   // re-firing on its own setState output.
@@ -1692,7 +2040,7 @@ function ChatSidebar({
     [filterTagIds, tagById],
   )
   /** Rows for the filter menu's Tags section, in the tag vocabulary's own order.
-   *  Counts come from `enrichedSlots`, NOT `filteredSlots`, so they describe the
+   *  Counts come from all `slots`, NOT `filteredSlots`, so they describe the
    *  vocabulary rather than the current selection — otherwise every unselected tag
    *  would read 0 the moment any tag was selected, which is the number a user
    *  consults precisely when deciding what to select next. */
@@ -1701,10 +2049,10 @@ function ChatSidebar({
       .sort((a, b) => a.order - b.order)
       .map(t => ({
         tag: t,
-        count: enrichedSlots.filter(s => (s.tags ?? []).includes(t.id)).length,
+        count: slots.filter(s => (s.tags ?? []).includes(t.id)).length,
         selected: filterTagIds.has(t.id),
       })),
-    [tags, enrichedSlots, filterTagIds],
+    [tags, slots, filterTagIds],
   )
   /** Names of the selected tags, in vocabulary order. Disjunction, not a comma
    *  join: selection is a union, so a screen reader should hear "Blocked or
@@ -1788,10 +2136,6 @@ function ChatSidebar({
   }, [columnEditId, popoverPos])
 
 
-  const createColumnMutation = useMutation({
-    mutationFn: (body: { name?: string; tag_ids?: string[]; mode?: TagColumnMode }) => api.createTagColumn(body),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['tag-columns'] }),
-  })
   const updateColumnMutation = useMutation({
     mutationFn: ({ id, body }: { id: string; body: { name?: string; tag_ids?: string[]; mode?: TagColumnMode; order?: number; include_untagged?: boolean } }) => api.updateTagColumn(id, body),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['tag-columns'] }),
@@ -1829,8 +2173,94 @@ function ChatSidebar({
     mutationFn: ({ slot, columnId }: { slot: string; columnId: string }) => api.dropSlotToColumn(slot, columnId),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['chat-slots'] }),
   })
-  // Filter predicate for a single column
-  const columnMatches = useCallback((col: TagColumn, slotTags: string[]): boolean => {
+  /** Lanes the board does not have yet. Drives the seeding write and the menu
+   *  affordance, so the offer to add lanes appears exactly when there is
+   *  something to add — including after a partial failure left the set
+   *  incomplete, which is what makes "click again to finish" a real recovery
+   *  path rather than a claim.
+   *
+   *  This is an AFFORDANCE, not the uniqueness rule. It reads a cached column
+   *  list, so two dashboards can both compute the same missing lane; the backend
+   *  decides uniqueness by `state_key` under its write lock and returns the
+   *  existing lane instead of creating a second one. */
+  const missingLanes = useMemo(() => {
+    const present = new Set(rawColumns.filter(c => c.source === 'state').map(c => c.state_key))
+    return SESSION_LANES.filter(lane => !present.has(lane.key))
+  }, [rawColumns])
+
+  /** Add the four derived state lanes to the board.
+   *
+   *  Purely ADDITIVE and IDEMPOTENT: it creates only the lanes that are missing
+   *  and never deletes a column. That is the invariant, not an implementation
+   *  detail — an additive action that also disposes of persisted rows has to
+   *  guess which ones are disposable, and the unnamed match-all shape the view
+   *  toggle once created is byte-identical to a bare column the user added
+   *  themselves via "Add column after". No predicate can separate them, so the
+   *  only safe answer is to delete neither.
+   *
+   *  Consequences of the invariant, all of them deliberate:
+   *  - There is no two-write ordering to get wrong, so a mid-flight failure
+   *    leaves fewer lanes rather than a board stripped of its columns; clicking
+   *    again completes the set because creation is keyed on what is missing.
+   *  - A pre-existing bare column survives and sits beside the lanes, showing
+   *    every session. It is one click to remove and is not ours to delete.
+   *  - Re-running is harmless, which is what makes the pending-guard on the
+   *    menu items a second line of defence rather than the only one.
+   */
+  const seedStateLanesMutation = useMutation({
+    mutationFn: async () => {
+      for (const lane of missingLanes) {
+        await api.createTagColumn({ source: 'state', state_key: lane.key, tag_ids: [], mode: 'any' })
+      }
+      return rawColumns.length + missingLanes.length
+    },
+    onSuccess: (columnCount: number) => {
+      queryClient.invalidateQueries({ queryKey: ['tag-columns'] })
+      // A board is a horizontal strip inside a 260px-default sidebar, so lanes
+      // that do not fit are reachable only by discovering the resize handle.
+      // Widen once to fit them; never shrink, so a width the user chose stands.
+      const next = boardSidebarWidth(columnCount, sidebarWidthRef.current, window.innerWidth)
+      if (next !== sidebarWidthRef.current) {
+        // Remember what the user had, so leaving board view can give it back.
+        // Persisting the automatic width without this destroys their chosen
+        // width permanently and strands a ~900px sidebar in list view.
+        safeSetItem(SIDEBAR_PRE_BOARD_LS_KEY, String(sidebarWidthRef.current))
+        setSidebarWidth(next)
+        onWidthChangeRef.current?.(next)
+        safeSetItem(SIDEBAR_LS_KEY, String(next))
+      }
+    },
+    onError: (err) => {
+      // Without this the toggle has already flipped to board view and nothing
+      // renders: no board, no message, no way to tell it failed from an empty
+      // one. Report it and hand back list view when nothing was created.
+      setSeedError(err instanceof Error ? err.message : String(err))
+      queryClient.invalidateQueries({ queryKey: ['tag-columns'] })
+    },
+  })
+  // Filter predicate for a single column. Takes the whole slot, not just its
+  // tags: a state column's membership is derived from live runtime fields, and
+  // a lane needs the same extras the row status chain uses (a parent whose
+  // sub-agent is blocked owes an approval even though the parent is idle).
+  const columnMatches = useCallback((col: TagColumn, slot: Slot): boolean => {
+    if (col.source === 'state') {
+      if (!col.state_key) return false
+      // Clamped against the running count exactly as the row status chain does:
+      // an approval count above the live agent count is stale, and unclamped it
+      // would pin an otherwise-idle session to Needs Approval indefinitely.
+      const running = subagentCounts[slot.key] || 0
+      // `slot` here is the raw payload, whose `running` covers only the slot's
+      // own turn. A dynamic workflow and a goal loop are both live work that
+      // outlive that flag, and the row status chain already reads them from the
+      // store — so the lane must too, or a session renders a workflow spinner
+      // while sitting in Idle.
+      return inferLane(slot, {
+        subagentAwaiting: Math.min(subagentApprovalCounts[slot.key] || 0, running),
+        backgroundWork: !!workflowActive[slot.key]
+          || Object.prototype.hasOwnProperty.call(goalLoops ?? {}, slot.key),
+      }) === col.state_key
+    }
+    const slotTags = slot.tags || []
     // "include untagged" OR'd on top of any tag filter
     if (col.include_untagged && slotTags.length === 0) return true
     if (!col.tag_ids || col.tag_ids.length === 0) return true
@@ -1838,7 +2268,7 @@ function ChatSidebar({
     if (col.mode === 'all') return col.tag_ids.every(t => set.has(t))
     if (col.mode === 'none') return !col.tag_ids.some(t => set.has(t))
     return col.tag_ids.some(t => set.has(t))  // 'any'
-  }, [])
+  }, [subagentApprovalCounts, subagentCounts, goalLoops, workflowActive])
 
   const slotFolders = useMemo(() => {
     const valid = new Set(folders.map(f => f.id))
@@ -1864,41 +2294,6 @@ function ChatSidebar({
     [foldersWithActiveSubtree],
   )
 
-  // State and in the memo deps on purpose, not a ref: a frozen run caches its
-  // stale list against new deps, so clearing a ref would invalidate nothing.
-  const [dragFrozen, setDragFrozen] = useState(false)
-  const frozenSlotsRef = useRef<Slot[]>([])
-
-  const filteredSlots = useMemo(() => {
-    if (dragFrozen) return frozenSlotsRef.current
-    const activeFilterDefs = SESSION_FILTERS.filter(filterDef => activeFilters.has(filterDef.key))
-    // Active content search: order by the backend's relevance ranking instead
-    // of the sidebar sort (mirrors the Older Sessions lane and the command
-    // palette). Pinning stays a reachability promise for browsing, not a
-    // ranking hint inside explicit search results.
-    const searchRanked = slotFilter.trim().length >= SEARCH_MIN_CHARS ? slotSearchRanks : null
-    const next = enrichedSlots
-      .filter(slot => {
-        if (activeFilterDefs.length > 0 && !activeFilterDefs.some(filterDef => slot[filterDef.key])) return false
-        // Unlike the folder filter this does NOT go inert while searching: it is a
-        // session property, so it behaves like the Unread/Pinned filters above.
-        if (activeTagIds.size > 0 && !(slot.tags ?? []).some(id => activeTagIds.has(id))) return false
-        if (!slotFilter) return true
-        // Scoped to title: that is the field a rename mutates, and widening it to
-        // key/agent appends rows the backend's content search deliberately excluded.
-        const titleMatch = (slot.title || '').toLowerCase().includes(slotFilter.toLowerCase())
-        if (searchRanked) return searchRanked.has(slot.key) || titleMatch
-        return ((slot.title || '') + slot.key + (slot.agent || '')).toLowerCase().includes(slotFilter.toLowerCase())
-      })
-      .sort((a, b) => searchRanked
-        ? (searchRanked.get(a.key) ?? Infinity) - (searchRanked.get(b.key) ?? Infinity)
-        : comparePinnedThenSort(a, b, sortKey, pinned))
-    frozenSlotsRef.current = next
-    return next
-  },
-    [enrichedSlots, slotFilter, slotSearchRanks, pinned, sortKey, activeFilters, activeTagIds, dragFrozen]
-  )
-
   // Folder IDs whose sessions are excluded from the flat lane because the
   // folder — or any ancestor — is unchecked in the filter menu's folder list.
   // Unchecking a parent hides its whole subtree, matching what the user sees
@@ -1920,6 +2315,138 @@ function ChatSidebar({
     return hidden
   }, [folders, filterHiddenFolders])
 
+  // The backend relevance ranking, live only while the query is long enough to
+  // have been sent. Shared by the search dimension's row predicate and by
+  // filteredSlots' sort, so the two cannot disagree about when ranking is on.
+  const searchRanked = useMemo(
+    () => (slotFilter.trim().length >= SEARCH_MIN_CHARS ? slotSearchRanks : null),
+    [slotFilter, slotSearchRanks],
+  )
+
+  /**
+   * THE single declaration of every filter dimension. `filteredSlots`,
+   * `listNarrowed`, and `revealBlockingFilters` all derive from this list, so
+   * adding a dimension is one entry here — the required fields force a
+   * decision per consumer, and THOSE THREE consumers cannot drift because
+   * none of them enumerates dimensions itself any more. The guard's limit:
+   * this declaration cannot see filtering done at the render sites (the
+   * folder dimension works that way), so a dimension that acts there must
+   * still answer `narrows` for real — writing `null` while narrowing the
+   * visible list at a render site re-creates the under-count this exists to
+   * prevent.
+   *
+   * The consumers legitimately answer different questions, and the per-field
+   * differences below are deliberate, not drift:
+   * - the folder dimension filters no rows (`filtersRow: null` — it drops
+   *   whole folder blocks/lanes at the render sites) and never narrows
+   *   (`narrows: null` — see the field docs on `FilterDimension`);
+   * - tags narrow by the RESOLVED `activeTagIds` but hide by the raw
+   *   `filterTagIds`, so a reveal arriving while the tag vocabulary is still
+   *   loading (when nothing is filtered yet) still clears the tag filter
+   *   instead of leaving the row to be re-hidden mid-flight.
+   *
+   * Bundling every consumer's state into one memo couples them: a change to
+   * reveal-only state (`filterTagIds`, `filterHiddenSubtree`, `folders`)
+   * re-derives `filteredSlots` — one extra filter+sort with content-identical
+   * rows. Accepted: no effect keys on `filteredSlots`, and its downstream
+   * memos already depend on that state themselves.
+   */
+  const filterDimensions = useMemo<FilterDimension[]>(() => {
+    const activeFilterDefs = SESSION_FILTERS.filter(filterDef => activeFilters.has(filterDef.key))
+    return [
+      {
+        // Tags. Unlike the folder filter this does NOT go inert while
+        // searching: it is a session property, so it behaves like the
+        // Unread/Pinned status chips.
+        filtersRow: slot => activeTagIds.size === 0 || (slot.tags ?? []).some(id => activeTagIds.has(id)),
+        narrows: () => activeTagIds.size > 0,
+        // Raw `filterTagIds`, not resolved `activeTagIds`, and not behind
+        // `excluded`: mid-flight nothing is filtered, so the row is re-hidden.
+        hides: slot => filterTagIds.size > 0 && !(slot.tags ?? []).some(id => filterTagIds.has(id)),
+        clear: () => clearTagFilter(),
+      },
+      {
+        // Text search. Scoped to title while the backend ranking is live: that
+        // is the field a rename mutates, and widening it to key/agent appends
+        // rows the backend's content search deliberately excluded.
+        filtersRow: slot => {
+          if (!slotFilter) return true
+          const titleMatch = (slot.title || '').toLowerCase().includes(slotFilter.toLowerCase())
+          if (searchRanked) return searchRanked.has(slot.key) || titleMatch
+          return ((slot.title || '') + slot.key + (slot.agent || '')).toLowerCase().includes(slotFilter.toLowerCase())
+        },
+        narrows: () => Boolean(slotFilter),
+        hides: (slot, excluded) => Boolean(slotFilter) && excluded(slot),
+        clear: () => setSlotFilter(''),
+      },
+      {
+        // Status chips (SESSION_FILTERS). Active chips OR together: a row
+        // passes when any active chip's predicate matches it.
+        filtersRow: slot => activeFilterDefs.length === 0 || activeFilterDefs.some(filterDef => _derivedLookup[filterDef.key](slot)),
+        narrows: () => activeFilters.size > 0,
+        hides: (slot, excluded) => activeFilters.size > 0 && excluded(slot),
+        clear: () => {
+          // Persisted like toggleFilter: remount re-reads the stored '1' and
+          // would silently restore the filter that hides this row.
+          for (const filterDef of SESSION_FILTERS) {
+            if (activeFilters.has(filterDef.key)) safeSetItem(filterDef.storageKey, '0')
+          }
+          setActiveFilters(new Set())
+        },
+      },
+      {
+        // Folder filter. It filters no rows and never narrows (see the memo
+        // doc above). The folder-EXPANSION step lives outside the reveal
+        // registry on purpose: it runs whether or not this filter was hiding
+        // anything.
+        filtersRow: null,
+        narrows: null,
+        hides: slot => !!slot.folder_id && filterHiddenSubtree.has(slot.folder_id),
+        clear: slot => {
+          // Un-hide the target's ancestor chain (persisted, mirroring
+          // toggleFolderFilter). Cycle-guarded like filterHiddenSubtree.
+          setFilterHiddenFolders(prev => {
+            const next = new Set(prev)
+            const visited = new Set<string>()
+            let curId: string | undefined = slot.folder_id
+            while (curId && !visited.has(curId)) {
+              visited.add(curId)
+              next.delete(curId)
+              const cid = curId
+              curId = folders.find(f => f.id === cid)?.parent_id
+            }
+            safeSetItem(HIDDEN_FOLDERS_LS_KEY, JSON.stringify([...next]))
+            return next
+          })
+        },
+      },
+    ]
+  }, [activeFilters, activeTagIds, filterTagIds, clearTagFilter, slotFilter, searchRanked, _derivedLookup, filterHiddenSubtree, folders])
+
+  // State and in the memo deps on purpose, not a ref: a frozen run caches its
+  // stale list against new deps, so clearing a ref would invalidate nothing.
+  const [dragFrozen, setDragFrozen] = useState(false)
+  const frozenSlotsRef = useRef<Slot[]>([])
+
+  const filteredSlots = useMemo(() => {
+    if (dragFrozen) return frozenSlotsRef.current
+    const next = slots
+      // Derived from filterDimensions — the single declaration above — so this
+      // site cannot hold a filter dimension the other consumers miss.
+      .filter(slot => filterDimensions.every(d => d.filtersRow === null || d.filtersRow(slot)))
+      // Active content search: order by the backend's relevance ranking instead
+      // of the sidebar sort (mirrors the Older Sessions lane and the command
+      // palette). Pinning stays a reachability promise for browsing, not a
+      // ranking hint inside explicit search results.
+      .sort((a, b) => searchRanked
+        ? (searchRanked.get(a.key) ?? Infinity) - (searchRanked.get(b.key) ?? Infinity)
+        : comparePinnedThenSort(a, b, sortKey, pinned))
+    frozenSlotsRef.current = next
+    return next
+  },
+    [slots, filterDimensions, searchRanked, pinned, sortKey, dragFrozen]
+  )
+
   // Which lane the sidebar is actually rendering. Mirrors the render branches
   // below exactly: flat wins when there are folders to flatten, otherwise the
   // tag-column board when columns exist, otherwise the folder tree. The folder
@@ -1932,9 +2459,27 @@ function ChatSidebar({
   // end. Everything that consults the filter routes through this flag.
   const folderFilterActive = slotFilter.trim() === '' && filterHiddenFolders.size > 0
 
-  // Is the list narrowed at all? A new filter dimension must be added here too,
-  // or the folder lane strands its folders as empty "New chat in <name>" shells.
-  const listNarrowed = Boolean(slotFilter) || activeFilters.size > 0 || activeTagIds.size > 0
+  // Is the list narrowed at all? Derived from filterDimensions: a dimension
+  // participates through its required `narrows` field, so this site cannot
+  // silently miss one (a missed dimension used to strand the folder lane's
+  // folders as empty "New chat in <name>" shells).
+  const listNarrowed = filterDimensions.some(d => d.narrows !== null && d.narrows())
+
+  /** Every filter that can hide a reveal target, derived from
+   *  `filterDimensions`: the reveal effect iterates this list instead of
+   *  naming the dimensions by hand. Deliberately NOT `listNarrowed` above —
+   *  that asks "is anything filtering?", this asks "does THIS row fail a
+   *  filter?", and each dimension answers the two questions separately
+   *  (`narrows` vs `hides`) in its one declaration. */
+  const revealBlockingFilters = useMemo<RevealBlockingFilter[]>(() => {
+    // Search and status defer to list membership: both rank against backend
+    // state (relevance, unread) that a single row cannot answer for alone.
+    const excluded = (slot: Slot) => !filteredSlots.some(s => s.key === slot.key)
+    return filterDimensions.map(d => ({
+      hides: (slot: Slot) => d.hides(slot, excluded),
+      clear: d.clear,
+    }))
+  }, [filterDimensions, filteredSlots])
 
   // List view (the folder tree) drops an unchecked folder's whole block —
   // header and sessions together. Only the folder's OWN id is checked here:
@@ -2086,9 +2631,40 @@ function ChatSidebar({
     if (f) updateFolderMutation.mutate({ id, body: { collapsed: !f.collapsed } })
   }, [folders, updateFolderMutation])
 
+  // Board-view collapse is per (column, folder): the same root folders render
+  // once per column, and the shared server flag would collapse a folder in
+  // every column at once. Overrides are client-local (localStorage) and layer
+  // over the server flag, which stays the default for untouched columns and
+  // the sole state for the list view.
+  const [boardCollapse, setBoardCollapse] = useState<Map<string, boolean>>(loadBoardFolderCollapse)
+  const boardFolderCollapsed = useCallback((columnId: string, folder: ChatFolder): boolean => {
+    return boardCollapse.get(boardCollapseKey(columnId, folder.id)) ?? !!folder.collapsed
+  }, [boardCollapse])
+  const toggleColumnCollapse = useCallback((columnId: string, folder: ChatFolder) => {
+    setBoardCollapse(prev => {
+      const next = new Map(prev)
+      const value = !(prev.get(boardCollapseKey(columnId, folder.id)) ?? !!folder.collapsed)
+      next.set(boardCollapseKey(columnId, folder.id), value)
+      // Delta write: another tab's overrides must survive this tab's toggle.
+      persistBoardOverride(columnId, folder.id, value)
+      return next
+    })
+  }, [])
+
   // ── Folder drag-to-reorder ──
+  // Mouse and touch are split on purpose — a single PointerSensor with a
+  // distance constraint swallows touch swipes on WebKit: past the activation
+  // distance dnd-kit preventDefault()s every move via its non-passive window
+  // touchmove listener ("required for iOS Safari", TouchSensor.setup), so a
+  // swipe that begins on a row cannot pan the list. Chromium ignores
+  // preventDefault() on pointermove for panning, which is why it only shows on
+  // WebKit. The TouchSensor's DELAY constraint inverts the contention: moving
+  // past the tolerance CANCELS the sensor and hands the gesture back to the
+  // browser; only a stationary 250ms hold arms a drag. Same split as the Apps
+  // nav rail (App.tsx) and the artifact library.
   const dndSensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 5 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
   )
   // Tracks the item currently being dragged, for the DragOverlay preview.
@@ -2166,43 +2742,10 @@ function ChatSidebar({
       console.debug('reveal-in-sidebar: no session for key', key)
       return
     }
-    // A live sidebar search or status filter can exclude the target row from
-    // the list entirely (#912 D5) — reveal is an explicit "show me this row",
-    // so drop the filters that hide it rather than scrolling to nothing.
-    // Outside the filteredSlots check: while the tag query is in flight nothing
-    // is filtered, so the row reads present and is re-hidden when it resolves.
-    if (filterTagIds.size > 0 && !(slot.tags ?? []).some(id => filterTagIds.has(id))) clearTagFilter()
-    if (!filteredSlots.some(s => s.key === key)) {
-      if (slotFilter) setSlotFilter('')
-      if (activeFilters.size > 0) {
-        // Persisted like toggleFilter: state alone is not enough — the sidebar
-        // unmounts whenever the drawer collapses, and remount re-reads the
-        // stored '1', silently restoring the filter that hides this row.
-        for (const filterDef of SESSION_FILTERS) {
-          if (activeFilters.has(filterDef.key)) safeSetItem(filterDef.storageKey, '0')
-        }
-        setActiveFilters(new Set())
-      }
-    }
+    // Reveal means "show me this row", so drop every filter hiding the target
+    // rather than scrolling to nothing (#912 D5). Registered in one list above.
+    for (const dim of revealBlockingFilters) if (dim.hides(slot)) dim.clear(slot)
     if (slot.folder_id) {
-      // The folder filter hides whole subtrees in the flat and tree lanes —
-      // un-hide the target's ancestor chain (persisted, mirroring
-      // toggleFolderFilter). Cycle-guarded like filterHiddenSubtree.
-      if (filterHiddenSubtree.has(slot.folder_id)) {
-        setFilterHiddenFolders(prev => {
-          const next = new Set(prev)
-          const visited = new Set<string>()
-          let curId: string | undefined = slot.folder_id
-          while (curId && !visited.has(curId)) {
-            visited.add(curId)
-            next.delete(curId)
-            const cid = curId
-            curId = folders.find(f => f.id === cid)?.parent_id
-          }
-          safeSetItem(HIDDEN_FOLDERS_LS_KEY, JSON.stringify([...next]))
-          return next
-        })
-      }
       // Expand all collapsed ancestor folders. Cycle-guarded: a hand-edited
       // folders.json can contain a parent_id loop and must not hang the tab.
       const visited = new Set<string>()
@@ -2211,6 +2754,11 @@ function ChatSidebar({
         visited.add(fid)
         const f = folders.find(x => x.id === fid)
         if (f?.collapsed) updateFolderMutation.mutate({ id: fid, body: { collapsed: false } })
+        // A reveal must win in every board column too: drop any per-column
+        // collapsed overrides, or the revealed row stays hidden in columns
+        // whose local state keeps this ancestor collapsed.
+        setBoardCollapse(prev => clearFolderOverrides(prev, fid))
+        persistClearFolderOverrides(fid)
         if (f?.parent_id) expand(f.parent_id)
       }
       expand(slot.folder_id)
@@ -2255,7 +2803,7 @@ function ChatSidebar({
       revealFlashTimersRef.current = [t1, t2]
     }
     tryScroll()
-  }, [revealRequest, dispatch, slots, folders, filteredSlots, filterHiddenSubtree, slotFilter, activeFilters, filterTagIds, clearTagFilter, updateFolderMutation])
+  }, [revealRequest, dispatch, slots, folders, revealBlockingFilters, updateFolderMutation])
   const renameCommit = useCallback((id: string, name: string) => {
     if (name.trim()) updateFolderMutation.mutate({ id, body: { name: name.trim() } })
     setEditingId(null)
@@ -2335,10 +2883,23 @@ function ChatSidebar({
     const over = event.over
     const overData = over?.data.current as { type?: string; folderId?: string | null } | undefined
     const targetFolderId = overData?.type === 'folder-drop' ? overData.folderId : null
-    // If hovering a collapsed folder, blink ring twice then expand
+    // If hovering a collapsed folder, blink ring twice then expand. In a board
+    // column, "collapsed" is that column's effective state (server flag +
+    // column override), and the expansion must clear the column's override —
+    // the server flag alone can read expanded while the hovered copy is
+    // collapsed by its override, which would leave the drop target shut.
     if (targetFolderId) {
+      const overColumnId = over ? boardColumnFromDroppableId(String(over.id)) : null
       const f = folders.find(x => x.id === targetFolderId)
-      if (f?.collapsed) {
+      const effectiveCollapsed = f ? (overColumnId ? boardFolderCollapsed(overColumnId, f) : !!f.collapsed) : false
+      const expandTarget = () => {
+        if (f?.collapsed) updateFolderMutation.mutate({ id: targetFolderId, body: { collapsed: false } })
+        if (overColumnId) {
+          setBoardCollapse(prev => clearFolderOverrides(prev, targetFolderId, overColumnId))
+          persistClearFolderOverrides(targetFolderId, overColumnId)
+        }
+      }
+      if (effectiveCollapsed) {
         if (dragExpandTimer.current?.id !== targetFolderId) {
           if (dragExpandTimer.current) clearTimeout(dragExpandTimer.current.timer)
           dragExpandTimer.current = {
@@ -2353,11 +2914,11 @@ function ChatSidebar({
                 bright(); setTimeout(dim, 100); setTimeout(bright, 200); setTimeout(dim, 300)
                 setTimeout(() => {
                   el.style.boxShadow = ''; el.style.opacity = ''
-                  updateFolderMutation.mutate({ id: targetFolderId, body: { collapsed: false } })
+                  expandTarget()
                   dragExpandTimer.current = null
                 }, 450)
               } else {
-                updateFolderMutation.mutate({ id: targetFolderId, body: { collapsed: false } })
+                expandTarget()
                 dragExpandTimer.current = null
               }
             }, 500),
@@ -2371,9 +2932,9 @@ function ChatSidebar({
       clearTimeout(dragExpandTimer.current.timer)
       dragExpandTimer.current = null
     }
-  }, [folders, updateFolderMutation])
+  }, [folders, updateFolderMutation, boardFolderCollapsed])
   const createChatInFolderMutation = useMutation({
-    mutationFn: ({ folderId }: { folderId: string; columnId?: string }) => {
+    mutationFn: ({ folderId }: { folderId: string; columnId?: string; focus?: boolean }) => {
       const agent = resolveFolderAgent(folders, folderId, defaultAgent)
       const effectiveMode = loadChatConfig().defaultAutopilot ? 'orchestrator' : (mode || '')
       // Carry folder membership in the create payload so createSlot publishes
@@ -2387,7 +2948,11 @@ function ChatSidebar({
       const project = resolveFolderProjectDir(folders, folderId)
       return dispatch(createSlot({ agent, mode: effectiveMode, folder_id: folderId, project })).unwrap()
     },
-    onSuccess: (slot: Slot, { columnId }: { folderId: string; columnId?: string }) => {
+    onSuccess: (slot: Slot, { columnId, focus }: { folderId: string; columnId?: string; focus?: boolean }) => {
+      // Focus only after the create fulfils: the composer is bound to the
+      // active slot, so focusing while createSlot is still in flight puts the
+      // caret on the OLD session and anything typed lands in its draft.
+      if (focus) focusComposer()
       if (slot?.key && columnId) {
         // Board view: also drop the new session into the column it was created
         // from, so a status-lane column shows it immediately instead of the
@@ -2401,7 +2966,7 @@ function ChatSidebar({
       console.error('Failed to create chat in folder:', err)
     },
   })
-  const createChatInFolder = useCallback((folderId: string, columnId?: string) => {
+  const createChatInFolder = useCallback((folderId: string, opts?: { columnId?: string; focus?: boolean }) => {
     // A nested folder selected from the create menu may be hidden behind one
     // or more collapsed ancestors. Expand the complete path optimistically so
     // the destination and its new session are visible as creation begins.
@@ -2412,9 +2977,14 @@ function ChatSidebar({
       const folder = folders.find(f => f.id === currentId)
       if (!folder) break
       if (folder.collapsed) updateFolderMutation.mutate({ id: folder.id, body: { collapsed: false } })
+      // Board columns keep their own collapse overrides; drop them for the
+      // whole ancestor path so the destination is visible in the clicked
+      // column (and every other) as creation begins.
+      setBoardCollapse(prev => clearFolderOverrides(prev, folder.id))
+      persistClearFolderOverrides(folder.id)
       currentId = folder.parent_id || undefined
     }
-    createChatInFolderMutation.mutate({ folderId, columnId })
+    createChatInFolderMutation.mutate({ folderId, columnId: opts?.columnId, focus: opts?.focus })
   }, [createChatInFolderMutation, folders, updateFolderMutation])
 
   // Create autopilot session mutation (consistent with useMutation pattern)
@@ -2431,7 +3001,7 @@ function ChatSidebar({
     mutationFn: () => {
       return dispatch(createSlot({ agent: defaultAgent || undefined, mode: 'crew' })).unwrap()
     },
-    onSuccess: () => { requestAnimationFrame(() => { if (!isTouchDevice()) document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message input"]')?.focus() }) },
+    onSuccess: focusComposer,
   })
 
   // Create default chat session mutation
@@ -2440,7 +3010,7 @@ function ChatSidebar({
       const effectiveMode = loadChatConfig().defaultAutopilot ? 'orchestrator' : (mode || '')
       return dispatch(createSlot({ agent: defaultAgent || undefined, mode: effectiveMode })).unwrap()
     },
-    onSuccess: () => { requestAnimationFrame(() => { if (!isTouchDevice()) document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message input"]')?.focus() }) },
+    onSuccess: focusComposer,
   })
 
   // Create a PLAIN chat, ignoring the `defaultAutopilot` preference.
@@ -2452,11 +3022,11 @@ function ChatSidebar({
   // entry pins the mode.
   const createPlainChatMutation = useMutation({
     mutationFn: () => dispatch(createSlot({ agent: defaultAgent || undefined, mode: mode || '' })).unwrap(),
-    onSuccess: () => { requestAnimationFrame(() => { if (!isTouchDevice()) document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message input"]')?.focus() }) },
+    onSuccess: focusComposer,
   })
 
   // Session colors
-  const { paletteColors, boost, colorMode } = useSessionPalette()
+  const { paletteColors, boost, boostFor, colorMode } = useSessionPalette()
 
   // ── Session row (reference-style: color palette, memory_mode, rename on right-click) ──
   // Does any descendant (direct or nested) of `folderId` contain a slot from `slots`?
@@ -2527,13 +3097,13 @@ function ChatSidebar({
           style={{ paddingLeft: '6px' }}
           role="button"
           tabIndex={0}
-          aria-expanded={!folder.collapsed}
-          aria-label={folder.collapsed ? i18nT('pages.chatSidebar.expand_folder_name', { name: folder.name }) : i18nT('pages.chatSidebar.collapse_folder_name', { name: folder.name })}
+          aria-expanded={!boardFolderCollapsed(columnId, folder)}
+          aria-label={boardFolderCollapsed(columnId, folder) ? i18nT('pages.chatSidebar.expand_folder_name', { name: folder.name }) : i18nT('pages.chatSidebar.collapse_folder_name', { name: folder.name })}
           {...(draggable ? dragHandleProps : {})}
-          onClick={() => toggleCollapse(folder.id)}
-          onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleCollapse(folder.id) } }}
+          onClick={() => toggleColumnCollapse(columnId, folder)}
+          onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleColumnCollapse(columnId, folder) } }}
         >
-          <FolderGlyph color={folder.color} size={11} open={!folder.collapsed} />
+          <FolderGlyph color={folder.color} size={11} open={!boardFolderCollapsed(columnId, folder)} />
           {editingId === folder.id && editScope === columnId ? (
             /* Inline rename input — board-view parity with renderFolderHeader.
              *  Without this branch the ⋯-menu "Rename" set editingId but no
@@ -2573,13 +3143,13 @@ function ChatSidebar({
                 <DropdownMenuItem className="text-danger focus:text-danger" onClick={() => { if (confirm(i18nT('pages.chatSidebar.delete_folder_confirm', { name: folder.name }))) deleteFolderMutation.mutate(folder.id) }}><X size={13} /> {i18nT('pages.chatSidebar.delete_folder')}</DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
-            <button type="button" data-testid={`col-${columnId}-folder-${folder.id}-new-chat`} className="text-muted hover:text-accent bg-transparent border-none cursor-pointer p-[2px]" title={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} aria-label={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} onClick={e => { e.stopPropagation(); createChatInFolder(folder.id, columnId) }} onMouseDown={e => { e.stopPropagation() }} onKeyDown={e => { e.stopPropagation() }}>
+            <button type="button" data-testid={`col-${columnId}-folder-${folder.id}-new-chat`} className="text-muted hover:text-accent bg-transparent border-none cursor-pointer p-[2px]" title={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} aria-label={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} onClick={e => { e.stopPropagation(); createChatInFolder(folder.id, { columnId }) }} onMouseDown={e => { e.stopPropagation() }} onKeyDown={e => { e.stopPropagation() }}>
               <MessageSquarePlus size={11} />
             </button>
           </span>
           )}
         </div>
-        <FolderBody open={!folder.collapsed && !forceCollapsed}>
+        <FolderBody open={!boardFolderCollapsed(columnId, folder) && !forceCollapsed}>
           {/* ml-4 + no pl: flush-connector treatment matching the list-view
            *  folder body (renderFolderBlock) so nested rows sit identically
            *  against the connector line in both views. */}
@@ -2587,7 +3157,7 @@ function ChatSidebar({
             {/* Empty-folder affordance — list-view parity (see renderFolderBlock). */}
             {deepChildren.length === 0 && childSlots.length === 0 && (
               <button key={`col-${columnId}-newchat-${folder.id}`} type="button"
-                onClick={() => createChatInFolder(folder.id, columnId)}
+                onClick={() => createChatInFolder(folder.id, { columnId })}
                 title={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} aria-label={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })}
                 className="w-full flex items-center gap-2.5 px-4 py-2 rounded-md text-[11px] text-muted hover:text-accent hover:bg-bg-hover transition-all bg-transparent border-none cursor-pointer text-left">
                 <span>{i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })}</span><MessageSquarePlus size={11} className="shrink-0 ml-auto" />
@@ -2691,19 +3261,18 @@ function ChatSidebar({
     // warn dot with an explicit "interrupted" instead. Guarded on the raw turn
     // flag plus workflow/subagent activity: while any of those run, the loop IS
     // working and `s.interrupted` only describes a superseded turn.
-    const goalLoopStalled = !!goalLoop && !!s.interrupted && !s.midTurn && !wfActive && subagentCount === 0
+    const goalLoopStalled = !!goalLoop && !!s.interrupted && !s.running && !wfActive && subagentCount === 0
     // Whatever this row would have said if no loop were running, reused as the
     // loop line's trailing detail. This is why the loop branch can outrank the
     // working signals below without swallowing them: live workflow/subagent/tool
     // status still shows, and between cycles it falls back to the last message.
-    // Reads `midTurn` (the raw turn flag), NOT `running`: enrichment widens
-    // `running` to include this very loop, and an idle-between-cycles row must
-    // say "Loop 7/24 · <last message>", not "Loop 7/24 · Thinking…".
+    // Reads the RAW `s.running`, not `runningSet`: the widened flag includes this
+    // very loop, and an idle-between-cycles row must show its last message.
     const goalLoopDetail = wfActive
       ? wfActive.label
       : subagentCount > 0
         ? subagentLabel
-        : s.midTurn
+        : s.running
           ? slotStatusText(slotStatusDetail[s.key], simplifiedToolNames, uiLang)
           : (s.last_message || '')
     const ci = s.color_index != null && s.color_index >= 0 && s.color_index < paletteColors.length ? s.color_index : null
@@ -2852,7 +3421,7 @@ function ChatSidebar({
         // with a definite direction, and rotation reads as progress where a
         // fading dot reads as a mere marker.
         key: 'running',
-        when: !!s.running,
+        when: runningSet.has(s.key),
         build: () => {
           const text = slotStatusText(slotStatusDetail[s.key], simplifiedToolNames, uiLang)
           return {
@@ -2876,16 +3445,25 @@ function ChatSidebar({
     // svg attribute, which is not a tooltip. It goes on the gutter element.
     const status: { glyph: React.ReactNode; label: string } | null = rowState
       ? { glyph: rowState.glyph, label: rowState.label }
-      : s.unread
+      : unreadSet.has(s.key)
         // A DOT, so it keeps its own size: `ROW_ICON_PX` sizes the lucide
         // glyphs, whose ink covers a fraction of their box, while a filled
         // disc covers all of it. At 10px it reads as heavier than every
         // state that outranks it.
         ? { glyph: <span className="w-2 h-2 rounded-full" style={{ background: 'var(--accent)' }} />, label: i18nT('pages.chatSidebar.agent_finished_your_turn') }
         : null
-    const rowColor = ci != null ? paletteColors[ci] : null
+    // Custom hex (color_hex) wins over the palette index. It is deliberately
+    // theme-independent: palette swatches re-derive from the theme accent,
+    // a custom color is frozen. Muted-text legibility still goes through the
+    // same APCA boost via boostFor.
+    const customHex = typeof s.color_hex === 'string' && s.color_hex ? s.color_hex : null
+    const rowColor = customHex ?? (ci != null ? paletteColors[ci] : null)
     const boostStyle: Record<string, string> = {}
-    if (rowColor && ci != null) {
+    if (customHex) {
+      boostStyle['--session-color'] = customHex
+      const cb = boostFor(customHex)
+      if (cb.mutedColors[0]) boostStyle['--session-muted'] = cb.mutedColors[0]
+    } else if (rowColor && ci != null) {
       boostStyle['--session-color'] = rowColor
       if (boost.mutedColors[ci]) boostStyle['--session-muted'] = boost.mutedColors[ci]
     }
@@ -3149,7 +3727,7 @@ function ChatSidebar({
                   onRename handler) so users can edit or drop it when they rename.
                   A separate ↳ glyph also double-stacked into "↳↳ Fork of …". */}
               {renamingSlot === s.key && renameScope === scope ? (
-                <textarea ref={renameInputRef} rows={1} className={`w-full bg-transparent border border-accent rounded px-1 py-0 ${ROW_TITLE_CLS} text-text-strong outline-none select-text resize-none block overflow-hidden`} value={renameValue} onChange={e => setRenameValue(e.target.value.replace(/[\r\n]+/g, ' '))} {...ime.bindEnter<HTMLTextAreaElement>({ onEnter: () => { (document.activeElement as HTMLTextAreaElement)?.blur() }, onEscape: () => { cancelRenameRef.current = true; setRenamingSlot(null) }, onBlur: () => { if (!cancelRenameRef.current && renameValue.trim()) { dispatch(sseSlotTitle({ key: s.key, title: renameValue.trim() })); api.renameSlot(s.key, renameValue.trim()).catch(() => { queryClient.invalidateQueries({ queryKey: ['chat-slots'] }) }) } cancelRenameRef.current = false; setRenamingSlot(null) } })} onMouseDown={e => e.stopPropagation()} />
+                <textarea ref={renameInputRef} rows={1} className={`w-full bg-transparent border border-accent rounded px-1 py-0 ${ROW_TITLE_CLS} text-text-strong outline-none select-text resize-none block overflow-hidden focus-ring`} value={renameValue} onChange={e => setRenameValue(e.target.value.replace(/[\r\n]+/g, ' '))} {...ime.bindEnter<HTMLTextAreaElement>({ onEnter: () => { (document.activeElement as HTMLTextAreaElement)?.blur() }, onEscape: () => { cancelRenameRef.current = true; setRenamingSlot(null) }, onBlur: () => { if (!cancelRenameRef.current && renameValue.trim()) { dispatch(sseSlotTitle({ key: s.key, title: renameValue.trim() })); api.renameSlot(s.key, renameValue.trim()).catch(() => { queryClient.invalidateQueries({ queryKey: ['chat-slots'] }) }) } cancelRenameRef.current = false; setRenamingSlot(null) } })} onMouseDown={e => e.stopPropagation()} />
               ) : (s.title && s.title !== s.key ? s.title : s.key)}
             </div>
             {/* Subtitle: the same ordered resolver the gutter glyph uses, so
@@ -3159,137 +3737,17 @@ function ChatSidebar({
             {rowState ? rowState.subtitle : s.last_message ? (
               <div className={ROW_STATUS_LINE_MUTED_CLS}>{s.last_message}</div>
             ) : null}
-            {s.source_links && s.source_links.length > 0 && (() => {
-              // `kind` is OPTIONAL on the wire and absent means 'change', so an
-              // older payload (or a test fixture that predates the field) keeps
-              // rendering exactly the PR/MR chip it always did.
-              const changeLinks = s.source_links.filter(link => (link.kind ?? 'change') !== 'issue')
-              const issueLinks = s.source_links.filter(link => (link.kind ?? 'change') === 'issue')
-              const hidden = typeof s.source_links_total === 'number'
-                ? s.source_links_total - s.source_links.length
-                : 0
-              const overflowTitle = issueLinks.length
-                ? i18nT('pages.chatSidebar.more_pull_request_or_issue_in_this_session', { count: hidden })
-                : i18nT('pages.chatSidebar.more_pull_request_in_this_session', { count: hidden })
-              /** Chip tooltip. A plain click now reveals in-panel, so a bare
-               *  "Open <url>" would promise the browser and mislead; naming the
-               *  modifier is also the only way that escape hatch is discoverable
-               *  rather than found by accident. */
-              const chipTitle = (link: SidebarSourceLink) => i18nT('pages.chatSidebar.open_source_link_in_side_panel', {
-                url: link.url,
-                modifier: platformShortcut('Cmd+click'),
-              })
-              /** Chip click: switch to the session the chip belongs to and reveal
-               *  its pull request / issue in that session's side panel, rather
-               *  than sending the user out to the provider's website.
-               *
-               *  The chip stays a real anchor with a real href, so four cases
-               *  deliberately fall through to plain link navigation instead:
-               *    - `onOpenSource` unset — the surface has no side panel to
-               *      reveal into (the `/embed/sessions` list).
-               *    - a modifier click — the user asked for a new tab/window
-               *      explicitly, and "Copy link address" still yields the PR url.
-               *    - offline — the panel loads a PR through the LOCAL provider
-               *      CLI, so with the gateway down the provider's own page is the
-               *      only thing that can answer at all.
-               *    - `onOpenSource` returning false — the panel could not resolve
-               *      this url, so the provider's page is better than a dead click.
-               *  Middle-click never reaches a click handler (it fires auxclick),
-               *  so it opens a background tab natively without a case here.
-               *
-               *  `preventDefault` comes LAST on purpose: the default action runs
-               *  only after every handler returns, so suppressing navigation
-               *  after the reveal is still effective — and it means the reveal
-               *  decides, rather than being assumed to succeed. */
-              const revealInPanel = (link: SidebarSourceLink) => (e: React.MouseEvent<HTMLAnchorElement>) => {
-                // The row is a click-to-switch button; never let a chip click
-                // reach it, whichever branch we take below.
-                e.stopPropagation()
-                if (!onOpenSource || !connected || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
-                if (!isActive) { dispatch(switchSlot(s.key)); onSelectSlot?.(s.key) }
-                if (!onOpenSource(s.key, { url: link.url, kind: link.kind ?? 'change' })) return
-                e.preventDefault()
-              }
-              return (
-                <div className="flex flex-wrap gap-1.5 mt-1">
-                  {changeLinks.map(link => (
-                    // `link.url` is always an `https://` URL on an allowlisted
-                    // host (state.py scans for the literal "https://" then
-                    // validates via parse_source_url), so no scheme sanitising is
-                    // needed for the href.
-                    //
-                    // The row is a dnd-kit draggable as well as a button, so the
-                    // anchor also disables its own native HTML5 drag — that would
-                    // otherwise put the URL on the dataTransfer instead of the
-                    // slot key in the board/flat scopes that use native drag.
-                    <a key={link.url} href={link.url} target="_blank" rel="noopener noreferrer"
-                      draggable={false}
-                      onClick={revealInPanel(link)}
-                      className="inline-flex items-center gap-1 px-1.5 py-[1px] rounded-[4px] text-[10px] leading-none font-medium text-muted no-underline border border-border bg-bg-elevated/60 hover:text-text hover:border-accent"
-                      title={chipTitle(link)}>
-                      {link.provider === 'github' ? <GithubLogo size={10} className="shrink-0" /> : link.provider === 'jira' ? <JiraLogo size={10} className="shrink-0" /> : <GitlabLogo size={10} className="shrink-0" />}
-                      {link.provider === 'github' ? `#${link.number}` : link.provider === 'jira' ? `${link.repo}-${link.number}` : `!${link.number}`}
-                      {link.state === 'merged' && (
-                        <span className="inline-flex shrink-0 text-aim" aria-label={i18nT('pages.chatSidebar.merged')} title={i18nT('pages.chatSidebar.merged')}>
-                          <GitMerge className="lucide-inline" aria-hidden="true" />
-                        </span>
-                      )}
-                      {link.state === 'closed' && <span className="capitalize text-danger">{link.state}</span>}
-                      {/* One status glyph, chosen by `chipStatusGlyph` — CI is moot
-                          once the PR is terminal (merged or closed), where the
-                          lifecycle glyph is the signal, and a merge conflict
-                          outranks a pending or passing rollup. */}
-                      {/* Pending CI is a STATIC amber dot (the provider's own pending
-                          convention), never a spinner: an animated glyph on a session
-                          card reads as "the agent is working on this session", which is
-                          a stronger claim than "this PR's checks haven't finished".
-                          Motion on the card stays reserved for session activity. */}
-                      {(() => {
-                        switch (chipStatusGlyph(link)) {
-                          case 'running':
-                            return <Circle className="lucide-inline shrink-0 text-warn scale-75" fill="currentColor" strokeWidth={0} aria-label={i18nT('pages.chatSidebar.checks_running')} />
-                          case 'passed':
-                            return <Check className="lucide-inline shrink-0 text-ok" aria-label={i18nT('pages.chatSidebar.checks_passed')} />
-                          case 'failed':
-                            return <X className="lucide-inline shrink-0 text-danger" aria-label={i18nT('pages.chatSidebar.checks_failed')} />
-                          case 'conflict':
-                            // The panel's own conflict-banner key, reused rather than
-                            // duplicated: the chip and the banner describe one pull
-                            // request, so they must not word it differently in any
-                            // locale.
-                            return <TriangleAlert className="lucide-inline shrink-0 text-danger" aria-label={i18nT('components.pullRequestPanel.merge_conflicts')} />
-                          default:
-                            return null
-                        }
-                      })()}
-                    </a>
-                  ))}
-                  {issueLinks.map(link => (
-                    // Issue chip: the same anchor discipline (reveal in panel,
-                    // no native drag) but deliberately NO ci / state / merge
-                    // decoration — the chip-status cache is pull-request-only in
-                    // this phase, so an issue chip has nothing truthful to colour
-                    // and a borrowed glyph would assert state we never fetched.
-                    // Both providers number issues with '#'.
-                    <a key={link.url} href={link.url} target="_blank" rel="noopener noreferrer"
-                      data-testid={`session-issue-chip-${link.number}`}
-                      draggable={false}
-                      onClick={revealInPanel(link)}
-                      className="inline-flex items-center gap-1 px-1.5 py-[1px] rounded-[4px] text-[10px] leading-none font-medium text-muted no-underline border border-border bg-bg-elevated/60 hover:text-text hover:border-accent"
-                      title={chipTitle(link)}>
-                      {link.provider === 'github' ? <GithubLogo size={10} className="shrink-0" /> : link.provider === 'jira' ? <JiraLogo size={10} className="shrink-0" /> : <GitlabLogo size={10} className="shrink-0" />}
-                      {link.provider !== 'jira' && <CircleDot className="lucide-inline shrink-0" aria-hidden="true" />}
-                      {link.provider === 'jira' ? `${link.repo}-${link.number}` : `#${link.number}`}
-                    </a>
-                  ))}
-                  {hidden > 0 && (
-                    <span className="inline-flex items-center px-1.5 py-[1px] rounded-[4px] text-[10px] leading-none font-medium text-muted border border-border bg-bg-elevated/60" title={overflowTitle}>
-                      +{hidden}
-                    </span>
-                  )}
-                </div>
-              )
-            })()}
+            {s.source_links && s.source_links.length > 0 && (
+              <SessionSourceChips
+                slotKey={s.key}
+                links={s.source_links}
+                total={s.source_links_total}
+                connected={connected}
+                isActive={isActive}
+                onOpenSource={onOpenSource}
+                onActivateSlot={() => { dispatch(switchSlot(s.key)); onSelectSlot?.(s.key) }}
+              />
+            )}
             {/* No tag chips here: every tag renders in the meta line above as
              *  tinted `· name` text. A chip row would print each tag twice. */}
           </div>
@@ -3646,14 +4104,18 @@ function ChatSidebar({
   // Used to reveal the empty-state drop placeholder inside the "No folder"
   // group so there's always a reachable ungroup target.
   const draggingFolderedSession = activeDrag?.type === 'session' && !!slotFolders[activeDrag.id]
-  // Whether the session being dragged may not be referenced into the open chat
-  // (incognito/temporary, or the session already on screen). Drives the drop
-  // zone's refusal state; the drop handler re-decides with the same function.
-  const draggingRefBlocked = activeDrag?.type === 'session' && !!sessionRefBlockReason({
-    key: activeDrag.id,
-    activeSlot,
-    memoryMode: slots.find(x => x.key === activeDrag.id)?.memory_mode,
-  })
+  // WHY the session being dragged may not be referenced into the open chat, or
+  // null when it may be. Carries the reason rather than a boolean because the two
+  // refusals read differently to the user (a privacy guard vs a self-drop no-op).
+  // Drives the drop zone's refusal state; the drop handler re-decides with the
+  // same function.
+  const draggingRefRefusal = activeDrag?.type === 'session'
+    ? sessionRefBlockReason({
+      key: activeDrag.id,
+      activeSlot,
+      memoryMode: slots.find(x => x.key === activeDrag.id)?.memory_mode,
+    })
+    : null
   // True while dragging a folder that currently has a parent — the only case
   // where "drop on the root lane to move to top level" applies.
   const draggingNestedFolder = activeDrag?.type === 'folder' && !!folders.find(f => f.id === activeDrag.id)?.parent_id
@@ -3701,10 +4163,46 @@ function ChatSidebar({
               <button className="w-7 h-7 rounded-md border border-border bg-transparent text-muted cursor-pointer flex items-center justify-center hover:border-border-strong hover:text-text transition-all" title={i18nT('pages.chatSidebar.more_options')} aria-label={i18nT('pages.chatSidebar.more_options')}><MoreVertical size={14} /></button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="min-w-[180px]">
-              <DropdownMenuItem onClick={() => { const isActive = tagColumnsEnabled && rawColumns.length > 0; const next = !isActive; const cfg = loadChatConfig(); saveChatConfig({ ...cfg, tagColumnsEnabled: next }); if (next && rawColumns.length === 0) { createColumnMutation.mutate({ name: '', tag_ids: [], mode: 'any' }) } }}>
+              <DropdownMenuItem disabled={seedStateLanesMutation.isPending} onClick={() => {
+                if (seedStateLanesMutation.isPending) return
+                const isActive = tagColumnsEnabled && rawColumns.length > 0
+                const next = !isActive
+                const cfg = loadChatConfig()
+                saveChatConfig({ ...cfg, tagColumnsEnabled: next })
+                setSeedError('')
+                if (!next) {
+                  // Leaving board view: give back the width the user chose before
+                  // the lanes were auto-widened, rather than stranding a ~900px
+                  // sidebar in list view.
+                  const prior = parseInt(localStorage.getItem(SIDEBAR_PRE_BOARD_LS_KEY) || '', 10)
+                  if (!isNaN(prior) && prior >= SIDEBAR_MIN && prior <= SIDEBAR_MAX) {
+                    setSidebarWidth(prior)
+                    onWidthChangeRef.current?.(prior)
+                    safeSetItem(SIDEBAR_LS_KEY, String(prior))
+                    safeSetItem(SIDEBAR_PRE_BOARD_LS_KEY, '')
+                  }
+                }
+                // Seed when the board has no lanes and nothing configured worth
+                // keeping. Seeding is additive and idempotent, so a repeat click
+                // cannot duplicate lanes; the pending guard above only stops a
+                // second request racing the first before the cache refreshes.
+                if (next && !rawColumns.some(c => c.source === 'state' || c.name || (c.tag_ids || []).length || c.include_untagged)) {
+                  seedStateLanesMutation.mutate()
+                }
+              }}>
                 <Columns3 size={14} className={tagColumnsEnabled && rawColumns.length > 0 ? 'text-accent' : 'text-muted'} />
                 {tagColumnsEnabled && rawColumns.length > 0 ? i18nT('pages.chatSidebar.switch_to_list_view') : i18nT('pages.chatSidebar.switch_to_board_view')}
               </DropdownMenuItem>
+              {tagColumnsEnabled && rawColumns.length > 0 && missingLanes.length > 0 && (
+                <DropdownMenuItem
+                  data-testid="add-state-lanes"
+                  disabled={seedStateLanesMutation.isPending}
+                  onClick={() => { if (!seedStateLanesMutation.isPending) seedStateLanesMutation.mutate() }}
+                >
+                  <Columns3 size={14} className="text-muted" />
+                  {i18nT('pages.chatSidebar.add_state_lanes')}
+                </DropdownMenuItem>
+              )}
               <DropdownMenuItem onClick={() => { setCleanupOpen(!cleanupOpen); setCleanupExpanded(false); setCleanupError('') }}>
                 <BrushCleaning size={14} className="text-muted" />
                 {i18nT('pages.chatSidebar.clean_up_sessions')}
@@ -3793,7 +4291,7 @@ function ChatSidebar({
                         const walk = (list: ChatFolder[], depth: number) => { for (const f of list) { items.push({ f, depth }); walk(childrenOf(f.id), depth + 1) } }
                         walk(roots, 0)
                         return items.map(({ f, depth }) => (
-                          <DropdownMenuItem key={f.id} style={{ paddingLeft: `${12 + depth * 16}px` }} onClick={() => { createChatInFolder(f.id); requestAnimationFrame(() => { if (!isTouchDevice()) document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message input"]')?.focus() }) }}>
+                          <DropdownMenuItem key={f.id} style={{ paddingLeft: `${12 + depth * 16}px` }} onClick={() => createChatInFolder(f.id, { focus: true })}>
                             <Folder size={14} className={depth === 0 ? 'text-muted' : 'text-muted/60'} /> {f.name}
                           </DropdownMenuItem>
                         ))
@@ -4245,6 +4743,28 @@ function ChatSidebar({
           })}
         </div>
       )}
+      {seedError && (
+        /* Outside the layout branches on purpose. A TOTAL seed failure leaves
+         * zero columns, so the board branch never renders — a banner inside it
+         * would be invisible in exactly the case it exists for, while the
+         * toggle has already flipped and the user is looking at a list. */
+        <div
+          data-testid="lane-seed-error"
+          role="status"
+          className="mx-2 mt-2 px-2.5 py-1.5 rounded-md border text-[12px] shrink-0"
+          style={{ borderColor: 'var(--warn)', color: 'var(--warn)' }}
+        >
+          {i18nT('pages.chatSidebar.lane_seed_failed')}
+          <button
+            type="button"
+            className="ml-2 underline bg-transparent border-none cursor-pointer p-0"
+            style={{ color: 'var(--warn)' }}
+            onClick={() => { setSeedError(''); seedStateLanesMutation.mutate() }}
+          >
+            {i18nT('pages.chatSidebar.lane_seed_retry')}
+          </button>
+        </div>
+      )}
       <LayoutGroup id="chat-slots">
         {flatView && folders.length > 0 ? (
           // Flat view: every chat exploded out of its folder into one lane.
@@ -4323,7 +4843,7 @@ function ChatSidebar({
                *  drag, and only when a pane and a handler exist. */}
               {chatDropTarget && onDropSessionRef && activeDrag?.type === 'session'
                 && createPortal(
-                  <ChatPaneDropZone refused={draggingRefBlocked} />,
+                  <ChatPaneDropZone refusal={draggingRefRefusal} />,
                   chatDropTarget,
                 )}
               {/* Root lane is the fallback drop target: dropping a session on
@@ -4386,11 +4906,15 @@ function ChatSidebar({
           </motion.div>
         ) : (
           // Trello-style horizontal column strip
+          <div className="flex-1 min-h-0 flex flex-col">
           <div className="flex-1 overflow-x-auto overflow-y-hidden flex gap-2 p-2" data-testid="column-strip">
             {orderedColumns.map((col, colIdx) => {
-              const colSlots = filteredSlots.filter(s => columnMatches(col, s.tags || []))
+              const colSlots = filteredSlots.filter(s => columnMatches(col, s))
               const colTags = col.tag_ids.map(tid => tagById[tid]).filter(Boolean) as ChatTag[]
-              const isStatusLane = colTags.length === 1 && !!colTags[0].status
+              const laneDef = col.source === 'state' ? SESSION_LANES.find(l => l.key === col.state_key) : undefined
+              // Only a single-status-tag column can accept a card: dropping onto a
+              // derived lane has nothing to write (the backend refuses it too).
+              const isStatusLane = !laneDef && colTags.length === 1 && !!colTags[0].status
               return (
                 // Board column is a drag-and-drop drop zone (column reorder + session
                 // card drop); mouse-only drag handlers, so scope-disable the rule.
@@ -4436,7 +4960,15 @@ function ChatSidebar({
                       <GripVertical size={12} />
                     </span>
                     <div className="flex flex-wrap gap-1 items-center flex-1 min-w-0">
-                      {colTags.length === 0 ? (
+                      {laneDef ? (
+                        // A lane's identity is its runtime state, so it shows a
+                        // fixed name and accent rather than tag chips — there is
+                        // no filter behind it for the user to edit.
+                        <span className="inline-flex items-center gap-1.5 min-w-0" title={i18nT('pages.chatSidebar.lane_derived_hint')}>
+                          <span className="w-2 h-2 rounded-full shrink-0" style={{ background: laneDef.color }} aria-hidden />
+                          <span className="text-[11px] font-semibold uppercase tracking-wider truncate" style={{ color: laneDef.color }}>{i18nT(laneDef.labelKey)}</span>
+                        </span>
+                      ) : colTags.length === 0 ? (
                         <span className="text-[11px] text-muted font-semibold uppercase tracking-wider">{col.name || (col.include_untagged ? i18nT('pages.chatSidebar.untagged_2') : i18nT('pages.chatSidebar.all_sessions'))}</span>
                       ) : (
                         <>
@@ -4446,11 +4978,22 @@ function ChatSidebar({
                           {col.include_untagged && <span className="inline-flex items-center gap-1 px-1.5 py-[1px] rounded-[4px] text-[10px] leading-none font-medium border border-dashed border-muted text-muted" title={i18nT('pages.chatSidebar.also_shows_untagged_sessions')}>{i18nT('pages.chatSidebar.untagged')}</span>}
                         </>
                       )}
-                      {col.name && colTags.length > 0 && <span className="text-[11px] text-muted ml-1">· {col.name}</span>}
+                      {col.name && !laneDef && colTags.length > 0 && <span className="text-[11px] text-muted ml-1">· {col.name}</span>}
+                      {/* A bare match-all column beside the lanes shows every
+                        * session again, so the counts stop summing and cards
+                        * appear twice. Seeding deliberately does not delete it
+                        * (it is indistinguishable from a column the user added),
+                        * so say what it is and let them decide. */}
+                      {!laneDef && colTags.length === 0 && !col.name && !col.include_untagged
+                        && orderedColumns.some(c => c.source === 'state') && (
+                        <span data-testid={`column-duplicates-hint-${col.id}`} className="text-[10px] text-muted ml-1 truncate">
+                          · {i18nT('pages.chatSidebar.lane_legacy_column_hint')}
+                        </span>
+                      )}
                     </div>
                     <span className="text-[11px] text-muted shrink-0">{colSlots.length}</span>
                     <button type="button" data-testid={`column-new-folder-${col.id}`} className="text-muted hover:text-accent bg-transparent border-none cursor-pointer shrink-0 p-[2px]" title={i18nT('pages.chatSidebar.new_folder')} aria-label={i18nT('pages.chatSidebar.new_folder')} onClick={() => { setFolderModal({ mode: 'create', parentId: '' }) }}><FolderPlus size={12} /></button>
-                    <button type="button" data-testid={`column-edit-${col.id}`} className="text-muted hover:text-accent bg-transparent border-none cursor-pointer shrink-0 p-[2px]" title={i18nT('pages.chatSidebar.filter_manage_tags')} aria-label={i18nT('pages.chatSidebar.filter_manage_tags')} onClick={() => setColumnEditId(columnEditId === col.id ? null : col.id)}><TagIcon size={12} /></button>
+                    {!laneDef && <button type="button" data-testid={`column-edit-${col.id}`} className="text-muted hover:text-accent bg-transparent border-none cursor-pointer shrink-0 p-[2px]" title={i18nT('pages.chatSidebar.filter_manage_tags')} aria-label={i18nT('pages.chatSidebar.filter_manage_tags')} onClick={() => setColumnEditId(columnEditId === col.id ? null : col.id)}><TagIcon size={12} /></button>}
                     <button
                       type="button"
                       data-testid={`column-add-after-${col.id}`}
@@ -4580,6 +5123,7 @@ function ChatSidebar({
               )
             })}
           </div>
+          </div>
         )}
       </LayoutGroup>
 
@@ -4707,6 +5251,20 @@ function ChatSidebar({
                 // No search: skip the sort only when the backend already returns
                 // date-desc order.
                 const sortedHistory = (searchActive || sortKey === 'date-desc') ? filteredHistory : [...filteredHistory].sort((a, b) => compareBySort(a, b, sortKey))
+                // An empty pane is reachable whenever every session on disk is
+                // already open as a tab (the common case for a light user), so it
+                // needs to say so rather than render a search box over blank space.
+                // A filtered-to-nothing list is a different statement and reuses the
+                // wording the two sibling panes already use for it.
+                if (sortedHistory.length === 0) {
+                  return (
+                    <div className="px-3 py-4 text-[12px] text-muted text-center">
+                      {historyFilter
+                        ? i18nT('pages.chatSidebar.no_sessions_match')
+                        : i18nT('pages.chatSidebar.no_older_sessions')}
+                    </div>
+                  )
+                }
                 let prevSeg = ''
                 // Derive agent color the same way renderSessionRow does so history rows
                 // match the session-row visual language (agent name tinted by source).

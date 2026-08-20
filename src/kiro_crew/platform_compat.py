@@ -56,6 +56,14 @@ SIGTERM: int = getattr(signal, "SIGTERM", 15)
 # to the real flags on Windows. Mirrors the ``SIGKILL`` pattern above.
 CREATE_NEW_PROCESS_GROUP: int = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 DETACHED_PROCESS: int = getattr(subprocess, "DETACHED_PROCESS", 0)
+# CREATE_SUSPENDED has no ``subprocess`` alias to getattr from (that module
+# re-exports only a subset of the Win32 creation flags), so the value is spelled
+# out. It is the load-bearing half of race-free Job object assignment: a process
+# created suspended has not executed a single instruction, so it provably has no
+# descendants yet and none can escape the job. See :func:`apply_job_limits` and
+# :func:`resume_process_main_thread`. 0 on POSIX, where it is never used, so a
+# caller can OR it into ``creationflags`` unconditionally.
+CREATE_SUSPENDED: int = 0x00000004 if os.name == "nt" else 0
 # For the short-lived helper tools this module shells out to on Windows
 # (whoami / netstat / taskkill / icacls / powershell): a console-less parent
 # (gateway respawned with DETACHED_PROCESS, or pythonw) would otherwise
@@ -654,6 +662,79 @@ class _TokenUser(ctypes.Structure):
     """advapi32 ``TOKEN_USER`` — the ``TokenUser`` information-class payload."""
 
     _fields_ = [("User", _SidAndAttributes)]
+
+
+class _IoCounters(ctypes.Structure):
+    """kernel32 ``IO_COUNTERS`` — the I/O accounting block inside a job's limits.
+
+    Never read; present only so the extended-limit layout below has the correct
+    size and field offsets.
+    """
+
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_ulonglong),
+        ("WriteOperationCount", ctypes.c_ulonglong),
+        ("OtherOperationCount", ctypes.c_ulonglong),
+        ("ReadTransferCount", ctypes.c_ulonglong),
+        ("WriteTransferCount", ctypes.c_ulonglong),
+        ("OtherTransferCount", ctypes.c_ulonglong),
+    ]
+
+
+class _JobObjectBasicLimitInformation(ctypes.Structure):
+    """kernel32 ``JOBOBJECT_BASIC_LIMIT_INFORMATION``."""
+
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_longlong),
+        ("PerJobUserTimeLimit", ctypes.c_longlong),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    ]
+
+
+class _JobObjectExtendedLimitInformation(ctypes.Structure):
+    """kernel32 ``JOBOBJECT_EXTENDED_LIMIT_INFORMATION`` — the ceiling payload.
+
+    ``ActiveProcessLimit`` (in the basic block) bounds the process count where
+    ``TasksMax`` bounds tasks, and ``JobMemoryLimit`` is the ``MemoryMax``
+    equivalent. See :func:`apply_job_limits` for why the process row is not a
+    one-for-one mapping.
+    """
+
+    _fields_ = [
+        ("BasicLimitInformation", _JobObjectBasicLimitInformation),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+class _ThreadEntry32(ctypes.Structure):
+    """Toolhelp ``THREADENTRY32`` — thread-enumeration snapshot entry.
+
+    Used by :func:`resume_process_main_thread`, which takes
+    ``ctypes.POINTER(_ThreadEntry32)`` for the ``Thread32First`` /
+    ``Thread32Next`` argtypes — so this layout in particular MUST stay at module
+    scope: it is pointed at, which is exactly what pins a type in ctypes'
+    unbounded memo, and the helper runs once per agent spawn.
+    """
+
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ThreadID", wintypes.DWORD),
+        ("th32OwnerProcessID", wintypes.DWORD),
+        ("tpBasePri", wintypes.LONG),
+        ("tpDeltaPri", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -2021,6 +2102,78 @@ def pid_exists(pid: int) -> bool:
         return False
 
 
+#: Seconds before the ``ps`` start-time probe is abandoned. Only the BSD leg
+#: spawns anything; Linux reads /proc and Windows calls the kernel directly.
+_START_TIME_PS_TIMEOUT = 2
+
+
+def process_start_time(pid: int) -> str | None:
+    """Stable identity for WHEN *pid* started, or ``None`` when unreadable.
+
+    An opaque token whose only contract is that it compares equal across gateway
+    generations on the same host while the PID still names the same process
+    object, and unequal once that PID has been recycled onto another. Units
+    differ per platform and are deliberately not normalised -- nothing ever
+    compares one host's value against another's, and no caller parses it.
+
+    Callers use it as a PID-reuse guard before signalling, so an unreadable
+    value must fail SAFE: ``None`` means "identity unconfirmed", which every
+    caller treats as "do not kill".
+
+    * **Linux** -- ``/proc/<pid>/stat`` field 22 (start time in clock ticks
+      since boot): monotonic, locale-independent, and far finer than 1s, so
+      same-second reuse cannot alias.
+    * **Windows** -- the process creation ``FILETIME`` (100-ns units), read
+      through a QUERY-ONLY handle. Terminate rights are deliberately NOT
+      requested: this value is what decides whether a kill may happen at all, so
+      demanding the right to kill in order to read it would refuse the guard for
+      exactly the processes a caller must be most careful about.
+    * **macOS / other POSIX** -- ``ps -o lstart=`` (1s resolution, locale/TZ
+      formatted). Coarser, so a format or resolution drift can only make the
+      guard decline to act, never act on the wrong process.
+    """
+    if sys.platform == "linux":
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            # The comm field can contain spaces and parens; split after the
+            # LAST ')' so a process named "(evil) 1 2 3" cannot shift the index.
+            return stat.rsplit(")", 1)[1].split()[19]
+        except (OSError, ValueError, IndexError):
+            return None
+    if IS_WINDOWS:
+        # Opened and closed through the shared seams so this READ and the
+        # identity-pinned TERMINATE below cannot drift in how they acquire or
+        # release the handle -- the difference between the two is the handle's
+        # LIFETIME, and that is easier to reason about with one acquisition site.
+        handle = _open_process_query_handle(pid)
+        if handle is None:
+            return None
+        try:
+            identity = _windows_process_handle_identity(handle)
+        finally:
+            _close_process_handle(handle)
+        # (pid, creation_time, exit_time) -- only the creation half is an
+        # identity; exit_time moves as the process dies.
+        return str(identity[1]) if identity is not None else None
+    ps_bin = trusted_system_bin("ps")
+    if ps_bin is None:
+        return None
+    try:
+        out = subprocess.check_output(
+            [ps_bin, "-o", "lstart=", "-p", str(pid)],
+            stderr=subprocess.DEVNULL,
+            timeout=_START_TIME_PS_TIMEOUT,
+        )
+        # STRICT decode. A lossy one would turn unreadable bytes into a
+        # non-empty string, so the caller would accept garbage as a confirmed
+        # identity -- and two different processes whose output both decoded to
+        # replacement characters would compare equal. Undecodable output means
+        # the probe cannot be trusted, which is the None case.
+        return out.decode().strip() or None
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        return None
+
+
 def process_thread_count(pid: int) -> int | None:
     """Thread count of *pid*, or ``None`` when it cannot be determined.
 
@@ -2275,6 +2428,92 @@ def kill_process_tree(pid: int, sig: int = SIGTERM) -> bool:
     if r.returncode != 0:
         _raise_taskkill_error(pid, r.returncode, r.stderr or r.stdout)
     return True
+
+
+def _open_process_query_handle(pid: int) -> int | None:
+    """Open a QUERY-ONLY Windows handle to *pid*, or ``None``.
+
+    Terminate rights are deliberately NOT requested: the callers use this handle
+    to decide whether a kill may happen at all, so demanding the right to kill in
+    order to read the identity would refuse the guard for exactly the processes a
+    caller must be most careful about.
+
+    Returns ``None`` on every non-Windows platform, and on any failure -- an
+    unopenable process is one whose identity cannot be confirmed, which every
+    caller must treat as "do not kill".
+    """
+    if not IS_WINDOWS:
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    except Exception:
+        return None
+    return int(handle) if handle else None
+
+
+def _close_process_handle(handle: int) -> None:
+    """Release a handle from :func:`_open_process_query_handle`. Never raises."""
+    if not IS_WINDOWS or type(handle) is not int or handle <= 0:
+        return
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+    except Exception:
+        logger.debug("CloseHandle failed for process handle %d", handle, exc_info=True)
+
+
+def kill_process_tree_pinned(
+    pid: int, expected_start_time: str, sig: int = SIGTERM
+) -> bool:
+    """Kill *pid*'s tree only while its verified identity is PINNED OPEN.
+
+    :func:`kill_process_tree` addresses the target by PID, and on Windows it
+    does so from a separate ``taskkill`` process. A caller that merely read the
+    start time first has released every handle by then, so between the check and
+    the terminate the process can exit and Windows can recycle the PID onto an
+    unrelated process -- which ``taskkill /T /F /PID`` would then tear down with
+    its whole tree. The check is only as good as the window after it.
+
+    Windows keeps a process ID reserved for as long as ANY handle to the process
+    object remains open, so holding the query handle that verified the identity
+    across the terminate is what makes the PID still mean the same process when
+    ``taskkill`` resolves it. That is the guarantee this function adds, and the
+    only reason it exists.
+
+    Returns ``False`` -- WITHOUT invoking any kill -- when the handle cannot be
+    opened or the identity does not match *expected_start_time*. Callers must
+    treat that as "identity unconfirmed, do not reap", the same fail-safe the
+    start-time comparison already gives them. On a match it delegates to
+    :func:`kill_process_tree` and propagates its exceptions unchanged, so
+    ``except (ProcessLookupError, OSError)`` handlers keep firing as before.
+
+    POSIX is deliberately untouched: it delegates straight through, because
+    ``os.killpg`` is issued in-process by the same interpreter that did the
+    check and there is no handle to hold. The residual probe-to-signal window
+    there is the pre-existing one the callers already mitigate by re-confirming
+    identity before the destructive escalation.
+    """
+    if not IS_WINDOWS:
+        return kill_process_tree(pid, sig)
+    handle = _open_process_query_handle(pid)
+    if handle is None:
+        return False
+    try:
+        identity = _windows_process_handle_identity(handle)
+        # (pid, creation_time, exit_time) -- the creation half is the identity.
+        if identity is None or str(identity[1]) != expected_start_time:
+            return False
+        # The handle stays open for the whole call: taskkill resolves the PID
+        # while this process object is still referenced, so the PID cannot have
+        # been recycled onto a different process in between.
+        return kill_process_tree(pid, sig)
+    finally:
+        _close_process_handle(handle)
 
 
 async def kill_pid_async(pid: int, sig: int = SIGTERM) -> bool:
@@ -3305,6 +3544,241 @@ def system_cpu_percent() -> "float | None":
 
 
 # ---------------------------------------------------------------------------
+# Available physical memory, on every platform
+#
+# "How much RAM can a new process take without pushing this machine into swap"
+# has a different answer, and a different interface, on each OS: Linux publishes
+# the number outright, macOS publishes page counters and leaves the composition
+# to the caller, Windows has a Win32 call. A caller that reads only one of them
+# does not get a conservative answer on the others -- it gets NO answer, which
+# is why this lives here rather than at each call site.
+# ---------------------------------------------------------------------------
+
+_MIB_BYTES = 1024 * 1024
+
+#: ``natural_t`` is 32-bit on macOS, including on Apple silicon.
+_NATURAL_T = ctypes.c_uint
+
+#: ``host_statistics64`` flavor selector for ``vm_statistics64_data_t``.
+_HOST_VM_INFO64 = 4
+
+
+class _VMStatistics64(ctypes.Structure):
+    """``vm_statistics64_data_t`` (``<mach/vm_statistics.h>``), in kernel order.
+
+    Declared in full even though few fields are read, so the element count handed
+    to ``host_statistics64`` is exact and the trailing fields land at the offsets
+    the kernel writes them to.
+
+    Module scope is load-bearing: ``ctypes.POINTER(T)`` memoises T in a
+    module-level dict inside ctypes that is never evicted, so declaring this
+    inside the probe would pin a fresh pair of type objects on every call.
+    """
+
+    _fields_ = [
+        ("free_count", _NATURAL_T),
+        ("active_count", _NATURAL_T),
+        ("inactive_count", _NATURAL_T),
+        ("wire_count", _NATURAL_T),
+        ("zero_fill_count", ctypes.c_uint64),
+        ("reactivations", ctypes.c_uint64),
+        ("pageins", ctypes.c_uint64),
+        ("pageouts", ctypes.c_uint64),
+        ("faults", ctypes.c_uint64),
+        ("cow_faults", ctypes.c_uint64),
+        ("lookups", ctypes.c_uint64),
+        ("hits", ctypes.c_uint64),
+        ("purges", ctypes.c_uint64),
+        ("purgeable_count", _NATURAL_T),
+        ("speculative_count", _NATURAL_T),
+        ("decompressions", ctypes.c_uint64),
+        ("compressions", ctypes.c_uint64),
+        ("swapins", ctypes.c_uint64),
+        ("swapouts", ctypes.c_uint64),
+        ("compressor_page_count", _NATURAL_T),
+        ("throttled_count", _NATURAL_T),
+        ("external_page_count", _NATURAL_T),
+        ("internal_page_count", _NATURAL_T),
+        ("total_uncompressed_pages_in_compressor", ctypes.c_uint64),
+    ]
+
+
+#: How many ``natural_t``-sized elements the kernel must report having filled
+#: before ``external_page_count`` holds anything. ``host_statistics64`` writes
+#: the count back, and an older kernel that predates the field leaves it zero --
+#: indistinguishable from "no file-backed pages" unless the count is checked.
+#: Derived from the layout so it cannot go stale if a field is added above.
+_EXTERNAL_PAGE_COUNT_ELEMENTS = (
+    _VMStatistics64.external_page_count.offset + _VMStatistics64.external_page_count.size
+) // ctypes.sizeof(ctypes.c_int)
+
+
+def macos_vm_statistics() -> "tuple[_VMStatistics64, int] | None":
+    """Mach ``host_statistics64(HOST_VM_INFO64)``, or ``None`` on any failure.
+
+    Returns the filled struct and the element count the kernel wrote back, which
+    a caller needs to know whether the trailing (later-revision) fields are
+    meaningful. macOS-only; returns ``None`` everywhere else.
+
+    Reads in-process through ``ctypes``/``libSystem`` -- **no subprocess**. That
+    is not merely faster: the macOS app sandbox can deny spawning ``vm_stat`` or
+    ``sysctl``, and this probe runs on the gateway event loop.
+    """
+    try:
+        libc = ctypes.CDLL("/usr/lib/libSystem.dylib", use_errno=True)
+    except OSError:
+        return None  # not macOS / libSystem unavailable
+
+    try:
+        libc.mach_host_self.restype = ctypes.c_uint
+        libc.mach_task_self.restype = ctypes.c_uint
+        libc.mach_port_deallocate.argtypes = [ctypes.c_uint, ctypes.c_uint]
+        libc.host_statistics64.restype = ctypes.c_int
+        libc.host_statistics64.argtypes = [
+            ctypes.c_uint,
+            ctypes.c_int,
+            ctypes.POINTER(_VMStatistics64),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        host_port = libc.mach_host_self()
+        try:
+            stats = _VMStatistics64()
+            count = ctypes.c_uint(ctypes.sizeof(_VMStatistics64) // ctypes.sizeof(ctypes.c_int))
+            kern_return = libc.host_statistics64(
+                host_port,
+                _HOST_VM_INFO64,
+                ctypes.byref(stats),
+                ctypes.byref(count),
+            )
+        finally:
+            # Release the send right from mach_host_self so the port reference is
+            # not leaked per probe. Guarded so a missing symbol still returns
+            # None cleanly below rather than raising out of a memory reading.
+            try:
+                libc.mach_port_deallocate(libc.mach_task_self(), host_port)
+            except (AttributeError, OSError, ValueError):
+                pass
+    except (AttributeError, OSError, ValueError):
+        return None
+    if kern_return != 0:  # non-zero kern_return_t -> failure
+        return None
+    return stats, int(count.value)
+
+
+def _macos_available_mib() -> int:
+    """RAM in MiB a new process can take on macOS without swapping, or 0.
+
+    macOS publishes no ``MemAvailable``; it publishes page counters, and which
+    ones count as available is a decision. Each term here is one:
+
+    * ``free_count`` ALREADY INCLUDES ``speculative_count`` -- Darwin's own
+      ``vm_stat`` prints ``free_count - speculative_count`` as its "Pages free"
+      line. Adding speculative on top double-counts it, which inflates the
+      reading on exactly the loaded machine where it must not.
+    * ``purgeable_count`` is volatile memory the kernel may drop outright, with
+      no I/O, so it is genuinely available.
+    * ``inactive_count`` is NOT all reclaimable: it mixes clean file-backed pages
+      with DIRTY ANONYMOUS pages that cannot be handed over without compressing
+      or swapping them. ``HOST_VM_INFO64`` publishes no inactive-AND-file
+      counter, so the intersection is not computable -- but
+      ``min(inactive, external_page_count)`` is an upper bound on the file-backed
+      share, and it is strictly tighter than ``inactive``. That tightening is
+      what stops a browser's gigabytes of inactive anonymous memory reading as
+      free.
+
+    Compressed pages are occupied, so the compressor counts are excluded.
+
+    ``0`` means UNKNOWN, and callers skip an unknown reading rather than treating
+    it as zero memory. A read that SUCCEEDED but computed nothing therefore
+    returns 0 too: a host with no free, purgeable or file-backed pages at all is
+    not a reading anyone should act on.
+    """
+    probe = macos_vm_statistics()
+    if probe is None:
+        return 0
+    stats, filled = probe
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, OSError, ValueError):
+        return 0
+    if page_size <= 0:
+        return 0
+    inactive = int(stats.inactive_count)
+    if filled >= _EXTERNAL_PAGE_COUNT_ELEMENTS:
+        inactive = min(inactive, int(stats.external_page_count))
+    pages = int(stats.free_count) + int(stats.purgeable_count) + inactive
+    if pages <= 0:
+        return 0
+    # max(1, ...) only after the >0 check above, so a real but sub-MiB reading
+    # stays distinguishable from "unknown".
+    return max(1, pages * page_size // _MIB_BYTES)
+
+
+def _linux_available_mib() -> int:
+    """``MemAvailable`` in MiB, or 0 when ``/proc/meminfo`` cannot be read.
+
+    The kernel's own estimate of what a new allocation can use without swapping.
+    It counts reclaimable page cache, which ``MemFree`` and ``SC_AVPHYS_PAGES``
+    both omit -- on a host that has read any files those understate badly (they
+    match ``MemFree`` exactly, measured 43,574 MiB against ``MemAvailable``'s
+    74,768 MiB on the same idle host).
+    """
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.startswith("MemAvailable:"):
+                    continue
+                # "MemAvailable:   107374182 kB" -- the unit is always kB.
+                return int(line.split()[1]) * 1024 // _MIB_BYTES
+    except (OSError, IndexError, ValueError):
+        return 0
+    return 0
+
+
+def host_total_mib() -> int:
+    """Total physical RAM in MiB, or 0 when it cannot be determined.
+
+    POSIX ``sysconf`` first, then the Win32 reading -- the same order
+    ``sandbox._default_max_memory_mb`` uses, and for the same reason: ``os.sysconf``
+    does not EXIST on Windows, so a probe written against it alone does not return a
+    conservative number there, it returns nothing. Paired with
+    :func:`host_available_mib` so both halves of a memory budget answer on every
+    platform; a budget with only one of them silently stops bounding anything.
+    """
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if pages > 0 and page_size > 0:
+            return pages * page_size // _MIB_BYTES
+    except (AttributeError, OSError, ValueError):
+        pass
+    mem = system_memory()  # GlobalMemoryStatusEx: (total, available)
+    return (mem[0] // _MIB_BYTES) if mem else 0
+
+
+def host_available_mib() -> int:
+    """RAM in MiB actually free for a new process right now, or 0 when unknown.
+
+    **MiB, not GiB, and the unit is load-bearing.** In GiB every reading under
+    1 GiB truncates to ``0``, which is also this function's "could not
+    determine" answer -- so on the starved host the reading exists to protect,
+    860 MiB free would read as "unknown" and the bound built on it would vanish.
+
+    ``0`` is returned only when the platform genuinely cannot be read, so a
+    caller can distinguish "no headroom" from "no reading" and fail open on the
+    latter.
+    """
+    if IS_LINUX:
+        return _linux_available_mib()
+    if IS_MACOS:
+        return _macos_available_mib()
+    if IS_WINDOWS:
+        mem = system_memory()  # GlobalMemoryStatusEx: (total, available)
+        return (mem[1] // _MIB_BYTES) if mem else 0
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # strftime portability
 # ---------------------------------------------------------------------------
 
@@ -3353,3 +3827,289 @@ def raise_nofile_soft_limit(target: int) -> None:
             resource.setrlimit(resource.RLIMIT_NOFILE, (min(target, hard), hard))
     except (ValueError, OSError, ImportError):
         logger.debug("Could not raise RLIMIT_NOFILE", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Windows Job objects — the cgroup-v2-scope analogue
+# ---------------------------------------------------------------------------
+# On Linux, ``sandbox.cgroup_scope_argv`` bounds an agent subprocess AND all its
+# descendants as one cgroup (``TasksMax`` = fork-bomb ceiling, ``MemoryMax`` =
+# RSS-balloon ceiling). That wrapper is a no-op on Windows (there is no systemd)
+# and logs a one-time loud SECURITY warning, so Windows had NO fork-bomb and NO
+# memory ceiling on the agent tree at all.
+#
+# A Job object is the native equivalent: limits apply to every process in the
+# job, and descendants of a job member join the job automatically. Unlike the
+# cgroup path this cannot be expressed as an argv prefix — there is no wrapper
+# binary to prepend — so it is applied to an already-spawned pid instead. See the
+# race note in :func:`apply_job_limits` for why that pid must be SUSPENDED.
+_JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008
+_JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
+# JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000) is deliberately NOT set. It would
+# terminate the agent tree as soon as the last job handle closed, changing
+# process LIFECYCLE (a gateway exit would kill running agents) rather than merely
+# adding a resource ceiling. Omitting it also means the handle need not be held:
+# a job object stays alive while processes are assigned to it, so the limits keep
+# being enforced after CloseHandle. That makes this fire-and-forget, with no
+# handle registry and no teardown semantics to get wrong.
+_JOBOBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9  # JobObjectExtendedLimitInformation
+
+
+def apply_job_limits(pid: int, *, max_procs: int, max_memory_bytes: int) -> bool:
+    """Bound *pid* and its descendants with a Windows Job object.
+
+    The Windows analogue of ``sandbox.cgroup_scope_argv``:
+
+    ==============================  ====================================
+    cgroup v2                       Job object
+    ==============================  ====================================
+    ``TasksMax`` (fork bomb)        ``ActiveProcessLimit``
+    ``MemoryMax`` (RSS balloon)     ``JobMemoryLimit``
+    ==============================  ====================================
+
+    The memory row is a true equivalent; the process row is NOT one-for-one.
+    ``TasksMax`` counts tasks — every thread — while ``ActiveProcessLimit``
+    counts processes, so the same numeric budget is a LOOSER bound here: a
+    tree of N processes holds at least N tasks and usually many more. It still
+    bounds a fork bomb, which is the control's purpose, but do not read the two
+    limits as equal strictness, and do not "fix" the gap by scaling the number
+    without deciding what a process budget should be — the units differ, so
+    there is no arithmetic conversion between them.
+
+    Enforcement is by DENIAL, matching the cgroup tier's practical behavior:
+    once ``ActiveProcessLimit`` is reached the member's ``CreateProcess`` calls
+    fail with ``ERROR_NOT_ENOUGH_QUOTA``, and an allocation past
+    ``JobMemoryLimit`` fails, rather than the tree being killed outright.
+    Nothing about process lifetime changes (see the ``KILL_ON_JOB_CLOSE`` note
+    above).
+
+    Returns ``True`` when the limits were applied. Returns ``False`` — never
+    raises — on POSIX (where ``cgroup_scope_argv`` owns this), on a non-positive
+    limit, or on any Win32 failure; the caller treats that as "no ceiling
+    enforced" exactly as it already treats the cgroup probe failing.
+
+    Race-free ONLY when paired with :data:`CREATE_SUSPENDED`. Job membership
+    covers a member's FUTURE descendants but not ones it already spawned, so
+    assigning a *running* child leaves a window in which it could have forked
+    something that escapes the job. Callers therefore create the child with
+    ``creationflags |= CREATE_SUSPENDED`` — a suspended process has executed no
+    instructions and so provably has no descendants — call this, then
+    :func:`resume_process_main_thread`. That closes the window by construction
+    rather than merely making it small. This function still works on an
+    already-running pid (the ceiling then applies from that moment on); the
+    suspended handshake is what makes it airtight.
+    """
+    if IS_POSIX:
+        return False
+    if max_procs <= 0 or max_memory_bytes <= 0:
+        logger.debug(
+            "apply_job_limits: skipping non-positive limits (procs=%s, mem=%s)",
+            max_procs,
+            max_memory_bytes,
+        )
+        return False
+    job = None
+    proc_handle = None
+    kernel32 = None
+    # pragma: no cover below — the ctypes plumbing is Windows-only, and the
+    # Windows CI shards run with --no-cov (only the Ubuntu 3.12 shards measure
+    # coverage), so these statements are unmeasurable ANYWHERE rather than
+    # merely untested. Charging them to the denominator understates the file's
+    # real rate, the same reasoning setup.cfg records for the CI-deselected
+    # suites it omits. Everything above stays measured: the POSIX early-out is
+    # exercised by test_windows_job_limits.py's ungated inertness tests, and the
+    # Windows behavior itself is asserted against the live kernel there.
+    try:  # pragma: no cover
+        _PROCESS_SET_QUOTA = 0x0100  # noqa: N806 — Windows API constant
+        _PROCESS_TERMINATE = 0x0001  # noqa: N806 — AssignProcessToJobObject needs it
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        # Anonymous job (NULL name): nothing else can open it by name.
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            logger.warning(
+                "SECURITY: CreateJobObject failed (err=%s); fork-bomb / memory-DoS "
+                "ceilings are NOT enforced for pid %d",
+                _windows_last_error(),
+                pid,
+            )
+            return False
+
+        info = _JobObjectExtendedLimitInformation()
+        info.BasicLimitInformation.LimitFlags = (
+            _JOB_OBJECT_LIMIT_ACTIVE_PROCESS | _JOB_OBJECT_LIMIT_JOB_MEMORY
+        )
+        info.BasicLimitInformation.ActiveProcessLimit = max_procs
+        info.JobMemoryLimit = max_memory_bytes
+        if not kernel32.SetInformationJobObject(
+            job,
+            _JOBOBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            logger.warning(
+                "SECURITY: SetInformationJobObject failed (err=%s); ceilings NOT "
+                "enforced for pid %d",
+                _windows_last_error(),
+                pid,
+            )
+            return False
+
+        proc_handle = kernel32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, pid)
+        if not proc_handle:
+            logger.warning(
+                "SECURITY: OpenProcess(SET_QUOTA|TERMINATE) failed for pid %d (err=%s); "
+                "ceilings NOT enforced",
+                pid,
+                _windows_last_error(),
+            )
+            return False
+        if not kernel32.AssignProcessToJobObject(job, proc_handle):
+            logger.warning(
+                "SECURITY: AssignProcessToJobObject failed for pid %d (err=%s); "
+                "ceilings NOT enforced",
+                pid,
+                _windows_last_error(),
+            )
+            return False
+        logger.info(
+            "Job object ceilings applied to pid %d (max_procs=%d, max_mem=%dMB)",
+            pid,
+            max_procs,
+            max_memory_bytes // (1024 * 1024),
+        )
+        return True
+    except Exception:
+        logger.warning("apply_job_limits failed for pid %s", pid, exc_info=True)
+        return False
+    finally:
+        # Safe to close BOTH handles: without KILL_ON_JOB_CLOSE the job object
+        # outlives our handle for as long as processes remain assigned, so the
+        # limits stay in force. Leaking these would be a per-spawn handle leak in
+        # a long-lived gateway.
+        for handle in (proc_handle, job):
+            if handle and kernel32 is not None:
+                try:
+                    kernel32.CloseHandle(handle)
+                except Exception:
+                    logger.debug("CloseHandle failed", exc_info=True)
+
+
+_TH32CS_SNAPTHREAD = 0x00000004
+_THREAD_SUSPEND_RESUME = 0x0002
+_INVALID_HANDLE_VALUE = -1
+# ResumeThread returns the thread's PREVIOUS suspend count, or (DWORD)-1 on
+# failure. Compared as an unsigned 32-bit value because the restype is DWORD.
+_RESUME_THREAD_FAILED = 0xFFFFFFFF
+
+
+def resume_process_main_thread(pid: int) -> bool:
+    """Resume every suspended thread of *pid*. Returns True iff one was resumed.
+
+    The other half of race-free Job object assignment. A child spawned with
+    :data:`CREATE_SUSPENDED` has executed no instructions, so
+    :func:`apply_job_limits` can put it in a job knowing no descendant escaped;
+    this then lets it run.
+
+    kernel32 has no ``ResumeProcess``, so the main thread has to be reached by
+    ID: snapshot the system thread list
+    (``CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)``), select entries whose
+    ``th32OwnerProcessID`` matches, and ``ResumeThread`` each. A freshly created
+    suspended process has exactly one thread, but every match is resumed rather
+    than only the first — resuming a thread that is not suspended is a harmless
+    no-op (its suspend count is already 0), whereas guessing wrong about which
+    thread is "main" would leave the process wedged forever.
+
+    Returns ``False`` — never raises — on POSIX (nothing is ever suspended there)
+    or on any Win32 failure. A ``False`` return is SERIOUS for the caller: the
+    child is alive but frozen, and the only safe response is to kill it rather
+    than let a suspended process masquerade as a running agent. See
+    ``acp.client.finish_suspended_spawn``, which implements that policy.
+    """
+    if IS_POSIX:
+        return False
+    snapshot = None
+    kernel32 = None
+    # Windows-only ctypes plumbing, unmeasurable on every runner — see the note
+    # in :func:`apply_job_limits`.
+    try:  # pragma: no cover
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)]
+        kernel32.Thread32First.restype = wintypes.BOOL
+        kernel32.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)]
+        kernel32.Thread32Next.restype = wintypes.BOOL
+        kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenThread.restype = wintypes.HANDLE
+        kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+        kernel32.ResumeThread.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPTHREAD, 0)
+        if not snapshot or snapshot == _INVALID_HANDLE_VALUE:
+            logger.error(
+                "resume_process_main_thread: thread snapshot failed for pid %d (err=%s)",
+                pid,
+                _windows_last_error(),
+            )
+            return False
+        entry = _ThreadEntry32()
+        entry.dwSize = ctypes.sizeof(_ThreadEntry32)
+        resumed = 0
+        ok = kernel32.Thread32First(snapshot, ctypes.byref(entry))
+        while ok:
+            if entry.th32OwnerProcessID == pid:
+                thread = kernel32.OpenThread(_THREAD_SUSPEND_RESUME, False, entry.th32ThreadID)
+                if thread:
+                    try:
+                        if kernel32.ResumeThread(thread) != _RESUME_THREAD_FAILED:
+                            resumed += 1
+                        else:
+                            logger.error(
+                                "ResumeThread failed for tid %d of pid %d (err=%s)",
+                                entry.th32ThreadID,
+                                pid,
+                                _windows_last_error(),
+                            )
+                    finally:
+                        kernel32.CloseHandle(thread)
+                else:
+                    logger.error(
+                        "OpenThread(SUSPEND_RESUME) failed for tid %d of pid %d (err=%s)",
+                        entry.th32ThreadID,
+                        pid,
+                        _windows_last_error(),
+                    )
+            # Thread32Next overwrites the entry, dwSize included, so it must be
+            # reset before every call or the next iteration fails.
+            entry.dwSize = ctypes.sizeof(_ThreadEntry32)
+            ok = kernel32.Thread32Next(snapshot, ctypes.byref(entry))
+        if not resumed:
+            logger.error("resume_process_main_thread: no threads resumed for pid %d", pid)
+        return resumed > 0
+    except Exception:
+        logger.error("resume_process_main_thread failed for pid %s", pid, exc_info=True)
+        return False
+    finally:
+        if snapshot and snapshot != _INVALID_HANDLE_VALUE and kernel32 is not None:
+            try:
+                kernel32.CloseHandle(snapshot)
+            except Exception:
+                logger.debug("CloseHandle(snapshot) failed", exc_info=True)

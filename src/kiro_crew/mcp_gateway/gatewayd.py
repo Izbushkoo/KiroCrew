@@ -65,6 +65,7 @@ from kiro_crew.mcp_gateway.prewarm import (
     default_hot_keys_path,
     prewarm_from_payloads,
 )
+from kiro_crew.mcp_gateway.resolve_once import resolved_launch
 from kiro_crew.mcp_gateway.rewriter import (
     env_sidecar_dir,
     env_sidecar_name,
@@ -123,10 +124,15 @@ def _emit_lazy_load_metrics(elapsed_ms: float, *, warm: bool) -> None:
 
 
 # Max bytes accepted for any single stub->gateway frame. Registration
-# payloads from the stub are well under 4 KiB; 1 MiB is a very loose cap
+# payloads from the stub are well under 4 KiB, so this is a very loose cap
 # that still guards against a malformed or hostile peer blowing memory
 # with ``readuntil(b"\n")``.
-_MAX_FRAME_BYTES = READ_BUFFER_LIMIT_BYTES  # 1 MiB; see pool.READ_BUFFER_LIMIT_BYTES
+#
+# It is the read-buffer limit: 64 MiB by default, and operator-tunable via
+# ``mcp_gateway.read_buffer_limit_bytes`` / ``KIROCREW_MCP_READ_LIMIT``. Anything
+# that materializes a frame this size -- a test, a fuzz payload -- allocates tens
+# of MiB, so build it inside the function that needs it.
+_MAX_FRAME_BYTES = READ_BUFFER_LIMIT_BYTES  # see pool.READ_BUFFER_LIMIT_BYTES
 
 # How long a connection handler waits for the first Register message
 # before giving up on an idle client. Keeps the event loop from
@@ -326,6 +332,10 @@ async def run_gatewayd(
     await transport.remove_stale(socket_path)
 
     resolver = target_resolver if target_resolver is not None else env_target_resolver
+    # Pre-resolved npm specs launch straight from the store; everything else is
+    # handed through unchanged. Wrapping an INJECTED resolver too keeps the
+    # behaviour identical whether the daemon resolves from env or a test's stub.
+    resolver = resolve_once_resolver(resolver)
     # Shared circuit breaker keyed by server name: a server
     # that crash-loops on spawn trips OPEN and get_or_create rejects further
     # spawns so the stub falls back to per-session exec instead of churning.
@@ -1116,9 +1126,7 @@ def _declared_non_secret_env(pool_key: PoolKey) -> dict[str, str]:
     BLOCKING: reads a file. Callers must run it off the event loop.
     """
     pairs = _declared_env_pairs(pool_key)
-    return {
-        k: v for k, v in non_secret_env(pairs).items() if not is_credential_env_key(k)
-    }
+    return {k: v for k, v in non_secret_env(pairs).items() if not is_credential_env_key(k)}
 
 
 def _declared_env_pairs(pool_key: PoolKey) -> dict[str, str]:
@@ -1186,11 +1194,16 @@ def _declared_env_for_private_backend(pool_key: PoolKey) -> dict[str, str]:
     another session's backend. Here the declaring session and the only consuming
     session are the same one.
 
-    Nor is this gated on ``forward_declared_env``: that switch exists to let an
-    operator accept the co-tenancy hazard for POOLED backends. Withholding the
-    env here would instead be a regression — the same server spawned without a
-    gateway gets its declared env from the agent runtime, so a private backend
-    that silently dropped it would break servers that work today.
+    Nor is this gated on ``forward_declared_env``: post-flip that switch is an
+    escape hatch for disabling forwarding fleet-wide, not a gate on accepting a
+    co-tenancy hazard — the hazard it once gated is closed by construction for
+    pooled backends (only keys inside ``effective_env_hash`` are forwarded, and
+    the coherence gate re-checks the sidecar against that hash at spawn). Note
+    the per-server opt-out is membership in ``mcp_gateway.stub_servers``, which is
+    the only stub trigger; this flag is the coarser fleet-wide spelling.
+    Withholding the env here would instead be a regression — the same server
+    spawned without a gateway gets its declared env from the agent runtime, so a
+    private backend that silently dropped it would break servers that work today.
 
     The coherence gate still applies: a sidecar edited after this session
     started yields ``{}`` rather than values the running stub never hashed.
@@ -1265,6 +1278,54 @@ def env_target_resolver(pool_key: PoolKey) -> Optional[tuple[str, list[str], dic
     # to spawn it first. The channel is delivered PER CALL instead, in
     # _meta.kirocrew.caller (see _inject_caller_meta).
     return command, args, env, pool_key.work_dir
+
+
+def _resolve_once_home() -> str:
+    """The data home whose resolve-once store this daemon reads.
+
+    Mirrors the socket-path resolution so the daemon and the gateway that filled
+    the store agree on where it lives.
+    """
+    home = os.environ.get("KIROCREW_HOME")
+    return str(Path(home) if home else _config_dir())
+
+
+def resolve_once_resolver(inner: TargetResolver) -> TargetResolver:
+    """Wrap ``inner`` so an already-resolved npm spec launches without npm.
+
+    An ``npx`` target re-asks the registry what its spec means on every launch.
+    When the gateway has pre-resolved that spec into its store, this substitutes
+    the recorded entry point, turning the launch into a plain ``node`` exec with
+    no network and no dependency resolution.
+
+    Purely a substitution: env and work_dir are whatever ``inner`` computed, so
+    the PoolKey's env hash still describes what is spawned. Anything not
+    pre-resolved -- a non-npm command, a spec never prefetched, a store entry
+    that has gone stale on disk -- passes through untouched, so this can only
+    remove work from the launch path, never add a failure to it.
+    """
+
+    def _resolver(pool_key: PoolKey) -> Optional[tuple[str, list[str], dict[str, str], str]]:
+        target = inner(pool_key)
+        if target is None:
+            return None
+        command, args, env, work_dir = target
+        try:
+            launch = resolved_launch(_resolve_once_home(), command, args)
+        except Exception:  # pragma: no cover — a store read must never break spawn
+            logger.debug("resolve-once lookup failed; using npm launcher", exc_info=True)
+            return target
+        if launch is None:
+            return target
+        resolved_command, resolved_args = launch
+        logger.info(
+            "resolve-once: %s launching pre-resolved tree instead of %s",
+            pool_key.server_name,
+            os.path.basename(command),
+        )
+        return resolved_command, resolved_args, env, work_dir
+
+    return _resolver
 
 
 # --- Connection handling ----------------------------------------------------
@@ -1930,8 +1991,7 @@ async def _handle_connection(
         peer_result = socketsec.check_peer_is_self(writer)
         if peer_result is socketsec.PeerCredResult.MISMATCH:
             logger.warning(
-                "rejecting gateway connection: peer principal is a different "
-                "user (%s)",
+                "rejecting gateway connection: peer principal is a different " "user (%s)",
                 peer_result.value,
             )
             _audit_peer_denied(f"peer principal mismatch ({peer_result.value})")
@@ -1942,7 +2002,9 @@ async def _handle_connection(
                 "this platform and socket %s is not owner-only (0600)",
                 socket_path,
             )
-            _audit_peer_denied(f"peer principal unverifiable and socket not owner-only: {socket_path}")
+            _audit_peer_denied(
+                f"peer principal unverifiable and socket not owner-only: {socket_path}"
+            )
             return
         logger.debug(
             "peer uid unverifiable on this platform; socket %s verified "
@@ -2020,7 +2082,8 @@ async def _handle_connection(
             # Audit the denial like every other app-call outcome (same SEL shape
             # as app_call.handle_app_call's allow/deny events).
             _audit(
-                "denied", "mcp-apps feature disabled",
+                "denied",
+                "mcp-apps feature disabled",
                 spool_id=str(register.get("spool_id") or ""),
                 tool=str(register.get("tool") or ""),
             )
@@ -2070,6 +2133,7 @@ async def _handle_connection(
         """
         if not exclusive_stub_uuid:
             pool.unreserve(pool_key)
+
     if not stub_uuid:
         await _write_json_line(
             writer,
@@ -2121,7 +2185,9 @@ async def _handle_connection(
                         # ``user_identity`` is the legacy spelling an older
                         # stub may still send; the field was deleted from
                         # PoolKey but stays honored here as a diagnostic.
-                        register.get("principal_id") or register.get("user_identity") or ""
+                        register.get("principal_id")
+                        or register.get("user_identity")
+                        or ""
                     ),
                     channel_id=str(register.get("channel_id") or ""),
                     from_gateway=True,
@@ -2355,7 +2421,9 @@ async def _handle_connection(
                     _acquire_t0 = time.monotonic()
                     try:
                         backend, _was_spawned = await _acquire_backend(
-                            pool, pool_key, resolver,
+                            pool,
+                            pool_key,
+                            resolver,
                             exclusive_stub_uuid=exclusive_stub_uuid,
                         )
                         # acquire-only duration, captured before the attach_stub
@@ -2455,7 +2523,9 @@ async def _handle_connection(
                 _lazy_t0 = time.monotonic()
                 try:
                     backend, _lazy_was_spawned = await _acquire_backend(
-                        pool, pool_key, resolver,
+                        pool,
+                        pool_key,
+                        resolver,
                         exclusive_stub_uuid=exclusive_stub_uuid,
                     )
                     # acquire/spawn-only duration, captured before the attach +
@@ -2640,9 +2710,7 @@ async def _handle_connection(
             if orphan is not None:
                 await orphan.shutdown(timeout=2.0)
         except Exception:
-            logger.warning(
-                "releasing private backend for stub %s failed", stub_uuid, exc_info=True
-            )
+            logger.warning("releasing private backend for stub %s failed", stub_uuid, exc_info=True)
         if writer_task is not None:
             writer_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -2694,8 +2762,7 @@ async def _acquire_backend(
         # filesystem, either of which would stall gateway traffic and heartbeat
         # processing if done inline after a config invalidation.
         declared = await asyncio.to_thread(
-            _declared_env_for_private_backend if exclusive_stub_uuid
-            else _declared_env_to_forward,
+            _declared_env_for_private_backend if exclusive_stub_uuid else _declared_env_to_forward,
             pool_key,
         )
         if declared:
@@ -2801,7 +2868,9 @@ async def _respawn_backend_for_stub(
 
     try:
         new_backend, _ = await _acquire_backend(
-            pool, pool_key, resolver,
+            pool,
+            pool_key,
+            resolver,
             # A respawn must not silently promote a private backend into the
             # shared bucket: the replacement inherits the original binding.
             exclusive_stub_uuid=stub_uuid if old_backend.exclusive_token else "",
@@ -2877,9 +2946,7 @@ async def _drain_inbox_to_stub(
                 with _counted_stub_write():
                     async with guard:
                         writer.write(payload)
-                        await asyncio.wait_for(
-                            writer.drain(), timeout=_WRITE_REPLY_TIMEOUT_SECS
-                        )
+                        await asyncio.wait_for(writer.drain(), timeout=_WRITE_REPLY_TIMEOUT_SECS)
             except (ConnectionError, BrokenPipeError):
                 # Scope E: log late responses dropped after stub detach
                 # instead of letting BrokenPipeError propagate unlogged.

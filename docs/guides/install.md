@@ -40,9 +40,9 @@ Builds use plain `pip` + `npm`/Vite + `pytest`, driven by the repo-root
 | **Node.js + npm** | Building the dashboard | `20 \|\| >= 22` (`website/package.json` `engines`); `ensure-node.sh` targets 20, and drops to 16 on Amazon Linux 2 where newer official builds need a glibc that host does not have |
 | **`kiro-cli`** | Driving the LLM | Required; see below |
 
-Node is only needed to *build* the dashboard. The prebuilt wheel, the DMG, and
-the AppImage all ship the dashboard already bundled, so end users of those
-artifacts need neither Node nor a compiler.
+Node is only needed to *build* the dashboard. The prebuilt wheel, the DMG, the
+AppImage, and the Linux `.deb` / `.rpm` packages all ship the dashboard already
+bundled, so end users of those artifacts need neither Node nor a compiler.
 
 ### Agent backend: `kiro-cli` (required)
 
@@ -85,6 +85,38 @@ config is coerced to it on load.
 
 ## Install paths
 
+### Which path on Linux
+
+**Start with the one-line install below.** It is the smoothest Linux path and
+the one that needs the fewest decisions: it puts `kirocrew` on your `PATH` at a
+stable location, which is what makes `kirocrew service install` — and therefore
+the [AppArmor profile](#linux-the-agent-sandbox-and-unprivileged-user-namespaces)
+the agent sandbox needs on Ubuntu 23.10+ — reachable in the first place. You
+work in the dashboard through your browser at `localhost:5476`.
+
+Install a **desktop package** (`.deb` / `.rpm`) *in addition* when you want the
+things only the Electron shell provides: an application-menu entry and icon, a
+native window with persisted geometry, a dock/taskbar badge, a system-wide hotkey
+to summon the dashboard, a gateway that starts and stops with the app, and
+in-app updates. The packages install to a fixed path under `/opt`, so the same
+PATH and AppArmor mechanics that make the one-line install work apply to them
+too.
+
+The **AppImage** stays available for hosts where you cannot install a system
+package (no root, an unsupported distro). It needs FUSE present, and because it
+runs from a randomized temporary mount there is no durable path to attach an
+AppArmor profile to or to point a `kirocrew` launcher at — so on a distro that
+restricts unprivileged user namespaces it needs the extra manual step described
+in the sandbox section. Prefer a package where you can.
+
+| You want | Use |
+|---|---|
+| The dashboard, a terminal, scheduled work, a server | **One-line install** (a) |
+| A desktop app on Debian/Ubuntu | **`.deb`** (d) |
+| A desktop app on Fedora / RHEL / CentOS Stream / Amazon Linux 2023 | **`.rpm`** (d) |
+| A desktop app with no root and no package manager | **AppImage** (d) |
+| A container host | **Docker** ([guide](docker.md)) |
+
 ### a. One-line install (fastest)
 
 Installs a prebuilt, sha256-verified wheel from the release CDN. No clone, no
@@ -116,17 +148,21 @@ home (`~/.kiro/crew-venv`, override with `KIROCREW_VENV`) and symlinks
 data home, so no whole-home operation can ever delete the live interpreter. The
 selected channel is recorded to `~/.kiro/crew/channel`.
 
-If the host has no Python 3.10+, the installer installs one from your distro:
-`apt` on Debian/Ubuntu (including the split `python3-venv` package), `dnf` on
-Amazon Linux / RHEL / CentOS Stream, and `yum` on CentOS 7. Where no base-repo
-package supplies 3.10+ (CentOS 7 ships 3.6, older Ubuntu 3.8) it uses an
-**already-installed** [mise](https://mise.jdx.dev/) python-build-standalone
-interpreter if you have one (it runs on the older glibc those releases carry);
-otherwise it prints how to get a newer Python and stops. The signed installer
-never pipes an unsigned third-party script into a shell — to use the mise path,
-install mise yourself first (`curl https://mise.run | sh`). When it finishes it
-prints the next step: `kirocrew gateway` to start now, or `kirocrew service
-install` to run it as a service.
+If the host has no Python 3.10+, the installer provisions one itself instead of
+touching the system: it downloads a SHA-256-pinned [uv](https://docs.astral.sh/uv/)
+binary (or uses an already-installed `uv` on `PATH`), then installs a
+[python-build-standalone](https://github.com/astral-sh/python-build-standalone)
+CPython 3.12 into a user-owned directory beside the data home
+(`~/.kiro/crew-python`, override with `KIROCREW_PYTHON_DIR`). No package
+manager, no sudo, and the prebuilt interpreter runs on old-glibc distros
+(CentOS 7) whose base repos never reach 3.10. Pass `--managed-python` (or set
+`KIROCREW_MANAGED_PYTHON=1`) to always use the uv-provisioned interpreter and
+skip the system ones entirely — useful when the system Python is fragile or
+version-managed. The signed installer never pipes an unsigned third-party
+script into a shell: uv is fetched as a tarball and verified against pinned
+digests, exactly like the wheel itself. When it finishes it prints the next
+step: `kirocrew gateway` to start now, or `kirocrew service install` to run it
+as a service.
 
 ### b. From source (development)
 
@@ -238,13 +274,11 @@ Optional extras (install with e.g. `pip install "kirocrew[voice]"`):
 | `otlp` | `opentelemetry-exporter-otlp-proto-http` | OTLP/HTTP metrics export. Installing it does not enable egress; that still needs an explicit `telemetry.otlp_endpoint` |
 | `perf` | `py-spy` | Out-of-process profiling (`kirocrew perf sample --pid`). The in-process sampler needs nothing extra |
 | `teams` | `PyJWT[crypto]` | Microsoft Teams channel (validates the inbound Bot Framework RS256 JWT) |
-| `desktop` | `pyinstaller` | Building a frozen backend from `packaging/kirocrew-backend.spec` |
 | `dev` | pytest, black, isort, flake8, mypy, ... | Contributor tooling; what `make build` installs |
 
-The `desktop` extra exists, but neither `make desktop` nor `make backend-bin`
-needs it: both run `packaging/build-desktop.sh`, which embeds a
-python-build-standalone interpreter instead of freezing one. PyInstaller is only
-required if you invoke `packaging/kirocrew-backend.spec` directly.
+`make desktop` and `make backend-bin` need no extra: both run
+`packaging/build-desktop.sh`, which provisions a python-build-standalone
+interpreter and pip-installs the project into it.
 
 ### d. Bundled desktop app
 
@@ -256,17 +290,57 @@ npm, or Node:
 make desktop
 ```
 
-Output is a DMG (plus a zip) on macOS and an AppImage on Linux, under
-`website/electron/dist/`. On macOS the default is ONE universal DMG: the
-Electron shell is lipo-merged, and the backend, which cannot be lipo-merged,
-ships as two complete PBS trees selected at launch by `process.arch`. The
-x86_64 backend is built under Rosetta 2, so a universal build needs an
-Apple-Silicon host; `UNIVERSAL=0` forces a faster host-arch-only build. Linux is
-always host-arch.
+Output is a DMG (plus a zip) on macOS, an AppImage plus a `.deb` and an `.rpm`
+on Linux, and an assisted NSIS Setup.exe on Windows, under
+`website/electron/dist/`. The macOS DMG opens to a branded
+drag-to-Applications layout carrying the opening animation's artwork. The
+Windows wizard keeps native controls and its
+per-user default while carrying matching Kiro Crew artwork through its sidebar
+and header. On macOS the default is ONE universal DMG: the Electron shell is
+lipo-merged, and the backend, which cannot be lipo-merged, ships as two complete
+PBS trees selected at launch by `process.arch`. The x86_64 backend is built
+under Rosetta 2, so a universal build needs an Apple-Silicon host;
+`UNIVERSAL=0` forces a faster host-arch-only build. Linux is always host-arch,
+and the three Linux formats come from one backend tree packaged three times.
+
+#### Installing a Linux desktop package
+
+```bash
+sudo apt install ./KiroCrew-x86_64.deb     # Debian, Ubuntu
+sudo dnf install ./KiroCrew-x86_64.rpm     # Fedora, RHEL, CentOS Stream, AL2023
+```
+
+Either one installs to `/opt/KiroCrew`, registers the application-menu entry and
+MIME database, refreshes the icon cache, links `/usr/bin/kirocrew-desktop`, and —
+on a host whose AppArmor supports the bundled profile — installs and loads the
+`userns` profile the agent sandbox needs, so no manual `sandbox install-profile`
+step is required. The fixed install path is what makes all of that durable.
+
+Updates arrive through the app (**About → Check for updates**), which downloads
+the new package and hands it to `dpkg` / `rpm`. That needs root, so expect one
+elevation prompt (`pkexec` or `sudo`) at install time — it is the package
+manager doing the write, not the app. `sudo apt remove kirocrew` /
+`sudo dnf remove kirocrew` uninstalls; see
+[Uninstalling](#uninstalling) for what happens to your data.
+
+The AppImage needs no root and no package manager, which is the reason to pick
+it, but it also needs FUSE present (`sudo dnf install fuse` on Amazon Linux
+2023, which ships without it; `--appimage-extract-and-run` is the escape hatch)
+and it runs from a randomized temporary mount, so it carries the manual
+sandbox-profile step and the move-breaks-it caveat documented in the
+[sandbox section](#linux-the-agent-sandbox-and-unprivileged-user-namespaces).
+
+All three Linux formats are built from the same glibc floor as the build runner.
+Verified requirement at the time of writing is **glibc 2.34**, which covers
+Ubuntu 22.04+, Debian 12+, Fedora, CentOS Stream 9 and Amazon Linux 2023, and
+excludes Ubuntu 20.04, Debian 11 and Amazon Linux 2 — on those, use the
+[one-line install](#a-one-line-install-fastest) instead.
 
 Prebuilt downloads for the release channels are linked from the
-[README](../../README.md#app-downloads). Windows has no desktop build yet:
-run the gateway from a source install and open the dashboard in a browser.
+[README](../../README.md#app-downloads). The Windows desktop installer remains
+a preview artifact; see [windows-install.md](windows-install.md) for its current
+publishing and signing status. The source install remains the fully supported
+Windows path.
 
 See [desktop-app.md](../build/desktop-app.md) for the full pipeline (frontend,
 PBS provisioning, pip install, pruning, electron-builder) and how the app
@@ -624,6 +698,12 @@ nothing. Run the gateway as the service instead.
 
 ### The AppImage (desktop app) needs its own profile
 
+A **`.deb` or `.rpm` install needs none of this section**: the package's
+post-install step writes and loads a `userns` profile attached to its own fixed
+path under `/opt`, so the sandbox works on a stock Ubuntu 23.10+ host with no
+manual step and nothing to re-point later. That fixed path is the whole
+difference — everything below exists because an AppImage does not have one.
+
 The profile above is applied **by systemd**, so it covers the installed service
 and nothing else. Launching the AppImage directly gives systemd no part to play:
 the app execs the bundled backend itself, so neither process gets a profile and
@@ -952,6 +1032,11 @@ For reference, the data home structure and what each uninstall path touches:
   cleanup hook.
 - The macOS DMG/zip and the Linux AppImage have no cleanup hook, so removing the
   application bundle or image leaves the data home intact.
+- A Linux `.deb` / `.rpm` removal DOES run the package's own post-remove step,
+  which drops `/usr/bin/kirocrew-desktop` and the installed AppArmor profile. It
+  deliberately leaves the data home alone: `~/.kiro/crew` holds your sessions,
+  memory and credentials, so it is yours to remove (see
+  [Removing user data](#removing-user-data)), not the package manager's.
 - App Kit uninstall preserves `apps/<name>/data/` by default. Deleting that app
   data is a separate, explicit action:
   `kirocrew app uninstall NAME --purge-data`, or unchecking **Keep app data** in
