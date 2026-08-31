@@ -127,15 +127,27 @@ def test_registering_a_backend_makes_it_survive_load() -> None:
     Ordering is the edition's to get right -- registration must precede the first
     config load.
     """
-    assert _normalize_acp_backend(ACP_BACKEND_CLAUDE) == ACP_BACKEND_KIRO
-    before = set(acp_backends._selectable)
+    # Snapshot BOTH sets (not just _selectable): this fork's own
+    # DefaultProviderRegistry registers claude unconditionally (into both
+    # _baseline and _selectable — see register_selectable_backend), so a test
+    # in the same xdist worker that already booted the default platform
+    # context leaves claude permanently registered for the rest of that
+    # worker's life. The scenario below needs "not yet registered" as its
+    # STARTING condition regardless of that prior state, and must restore
+    # whatever was actually there — not assume it was absent — when done.
+    before_baseline = set(acp_backends._baseline)
+    before_selectable = set(acp_backends._selectable)
     try:
+        acp_backends._baseline.discard(ACP_BACKEND_CLAUDE)
+        acp_backends._selectable.discard(ACP_BACKEND_CLAUDE)
+        assert _normalize_acp_backend(ACP_BACKEND_CLAUDE) == ACP_BACKEND_KIRO
         acp_backends.register_selectable_backend(ACP_BACKEND_CLAUDE)
         assert _normalize_acp_backend(ACP_BACKEND_CLAUDE) == ACP_BACKEND_CLAUDE
     finally:
+        acp_backends._baseline.clear()
+        acp_backends._baseline.update(before_baseline)
         acp_backends._selectable.clear()
-        acp_backends._selectable.update(before)
-    assert _normalize_acp_backend(ACP_BACKEND_CLAUDE) == ACP_BACKEND_KIRO
+        acp_backends._selectable.update(before_selectable)
 
 
 def test_config_load_never_reads_the_platform_context(monkeypatch) -> None:
