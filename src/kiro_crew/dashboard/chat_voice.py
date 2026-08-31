@@ -297,7 +297,14 @@ async def _synthesize_nonstreaming(
             {"slot": slot_key, "audio": audio_b64, "chunks": 1, "audioMime": "audio/wav"},
         )
 
-        # Track OpenAI TTS cost on the last assistant message's turn_stats.
+        # Track OpenAI TTS cost on the last assistant message's turn_stats, in
+        # its OWN field: `voice_cost_usd`, never `cost_usd`. The latter is the
+        # chat backend's own self-reported spend (claude_code's ACP-reported
+        # estimate) — a different bill from a different owner, and one that
+        # is not necessarily an actual dollar charge on a subscription plan,
+        # unlike this metered-per-character OpenAI cost. Merging the two under
+        # one field/label misattributed real Anthropic spend as "OpenAI $…"
+        # the moment the Claude backend became reachable.
         if _vc.provider == PROVIDER_OPENAI and slot_key:
             effective_engine = engine or _vc.default_engine
             per_char = 0.000030 if effective_engine == "tts-1-hd" else 0.000015
@@ -308,8 +315,8 @@ async def _synthesize_nonstreaming(
                     if m.get("role") == "assistant":
                         meta = m.setdefault("meta", {})
                         ts = meta.setdefault("turn_stats", {})
-                        ts["cost_usd"] = round(
-                            ts.get("cost_usd", 0.0) + tts_cost, 6
+                        ts["voice_cost_usd"] = round(
+                            ts.get("voice_cost_usd", 0.0) + tts_cost, 6
                         )
                         break
 

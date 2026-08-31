@@ -51,6 +51,27 @@ class TestAttachTurnStats:
         assert "cost_usd" not in stats
         assert stats["credits"] == 2.5
 
+    def test_pending_openai_voice_cost_lands_in_its_own_field_not_cost_usd(self):
+        # Two different bills, two different owners: the backend's own
+        # self-reported spend (cost_usd, claude_code) must never be summed
+        # with this fork's OpenAI STT/TTS metering (voice_cost_usd) — merging
+        # them under one field once misattributed real Anthropic spend to a
+        # footer line hardcoded "OpenAI $...".
+        slot = _make_slot_with_assistant_message()
+        slot._pending_stt_cost = 0.0005
+        _attach_turn_stats(slot, 8000, 0.0, 0.18)
+        stats = slot.messages[-1]["meta"]["turn_stats"]
+        assert stats["cost_usd"] == 0.18
+        assert stats["voice_cost_usd"] == 0.0005
+        # Consumed, not left to double-count a later turn.
+        assert slot._pending_stt_cost == 0.0
+
+    def test_no_pending_voice_cost_omits_the_key(self):
+        slot = _make_slot_with_assistant_message()
+        _attach_turn_stats(slot, 8000, 0.0, 0.18)
+        stats = slot.messages[-1]["meta"]["turn_stats"]
+        assert "voice_cost_usd" not in stats
+
     def test_no_elapsed_is_noop(self):
         # elapsed_ms=0 means EVENT_COMPLETE never arrived (aborted turn) —
         # nothing should be attached.

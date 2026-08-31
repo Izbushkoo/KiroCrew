@@ -720,18 +720,41 @@ describe('turn stats footer (elapsed time + credits)', () => {
     expect(text).toMatch(/^2\.50 credits ·\s*1m 24s$/)
   })
 
-  it('puts the dollar cost before the elapsed time too', () => {
+  it('puts the backend cost estimate before the elapsed time too', () => {
     render(<AssistantMessage content="done" isStreaming={false} slotRunning={false} turnStats={{ elapsed_ms: 8_400, cost_usd: 0.0231 }} />)
     const text = screen.getByTestId('turn-stats').textContent!.replace(/\s+/g, ' ').trim()
-    expect(text).toMatch(/^\$0\.02 ·\s*8\.4s$/)
+    expect(text).toMatch(/^Claude ~\$0\.02 ·\s*8\.4s$/)
   })
 
-  it('renders cost_usd when the provider bills in dollars (no credits)', () => {
+  it('renders cost_usd as the backend\'s own estimate, distinct from OpenAI', () => {
     render(<AssistantMessage content="done" isStreaming={false} slotRunning={false} turnStats={{ elapsed_ms: 8_400, cost_usd: 0.0231 }} />)
     const stats = screen.getByTestId('turn-stats')
     expect(stats).toHaveTextContent('8.4s')
-    expect(stats).toHaveTextContent('$0.02')
+    expect(stats).toHaveTextContent('Claude ~$0.02')
     expect(stats).not.toHaveTextContent('credits')
+    expect(stats).not.toHaveTextContent('OpenAI')
+  })
+
+  // Two DIFFERENT bills — see the TurnStats doc comment in AssistantMessage.tsx.
+  // Merging them under one "OpenAI $…" label (as this footer used to, before
+  // the Claude backend became reachable) misattributes real Anthropic spend
+  // to OpenAI.
+  it('shows OpenAI voice cost and the backend cost estimate as two separate items', () => {
+    render(<AssistantMessage content="done" isStreaming={false} slotRunning={false} turnStats={{ elapsed_ms: 8_400, cost_usd: 0.18, voice_cost_usd: 0.0005 }} />)
+    const stats = screen.getByTestId('turn-stats')
+    expect(stats).toHaveTextContent('OpenAI $0.0005')
+    expect(stats).toHaveTextContent('Claude ~$0.18')
+    expect(screen.getByTestId('turn-backend-cost')).toHaveAttribute(
+      'title',
+      "Anthropic's own estimate of this turn's cost. Not an actual charge on a Pro/Max/Team plan — that usage draws down your subscription's rolling quota, not dollars.",
+    )
+  })
+
+  it('renders only the OpenAI voice cost when the backend reported none', () => {
+    render(<AssistantMessage content="done" isStreaming={false} slotRunning={false} turnStats={{ elapsed_ms: 8_400, voice_cost_usd: 0.0005 }} />)
+    const stats = screen.getByTestId('turn-stats')
+    expect(stats).toHaveTextContent('OpenAI $0.0005')
+    expect(screen.queryByTestId('turn-backend-cost')).not.toBeInTheDocument()
   })
 
   it('renders elapsed alone when nothing was billed', () => {

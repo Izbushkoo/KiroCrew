@@ -9,6 +9,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_state
+from kiro_crew.dashboard.state import _ChatSlot
 
 
 def _make_voice_app(state):
@@ -431,6 +432,46 @@ class TestVoiceConfig:
         assert "voice_chunk" in kinds and "voice_complete" in kinds
         payloads = [c.args[1] for c in state.broadcast_ws.call_args_list]
         assert all(payload["audioMime"] == "audio/wav" for payload in payloads)
+
+    @pytest.mark.asyncio
+    async def test_openai_tts_cost_lands_in_voice_cost_usd_not_cost_usd(self, tmp_path, monkeypatch):
+        # Two different bills, two different owners: OpenAI TTS is this fork's
+        # own metered cost (always real, always dollars), never the same field
+        # as the ACP backend's own self-reported spend (claude_code) — merging
+        # them once misattributed real Anthropic spend to a footer line
+        # hardcoded "OpenAI $...".
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        mock_vc = MagicMock(
+            provider="openai", default_voice="alloy", default_engine="tts-1",
+            default_rate="100%", default_pitch="0%", aws_profile="", region="",
+            piper_binary="", piper_model="", piper_model_config="", piper_length_scale=1.0,
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
+
+        wav = tmp_path / "out.wav"
+        wav.write_bytes(b"RIFF....WAVEfake-audio-bytes")
+
+        async def _fake_synth(text, **kw):
+            return str(wav)
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice.synthesize_speech", _fake_synth)
+
+        state = _make_state(tmp_path)
+        state.broadcast_ws = MagicMock()
+        slot = _ChatSlot("s1")
+        slot.append("assistant", "done.", "msg msg-a", broadcast=False)
+        # A backend cost already on the turn (e.g. claude_code) must survive
+        # untouched -- the TTS cost is additive on its OWN field only.
+        slot.messages[-1]["meta"] = {"turn_stats": {"elapsed_ms": 1000, "cost_usd": 0.18}}
+        state._slots["s1"] = slot
+
+        async with TestClient(TestServer(_make_voice_app(state))) as client:
+            resp = await client.post("/api/voice/synthesize", json={"text": "hello there", "slot": "s1"})
+            assert resp.status == 200
+
+        stats = slot.messages[-1]["meta"]["turn_stats"]
+        assert stats["cost_usd"] == 0.18  # untouched
+        assert stats["voice_cost_usd"] == round(len("hello there") * 0.000015, 6)
 
     @pytest.mark.asyncio
     async def test_put_config_invalid_json(self, tmp_path, monkeypatch):

@@ -1401,12 +1401,24 @@ def _attach_turn_stats(
 
     ``elapsed_ms`` is the turn wall clock (or the provider-reported duration
     when available); ``credits`` is kiro-cli's per-turn ``meteringUsage`` sum;
-    ``cost_usd`` is claude_code's API-reported cost. ``model`` is what served
-    this turn (``read_turn_model``): a concrete id on a pinned session, or the
-    bare ``"auto"`` when the turn was handed to Auto and the backend disclosed
-    no id for it — Auto's per-turn choice is not on the ACP wire, so ``"auto"``
-    is the whole of what can be said truthfully. Zero/empty fields are omitted
-    so the frontend renders only what the provider actually reported.
+    ``cost_usd`` is claude_code's own API-reported spend for the turn — an
+    Anthropic-computed ESTIMATE, not necessarily an actual dollar charge (a
+    Pro/Max/Team plan draws usage from a rolling quota instead). ``model`` is
+    what served this turn (``read_turn_model``): a concrete id on a pinned
+    session, or the bare ``"auto"`` when the turn was handed to Auto and the
+    backend disclosed no id for it — Auto's per-turn choice is not on the ACP
+    wire, so ``"auto"`` is the whole of what can be said truthfully.
+    Zero/empty fields are omitted so the frontend renders only what the
+    provider actually reported.
+
+    ``voice_cost_usd`` (this fork's own OpenAI STT/TTS metering, accumulated
+    on ``slot._pending_stt_cost`` before this call and by ``chat_voice.py``
+    after it) is a SEPARATE, always-real, always-billed-in-dollars figure —
+    kept out of ``cost_usd`` on purpose so the two are never summed under one
+    label. They used to share the field, which was harmless only because the
+    Claude backend was unreachable in the public build and OpenAI voice was
+    the sole contributor; once Claude became selectable, the merge started
+    misattributing real Anthropic spend to OpenAI.
 
     ``turn_boundary`` is ``len(slot.messages)`` captured at turn start: only
     messages appended DURING this turn are candidates. Without it, an
@@ -1417,16 +1429,18 @@ def _attach_turn_stats(
     """
     if elapsed_ms <= 0:
         return
-    # Include any pending OpenAI STT cost accumulated before this turn.
-    pending_stt = getattr(slot, "_pending_stt_cost", 0.0)
-    if pending_stt > 0:
-        cost_usd = cost_usd + pending_stt
+    # Include any pending OpenAI STT cost accumulated before this turn — its
+    # OWN field, never merged into cost_usd (see the docstring).
+    voice_cost_usd = getattr(slot, "_pending_stt_cost", 0.0)
+    if voice_cost_usd > 0:
         slot._pending_stt_cost = 0.0
     stats: dict[str, Any] = {"elapsed_ms": int(elapsed_ms)}
     if credits > 0:
         stats["credits"] = round(credits, 4)
     if cost_usd > 0:
         stats["cost_usd"] = round(cost_usd, 6)
+    if voice_cost_usd > 0:
+        stats["voice_cost_usd"] = round(voice_cost_usd, 6)
     if model:
         stats["model"] = model
     boundary = max(0, turn_boundary)

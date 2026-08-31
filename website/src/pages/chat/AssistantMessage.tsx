@@ -25,8 +25,20 @@ import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 /** Per-turn stats attached by the backend to the last assistant message of a
  *  completed turn (chat_runner._attach_turn_stats). Parity with the end-of-turn
  *  line kiro-cli prints natively: elapsed wall clock + credits (kiro) or
- *  API cost (claude_code). Zero fields are omitted by the backend. */
-export interface TurnStats { elapsed_ms: number; credits?: number; cost_usd?: number; model?: string }
+ *  API cost (claude_code). Zero fields are omitted by the backend.
+ *
+ *  `cost_usd` and `voice_cost_usd` are two DIFFERENT bills and must never be
+ *  summed or shown under one label: `cost_usd` is the ACP backend's own
+ *  self-reported spend (claude_code today) — an Anthropic-computed estimate
+ *  that is NOT an actual charge on a Pro/Max/Team subscription, where usage
+ *  draws down a rolling quota instead of dollars. `voice_cost_usd` is this
+ *  fork's own OpenAI STT/TTS metering (chat_voice.py / transcribe.py) — a
+ *  real, always-billed-in-dollars API cost, regardless of which chat backend
+ *  is active. They used to be merged into one `cost_usd` field labeled
+ *  "OpenAI $…" unconditionally, which was harmless only because Claude was
+ *  unreachable in the public build; the moment it became selectable, that
+ *  label started misattributing real Anthropic spend to OpenAI. */
+export interface TurnStats { elapsed_ms: number; credits?: number; cost_usd?: number; voice_cost_usd?: number; model?: string }
 
 /** Trim a served model id to a compact footer label: drop region/vendor
  *  routing prefixes ("global.anthropic.claude-opus-4-8[1m]" → "claude-opus-4-8[1m]").
@@ -238,10 +250,14 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
     if (!turnStats) return undefined
     const elapsed = fmtTurnElapsed(turnStats.elapsed_ms)
     const hasCredits = (turnStats.credits ?? 0) > 0
-    const hasCost = (turnStats.cost_usd ?? 0) > 0
+    // The tooltip sentence states one combined figure — the per-source
+    // breakdown (OpenAI vs. the backend's own estimate) lives in the footer
+    // line itself, which is always visible, not hidden behind a hover.
+    const totalCostUsd = (turnStats.cost_usd ?? 0) + (turnStats.voice_cost_usd ?? 0)
+    const hasCost = totalCostUsd > 0
     const credits = hasCredits ? fmtCredits(turnStats.credits!) : ''
     const cost = hasCost
-      ? fmtCurrency(turnStats.cost_usd!, 'USD', { maximumFractionDigits: 4, minimumFractionDigits: 4 })
+      ? fmtCurrency(totalCostUsd, 'USD', { maximumFractionDigits: 4, minimumFractionDigits: 4 })
       : ''
     const base = hasCredits && hasCost ? i18nT('pages.chat.assistantMessage.turn_took_credits_cost', { elapsed, credits, cost })
       : hasCredits ? i18nT('pages.chat.assistantMessage.turn_took_credits', { elapsed, credits })
@@ -290,16 +306,32 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
             the credit figure. */}
         {(() => {
           const credits = turnStats.credits ?? 0
-          const cost = turnStats.cost_usd ?? 0
+          // Two DIFFERENT bills — see the TurnStats doc comment. Never
+          // summed and never sharing a label: voice_cost_usd is this fork's
+          // own OpenAI STT/TTS metering (real, always billed in dollars);
+          // cost_usd is the chat backend's own self-reported spend (Claude
+          // today) — an estimate, not necessarily an actual charge on a
+          // subscription plan.
+          const voiceCost = turnStats.voice_cost_usd ?? 0
+          const backendCost = turnStats.cost_usd ?? 0
+          const fmt = (n: number) => `$${n < 0.01 ? n.toFixed(4) : n.toFixed(2)}`
           const items: string[] = []
           if (credits > 0) items.push(`${fmtCredits(credits)} credits`)
-          if (cost > 0) items.push(`OpenAI $${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(2)}`)
+          if (voiceCost > 0) items.push(`OpenAI ${fmt(voiceCost)}`)
           const billed = items.join(' · ')
           return <>
             {/* Model leads (what served), then cost (what it took), then time.
                 Trimmed for width; the untrimmed id is in the footer tooltip. */}
             {turnStats.model && <span className="font-mono" data-testid="turn-model">{fmtTurnModel(turnStats.model)} ·</span>}
             {billed && <span>{billed} ·</span>}
+            {backendCost > 0 && (
+              <span
+                data-testid="turn-backend-cost"
+                title={i18nT('pages.chat.assistantMessage.backend_cost_estimate_note')}
+              >
+                {i18nT('pages.chat.assistantMessage.backend_cost_estimate', { cost: fmt(backendCost) })} ·
+              </span>
+            )}
             <Clock size={11} aria-hidden="true" />
             <span>{fmtTurnElapsed(turnStats.elapsed_ms)}</span>
           </>

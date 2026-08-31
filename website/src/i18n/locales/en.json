@@ -5816,6 +5816,8 @@
       },
       "assistantMessage": {
         "applied_to_tasks": "Applied to Tasks",
+        "backend_cost_estimate": "Claude ~{{cost}}",
+        "backend_cost_estimate_note": "Anthropic's own estimate of this turn's cost. Not an actual charge on a Pro/Max/Team plan — that usage draws down your subscription's rolling quota, not dollars.",
         "copy": "Copy",
         "copy_link_to_message": "Copy link to message",
         "fork_conversation_from_here": "Fork conversation from here",
