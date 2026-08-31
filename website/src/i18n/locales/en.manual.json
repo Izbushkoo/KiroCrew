@@ -1258,6 +1258,20 @@
       "no_matches_ctrl_enter_sends": "No matching files — Ctrl+Enter sends the message",
       "no_matches_enter_sends": "No matching files — Enter sends the message"
     },
+    "claudeAccountModal": {
+      "checking_usage": "Checking usage…",
+      "claude_account": "Claude Account",
+      "disclaimer": "This is this fork's own estimate of what claude_code reported for messages sent through it — not a remaining-quota reading. {{productName}} cannot obtain your account's actual limits or full spend history; check console.anthropic.com for those.",
+      "estimated_spend": "Estimated spend (this install)",
+      "limit_approaching": "Approaching a Claude usage limit",
+      "limit_reached": "Claude usage limit reached",
+      "open_console": "Open Anthropic console",
+      "tracking_since": "Tracking since",
+      "usage_unavailable": "Usage unavailable",
+      "utilization_pct": "{{pct}}% used",
+      "window_five_hour": "5-hour window",
+      "window_seven_day": "7-day window"
+    },
     "kiroAccountModal": {
       "account_details_unavailable": "Account details unavailable",
       "checking_account": "Checking account…",
@@ -2493,21 +2507,6 @@
       "subtitle": "Start from a pre-made schedule — you review and save before anything runs.",
       "title": "Schedule templates",
       "use_template": "Use the {{title}} template"
-    },
-    "mobileSyncModal": {
-      "title": "Mobile Sync",
-      "dialog_label": "Mobile Sync Dialog",
-      "close": "Close",
-      "fetch_error": "Failed to load sync info: {{error}}",
-      "secure_badge": "Secure global connection (4G/5G/Wi-Fi)",
-      "tunnel_unavailable": "Secure tunnel is not available. Please check your Cloudflare Tunnel configuration.",
-      "qr_label": "QR code for connecting your smartphone",
-      "copy_link": "Copy link",
-      "copied": "Copied!",
-      "install_title": "📱 Android Installation Steps:",
-      "install_step_1": "Point your smartphone camera at the QR code and open the link.",
-      "install_step_2": "In Chrome menu (3 dots), tap \"Add to Home screen\".",
-      "install_step_3": "A KiroCrew app icon will appear on your home screen."
     },
     "skillsMultiSelect": {
       "add_skill": "Add skill",
@@ -4993,6 +4992,7 @@
         "faster": "Faster",
         "fastest": "Fastest",
         "normal": "Normal",
+        "openai_tts_cloud": "OpenAI TTS (Cloud)",
         "piper_local_offline": "Piper (local, offline)",
         "slow": "Slow",
         "slower": "Slower",

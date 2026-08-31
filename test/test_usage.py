@@ -19,6 +19,7 @@ from kiro_crew.dashboard.handlers.usage import (
     _cached_parse_sessions,
     _parse_sessions,
     _parse_token_history,
+    api_claude_usage,
     api_kiro_usage,
     get_usage_cache,
     persist_token_record,
@@ -361,6 +362,55 @@ class TestApiKiroUsage:
                 resp = await client.get("/api/usage/kiro")
                 data = await resp.json()
                 assert data["billing"] == {}
+
+
+class TestApiClaudeUsage:
+    """GET /api/usage/claude — this fork's own Claude-backend usage view.
+
+    Never owner-gated (same as api_kiro_usage), so no auth setup here — see
+    the handler's own docstring for why: this is local, self-written
+    telemetry, not host-configuration state.
+    """
+
+    @pytest.mark.asyncio
+    async def test_zero_baseline_with_no_rate_limit_signal(self, tmp_path, monkeypatch):
+        from kiro_crew import claude_usage as claude_usage_mod
+        from kiro_crew.acp import client as acp_client_module
+
+        monkeypatch.setattr(claude_usage_mod, "config_dir", lambda: tmp_path)
+        monkeypatch.setattr(acp_client_module, "_last_claude_rate_limit", None)
+
+        app = web.Application()
+        app.router.add_get("/api/usage/claude", api_claude_usage)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/usage/claude")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data == {
+                "total_cost_usd": 0.0,
+                "since": None,
+                "rate_limit": None,
+                "console_url": "https://console.anthropic.com/settings/usage",
+            }
+
+    @pytest.mark.asyncio
+    async def test_reports_the_persisted_total_and_the_live_rate_limit_signal(self, tmp_path, monkeypatch):
+        from kiro_crew import claude_usage as claude_usage_mod
+        from kiro_crew.acp import client as acp_client_module
+
+        monkeypatch.setattr(claude_usage_mod, "config_dir", lambda: tmp_path)
+        claude_usage_mod.record_cost(0.42)
+        rate_limit = {"status": "allowed_warning", "utilization": 91.0}
+        monkeypatch.setattr(acp_client_module, "_last_claude_rate_limit", rate_limit)
+
+        app = web.Application()
+        app.router.add_get("/api/usage/claude", api_claude_usage)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/usage/claude")
+            data = await resp.json()
+            assert data["total_cost_usd"] == 0.42
+            assert data["since"] is not None
+            assert data["rate_limit"] == rate_limit
 
 
 # ── _parse_token_history ─────────────────────────────────────────────────

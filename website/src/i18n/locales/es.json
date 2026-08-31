@@ -7734,6 +7734,20 @@
       "copy_failed_select_the_link_and_copy_it_manually": "No se pudo copiar: selecciona el enlace y cópialo manualmente.",
       "could_not_create_a_link_try_again": "No se pudo crear el enlace: inténtalo de nuevo.",
       "phone_connection_is_disabled_by_policy_on_this_dep": "La conexión del teléfono está deshabilitada por política en esta implementación."
+    },
+    "claudeAccountModal": {
+      "checking_usage": "Checking usage…",
+      "claude_account": "Claude Account",
+      "disclaimer": "This is this fork's own estimate of what claude_code reported for messages sent through it — not a remaining-quota reading. {{productName}} cannot obtain your account's actual limits or full spend history; check console.anthropic.com for those.",
+      "estimated_spend": "Estimated spend (this install)",
+      "limit_approaching": "Approaching a Claude usage limit",
+      "limit_reached": "Claude usage limit reached",
+      "open_console": "Open Anthropic console",
+      "tracking_since": "Tracking since",
+      "usage_unavailable": "Usage unavailable",
+      "utilization_pct": "{{pct}}% used",
+      "window_five_hour": "5-hour window",
+      "window_seven_day": "7-day window"
     }
   },
   "hooks": {
@@ -8762,7 +8776,9 @@
         "needs_active_chat": "Disponible cuando esta conversación termine de abrirse",
         "needs_earlier_history_count_one": "Selecciona para cargar el historial anterior: queda {{count}} mensaje anterior",
         "needs_earlier_history_count_many": "Selecciona para cargar el historial anterior: quedan {{count}} mensajes anteriores",
-        "needs_earlier_history_count_other": "Selecciona para cargar el historial anterior: quedan {{count}} mensajes anteriores"
+        "needs_earlier_history_count_other": "Selecciona para cargar el historial anterior: quedan {{count}} mensajes anteriores",
+        "backend_cost_estimate": "Claude ~{{cost}}",
+        "backend_cost_estimate_note": "Anthropic's own estimate of this turn's cost. Not an actual charge on a Pro/Max/Team plan — that usage draws down your subscription's rolling quota, not dollars."
       },
       "chatFooter": {
         "compacting": "Compactando…",
@@ -9909,7 +9925,10 @@
         "new_sessions_use_this_agent_a_session_that_is_al": "Las sesiones nuevas usan este agente. Una sesión ya abierta conserva el agente con el que se inició: cambiarlo aquí no la modifica a mitad de sesión.",
         "not_enabled_in_this_build": "No habilitado en esta compilación",
         "retry": "Reintentar",
-        "set_is_fixed_at_gateway_start": "Qué agentes aparecen aquí se decide al iniciar el gateway. Una implementación gestionada puede restringir el conjunto por política; editar esa política surte efecto en el siguiente inicio."
+        "set_is_fixed_at_gateway_start": "Qué agentes aparecen aquí se decide al iniciar el gateway. Una implementación gestionada puede restringir el conjunto por política; editar esa política surte efecto en el siguiente inicio.",
+        "install": "Install",
+        "install_failed": "Install failed.",
+        "install_for": "Install {{agent}}"
       },
       "featurePreviewsTab": {
         "crew": "Crew",
@@ -12989,7 +13008,8 @@
         "speed": "Velocidad",
         "text_to_speech": "Texto a voz",
         "us_east_1": "us-east-1",
-        "voice": "Voz"
+        "voice": "Voz",
+        "openai_tts_cloud": "OpenAI TTS (Cloud)"
       },
       "weComPanel": {
         "allow_all_bypass_note": "La opción de permitir a todos está activada: se omite la lista de userid de arriba. Se conserva para cuando vuelvas a desactivarla.",

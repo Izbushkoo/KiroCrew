@@ -494,6 +494,7 @@ from kiro_crew.dashboard.handlers.updates import (  # noqa: E402, F401
     install_log_ring_handler,
 )
 from kiro_crew.dashboard.handlers.usage import (  # noqa: E402, F401
+    api_claude_usage,
     api_kiro_usage,
     api_usage,
 )

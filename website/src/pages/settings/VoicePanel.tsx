@@ -29,7 +29,7 @@ const PROVIDER_OPTIONS = ['piper', 'polly', 'openai']
 const PROVIDER_LABEL_KEY: Record<string, string> = {
   piper: 'pages.settings.voicePanel.piper_local_offline',
   polly: 'pages.settings.voicePanel.amazon_polly_cloud',
-  openai: 'OpenAI TTS (Cloud)',
+  openai: 'pages.settings.voicePanel.openai_tts_cloud',
 }
 
 // Piper speed is controlled by length_scale (lower = faster). Map friendly

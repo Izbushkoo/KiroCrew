@@ -7522,6 +7522,20 @@
       "copy_failed_select_the_link_and_copy_it_manually": "コピーできませんでした。リンクを選択して手動でコピーしてください。",
       "could_not_create_a_link_try_again": "リンクを作成できませんでした。再試行してください。",
       "phone_connection_is_disabled_by_policy_on_this_dep": "このデプロイメントでは、ポリシーにより電話の接続が無効になっています。"
+    },
+    "claudeAccountModal": {
+      "checking_usage": "Checking usage…",
+      "claude_account": "Claude Account",
+      "disclaimer": "This is this fork's own estimate of what claude_code reported for messages sent through it — not a remaining-quota reading. {{productName}} cannot obtain your account's actual limits or full spend history; check console.anthropic.com for those.",
+      "estimated_spend": "Estimated spend (this install)",
+      "limit_approaching": "Approaching a Claude usage limit",
+      "limit_reached": "Claude usage limit reached",
+      "open_console": "Open Anthropic console",
+      "tracking_since": "Tracking since",
+      "usage_unavailable": "Usage unavailable",
+      "utilization_pct": "{{pct}}% used",
+      "window_five_hour": "5-hour window",
+      "window_seven_day": "7-day window"
     }
   },
   "hooks": {
@@ -8516,7 +8530,9 @@
         "needs_earlier_history": "選択すると以前の履歴を次の1ページ分読み込みます",
         "more_actions": "その他の操作",
         "needs_active_chat": "このチャットを開き終えると利用できます",
-        "needs_earlier_history_count_other": "選択すると以前の履歴を読み込みます（残り{{count}}件）"
+        "needs_earlier_history_count_other": "選択すると以前の履歴を読み込みます（残り{{count}}件）",
+        "backend_cost_estimate": "Claude ~{{cost}}",
+        "backend_cost_estimate_note": "Anthropic's own estimate of this turn's cost. Not an actual charge on a Pro/Max/Team plan — that usage draws down your subscription's rolling quota, not dollars."
       },
       "chatFooter": {
         "compacting": "コンパクト中…",
@@ -9617,7 +9633,10 @@
         "new_sessions_use_this_agent_a_session_that_is_al": "新しいセッションはこのエージェントを使用します。すでに開いているセッションは開始時のエージェントを維持し、ここで切り替えてもセッション中に変わることはありません。",
         "not_enabled_in_this_build": "このビルドでは有効になっていません",
         "retry": "再試行",
-        "set_is_fixed_at_gateway_start": "ここに表示されるエージェントは gateway の起動時に決まります。管理された環境ではポリシーで対象を制限できます。ポリシーの変更は次回の起動時に反映されます。"
+        "set_is_fixed_at_gateway_start": "ここに表示されるエージェントは gateway の起動時に決まります。管理された環境ではポリシーで対象を制限できます。ポリシーの変更は次回の起動時に反映されます。",
+        "install": "Install",
+        "install_failed": "Install failed.",
+        "install_for": "Install {{agent}}"
       },
       "featurePreviewsTab": {
         "crew": "Crew",
@@ -12652,7 +12671,8 @@
         "speed": "速度",
         "text_to_speech": "テキスト音声変換",
         "us_east_1": "us-east-1",
-        "voice": "音声"
+        "voice": "音声",
+        "openai_tts_cloud": "OpenAI TTS (Cloud)"
       },
       "weComPanel": {
         "allow_all_bypass_note": "すべて許可がオンになっています。上記のユーザーIDリストはスキップされます。戻すときのために保持されています。",

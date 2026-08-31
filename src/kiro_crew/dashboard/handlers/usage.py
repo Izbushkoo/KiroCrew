@@ -1973,3 +1973,52 @@ async def api_kiro_usage(request: web.Request) -> web.Response:
 async def api_usage(request: web.Request) -> web.Response:
     """GET /api/usage — usage stats for the kiro-cli (KiroACP) provider."""
     return await api_kiro_usage(request)
+
+
+#: Where a human checks the ACTUAL subscription/API usage this endpoint
+#: cannot answer — see api_claude_usage's docstring.
+_CLAUDE_CONSOLE_USAGE_URL = "https://console.anthropic.com/settings/usage"
+
+
+async def api_claude_usage(request: web.Request) -> web.Response:
+    """GET /api/usage/claude — this fork's own Claude-backend usage view.
+
+    Two facts, from two different sources, neither of which is "remaining
+    quota" — that number does not exist anywhere this codebase can reach (no
+    documented, scriptable claude-agent-acp/SDK surface exposes it; see
+    ``docs/system-specs/features/claude-code-provider.md`` and
+    ``claude_usage.py``'s module docstring):
+
+    * ``total_cost_usd`` / ``since`` — this install's own running total of
+      claude_code's self-reported per-turn cost (``claude_usage.py``,
+      persisted). An Anthropic ESTIMATE, not necessarily an actual charge on
+      a Pro/Max/Team plan, and scoped to what THIS install has observed —
+      never the account's full history.
+    * ``rate_limit`` — the most recent real, Anthropic-sourced quota signal
+      this process has seen (``acp.client.get_last_claude_rate_limit``), or
+      None if none has arrived yet (which is the common case: the adapter
+      reports it sparsely, mainly near a warning/reject threshold — absence
+      here does not mean "no limit in effect").
+
+    ``console_url`` always points at Anthropic's own usage page: it is the
+    only place either of the two facts above can be verified against the
+    real account state, and the frontend links to it for exactly that
+    reason — this endpoint's disclaimer text depends on that link existing.
+
+    Never owner-gated, same as ``api_kiro_usage``: this is read-only local
+    telemetry (a small JSON file this process itself wrote, plus in-memory
+    state), not host-configuration state.
+    """
+    from kiro_crew.acp.client import get_last_claude_rate_limit
+    from kiro_crew.claude_usage import read_usage
+
+    usage = read_usage()
+    rate_limit = get_last_claude_rate_limit()
+    return web.json_response(
+        {
+            "total_cost_usd": usage["total_cost_usd"],
+            "since": usage["since"],
+            "rate_limit": rate_limit,
+            "console_url": _CLAUDE_CONSOLE_USAGE_URL,
+        }
+    )

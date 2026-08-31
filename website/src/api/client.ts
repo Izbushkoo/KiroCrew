@@ -1811,6 +1811,37 @@ export interface KiroCreditUsage {
   startUrl?: string
 }
 
+/**
+ * Real, Anthropic-sourced quota signal (`GET /api/usage/claude`'s
+ * `rate_limit`) — NOT an estimate, unlike `ClaudeUsage.totalCostUsd`. Absent
+ * (the payload's `rate_limit` is null) is the common case: the adapter
+ * reports this sparsely, mainly near a warning/reject threshold, so absence
+ * means "nothing to report right now", not "no limit in effect".
+ */
+export interface ClaudeRateLimit {
+  status: 'allowed' | 'allowed_warning' | 'rejected'
+  /** Percentage of the window used, 0-100, when the adapter included it. */
+  utilization?: number
+  /** Epoch seconds when the window resets, when the adapter included it. */
+  resetsAt?: number
+  /** e.g. 'five_hour', 'seven_day'. */
+  rateLimitType?: string
+}
+
+/**
+ * `GET /api/usage/claude` — see `claude_usage.py`'s module docstring and
+ * `api_claude_usage`'s docstring for why this is a spend ESTIMATE plus a
+ * sparse rate-limit signal, never a "remaining quota" reading (that number
+ * is not obtainable through any surface this codebase can reach).
+ */
+export interface ClaudeUsage {
+  totalCostUsd: number
+  /** Epoch seconds this install's running total started counting from, or undefined if nothing has been recorded yet. */
+  since?: number
+  rateLimit: ClaudeRateLimit | null
+  consoleUrl: string
+}
+
 export interface KasLoginStatus {
   authenticated: boolean
   /** Provider of the active sign-in (e.g. 'google', 'github', 'builder_id'), null when signed out. */
@@ -2354,6 +2385,24 @@ export const api = {
     history: { t: number; mb: number }[]
   }>,
   sessionsUsage: () => fetch('/api/sessions/usage').then(j) as Promise<{ usage?: KiroUsagePayload }>,
+  claudeUsage: () => fetch('/api/usage/claude').then(j).then((d: {
+    total_cost_usd: number
+    since: number | null
+    rate_limit: { status: string; utilization?: number; resets_at?: number; rate_limit_type?: string } | null
+    console_url: string
+  }): ClaudeUsage => ({
+    totalCostUsd: d.total_cost_usd,
+    since: d.since ?? undefined,
+    rateLimit: d.rate_limit && ['allowed', 'allowed_warning', 'rejected'].includes(d.rate_limit.status)
+      ? {
+          status: d.rate_limit.status as ClaudeRateLimit['status'],
+          utilization: d.rate_limit.utilization,
+          resetsAt: d.rate_limit.resets_at,
+          rateLimitType: d.rate_limit.rate_limit_type,
+        }
+      : null,
+    consoleUrl: d.console_url,
+  })),
   providerUsage: () => fetch('/api/usage').then(j),
   mcpProbeCache: () => fetch('/api/mcp/probe').then(j),
   // Agents

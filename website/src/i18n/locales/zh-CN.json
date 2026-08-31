@@ -7522,6 +7522,20 @@
       "copy_failed_select_the_link_and_copy_it_manually": "复制失败，请选中链接后手动复制。",
       "could_not_create_a_link_try_again": "无法创建链接，请重试。",
       "phone_connection_is_disabled_by_policy_on_this_dep": "此部署已通过策略禁用手机连接。"
+    },
+    "claudeAccountModal": {
+      "checking_usage": "Checking usage…",
+      "claude_account": "Claude Account",
+      "disclaimer": "This is this fork's own estimate of what claude_code reported for messages sent through it — not a remaining-quota reading. {{productName}} cannot obtain your account's actual limits or full spend history; check console.anthropic.com for those.",
+      "estimated_spend": "Estimated spend (this install)",
+      "limit_approaching": "Approaching a Claude usage limit",
+      "limit_reached": "Claude usage limit reached",
+      "open_console": "Open Anthropic console",
+      "tracking_since": "Tracking since",
+      "usage_unavailable": "Usage unavailable",
+      "utilization_pct": "{{pct}}% used",
+      "window_five_hour": "5-hour window",
+      "window_seven_day": "7-day window"
     }
   },
   "hooks": {
@@ -8516,7 +8530,9 @@
         "needs_earlier_history": "选择以加载下一页更早的历史记录",
         "more_actions": "更多操作",
         "needs_active_chat": "此对话完成打开后可用",
-        "needs_earlier_history_count_other": "选择以加载更早的历史记录 — 还剩 {{count}} 条更早的消息"
+        "needs_earlier_history_count_other": "选择以加载更早的历史记录 — 还剩 {{count}} 条更早的消息",
+        "backend_cost_estimate": "Claude ~{{cost}}",
+        "backend_cost_estimate_note": "Anthropic's own estimate of this turn's cost. Not an actual charge on a Pro/Max/Team plan — that usage draws down your subscription's rolling quota, not dollars."
       },
       "chatFooter": {
         "compacting": "压缩中…",
@@ -9617,7 +9633,10 @@
         "new_sessions_use_this_agent_a_session_that_is_al": "新会话使用此代理。已打开的会话保持启动时所用的代理；在此切换不影响正在进行的会话。",
         "not_enabled_in_this_build": "此版本中未启用",
         "retry": "重试",
-        "set_is_fixed_at_gateway_start": "此处显示哪些 agent 在 gateway 启动时确定。受管部署可通过策略限制该集合；修改策略需下次启动才生效。"
+        "set_is_fixed_at_gateway_start": "此处显示哪些 agent 在 gateway 启动时确定。受管部署可通过策略限制该集合；修改策略需下次启动才生效。",
+        "install": "Install",
+        "install_failed": "Install failed.",
+        "install_for": "Install {{agent}}"
       },
       "featurePreviewsTab": {
         "crew": "Crew",
@@ -12652,7 +12671,8 @@
         "speed": "速度",
         "text_to_speech": "文字转语音",
         "us_east_1": "us-east-1",
-        "voice": "语音"
+        "voice": "语音",
+        "openai_tts_cloud": "OpenAI TTS (Cloud)"
       },
       "weComPanel": {
         "allow_all_bypass_note": "已开启全部允许：上方的 userid 列表不再生效。它会保留下来，方便你切换回去。",

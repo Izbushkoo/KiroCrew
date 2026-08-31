@@ -8795,6 +8795,14 @@ async def _run_chat(
                 turn_boundary=_turn_msg_boundary,
                 model=_turn_model,
             )
+            # Fold this turn's Claude-reported cost into the install-wide
+            # running total the account chip reads (GET /api/usage/claude).
+            # Off-loop: small JSON read-modify-write. Best-effort — a failed
+            # persist must not fail the turn that already succeeded.
+            if _turn_cost_usd > 0:
+                from kiro_crew.claude_usage import record_cost
+
+                await asyncio.to_thread(record_cost, _turn_cost_usd)
             # Attach accumulated file changes to last assistant message before persist
             _flush_file_changes(slot)
             # Save to history and trigger memory consolidation

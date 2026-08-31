@@ -204,6 +204,20 @@ PREEXEC_EXEMPT: frozenset[str] = frozenset(
 BENIGN_SPAWNS: frozenset[str] = frozenset(
     {
         "acp/runtime.py::_get_rss_mb",
+        # The Claude ACP adapter's one-click install: `<npm> install --global
+        # <CLAUDE_ACP_NPM_PKG>`. Nothing here is agent-influenced — the package
+        # name is a module-level string constant imported from acp/client.py
+        # (never taken from the request body; the endpoint only accepts a
+        # closed-set backend id and looks the command up itself), "install"/
+        # "--global" are literals, and there is no cwd override. The npm binary
+        # itself is resolved via augmented_path (mise/nvm/PATH), the same class
+        # of non-agent-influenced system-tool resolution as the other resolvers
+        # this file already allowlists — not an agent tool call, so it cannot
+        # route through sandboxed_spawn_argv (that wrapper is for spawns the
+        # agent's own tool use can steer). The endpoint is owner-gated
+        # (`_deny_non_owner`), same trust tier as the other host-setup actions
+        # in this list.
+        "dashboard/handlers/acp_backend_status.py::_install_claude_adapter",
         # The shadow-venv update engine's four spawns. None is agent-influenced
         # and none can route through sandboxed_spawn_argv, because the engine's
         # whole job is to build the NEXT gateway install outside the agent

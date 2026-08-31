@@ -7522,6 +7522,20 @@
       "copy_failed_select_the_link_and_copy_it_manually": "복사하지 못했습니다. 링크를 선택하여 직접 복사하세요.",
       "could_not_create_a_link_try_again": "링크를 만들 수 없습니다. 다시 시도하세요.",
       "phone_connection_is_disabled_by_policy_on_this_dep": "이 배포에서는 정책에 따라 휴대전화 연결이 비활성화되어 있습니다."
+    },
+    "claudeAccountModal": {
+      "checking_usage": "Checking usage…",
+      "claude_account": "Claude Account",
+      "disclaimer": "This is this fork's own estimate of what claude_code reported for messages sent through it — not a remaining-quota reading. {{productName}} cannot obtain your account's actual limits or full spend history; check console.anthropic.com for those.",
+      "estimated_spend": "Estimated spend (this install)",
+      "limit_approaching": "Approaching a Claude usage limit",
+      "limit_reached": "Claude usage limit reached",
+      "open_console": "Open Anthropic console",
+      "tracking_since": "Tracking since",
+      "usage_unavailable": "Usage unavailable",
+      "utilization_pct": "{{pct}}% used",
+      "window_five_hour": "5-hour window",
+      "window_seven_day": "7-day window"
     }
   },
   "hooks": {
@@ -8516,7 +8530,9 @@
         "needs_earlier_history": "선택하면 이전 기록을 다음 페이지만큼 불러옵니다",
         "more_actions": "추가 작업",
         "needs_active_chat": "이 채팅이 완전히 열리면 사용할 수 있습니다",
-        "needs_earlier_history_count_other": "선택하면 이전 기록을 불러옵니다 — 이전 메시지 {{count}}개가 남아 있습니다"
+        "needs_earlier_history_count_other": "선택하면 이전 기록을 불러옵니다 — 이전 메시지 {{count}}개가 남아 있습니다",
+        "backend_cost_estimate": "Claude ~{{cost}}",
+        "backend_cost_estimate_note": "Anthropic's own estimate of this turn's cost. Not an actual charge on a Pro/Max/Team plan — that usage draws down your subscription's rolling quota, not dollars."
       },
       "chatFooter": {
         "compacting": "압축 중…",
@@ -9617,7 +9633,10 @@
         "new_sessions_use_this_agent_a_session_that_is_al": "새 세션은 이 에이전트를 사용합니다. 이미 열려 있는 세션은 시작할 때의 에이전트를 유지하며, 여기서 전환해도 세션 중에는 바뀌지 않습니다.",
         "not_enabled_in_this_build": "이 빌드에서는 활성화되지 않았습니다",
         "retry": "다시 시도",
-        "set_is_fixed_at_gateway_start": "여기에 표시되는 에이전트는 gateway가 시작될 때 결정됩니다. 관리형 배포는 정책으로 이 집합을 제한할 수 있으며, 정책 변경은 다음 시작 시 적용됩니다."
+        "set_is_fixed_at_gateway_start": "여기에 표시되는 에이전트는 gateway가 시작될 때 결정됩니다. 관리형 배포는 정책으로 이 집합을 제한할 수 있으며, 정책 변경은 다음 시작 시 적용됩니다.",
+        "install": "Install",
+        "install_failed": "Install failed.",
+        "install_for": "Install {{agent}}"
       },
       "featurePreviewsTab": {
         "crew": "Crew",
@@ -12652,7 +12671,8 @@
         "speed": "속도",
         "text_to_speech": "텍스트 음성 변환",
         "us_east_1": "us-east-1",
-        "voice": "음성"
+        "voice": "음성",
+        "openai_tts_cloud": "OpenAI TTS (Cloud)"
       },
       "weComPanel": {
         "allow_all_bypass_note": "모두 허용이 켜져 있어 위의 userid 목록은 무시됩니다. 다시 되돌릴 때를 위해 그대로 보관됩니다.",

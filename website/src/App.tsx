@@ -41,11 +41,11 @@ import { useNotificationSound } from './hooks/useNotificationSound'
 import { recordSessionStart, recordEvent } from './rum'
 import { ZoomProvider } from './hooks/ZoomProvider'
 import { api, isAuthBannerShown } from './api/client'
-import type { KiroCreditUsage, KiroUsagePayload } from './api/client'
+import type { ClaudeUsage, KiroCreditUsage, KiroUsagePayload } from './api/client'
 import { safeSetItem } from './utils/safeStorage'
 import { gcOrphanedStorage } from './utils/storageGc'
 import { isMetricNumber, metricNumber } from './utils/metrics'
-import { Rocket, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, Compass, LayoutGrid, Fullscreen, SquareTerminal, Bot, Smartphone, Search as SearchIcon } from 'lucide-react'
+import { Rocket, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, Compass, LayoutGrid, Fullscreen, SquareTerminal, Bot, Smartphone, Search as SearchIcon, Sparkles } from 'lucide-react'
 import { GithubIcon, DiscordIcon } from './components/BrandIcon'
 import { Toggle } from './components/ui'
 import OnboardingFlow from './components/OnboardingFlow'
@@ -143,6 +143,7 @@ import QuickSearchSurface from './components/QuickSearchSurface'
 import ReportProblemModal from './components/ReportProblemModal'
 import FeedbackPill from './components/FeedbackPill'
 import KiroAccountModal, { type KiroAccountUsage } from './components/KiroAccountModal'
+import ClaudeAccountModal, { type ClaudeAccountUsage } from './components/ClaudeAccountModal'
 import WindowsTitlebarMenu from './components/WindowsTitlebarMenu'
 
 import { i18nT } from './i18n/t'
@@ -1990,6 +1991,7 @@ export default function App() {
   const [updating, setUpdating] = useState(false)
   const [showUpdateModal, setShowUpdateModal] = useState(false)
   const [kiroUsageOpen, setKiroUsageOpen] = useState(false)
+  const [claudeUsageOpen, setClaudeUsageOpen] = useState(false)
   const [changes, setChanges] = useState('')
   const [showChangelog, setShowChangelog] = useState(false)
   const [autoUpdate, setAutoUpdate] = useState(true)
@@ -2320,6 +2322,30 @@ export default function App() {
   const kiroUsageState: KiroAccountUsage = kiroUsageFailed && !kiroUsage
     ? 'failed'
     : (kiroUsage ?? null)
+
+  // Which agent backend new sessions use — the capsule's usage segment and
+  // account modal are provider-aware on this. Shares the query KEY (not just
+  // the shape) with AgentBackendTab's own read of the same config, so the two
+  // never disagree and a switch there invalidates the cache here for free.
+  const { data: kirocrewCfg } = useQuery<{ agent?: { acp_backend?: string } }>({
+    queryKey: ['kirocrewConfig'],
+    queryFn: () => api.kirocrewConfig(),
+  })
+  const activeAcpBackend = kirocrewCfg?.agent?.acp_backend ?? ''
+
+  // Claude's own usage view — see ClaudeAccountModal / api_claude_usage for
+  // why this is an install-scoped spend ESTIMATE plus a sparse real
+  // rate-limit signal, never a "remaining quota" reading. Disabled off the
+  // Claude backend: no point polling an endpoint the capsule will not render.
+  const { data: claudeUsage, isError: claudeUsageFailed } = useQuery<ClaudeUsage | null>({
+    queryKey: ['claude-usage'],
+    queryFn: () => api.claudeUsage(),
+    enabled: activeAcpBackend === 'claude',
+    refetchInterval: 30_000,
+  })
+  const claudeUsageState: ClaudeAccountUsage = claudeUsageFailed && !claudeUsage
+    ? 'failed'
+    : (claudeUsage ?? null)
   const [metricsOpen, setMetricsOpen] = useState(() => localStorage.getItem('mc-topbar-metrics') === '1')
   // Readout capsule collapse: clicking the connection dot folds the capsule
   // down to just the dot; clicking again restores the full readout.
@@ -3106,10 +3132,36 @@ export default function App() {
                 <span className={dskValid ? metricColor(dskPct) : 'text-muted'}>{i18nT('app.dsk')} {dskValid ? fmtPercent(dskPct) : '\u2014'}</span>
               </span>)
             }
-            // Usage segment — Kiro credit plan from KiroCrew's own usage
-            // cache. Spinner while the cache warms, a dash when the fetch
-            // failed, hidden when the provider has no credit plan at all.
-            if (kiroUsageState !== 'none') {
+            // Usage segment. Provider-aware: kiro-cli's own credit plan by
+            // default, or (when the active backend is Claude) this fork's
+            // own Claude spend estimate + rate-limit signal — see
+            // ClaudeAccountModal for why that is a different kind of number
+            // and must never be mislabeled as kiro credits.
+            if (activeAcpBackend === 'claude') {
+              if (claudeUsageState === 'failed') {
+                segments.push(<button key="usage" className={`${seg} text-muted opacity-60`} onClick={() => setClaudeUsageOpen(true)} title={i18nT('components.claudeAccountModal.usage_unavailable')} aria-label={i18nT('components.claudeAccountModal.usage_unavailable')}><Sparkles size={12} /> <span className="font-mono text-[11px] tabular-nums">—</span></button>)
+              } else if (!claudeUsageState) {
+                segments.push(<button key="usage" className={`${seg} text-muted`} onClick={() => setClaudeUsageOpen(true)} title={i18nT('components.claudeAccountModal.checking_usage')} aria-label={i18nT('components.claudeAccountModal.checking_usage')}><Sparkles size={12} /> {!isMobile && <Loader2 size={11} className="animate-spin" />}</button>)
+              } else {
+                // A plain accumulated $ figure, never an "X/Y" ratio — there
+                // is no known ceiling to divide by (see ClaudeUsage's doc
+                // comment), so a ratio would imply a limit this fork cannot
+                // actually read.
+                const isWarn = claudeUsageState.rateLimit?.status === 'allowed_warning'
+                const isBlocked = claudeUsageState.rateLimit?.status === 'rejected'
+                const costStr = claudeUsageState.totalCostUsd < 0.01
+                  ? `$${claudeUsageState.totalCostUsd.toFixed(4)}`
+                  : `$${claudeUsageState.totalCostUsd.toFixed(2)}`
+                const title = isBlocked
+                  ? i18nT('components.claudeAccountModal.limit_reached')
+                  : isWarn
+                    ? i18nT('components.claudeAccountModal.limit_approaching')
+                    : i18nT('components.claudeAccountModal.claude_account')
+                segments.push(<button key="usage" className={isBlocked ? `${seg} text-danger` : isWarn ? `${seg} text-warn` : seg} onClick={() => setClaudeUsageOpen(true)} title={title} aria-label={title}>
+                  <Sparkles size={12} /> {!isMobile && <span className="tb-drop-usage font-mono text-[11px] whitespace-nowrap tabular-nums">{costStr}</span>}
+                </button>)
+              }
+            } else if (kiroUsageState !== 'none') {
               if (kiroUsageState === 'failed') {
                 // Failed with nothing cached to fall back on. A dash says that;
                 // a spinner would claim a fetch is still in flight. A failure
@@ -3982,6 +4034,7 @@ export default function App() {
     </WsContext.Provider>
     {shortcutsOpen && <ShortcutsModal onClose={() => setShortcutsOpen(false)} />}
     <KiroAccountModal open={kiroUsageOpen} onClose={() => setKiroUsageOpen(false)} usage={kiroUsageState} />
+    <ClaudeAccountModal open={claudeUsageOpen} onClose={() => setClaudeUsageOpen(false)} usage={claudeUsageState} />
     <QuickSearchSurface
       owners={slotOwners}
       open={commandPalette.open}

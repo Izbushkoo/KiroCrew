@@ -7628,6 +7628,20 @@
       "copy_failed_select_the_link_and_copy_it_manually": "কপি করা যায়নি — লিঙ্কটি নির্বাচন করে হাতে কপি করুন।",
       "could_not_create_a_link_try_again": "লিঙ্ক তৈরি করা যায়নি — আবার চেষ্টা করুন।",
       "phone_connection_is_disabled_by_policy_on_this_dep": "এই ডিপ্লয়মেন্টে নীতি অনুযায়ী ফোন সংযোগ নিষ্ক্রিয় করা আছে।"
+    },
+    "claudeAccountModal": {
+      "checking_usage": "Checking usage…",
+      "claude_account": "Claude Account",
+      "disclaimer": "This is this fork's own estimate of what claude_code reported for messages sent through it — not a remaining-quota reading. {{productName}} cannot obtain your account's actual limits or full spend history; check console.anthropic.com for those.",
+      "estimated_spend": "Estimated spend (this install)",
+      "limit_approaching": "Approaching a Claude usage limit",
+      "limit_reached": "Claude usage limit reached",
+      "open_console": "Open Anthropic console",
+      "tracking_since": "Tracking since",
+      "usage_unavailable": "Usage unavailable",
+      "utilization_pct": "{{pct}}% used",
+      "window_five_hour": "5-hour window",
+      "window_seven_day": "7-day window"
     }
   },
   "hooks": {
@@ -8639,7 +8653,9 @@
         "more_actions": "আরও অ্যাকশন",
         "needs_active_chat": "এই চ্যাট সম্পূর্ণ খোলা হলে উপলব্ধ হবে",
         "needs_earlier_history_count_one": "আগের ইতিহাস লোড করতে নির্বাচন করুন — আরও {{count}}টি পুরোনো বার্তা বাকি আছে",
-        "needs_earlier_history_count_other": "আগের ইতিহাস লোড করতে নির্বাচন করুন — আরও {{count}}টি পুরোনো বার্তা বাকি আছে"
+        "needs_earlier_history_count_other": "আগের ইতিহাস লোড করতে নির্বাচন করুন — আরও {{count}}টি পুরোনো বার্তা বাকি আছে",
+        "backend_cost_estimate": "Claude ~{{cost}}",
+        "backend_cost_estimate_note": "Anthropic's own estimate of this turn's cost. Not an actual charge on a Pro/Max/Team plan — that usage draws down your subscription's rolling quota, not dollars."
       },
       "chatFooter": {
         "compacting": "কম্প্যাক্ট করা হচ্ছে…",
@@ -9763,7 +9779,10 @@
         "new_sessions_use_this_agent_a_session_that_is_al": "নতুন সেশনগুলি এই এজেন্ট ব্যবহার করে। ইতিমধ্যে খোলা সেশন যে এজেন্টে শুরু হয়েছিল সেটিই ধরে রাখে — এখানে বদলালে চলমান সেশন বদলায় না।",
         "not_enabled_in_this_build": "এই বিল্ডে সক্রিয় নয়",
         "retry": "আবার চেষ্টা করুন",
-        "set_is_fixed_at_gateway_start": "এখানে কোন এজেন্টগুলি দেখা যাবে তা gateway চালু হওয়ার সময় নির্ধারিত হয়। পরিচালিত ডিপ্লয়মেন্ট নীতির মাধ্যমে এই সেট সীমিত করতে পারে; নীতি সম্পাদনা পরবর্তী চালুর সময় কার্যকর হয়।"
+        "set_is_fixed_at_gateway_start": "এখানে কোন এজেন্টগুলি দেখা যাবে তা gateway চালু হওয়ার সময় নির্ধারিত হয়। পরিচালিত ডিপ্লয়মেন্ট নীতির মাধ্যমে এই সেট সীমিত করতে পারে; নীতি সম্পাদনা পরবর্তী চালুর সময় কার্যকর হয়।",
+        "install": "Install",
+        "install_failed": "Install failed.",
+        "install_for": "Install {{agent}}"
       },
       "featurePreviewsTab": {
         "crew": "Crew",
@@ -12821,7 +12840,8 @@
         "speed": "গতি",
         "text_to_speech": "টেক্সট-টু-স্পিচ",
         "us_east_1": "us-east-1",
-        "voice": "কণ্ঠস্বর"
+        "voice": "কণ্ঠস্বর",
+        "openai_tts_cloud": "OpenAI TTS (Cloud)"
       },
       "weComPanel": {
         "allow_all_bypass_note": "সবাইকে অনুমতি চালু আছে: উপরের userid তালিকা এড়িয়ে যাওয়া হচ্ছে। আবার ফিরে গেলে কাজে লাগবে বলে তালিকাটা রেখে দেওয়া হয়েছে।",

@@ -1435,6 +1435,65 @@ def parse_usage_cost(update: dict[str, Any]) -> float | None:
     return float(amount)
 
 
+#: ``SDKRateLimitInfo.status`` values the claude-agent-acp adapter forwards
+#: verbatim (see ``parse_rate_limit_info``). An unrecognized status degrades
+#: the whole signal to absent rather than passing an unknown string through
+#: to the dashboard, which would otherwise have to guess how to render it.
+_KNOWN_RATE_LIMIT_STATUSES = frozenset({"allowed", "allowed_warning", "rejected"})
+
+
+def parse_rate_limit_info(update: dict[str, Any]) -> dict[str, Any] | None:
+    """Parse a ``usage_update``'s ``_meta["_claude/rateLimit"]`` extension.
+
+    Real, Anthropic-sourced quota data for a claude.ai subscription — NOT an
+    estimate like ``parse_usage_cost``. The claude-agent-acp adapter forwards
+    it unconditionally (no client opt-in needed) whenever the SDK's own
+    ``rate_limit_event`` fires, which per Anthropic's own design is sparse:
+    mostly silent during ordinary use and populated mainly as a session
+    approaches or hits a threshold. A caller must not treat "None" as "no
+    limit in effect" — it means "nothing to report right now", the same
+    absent-vs-zero distinction ``parse_usage_cost`` draws for cost.
+
+    kiro-cli never sends ``_meta``, so this always reads None on the kiro
+    path (harness parity — no branch needed at the call site).
+
+    Returns a dict with ``status`` (one of :data:`_KNOWN_RATE_LIMIT_STATUSES`),
+    and the optional ``utilization`` (float 0-100), ``resets_at`` (epoch
+    SECONDS — the adapter's ``resetsAt`` is epoch milliseconds, converted
+    here so every timestamp this module hands callers is in one unit), and
+    ``rate_limit_type`` (e.g. ``"five_hour"``, ``"seven_day"``) fields. An
+    unrecognized/malformed shape degrades to None rather than raising mid-turn
+    or passing an unvalidated value through to the dashboard.
+    """
+    if not isinstance(update, dict):
+        return None
+    meta = update.get("_meta")
+    if not isinstance(meta, dict):
+        return None
+    info = meta.get("_claude/rateLimit")
+    if not isinstance(info, dict):
+        return None
+    status = info.get("status")
+    if status not in _KNOWN_RATE_LIMIT_STATUSES:
+        return None
+
+    result: dict[str, Any] = {"status": status}
+
+    utilization = _token_count(info.get("utilization"))
+    if utilization is not None and 0 <= utilization <= 100:
+        result["utilization"] = float(utilization)
+
+    resets_at_ms = _token_count(info.get("resetsAt"))
+    if resets_at_ms is not None and resets_at_ms > 0:
+        result["resets_at"] = float(resets_at_ms) / 1000.0
+
+    rate_limit_type = info.get("rateLimitType")
+    if isinstance(rate_limit_type, str) and rate_limit_type:
+        result["rate_limit_type"] = rate_limit_type
+
+    return result
+
+
 def parse_prompt_token_usage(result: Any) -> tuple[int, int, int, int] | None:
     """Parse a PromptResponse's turn-scoped token counts.
 

@@ -27,12 +27,14 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from kiro_crew import model_registry
+from kiro_crew.acp import client as acp_client
 from kiro_crew.acp import kas_wire
 from kiro_crew.acp._dispatch import (
     build_permission_event,
     classify_notification,
     parse_metadata,
     parse_prompt_token_usage,
+    parse_rate_limit_info,
     parse_session_update,
     parse_text_chunk,
     parse_usage_cost,
@@ -3394,6 +3396,12 @@ class AcpSessionHandle:
             cost = parse_usage_cost(update)
             if cost is not None:
                 self.last_prompt_stats.apply_cost_cumulative(cost)
+            # Real Anthropic-sourced quota signal (not an estimate like cost,
+            # above); process-global like AcpClient's own tracking — see
+            # acp.client's ``_last_claude_rate_limit`` docstring for why.
+            rate_limit = parse_rate_limit_info(update)
+            if rate_limit is not None:
+                acp_client._last_claude_rate_limit = rate_limit
             return []
 
         # config_option_update: ACP pushes updated configOptions (e.g. after

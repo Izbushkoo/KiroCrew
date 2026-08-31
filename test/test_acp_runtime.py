@@ -2933,6 +2933,37 @@ def test_handle_update_malformed_cost_is_noop(cost):
     assert handle.last_prompt_stats.cost_session_usd == 0.0
 
 
+def test_handle_update_rate_limit_meta_updates_the_process_global(monkeypatch):
+    """SessionHandle parity with AcpClient: both paths write the same
+    process-global (acp.client._last_claude_rate_limit) — see its docstring
+    for why the signal is account-wide rather than per-session/per-handler."""
+    from kiro_crew.acp import client as acp_client_module
+
+    monkeypatch.setattr(acp_client_module, "_last_claude_rate_limit", None)
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    msg = JsonRpcMessage(
+        method=METHOD_SESSION_UPDATE,
+        params={
+            "sessionId": "sA",
+            "update": {
+                "sessionUpdate": "usage_update",
+                "used": 1,
+                "size": 2,
+                "_meta": {
+                    "_claude/rateLimit": {"status": "rejected", "rateLimitType": "seven_day"}
+                },
+            },
+        },
+    )
+    handle._handle_update(msg)
+    assert acp_client_module.get_last_claude_rate_limit() == {
+        "status": "rejected",
+        "rate_limit_type": "seven_day",
+    }
+
+
 @pytest.mark.parametrize(
     "used,size",
     [

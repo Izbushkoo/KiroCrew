@@ -42,6 +42,7 @@ from kiro_crew.acp._dispatch import (
     extract_tool_purpose,
     make_unified_diff,
     parse_prompt_token_usage,
+    parse_rate_limit_info,
     parse_session_modes,
     parse_usage_cost,
     parse_usage_update,
@@ -404,6 +405,26 @@ _UNRESOLVED: object = object()  # sentinel for "not yet resolved"
 # Cache the PATH with the resolution result. A failed resolve is cached too, so
 # recomputing PATH at the error site could report directories that were never searched.
 _claude_acp_argv_cache: tuple[list[str] | None, str] | object = _UNRESOLVED
+
+# Last-seen ``_claude/rateLimit`` signal (see ``_dispatch.parse_rate_limit_info``),
+# from whichever Claude session most recently reported one. Process-global
+# rather than per-session on purpose: the signal describes the ACCOUNT the
+# `claude` CLI is logged into, not the session that happened to observe it, so
+# any session sharing that login is an equally valid source and the dashboard
+# wants the most RECENT account-wide answer regardless of which session (or
+# how many concurrent ones) produced it. None until the first turn that gets
+# one; never cleared afterward (a stale reading is still the best available
+# answer until a fresher one arrives — the adapter re-reports on every
+# threshold-crossing turn, so staleness self-corrects rather than needing to
+# be modeled).
+_last_claude_rate_limit: dict[str, Any] | None = None
+
+
+def get_last_claude_rate_limit() -> dict[str, Any] | None:
+    """The most recent ``_claude/rateLimit`` signal from any Claude session in
+    this process, or None if none has arrived yet. See the module-level
+    ``_last_claude_rate_limit`` docstring for why this is process-global."""
+    return _last_claude_rate_limit
 
 
 def _vendored_claude_acp_roots(pkg_dir: Path | None = None) -> list[Path]:
@@ -5360,6 +5381,13 @@ class AcpClient:
             cost = parse_usage_cost(update)
             if cost is not None:
                 self.last_prompt_stats.apply_cost_cumulative(cost)
+            # Real Anthropic-sourced quota signal (not an estimate like
+            # cost, above) — see parse_rate_limit_info's docstring for why
+            # None here means "nothing to report", not "no limit in effect".
+            rate_limit = parse_rate_limit_info(update)
+            if rate_limit is not None:
+                global _last_claude_rate_limit  # noqa: PLW0603
+                _last_claude_rate_limit = rate_limit
         elif kind == UPDATE_CONFIG_OPTION:
             self._handle_config_option_update(msg)
         elif self._is_claude and kind and kind not in KNOWN_SESSION_UPDATES:

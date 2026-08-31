@@ -16,7 +16,11 @@ from datetime import datetime
 
 import pytest
 
-from kiro_crew.acp._dispatch import parse_prompt_token_usage, parse_usage_cost
+from kiro_crew.acp._dispatch import (
+    parse_prompt_token_usage,
+    parse_rate_limit_info,
+    parse_usage_cost,
+)
 from kiro_crew.acp.client import AcpClient
 from kiro_crew.acp.types import AcpPromptStats, TurnUsage
 
@@ -101,6 +105,92 @@ class TestParseUsageCost:
         # update.usage.cost shape gets the same currency policy.
         update = {"usage": {"cost": {"amount": 0.42, "currency": "EUR"}}}
         assert parse_usage_cost(update) is None
+
+
+# ── parse_rate_limit_info ─────────────────────────────────────────────
+#
+# Real, Anthropic-sourced quota data (unlike parse_usage_cost's estimate) —
+# forwarded by claude-agent-acp as usage_update's _meta["_claude/rateLimit"].
+# kiro-cli never sends _meta, so this always reads None on the kiro path.
+
+
+class TestParseRateLimitInfo:
+    def test_full_shape(self):
+        update = {
+            "used": 1,
+            "size": 2,
+            "_meta": {
+                "_claude/rateLimit": {
+                    "status": "allowed_warning",
+                    "utilization": 87.5,
+                    "resetsAt": 1893456000000,  # epoch ms
+                    "rateLimitType": "five_hour",
+                }
+            },
+        }
+        assert parse_rate_limit_info(update) == {
+            "status": "allowed_warning",
+            "utilization": 87.5,
+            "resets_at": 1893456000.0,  # converted to epoch seconds
+            "rate_limit_type": "five_hour",
+        }
+
+    def test_status_only_shape(self):
+        # The common case: the SDK's rate_limit_event omits utilization
+        # outside a warning/reject threshold. Absence of the optional fields
+        # must not be treated as malformed.
+        update = {"_meta": {"_claude/rateLimit": {"status": "allowed"}}}
+        assert parse_rate_limit_info(update) == {"status": "allowed"}
+
+    def test_no_meta_reads_absent(self):
+        # kiro-cli's shape: used/size only, no _meta at all.
+        assert parse_rate_limit_info({"used": 5000, "size": 10000}) is None
+
+    def test_no_rate_limit_key_under_meta(self):
+        assert parse_rate_limit_info({"_meta": {"other": "thing"}}) is None
+
+    def test_non_dict_update(self):
+        assert parse_rate_limit_info("nope") is None  # type: ignore[arg-type]
+        assert parse_rate_limit_info(None) is None  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "status",
+        ["bogus", "", None, 1, True],
+    )
+    def test_unrecognized_status_degrades_to_absent(self, status):
+        # An unknown status is worse than none: the dashboard would have to
+        # guess how to render it, so the whole signal drops instead.
+        update = {"_meta": {"_claude/rateLimit": {"status": status}}}
+        assert parse_rate_limit_info(update) is None
+
+    @pytest.mark.parametrize(
+        "utilization",
+        ["87.5", [87.5], True, float("nan"), float("inf"), -1, 101],
+    )
+    def test_malformed_utilization_is_dropped_not_the_whole_signal(self, utilization):
+        # A bad utilization must not sink the status/resets_at/type fields
+        # that DID parse cleanly.
+        update = {
+            "_meta": {
+                "_claude/rateLimit": {"status": "allowed_warning", "utilization": utilization}
+            }
+        }
+        result = parse_rate_limit_info(update)
+        assert result == {"status": "allowed_warning"}
+
+    def test_malformed_resets_at_is_dropped_not_the_whole_signal(self):
+        update = {
+            "_meta": {"_claude/rateLimit": {"status": "rejected", "resetsAt": "not-a-number"}}
+        }
+        assert parse_rate_limit_info(update) == {"status": "rejected"}
+
+    def test_non_positive_resets_at_is_dropped(self):
+        update = {"_meta": {"_claude/rateLimit": {"status": "rejected", "resetsAt": 0}}}
+        assert parse_rate_limit_info(update) == {"status": "rejected"}
+
+    def test_empty_rate_limit_type_is_dropped(self):
+        update = {"_meta": {"_claude/rateLimit": {"status": "allowed", "rateLimitType": ""}}}
+        assert parse_rate_limit_info(update) == {"status": "allowed"}
 
 
 # ── parse_prompt_token_usage ─────────────────────────────────────────────
@@ -297,6 +387,40 @@ class TestClientTracking:
         client._track_usage_update(_Msg({"sessionUpdate": "usage_update", "used": 10, "size": 100}))
         assert client.last_prompt_stats.cost_usd == 0.0
         assert client.last_prompt_stats.cost_session_usd == 0.0
+
+    def test_rate_limit_meta_updates_the_process_global(self, monkeypatch):
+        from kiro_crew.acp import client as acp_client_module
+
+        monkeypatch.setattr(acp_client_module, "_last_claude_rate_limit", None)
+        client = _bare_client()
+        client._track_usage_update(
+            _Msg(
+                {
+                    "sessionUpdate": "usage_update",
+                    "used": 10,
+                    "size": 100,
+                    "_meta": {
+                        "_claude/rateLimit": {"status": "allowed_warning", "utilization": 90}
+                    },
+                }
+            )
+        )
+        assert acp_client_module.get_last_claude_rate_limit() == {
+            "status": "allowed_warning",
+            "utilization": 90.0,
+        }
+
+    def test_no_rate_limit_meta_leaves_the_global_untouched(self, monkeypatch):
+        # Absence must not overwrite a still-relevant prior reading — see
+        # parse_rate_limit_info's docstring for why None means "nothing new
+        # to report", not "the limit no longer applies".
+        from kiro_crew.acp import client as acp_client_module
+
+        sentinel = {"status": "rejected"}
+        monkeypatch.setattr(acp_client_module, "_last_claude_rate_limit", sentinel)
+        client = _bare_client()
+        client._track_usage_update(_Msg({"sessionUpdate": "usage_update", "used": 10, "size": 100}))
+        assert acp_client_module.get_last_claude_rate_limit() is sentinel
 
     def test_prompt_usage_folds_tokens(self):
         client = _bare_client()
