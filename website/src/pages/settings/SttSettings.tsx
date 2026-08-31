@@ -117,14 +117,6 @@ const DOWNLOAD_POLL_MS = 1000
  * and the transcript feels stuck. 50 ms steps because the perceptible difference
  * is coarse and a finer step turns a small adjustment into a dozen clicks.
  */
-const PROVIDER_LABEL_KEY: Record<string, string> = {
-  whisper: 'pages.settings.sttSettings.provider_whisper',
-  mlx: 'pages.settings.sttSettings.provider_mlx',
-  apple: 'pages.settings.sttSettings.provider_apple',
-  transcribe: 'pages.settings.sttSettings.provider_transcribe',
-  openai: 'pages.settings.sttSettings.provider_openai',
-}
-
 const SILENCE_MS_MIN = 250
 const SILENCE_MS_MAX = 2000
 const SILENCE_MS_STEP = 50
