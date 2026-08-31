@@ -318,6 +318,59 @@ class TestTeamIdInjection:
         assert result is True
         assert c._web.conversations_info.await_args.kwargs["team_id"] == "TWORK"
 
+    # ── ensure_channel_team: the cache's only production feeder ──────
+
+    @pytest.mark.asyncio
+    async def test_ensure_resolves_the_home_workspace_not_the_author(self) -> None:
+        """The value that enters the routing cache is the channel's HOME
+        workspace (conversations_info's ``context_team_id``). An inbound
+        event's ``team`` is the author's workspace — a participant's, on a
+        shared channel — and must never reach this cache; the inbound
+        handler therefore never passes it here."""
+        c = self._client()
+        resp = MagicMock()
+        resp.data = {"channel": {"id": "C1", "context_team_id": "THOME"}}
+        c._web.conversations_info = AsyncMock(return_value=resp)
+        await c.ensure_channel_team("C1")
+        assert c._channel_team == {"C1": "THOME"}
+
+    @pytest.mark.asyncio
+    async def test_ensure_skips_a_channel_already_resolved(self) -> None:
+        c = self._client()
+        c.record_channel_team("C1", "TKNOWN")
+        c._web.conversations_info = AsyncMock()
+        await c.ensure_channel_team("C1")
+        c._web.conversations_info.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_lookup_is_retried_once_per_process_not_per_message(self) -> None:
+        """A channel whose home team cannot be resolved must not cost one
+        conversations_info call per inbound message for the rest of the run."""
+        c = self._client()
+        c._web.conversations_info = AsyncMock(side_effect=RuntimeError("missing scope"))
+        await c.ensure_channel_team("C1")
+        await c.ensure_channel_team("C1")
+        await c.ensure_channel_team("C1")
+        assert c._web.conversations_info.await_count == 1
+        assert c._channel_team == {}
+        # And the outbound routing answer for it is a no-op, exactly as for
+        # a channel the cache has never seen.
+        kw: dict = {"channel": "C1"}
+        c._inject_team("C1", kw)
+        assert "team_id" not in kw
+
+    @pytest.mark.asyncio
+    async def test_an_answer_without_context_team_id_counts_as_unresolved(self) -> None:
+        c = self._client()
+        resp = MagicMock()
+        resp.data = {"channel": {"id": "C1"}}
+        c._web.conversations_info = AsyncMock(return_value=resp)
+        await c.ensure_channel_team("C1")
+        assert c._channel_team == {}
+        # Same per-process bound as an erroring lookup.
+        await c.ensure_channel_team("C1")
+        assert c._web.conversations_info.await_count == 1
+
     # ── start_stream workspace_team priority ─────────────────────────
 
     @pytest.mark.asyncio
@@ -338,24 +391,116 @@ class TestTeamIdInjection:
 
     @pytest.mark.asyncio
     async def test_start_stream_falls_back_to_recipient_when_no_cache(self) -> None:
-        """When the channel is unknown to the cache, recipient team_id is
-        the only signal we have for workspace routing."""
+        """When the channel's home team cannot be resolved, the recipient team_id
+        is the only signal left for workspace routing.
+
+        ``conversations_info`` is stubbed (single-workspace shape) because
+        ``start_stream`` now attempts resolution first; a bare MagicMock would
+        make this assert on a swallowed TypeError rather than on the fallback.
+        """
         c = self._client()
         c._web.api_call = AsyncMock(return_value={"ts": "1"})
+        c._web.conversations_info = AsyncMock(return_value=self._info_resp({"id": "C_unseen"}))
         await c.start_stream("C_unseen", "thread1", team_id="TRECIPIENT")
         body = c._web.api_call.await_args.kwargs["json"]
         assert body["team_id"] == "TRECIPIENT"
 
+    @staticmethod
+    def _info_resp(channel_payload: dict) -> MagicMock:
+        """A conversations_info response in the shape the SDK returns.
+
+        ``ensure_channel_team`` reads ``resp.data``, so a bare dict resolves to
+        nothing and would make a resolution assertion pass vacuously.
+        """
+        resp = MagicMock()
+        resp.data = {"channel": channel_payload}
+        return resp
+
     @pytest.mark.asyncio
     async def test_start_stream_omits_team_id_when_neither_known(self) -> None:
-        """Single-workspace install: no cache, no recipient — no team_id
-        in the body."""
+        """Single-workspace install: resolution finds no ``context_team_id``, and
+        no recipient was supplied, so no team_id reaches the body.
+
+        ``conversations_info`` is stubbed with the single-workspace shape rather
+        than left a bare MagicMock: ``start_stream`` now resolves the channel's
+        home team first, and a non-awaitable stub would make this pass on a
+        swallowed TypeError instead of on the behaviour being asserted.
+        """
         c = self._client()
         c._web.api_call = AsyncMock(return_value={"ts": "1"})
+        c._web.conversations_info = AsyncMock(return_value=self._info_resp({"id": "C1"}))
         await c.start_stream("C1", "thread1")
         body = c._web.api_call.await_args.kwargs["json"]
         assert "team_id" not in body
         assert "recipient_team_id" not in body
+
+    @pytest.mark.asyncio
+    async def test_start_stream_resolves_home_team_when_cache_is_cold(self) -> None:
+        """Regression: the dashboard->Slack mirror starts a stream with no inbound
+        event behind it, so this per-process cache can be cold (a gateway restart,
+        or a session linked from Slack then driven only from the dashboard). It
+        threads no team_id and has no linking user to thread, so before this the
+        body carried neither team_id nor recipient_team_id and an org-wide install
+        rejected the call with missing_recipient_team_id -- silently demoting the
+        mirror's tool-animation stream. The channel alone is enough to resolve it.
+        """
+        c = self._client()
+        c._web.api_call = AsyncMock(return_value={"ts": "1"})
+        c._web.conversations_info = AsyncMock(
+            return_value=self._info_resp({"id": "C1", "context_team_id": "THOME"})
+        )
+
+        await c.start_stream("C1", "thread1")
+
+        c._web.conversations_info.assert_awaited_once_with(channel="C1")
+        body = c._web.api_call.await_args.kwargs["json"]
+        assert body["team_id"] == "THOME"
+        assert body["recipient_team_id"] == "THOME"
+        # Resolved once, then cached for the rest of the process.
+        assert c._channel_team["C1"] == "THOME"
+
+    @pytest.mark.asyncio
+    async def test_start_stream_costs_no_lookup_when_already_cached(self) -> None:
+        """The inbound callers must not pay an extra API call: one inbound message
+        per channel already warmed this cache, and a warm channel short-circuits
+        before conversations_info."""
+        c = self._client()
+        c._web.api_call = AsyncMock(return_value={"ts": "1"})
+        c._web.conversations_info = AsyncMock()
+        c.record_channel_team("C1", "TCHANNEL_A")
+
+        await c.start_stream("C1", "thread1")
+
+        c._web.conversations_info.assert_not_awaited()
+        assert c._web.api_call.await_args.kwargs["json"]["team_id"] == "TCHANNEL_A"
+
+    @pytest.mark.asyncio
+    async def test_start_stream_does_not_retry_an_unresolvable_channel(self) -> None:
+        """A channel whose home team cannot be resolved costs one lookup per
+        process, not one per stream -- otherwise a single-workspace install would
+        pay a failed conversations_info on every mirrored turn."""
+        c = self._client()
+        c._web.api_call = AsyncMock(return_value={"ts": "1"})
+        c._web.conversations_info = AsyncMock(return_value=self._info_resp({"id": "C1"}))
+
+        await c.start_stream("C1", "thread1")
+        await c.start_stream("C1", "thread2")
+
+        assert c._web.conversations_info.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_start_stream_survives_a_failing_home_team_lookup(self) -> None:
+        """Resolution is best-effort: a conversations_info failure must not take
+        the stream down with it, since the pre-existing behaviour (no team_id) is
+        still a working single-workspace call."""
+        c = self._client()
+        c._web.api_call = AsyncMock(return_value={"ts": "1"})
+        c._web.conversations_info = AsyncMock(side_effect=RuntimeError("slack down"))
+
+        ts = await c.start_stream("C1", "thread1")
+
+        assert ts == "1"
+        assert "team_id" not in c._web.api_call.await_args.kwargs["json"]
 
     @pytest.mark.asyncio
     async def test_start_stream_derives_recipient_team_from_cache(self) -> None:

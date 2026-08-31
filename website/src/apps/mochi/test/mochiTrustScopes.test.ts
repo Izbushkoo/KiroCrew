@@ -6,10 +6,10 @@
  *
  *  1. The GRANT SCOPE. A trust click widens what runs unasked, and the `pattern`
  *     string decides by how much. The pet panel must produce EXACTLY what the
- *     dashboard's TrustDropdown produces for the same click; until that transform
- *     is hoisted into a shared module (its own core-scoped PR — see
- *     src/shared/trustPatterns.ts), these exact-output assertions are what keep
- *     the two from drifting and the pet from granting wider than its label says.
+ *     dashboard's TrustDropdown produces for the same click. The transforms are
+ *     hoisted into one shared module (src/shared/trustPatterns.ts re-exports
+ *     website/src/utils/trustPatterns.ts); the identity assertions below make a
+ *     re-introduced copy fail here rather than drift silently.
  *  2. The BUBBLE COPY. It must name the agent's purpose and NOTHING about the
  *     command: a bubble sits on the desktop in front of anyone looking at the
  *     screen. A future edit that interpolates the command there would be a leak,
@@ -24,6 +24,12 @@ import {
 } from '../src/shared/trustPatterns'
 import { permissionApprovalFromFrame } from '../panel/panelBridge'
 import { approvalBubbleText, approvalPurpose } from '../src/renderer/hooks/useApprovalBubble'
+// The dashboard import, used ONLY so the identity test can prove both call
+// sites resolve to the SAME implementation, not two byte-identical copies.
+import {
+  trustBasePattern as dashboardTrustBasePattern,
+  truncateCommandLabel as dashboardTruncateCommandLabel,
+} from '../../../utils/trustPatterns'
 
 /** A permission-role chat frame, as the gateway broadcasts it. */
 function frame(meta: Record<string, unknown>): Record<string, unknown> {
@@ -46,19 +52,26 @@ describe('trust pattern transform (shared with the dashboard)', () => {
   })
 
   it('truncates only the LABEL, never the pattern', () => {
-    const long = 'a'.repeat(80)
-    expect(truncateCommandLabel(long)).toHaveLength(65) // 64 + ellipsis
+    const long = 'a'.repeat(300)
+    expect(truncateCommandLabel(long)).toHaveLength(256)
     expect(trustBasePattern(long)).toBe(long + ' *')
   })
 
-  it('matches the dashboard budget: leaves exactly-max untouched, truncates one past it', () => {
-    // 64 mirrors the budget PR #4393 introduces for the dashboard copy in
-    // website/src/utils/trustPatterns.ts (still 30 until that PR lands). The two
-    // must converge — a divergent constant re-creates the collision on one
-    // surface only (see #4462 / #4436).
-    const exactly64 = 'a'.repeat(64)
-    expect(truncateCommandLabel(exactly64)).toBe(exactly64)
-    expect(truncateCommandLabel('a'.repeat(65))).toBe(exactly64 + '…')
+  it('IS the dashboard implementation — one module, not two synced copies', () => {
+    // Reference identity, not byte-parity: a re-introduced local copy could stay
+    // byte-identical for a while and drift later, but it can never be the same
+    // function object. This is what makes the next duplication redden on day one.
+    expect(truncateCommandLabel).toBe(dashboardTruncateCommandLabel)
+    expect(trustBasePattern).toBe(dashboardTrustBasePattern)
+  })
+
+  it('renders the same label as the dashboard for the same command', () => {
+    // One behavioral spot check on top of the identity assertion, so a future
+    // wrapper (same module, different behavior) is also caught.
+    const cmd = `gh api repos/kirodotdev/KiroCrew/contents/${'p/'.repeat(120)}config.json --jq .sha`
+    expect(cmd.length).toBeGreaterThan(256)
+    expect(truncateCommandLabel(cmd)).toBe(dashboardTruncateCommandLabel(cmd))
+    expect(truncateCommandLabel(cmd)).toHaveLength(256)
   })
 
   it('does not render two commands from the original report with the same label', () => {
@@ -93,17 +106,20 @@ describe('permissionApprovalFromFrame carries the scope fields', () => {
         tool_title: 'Running: npm test',
         full_command: 'npm test',
         base_command: 'npm',
+        trust_grantable: '1',
       }),
     )
     expect(req).not.toBeNull()
     expect(req?.fullCommand).toBe('npm test')
     expect(req?.baseCommand).toBe('npm')
+    expect(req?.trustGrantable).toBe(true)
   })
 
-  it('leaves them undefined when the gateway sent none, so the card degrades to the single grant', () => {
+  it('leaves trust unavailable when the gateway sent no grant proof', () => {
     const req = permissionApprovalFromFrame(frame({ request_id: 'r1', tool_title: 'T' }))
     expect(req?.fullCommand).toBeUndefined()
     expect(req?.baseCommand).toBeUndefined()
+    expect(req?.trustGrantable).toBeUndefined()
   })
 
   it('extracts the agent-declared purpose from the tool arguments', () => {

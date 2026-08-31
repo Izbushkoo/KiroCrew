@@ -18,6 +18,7 @@ from hypothesis import strategies as st
 from kiro_crew import platform_compat
 from kiro_crew.apps.bridges import (
     RegistrationResult,
+    _app_crons_path,
     _deregister_agents,
     _deregister_crons,
     _deregister_mcp_servers,
@@ -30,6 +31,7 @@ from kiro_crew.apps.bridges import (
     _safe_link_name,
     deregister_app,
     load_app_cron_defs,
+    refresh_app_agents,
     register_app,
     register_app_crons_with_service,
 )
@@ -322,6 +324,30 @@ class TestAgentRegistration:
         assert link.is_file(), "the working config must survive a failed rewrite"
         assert link.read_text(encoding="utf-8") == good, "…with its old contents intact"
 
+    @pytest.mark.parametrize("content", ["[1, 2, 3]", "42", "null", "true", '"a string"'])
+    def test_a_valid_json_non_object_agent_spec_is_skipped(
+        self, tmp_path, app_env, content
+    ):
+        """A spec that is valid JSON but not an object parses fine, so the
+        JSONDecodeError guard never fires — but ``.get`` on the parsed value
+        would raise AttributeError and take down the whole registration pass.
+        Same disposition as the unreadable case: skip that agent, register
+        nothing for it, and do not crash.
+        """
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        manifest = AppManifest.from_json_file(
+            app_env["home"] / "apps" / "test-app" / APP_MANIFEST_FILENAME
+        )
+        app_root = app_env["home"] / "apps" / "test-app"
+        (app_root / "agents" / "my-agent.json").write_text(content, encoding="utf-8")
+
+        registered = _register_agents("test-app", manifest, app_root)
+
+        assert registered == []
+        link = app_env["kiro_agents"] / "test-app--my-agent.json"
+        assert not link.exists(), "a spec that was never understood must not be materialized"
+
     def test_a_legacy_symlink_is_still_replaced(self, tmp_path, app_env):
         """A symlink from an older KiroCrew is dropped and replaced with a real file."""
         src = _make_app_source(tmp_path)
@@ -591,6 +617,63 @@ class TestCronRegistration:
         assert len(defs) == 1
         assert defs[0]["enabled"] is False
 
+    @pytest.mark.parametrize("payload", ["{}", '{"name": "x"}', "42", '"str"', "null", "true"])
+    def test_non_list_cron_manifest_is_ignored(self, payload, tmp_path, app_env):
+        """Valid JSON that is not an array yields no definitions, not a crash.
+
+        ``app-crons.json`` sits in the app's install directory, which is
+        ordinary user-writable state. A non-array parses cleanly, so the
+        ``JSONDecodeError`` guard never sees it and the value is returned
+        under a ``list[dict]`` annotation that promised otherwise.
+        """
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        _app_crons_path("test-app").write_text(payload, encoding="utf-8")
+
+        assert load_app_cron_defs("test-app") == []
+
+    def test_non_object_entries_are_skipped_and_the_rest_survive(self, tmp_path, app_env):
+        """One malformed row must not cost the good rows beside it.
+
+        Matches the disposition the registration loop already gives an entry
+        whose ``add_job`` raises: skip that one, keep going.
+        """
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        _app_crons_path("test-app").write_text(
+            json.dumps([{"name": "test-app/good", "every": 60}, "junk", 7, None, []]),
+            encoding="utf-8",
+        )
+
+        defs = load_app_cron_defs("test-app")
+        assert defs == [{"name": "test-app/good", "every": 60}]
+
+    def test_a_non_list_manifest_does_not_break_registration(self, tmp_path, app_env):
+        """The end-to-end shape: enabling the app must not raise.
+
+        ``register_app_crons_with_service`` reads ``d.get("name", "")`` OUTSIDE
+        its per-job ``try``, so before the guard a JSON object here raised
+        ``AttributeError`` (iterating an object yields its string keys) and a
+        scalar raised ``TypeError`` -- out of the app-enable path entirely.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from kiro_crew.apps.bridges import register_app_crons_with_service
+
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        _app_crons_path("test-app").write_text(
+            json.dumps({"name": "test-app/refresh", "every": 60}), encoding="utf-8"
+        )
+
+        mock_sdk = MagicMock()
+        mock_sdk.list_jobs.return_value = []
+        with patch("kiro_crew.apps.bridges.CronSDK", return_value=mock_sdk):
+            result = _run(register_app_crons_with_service("test-app", MagicMock()))
+
+        assert result == []
+        mock_sdk.add_job_async.assert_not_called()
+
     def test_deregister_crons(self, tmp_path, app_env):
         src = _make_app_source(tmp_path)
         install_app(src)
@@ -697,6 +780,43 @@ class TestTopLevel:
         assert len(result.skills) == 1
         assert len(result.crons) == 1
         assert result.errors == []
+
+    def test_register_app_reports_zero_registered_when_agent_source_missing(
+        self, tmp_path, app_env
+    ):
+        # A manifest that DECLARES agents but whose agent source is absent /
+        # unreadable materializes none. That must surface as a visible error
+        # (which reconcile counts), not a silent 0-agent success.
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        # Drop the declared agent's source from the installed snapshot.
+        (app_env["home"] / "apps" / "test-app" / "agents" / "my-agent.json").unlink()
+
+        result = register_app("test-app")
+
+        assert result.agents == []
+        assert any("0 of" in error and "test-app" in error for error in result.errors)
+
+    def test_refresh_app_agents_denied_scrubs_and_registers_nothing(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        # An app whose execution admission was revoked must NOT be re-materialized
+        # by the from-source recovery path: refresh_app_agents must honor the same
+        # gate register_app does -- scrub any stale agent spec and register nothing
+        # -- or a revoked app's agent (and its merged MCP servers) becomes
+        # dispatchable again.
+        import kiro_crew.apps.execution as execution_mod
+
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        assert refresh_app_agents("test-app")  # admitted: materializes, returns names
+        assert any(app_env["kiro_agents"].iterdir())
+
+        monkeypatch.setattr(execution_mod, "third_party_execution_allowed", lambda: False)
+        refreshed = refresh_app_agents("test-app")
+
+        assert refreshed == []
+        assert not any(app_env["kiro_agents"].iterdir())
 
     def test_install_while_execution_denied_registers_nothing(self, tmp_path, app_env, monkeypatch):
         import kiro_crew.apps.execution as execution_mod
@@ -2185,6 +2305,8 @@ class TestCronServiceBridge:
                 "env": {"FOO": "bar"},
                 "persistent_session": False,
                 "silent": True,
+                "timezone": "America/New_York",
+                "skip_dates": ["2026-12-25"],
             }
         ]
         self._write_app_crons(tmp_path, "test-app", cron_defs)
@@ -2211,7 +2333,35 @@ class TestCronServiceBridge:
             persistent_session=False,
             silent=True,
             enabled=True,
+            timezone="America/New_York",
+            skip_dates=["2026-12-25"],
         )
+
+    def test_cron_without_timezone_passes_the_empty_sentinel(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        """A def that names no zone keeps today's config-then-UTC fallback."""
+        from unittest.mock import MagicMock, patch
+
+        from kiro_crew.apps.bridges import register_app_crons_with_service
+
+        self._write_app_crons(
+            tmp_path,
+            "test-app",
+            [{"name": "test-app/refresh", "every": 600, "message": "go"}],
+        )
+
+        mock_cron_service = MagicMock()
+        mock_sdk = MagicMock()
+        mock_sdk.list_jobs.return_value = []
+        mock_sdk.add_job_if_absent_async = AsyncMock(return_value=MagicMock(id="abc123"))
+
+        with patch("kiro_crew.apps.bridges.CronSDK", return_value=mock_sdk):
+            _run(register_app_crons_with_service("test-app", mock_cron_service))
+
+        kwargs = mock_sdk.add_job_if_absent_async.call_args.kwargs
+        assert kwargs["timezone"] == ""
+        assert kwargs["skip_dates"] is None
 
     def test_disabled_cron_registers_paused(self, tmp_path, app_env, monkeypatch):
         """A manifest cron with enabled:false is passed through as enabled=False."""
@@ -2358,6 +2508,8 @@ class TestCronServiceBridge:
             persistent_session=False,
             silent=True,
             enabled=True,
+            timezone="",
+            skip_dates=None,
         )
 
     def test_rejects_malicious_command(self, tmp_path, app_env, monkeypatch):
@@ -2489,6 +2641,8 @@ class TestCronServiceBridge:
             env={"K": "V"},
             persistent_session=False,
             silent=True,
+            timezone="America/New_York",
+            skip_dates=["2026-12-25"],
         )
         manifest.crons = [entry]
 
@@ -2501,6 +2655,10 @@ class TestCronServiceBridge:
         assert d["env"] == {"K": "V"}
         assert d["persistent_session"] is False
         assert d["silent"] is True
+        # Without these the declared zone is dropped between the manifest and
+        # the scheduler, and the job fires in UTC.
+        assert d["timezone"] == "America/New_York"
+        assert d["skip_dates"] == ["2026-12-25"]
 
     def test_add_job_exception_logged_and_skipped(self, tmp_path, app_env):
         """Exception from CronSDK.add_job is caught, logged, and execution continues."""
@@ -3154,7 +3312,8 @@ class TestReregisterRefreshesAgents:
             bridges_mod, "_register_mcp_servers", lambda n, m, live_port=None: ["srv"]
         )
         monkeypatch.setattr(
-            bridges_mod, "_register_agents", lambda n, m, r: calls.append(f"agents:{n}")
+            bridges_mod, "_register_agents",
+            lambda n, m, r, io_failures=None: calls.append(f"agents:{n}"),
         )
         # give _registration_source a manifest with mcpServers
 
@@ -3296,6 +3455,33 @@ class TestPruneAbortsOnUnreadableAgent:
 
         bridges_mod._prune_stale_app_resources("test-app", manifest, app_root)
         assert keep.is_file(), "prune must abort — not delete a config over an unreadable source"
+
+    @pytest.mark.parametrize("content", ["[1, 2, 3]", "42", "null", "true", '"a string"'])
+    def test_a_valid_json_non_object_agent_spec_aborts_the_agent_prune(
+        self, tmp_path, app_env, monkeypatch, content
+    ):
+        """Valid JSON that is not an object parses fine, so the JSONDecodeError
+        guard never fires — but ``.get`` on the parsed value would raise
+        AttributeError. A spec that cannot be read as an object is the same
+        cannot-read != removed situation: the agent must be RETAINED (treated
+        as present), never pruned out of its last-good materialized config.
+        """
+        from kiro_crew.apps import bridges as bridges_mod
+
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        manifest = AppManifest.from_json_file(
+            app_env["home"] / "apps" / "test-app" / APP_MANIFEST_FILENAME
+        )
+        app_root = app_env["home"] / "apps" / "test-app"
+        # A materialized config that MUST survive if the prune aborts.
+        keep = app_env["kiro_agents"] / "test-app--my-agent.json"
+        keep.write_text('{"name": "my-agent"}', encoding="utf-8")
+        # Make the declared agent source valid JSON but not an object.
+        (app_root / "agents" / "my-agent.json").write_text(content, encoding="utf-8")
+
+        bridges_mod._prune_stale_app_resources("test-app", manifest, app_root)
+        assert keep.is_file(), "prune must retain the agent — a non-object spec is unreadable, not removed"
 
 
 class TestMalformedConfigIsNotClobbered:
@@ -3518,3 +3704,448 @@ class TestRegisterAgentsSnapshotUpkeep:
         assert out == []
         # Nothing to publish, but the directory is still reconciled.
         assert calls == ["refresh"]
+
+
+class TestRefreshAppAgentsReportsIoFailures:
+    """A partial agent rewrite is not a reconciled one (#5726 review).
+
+    `_register_agents` skips a failing agent and continues, so a write that hit ENOSPC
+    left the agent JSON holding the dead MCP url while the caller was told the refresh
+    succeeded. Only the I/O class is collected: this function returns an empty list for
+    several PERMANENT reasons — a self-managed app, a denied one, no declared agents —
+    and a caller that retried on emptiness would spin forever on any of them.
+    """
+
+    def _wire(self, monkeypatch, brmod, tmp_path, *, agents=("a.json",)):
+        monkeypatch.setattr(
+            brmod, "get_app_manifest",
+            lambda name: SimpleNamespace(agents=list(agents)),
+        )
+        monkeypatch.setattr(brmod, "get_app", lambda name: {"resources": "gateway"})
+        monkeypatch.setattr(brmod, "_app_resource_root", lambda name: tmp_path)
+        monkeypatch.setattr(
+            brmod, "_registration_denied",
+            lambda name, action, app_root: None,
+        )
+
+    def test_an_io_failure_is_collected(self, monkeypatch, tmp_path):
+        import kiro_crew.apps.bridges as brmod
+        self._wire(monkeypatch, brmod, tmp_path)
+
+        def _fake(app_name, manifest, app_root, io_failures=None):
+            if io_failures is not None:
+                io_failures.append("app--agent.json")
+            return []
+        monkeypatch.setattr(brmod, "_register_agents", _fake)
+
+        collected: list[str] = []
+        brmod.refresh_app_agents("app", io_failures=collected)
+        assert collected == ["app--agent.json"]
+
+    def test_a_permanent_skip_collects_nothing(self, monkeypatch, tmp_path):
+        # An unsafe agent name or malformed spec registers nothing and never will.
+        import kiro_crew.apps.bridges as brmod
+        self._wire(monkeypatch, brmod, tmp_path)
+        monkeypatch.setattr(
+            brmod, "_register_agents",
+            lambda app_name, manifest, app_root, io_failures=None: [],
+        )
+
+        collected: list[str] = []
+        brmod.refresh_app_agents("app", io_failures=collected)
+        assert collected == []
+
+    def test_a_self_managed_app_is_never_materialized(self, monkeypatch, tmp_path):
+        # `resources="app"` means the app registers its own agents; the gateway
+        # publishing them too is duplicate dispatchable configuration.
+        import kiro_crew.apps.bridges as brmod
+        self._wire(monkeypatch, brmod, tmp_path)
+        monkeypatch.setattr(brmod, "get_app", lambda name: {"resources": "app"})
+        monkeypatch.setattr(
+            brmod, "_register_agents",
+            lambda *a, **k: pytest.fail("must not materialize a self-managed app"),
+        )
+
+        collected: list[str] = []
+        assert brmod.refresh_app_agents("app", io_failures=collected) == []
+        assert collected == []  # nothing to do is not a failure
+
+    def test_a_denied_app_has_its_agents_scrubbed_not_rewritten(self, monkeypatch, tmp_path):
+        # Rewriting a revoked app's agents would make them dispatchable again.
+        import kiro_crew.apps.bridges as brmod
+        self._wire(monkeypatch, brmod, tmp_path)
+        monkeypatch.setattr(
+            brmod, "_registration_denied", lambda name, action, app_root: "revoked"
+        )
+        scrubbed: list[str] = []
+        monkeypatch.setattr(
+            brmod, "_deregister_agents", lambda name: scrubbed.append(name)
+        )
+        monkeypatch.setattr(
+            brmod, "_register_agents",
+            lambda *a, **k: pytest.fail("must not re-register a denied app"),
+        )
+
+        collected: list[str] = []
+        assert brmod.refresh_app_agents("app", io_failures=collected) == []
+        assert scrubbed == ["app"]
+        assert collected == []
+
+
+class TestDemotionKeepsBackendIndependentServers:
+    """A dead HTTP backend must not take an app's stdio tools with it (#5726 review).
+
+    stdio/command servers are launched by kiro-cli itself and have no port to be dead.
+    Blanket-deregistering every `<app>:` entry on demotion removed working tools for a
+    reason that had nothing to do with them.
+    """
+
+    def test_the_unhealthy_reconcile_scrubs_http_and_keeps_stdio(
+        self, monkeypatch, tmp_path
+    ):
+        import kiro_crew.apps.backend as bmod
+        import kiro_crew.apps.bridges as brmod
+
+        calls: dict[str, object] = {}
+
+        # Fabricated app: not in installed.json, so the demotion path's enablement gate
+        # would otherwise divert into the disabled-app cleanup. The gate is pinned by
+        # TestDemotionRefreshIsGatedOnEnablement.
+        monkeypatch.setattr(bmod, "_app_enabled_state", lambda name: True)
+
+        def _scrub(app_name, unreconciled=None):
+            calls["app"] = app_name
+            return ["app:stdio-tool"]  # the stdio entry survives
+        monkeypatch.setattr(brmod, "scrub_backend_mcp_url", _scrub)
+        monkeypatch.setattr(brmod, "refresh_app_agents",
+                            lambda name, io_failures=None: [])
+
+        def _blanket(name):
+            raise AssertionError("must not blanket-deregister on a health demotion")
+        monkeypatch.setattr(brmod, "_deregister_mcp_servers", _blanket)
+
+        assert bmod._gate_mcp_registration("app", 9280, healthy=False) is True
+        assert calls == {"app": "app"}
+
+    def test_the_registration_path_pops_a_stale_http_entry(self):
+        # Pins the property the fix leans on, in the code that owns it: with no live
+        # port, an HTTP server is removed rather than merely left unwritten — otherwise
+        # the dead url would survive the demotion.
+        import inspect
+
+        import kiro_crew.apps.bridges as brmod
+        src = inspect.getsource(brmod._register_mcp_servers)
+        assert "servers.pop(namespaced, None)" in src
+        assert "if is_http and not resolved_port:" in src
+
+
+class TestScrubFallsBackWhenTheManifestCannotSay:
+    """No manifest → remove everything, rather than keep a dead url out of ignorance."""
+
+    def test_an_unresolvable_manifest_scrubs_every_entry(self, monkeypatch):
+        import kiro_crew.apps.bridges as brmod
+
+        monkeypatch.setattr(brmod, "_registration_source", lambda n: (None, brmod.Path(".")))
+        removed: list[str] = []
+        monkeypatch.setattr(
+            brmod, "_deregister_mcp_servers",
+            lambda n: (removed.append(n), 2)[1],
+        )
+        monkeypatch.setattr(
+            brmod, "reregister_app_mcp_servers",
+            lambda n, live_port=None: pytest.fail("cannot register without a manifest"),
+        )
+
+        assert brmod.scrub_backend_mcp_url("gone") == []
+        assert removed == ["gone"]
+
+    def test_a_manifest_declaring_no_servers_also_scrubs_everything(self, monkeypatch):
+        # A stale `<app>:` entry with nothing declaring it is exactly the shape that
+        # should not survive; there is no independent server to protect.
+        import kiro_crew.apps.bridges as brmod
+
+        empty = SimpleNamespace(mcpServers={})
+        monkeypatch.setattr(brmod, "_registration_source", lambda n: (empty, brmod.Path(".")))
+        removed: list[str] = []
+        monkeypatch.setattr(
+            brmod, "_deregister_mcp_servers",
+            lambda n: (removed.append(n), 1)[1],
+        )
+
+        assert brmod.scrub_backend_mcp_url("bare") == []
+        assert removed == ["bare"]
+
+
+class TestLifecycleWritersShareTheHealthSerialization:
+    """Both families of writer hold one lock (#5726 review).
+
+    An app's mcp.json entries and its materialized agents are written by the lifecycle
+    paths here AND by the backend's health watch. Unserialized, the two can interleave
+    their decisions — each doing a correct read-modify-write, with the STALE one landing
+    last. Closing that per call site is what this review kept re-finding; the writers now
+    share the guard instead.
+    """
+
+    def _lock_held(self):
+        # RLock has no public `locked()`; a non-blocking acquire from ANOTHER thread is
+        # the honest probe — it fails only while someone actually holds it.
+        import threading
+
+        import kiro_crew.apps.backend as bmod
+        result: list[bool] = []
+
+        def _probe():
+            got = bmod._health_reconcile_lock.acquire(blocking=False)
+            result.append(not got)
+            if got:
+                bmod._health_reconcile_lock.release()
+        t = threading.Thread(target=_probe)
+        t.start()
+        t.join()
+        return result[0]
+
+    def test_mcp_registration_runs_under_the_guard(self, monkeypatch):
+        import kiro_crew.apps.bridges as brmod
+        held: list[bool] = []
+        monkeypatch.setattr(
+            brmod, "_read_mcp_json_unlocked",
+            lambda strict=False: (held.append(self._lock_held()), {"mcpServers": {}})[1],
+        )
+        monkeypatch.setattr(brmod, "_write_mcp_json_unlocked", lambda data: None)
+
+        # A non-empty manifest: the function returns before the lock when there is
+        # nothing to register, so an empty one would pass this test vacuously.
+        monkeypatch.setattr(brmod, "strip_ungoverned_auto_approve", lambda m: m)
+        brmod._register_mcp_servers(
+            "app", SimpleNamespace(mcpServers={"srv": {"command": "x"}})
+        )
+        assert held == [True]
+
+    def test_mcp_deregistration_runs_under_the_guard(self, monkeypatch):
+        import kiro_crew.apps.bridges as brmod
+        held: list[bool] = []
+        monkeypatch.setattr(
+            brmod, "_read_mcp_json_unlocked",
+            lambda strict=False: (held.append(self._lock_held()), {"mcpServers": {}})[1],
+        )
+        monkeypatch.setattr(brmod, "_write_mcp_json_unlocked", lambda data: None)
+
+        brmod._deregister_mcp_servers("app")
+        assert held == [True]
+
+    def test_agent_materialization_runs_under_the_guard(self, monkeypatch, tmp_path):
+        # The READ is inside too, not just the write: an agent copies the ambient spec,
+        # so a read before a scrub and a write after it is the interleave that matters.
+        import kiro_crew.apps.bridges as brmod
+        held: list[bool] = []
+        monkeypatch.setattr(brmod, "_kiro_agents_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            brmod, "_agent_mcp_policy",
+            lambda name: (held.append(self._lock_held()), {})[1],
+        )
+
+        brmod._register_agents("app", SimpleNamespace(agents=[]), tmp_path)
+        assert held == [True]
+
+    def test_the_health_path_can_re_enter_it(self):
+        # The health transition holds the lock and then calls straight into these
+        # writers. A non-re-entrant lock would deadlock the watch thread here, which is
+        # why it is an RLock — pinned so nobody "simplifies" it back to Lock.
+        import kiro_crew.apps.backend as bmod
+
+        with bmod._health_reconcile_lock:
+            assert bmod._health_reconcile_lock.acquire(blocking=False)
+            bmod._health_reconcile_lock.release()
+
+
+class TestRenderFailureIsClassifiedByCause:
+    """`_render_shipped_agent` returns None for three reasons; one is retryable.
+
+    An unresolved placeholder and invalid rendered JSON are properties of the template
+    and fail identically forever — reporting them to a caller that retries would spin
+    without converging. Only the write failure can succeed later.
+    """
+
+    def _template(self, tmp_path, body: str):
+        src = tmp_path / "agent.json"
+        src.write_text(body, encoding="utf-8")
+        return src
+
+    def test_a_write_failure_is_collected(self, monkeypatch, tmp_path):
+        import kiro_crew.apps.bridges as brmod
+        src = self._template(tmp_path, '{"name": "a", "root": "{ENGINE_ROOT}"}')
+        monkeypatch.setattr(brmod, "_placeholder_values", lambda n: {"{ENGINE_ROOT}": "/x"})
+        monkeypatch.setattr(brmod, "_kiro_agents_dir", lambda: tmp_path / "agents")
+
+        def _boom(target, data):
+            raise OSError("ENOSPC")
+        monkeypatch.setattr(brmod, "atomic_write", _boom)
+
+        collected: list[str] = []
+        assert brmod._render_shipped_agent("app", src, io_failures=collected) is None
+        assert collected == [str(src)]
+
+    def test_an_unresolved_placeholder_is_not_collected(self, monkeypatch, tmp_path):
+        import kiro_crew.apps.bridges as brmod
+        src = self._template(tmp_path, '{"name": "a", "root": "{ENGINE_ROOT}"}')
+        monkeypatch.setattr(brmod, "_placeholder_values", lambda n: {})  # nothing resolves
+
+        collected: list[str] = []
+        assert brmod._render_shipped_agent("app", src, io_failures=collected) is None
+        assert collected == []  # permanent: retrying never converges
+
+    def test_invalid_rendered_json_is_not_collected(self, monkeypatch, tmp_path):
+        import kiro_crew.apps.bridges as brmod
+        src = self._template(tmp_path, '{"name": "a", "root": "{ENGINE_ROOT}"')  # unbalanced
+        monkeypatch.setattr(brmod, "_placeholder_values", lambda n: {"{ENGINE_ROOT}": "/x"})
+
+        collected: list[str] = []
+        assert brmod._render_shipped_agent("app", src, io_failures=collected) is None
+        assert collected == []
+
+
+class TestScrubNeverDeletesMaterializedAgents:
+    """The scrub fallback must not delete agent files (#5726 review).
+
+    Deleting them is unrecoverable — it takes the user-owned fields
+    `_preserve_user_agent_edits` carries across every refresh — while what it would
+    prevent, an agent naming a removed server, costs failed tool calls until the next
+    refresh rewrites it. An unreadable manifest is also frequently TRANSIENT, so
+    destroying data over it trades a temporary fault for a permanent one. Only
+    `deregister_app` owns deleting these files.
+    """
+
+    def test_an_unreadable_manifest_keeps_the_agents(self, monkeypatch):
+        import kiro_crew.apps.bridges as brmod
+
+        monkeypatch.setattr(brmod, "_registration_source", lambda n: (None, brmod.Path(".")))
+        monkeypatch.setattr(brmod, "_deregister_mcp_servers", lambda n: 1)
+        monkeypatch.setattr(
+            brmod, "_deregister_agents",
+            lambda n: pytest.fail("user-edited agent configs must survive a scrub"),
+        )
+
+        assert brmod.scrub_backend_mcp_url("unreadable") == []
+
+    def test_a_manifest_declaring_no_servers_keeps_them_too(self, monkeypatch):
+        import kiro_crew.apps.bridges as brmod
+
+        monkeypatch.setattr(
+            brmod, "_registration_source",
+            lambda n: (SimpleNamespace(mcpServers={}), brmod.Path(".")),
+        )
+        monkeypatch.setattr(brmod, "_deregister_mcp_servers", lambda n: 1)
+        monkeypatch.setattr(
+            brmod, "_deregister_agents",
+            lambda n: pytest.fail("nothing declared means nothing stale to remove"),
+        )
+
+        assert brmod.scrub_backend_mcp_url("bare") == []
+
+    def test_the_mcp_entry_is_still_scrubbed(self, monkeypatch):
+        # Keeping the agents must not turn into keeping the dead url as well.
+        import kiro_crew.apps.bridges as brmod
+
+        monkeypatch.setattr(brmod, "_registration_source", lambda n: (None, brmod.Path(".")))
+        removed: list[str] = []
+        monkeypatch.setattr(
+            brmod, "_deregister_mcp_servers", lambda n: (removed.append(n), 1)[1]
+        )
+        monkeypatch.setattr(brmod, "_deregister_agents", lambda n: 0)
+
+        brmod.scrub_backend_mcp_url("gone")
+        assert removed == ["gone"]
+
+
+class TestUnreadableManifestIsNotASilentRegistration:
+    """An unreadable manifest registered nothing, so it must not report success.
+
+    `reregister_app_mcp_servers` returns an empty list for several reasons. One of them —
+    the manifest could not be read — means nothing was written, and recording that as a
+    completed registration leaves a healthy backend with no MCP entry and nothing to
+    retry it.
+    """
+
+    def test_an_unreadable_manifest_is_collected(self, monkeypatch):
+        import kiro_crew.apps.bridges as brmod
+
+        monkeypatch.setattr(brmod, "_registration_source", lambda n: (None, brmod.Path(".")))
+        monkeypatch.setattr(
+            brmod, "_registration_denied", lambda name, action, app_root: None
+        )
+
+        collected: list[str] = []
+        assert brmod.reregister_app_mcp_servers("app", io_failures=collected) == []
+        assert collected == ["app: manifest unreadable"]
+
+    def test_a_manifest_declaring_no_servers_is_not_collected(self, monkeypatch):
+        # Readable and simply empty: nothing to register, and retrying never changes it.
+        import kiro_crew.apps.bridges as brmod
+
+        monkeypatch.setattr(
+            brmod, "_registration_source",
+            lambda n: (SimpleNamespace(mcpServers={}, agents=[]), brmod.Path(".")),
+        )
+        monkeypatch.setattr(
+            brmod, "_registration_denied", lambda name, action, app_root: None
+        )
+
+        collected: list[str] = []
+        assert brmod.reregister_app_mcp_servers("app", io_failures=collected) == []
+        assert collected == []
+
+
+class TestScrubDoesNotRematerializeAgents:
+    """The scrub must not write agents (#5726 review).
+
+    `reregister_app_mcp_servers` calls `_register_agents` internally, so routing the
+    scrub through it re-materialized this app's agent configs BEFORE the caller's
+    enablement check ran — making a disabled app's agents dispatchable in the gap. The
+    scrub needs only the mcp.json half; the agent refresh belongs to the caller, which
+    gates it.
+    """
+
+    def test_the_scrub_touches_mcp_only(self, monkeypatch):
+        import kiro_crew.apps.bridges as brmod
+
+        manifest = SimpleNamespace(mcpServers={"srv": {"command": "x"}}, agents=["a.json"])
+        monkeypatch.setattr(
+            brmod, "_registration_source", lambda n: (manifest, brmod.Path("."))
+        )
+        monkeypatch.setattr(
+            brmod, "_registration_denied", lambda name, action, app_root: None
+        )
+        monkeypatch.setattr(
+            brmod, "_register_mcp_servers",
+            lambda name, m, live_port=None: ["app:srv"],
+        )
+        monkeypatch.setattr(
+            brmod, "_register_agents",
+            lambda *a, **k: pytest.fail("the scrub must not re-materialize agents"),
+        )
+
+        assert brmod.scrub_backend_mcp_url("app") == ["app:srv"]
+
+    def test_a_denied_app_still_gets_a_full_removal(self, monkeypatch):
+        # The admission gate `reregister_app_mcp_servers` applied has to survive the
+        # switch: nothing of a denied app stays reachable, not even its stdio servers.
+        import kiro_crew.apps.bridges as brmod
+
+        manifest = SimpleNamespace(mcpServers={"srv": {"command": "x"}}, agents=[])
+        monkeypatch.setattr(
+            brmod, "_registration_source", lambda n: (manifest, brmod.Path("."))
+        )
+        monkeypatch.setattr(
+            brmod, "_registration_denied", lambda name, action, app_root: "revoked"
+        )
+        removed: list[str] = []
+        monkeypatch.setattr(
+            brmod, "_deregister_mcp_servers", lambda n: (removed.append(n), 1)[1]
+        )
+        monkeypatch.setattr(
+            brmod, "_register_mcp_servers",
+            lambda *a, **k: pytest.fail("a denied app must not keep any server"),
+        )
+
+        assert brmod.scrub_backend_mcp_url("app") == []
+        assert removed == ["app"]

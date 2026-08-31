@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import errno
 import faulthandler
 import logging
 import os
 import stat
+import sys
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -34,8 +36,11 @@ from kiro_crew.channel_transcript_migration import migrate_channel_transcripts
 from kiro_crew.config import data_home
 from kiro_crew.config.loader import (
     KiroCrewConfig,
+    consume_managed_service_launch_environment,
+    load_loop_stall_exit_after,
     refresh_config_meta_stamp,
     refresh_materialized_agents,
+    resolve_loop_stall_exit_after,
 )
 from kiro_crew.dashboard import (
     cautious_boot,
@@ -43,6 +48,7 @@ from kiro_crew.dashboard import (
     chat,
     handlers,
     tailnet,
+    tailnet_serve,
 )
 from kiro_crew.dashboard.mobile_tunnel import start_tunnel
 from kiro_crew.dashboard.crash_dump_store import (
@@ -104,11 +110,13 @@ from kiro_crew.dashboard.handlers.artifacts import (
 from kiro_crew.dashboard.handlers.feedback import setup_feedback_routes
 from kiro_crew.dashboard.handlers.knowledge import setup_knowledge_routes
 from kiro_crew.dashboard.handlers.link_meta import setup_link_meta_routes
+from kiro_crew.dashboard.handlers.secrets import setup_secrets_routes
 from kiro_crew.dashboard.handlers.source_providers import (
     register_status_delta_sink,
     unregister_status_delta_sink,
 )
 from kiro_crew.dashboard.handlers.weixin_qr import setup_weixin_routes
+from kiro_crew.dashboard.handlers.whatsapp_setup import setup_whatsapp_routes
 from kiro_crew.dashboard.loop_watchdog import LoopStallWatchdog
 from kiro_crew.dashboard.origin import (
     PROBE_PATHS,
@@ -117,6 +125,7 @@ from kiro_crew.dashboard.origin import (
     check_host,
     check_origin,
     dashboard_socket_path,
+    frame_ancestors_value,
     resolve_dashboard_host,
     should_canonicalize_host,
 )
@@ -132,6 +141,7 @@ from kiro_crew.dashboard.state import _DEFAULT_PORT, DashboardState
 from kiro_crew.dashboard.token_auth import (
     _cookie_port_from_host,
     _is_spa_shell_request,
+    is_csrf_exempt,
     register_app_window_paths,
     token_auth_middleware,
     token_embed_parent_port,
@@ -157,8 +167,10 @@ from kiro_crew.platform import (
 from kiro_crew.power import SleepInhibitor
 from kiro_crew.safety_override import (
     apply_config_duration,
+    describe_dropped_grant,
     grant_declared_yolo,
     safety_override,
+    take_dropped_grant,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -201,6 +213,12 @@ _DIST_DIR = _STATIC_DIR / "dist"
 # outlasts a sleep timer, so not catching it is harmless.
 _PREVENT_SLEEP_POLL_INTERVAL_SECS = 15.0
 
+# How long the speech idle-sweep task waits before importing the recogniser package.
+# Its only job is to keep boot clean: the import pulls numpy and the binding, and the
+# hook that starts this task runs before either socket binds. Anything past the first
+# few seconds of boot works, since the sweep's own interval is a minute.
+_STT_SWEEP_BOOT_DELAY_SECS = 30.0
+
 
 async def _prune_browser_snapshots_loop() -> None:
     """Keep the browser snapshot directory bounded for as long as we run.
@@ -222,13 +240,60 @@ async def _prune_browser_snapshots_loop() -> None:
         await asyncio.sleep(30 * 60.0)
 
 
-async def _should_prevent_sleep(state: DashboardState) -> bool:
+#: The tailnet publish state is a subprocess round trip (`tailscale serve
+#: status`), and the prevent-sleep poll runs every 15s — far too often to spawn a
+#: CLI each time. Cached SEPARATELY from the mobile-access card's own reads, which
+#: stay live on purpose: a stale awake decision costs at most one window of
+#: battery, while a stale card would show the operator the wrong next action.
+_TAILNET_AWAKE_TTL_SECS = 60.0
+
+#: ``(monotonic expiry, published)``. Module-level so both server entrypoints
+#: share one cache rather than each paying its own subprocess.
+_tailnet_awake_cache: tuple[float, bool] = (0.0, False)
+
+
+async def _tailnet_publish_keeps_awake(port: int) -> bool:
+    """Whether serve is currently fronting *port*, TTL-cached. Never raises."""
+    global _tailnet_awake_cache
+    if not port:
+        return False
+    now = time.monotonic()
+    expiry, cached = _tailnet_awake_cache
+    if expiry > now:
+        return cached
+    try:
+        serve = await asyncio.to_thread(tailnet_serve.serve_state, port)
+        # ``published is None`` means we could not tell. Treated as NOT published,
+        # because the fail-closed direction for this decision is letting the host
+        # sleep — an unresolvable probe must not pin a laptop awake indefinitely.
+        published = serve.published is True
+    except Exception:
+        logger.debug("prevent-sleep tailnet probe failed", exc_info=True)
+        published = False
+    _tailnet_awake_cache = (now + _TAILNET_AWAKE_TTL_SECS, published)
+    return published
+
+
+async def _should_prevent_sleep(state: DashboardState, port: int) -> bool:
     """Whether the host should be kept awake right now.
 
-    True only when the user opted in (``dashboard.prevent_sleep``) AND some live
-    session has a turn in flight. Reads config live so toggling the flag takes
-    effect on the next poll without a restart. Fail-closed: any error resolves to
-    "allow sleep" so a config/lookup hiccup can never wedge the machine awake.
+    Two independent reasons, either sufficient on its own:
+
+    * **A turn is in flight**, and the user opted in via
+      ``dashboard.prevent_sleep``. The original reason this poll exists.
+    * **The dashboard is published on this machine's tailnet**, and
+      ``dashboard.tailscale.keep_awake`` is on. A phone loses the dashboard the
+      moment the laptop idles, so publishing is itself the opt-in — an operator
+      who put the dashboard on their tailnet asked for it to stay reachable.
+      Deliberately NOT also gated on ``dashboard.prevent_sleep``: that switch is
+      scoped to in-flight turns, and making someone find it to keep a published
+      dashboard alive would be the wrong switch in the wrong place. The escape
+      hatch is ``keep_awake``, which turns off the awake half without
+      unpublishing.
+
+    Reads config live so either toggle takes effect on the next poll without a
+    restart. Fail-closed throughout: any error resolves to "allow sleep", so a
+    config or daemon hiccup can never wedge the machine awake.
     """
     try:
         # KiroCrewConfig.load() does a stat and, on a cache miss, a JSON read +
@@ -236,10 +301,22 @@ async def _should_prevent_sleep(state: DashboardState) -> bool:
         # and this runs on the gateway event loop every poll — offload it so a
         # slow read can never stall chat/heartbeat (no-blocking-call-on-event-loop).
         cfg = await asyncio.to_thread(KiroCrewConfig.load)
-        if not cfg.dashboard.prevent_sleep:
-            return False
+        # Both reads sit INSIDE the guard, and that placement is the actual
+        # defence: a config object predating the tailscale section raises on the
+        # attribute, and outside the guard that would propagate — a partially
+        # formed config wedging a laptop awake, since the poll swallows the error
+        # and retries forever. The getattr defaults are belt-and-braces on top.
+        tailscale_cfg = getattr(cfg.dashboard, "tailscale", None)
+        tailnet_enabled = bool(getattr(tailscale_cfg, "enabled", False))
+        tailnet_keep_awake = bool(getattr(tailscale_cfg, "keep_awake", False))
+        tailnet_wants_awake = tailnet_enabled and tailnet_keep_awake
+        opted_into_turn_wake = bool(getattr(cfg.dashboard, "prevent_sleep", False))
     except Exception:
         logger.debug("prevent-sleep config read failed", exc_info=True)
+        return False
+    if tailnet_wants_awake and await _tailnet_publish_keeps_awake(port):
+        return True
+    if not opted_into_turn_wake:
         return False
     sessions = getattr(state, "sessions", None)
     if sessions is None:
@@ -296,6 +373,14 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         # ``local_only=False`` deployment reclassifies strict paths as mixed.
         "/api/computer-use/frame",
         "/api/session-keepalive",
+        # In-app update approval (RFC OQ7 step-up). STRICT: its only legitimate
+        # caller is `kirocrew update approve` on the gateway host presenting the
+        # trust/-fenced nonce plus X-Local-Secret; no browser ever posts to it —
+        # the SPA can only ARM. Keeping it off the cookie fall-through means a
+        # dashboard bearer cannot even reach the handler whose refusal is the
+        # boundary, and the handler re-asserts host-locality itself because a
+        # local_only=False deployment reclassifies strict paths as mixed.
+        "/api/update/approve",
         "/api/session-tool-policy",
         # NOTE: "/api/hooks/agent" is deliberately NOT here. It is an inbound
         # webhook for EXTERNAL callers (CI runners, review bots) that hold no
@@ -310,15 +395,39 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         "/api/outbox/notify",
         "/api/notifications/agent",  # MCP-only (send_notification tool); no browser caller
         "/api/slack/upload-file",
+        "/api/channel/upload-file",
         "/api/slack/pins",
         "/api/slack/reactions",
         "/api/slack-profile",  # MCP-only (slack_profile tool); no browser caller
         "/api/sessions/summarize",  # MCP-only (list_sessions summarize leg); internal-secret, no browser caller
+        # MCP-only (session_ledger_read / session_ledger_record tools); no
+        # browser caller. Prefix matching covers "/api/session-ledger/record".
+        # Without this entry the tools' internal-secret calls fall through to
+        # cookie auth and are refused before the handler's own session
+        # recognition can run.
+        "/api/session-ledger",
         # MCP-only (knowledge_add_document tool); no browser caller — the
         # dashboard ingests via its own cookie-authed knowledge routes. Same
         # wiring class as "/api/notifications/agent" above.
         "/api/knowledge/agent-document",
         "/api/mcp/servers",
+        # Session control -- the three routes behind the session_create /
+        # session_stop / session_read_message MCP tools.
+        # STRICT, not mixed: no browser calls them, and they are the entry point
+        # to opening, stopping, and reading ANOTHER live conversation. A cookie
+        # fall-through there would be a new authorization path, not a
+        # convenience.
+        #
+        # Every route registered under /api/session-control MUST appear here.
+        # An unlisted path falls through to the general branch, which honors only
+        # cookie/query tokens, so the MCP caller's X-Internal-Secret is ignored
+        # and the handler's own internal_auth re-assert then refuses it -- the
+        # tool is unreachable in production while handler-level tests still pass.
+        "/api/session-control/create",
+        "/api/session-control/stop",
+        "/api/session-control/close",
+        "/api/session-control/send",
+        "/api/session-control/read",
     }
 )
 
@@ -334,7 +443,7 @@ async def _audit_denied(caller: str, request: web.Request, error: str) -> None:
 
     * OFF THE LOOP — ``log_api_access`` only enqueues, but the first ``sel()``
       of a process CONSTRUCTS the log: trust-dir creation, key validation, and
-      on Windows an ``icacls`` subprocess to lock the key file's DACL. A fresh
+      on Windows the owner-only DACL on the key file. A fresh
       dashboard whose first state-changing request is cross-origin would run
       that synchronously on the event loop and stall every other request.
     * BEST-EFFORT — a trust root too short to sign the chain makes construction
@@ -407,6 +516,66 @@ def _make_host_validation_middleware(caller: str) -> Callable:
         return await handler(request)  # type: ignore[operator]
 
     return host_validation_middleware
+
+
+#: Methods the CSRF barrier skips. A safe method does not mutate state, and
+#: GET-based exfiltration is covered by the Host barrier above, which runs on
+#: every method.
+_CSRF_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _make_csrf_middleware(caller: str) -> Callable:
+    """Build the cross-site CSRF barrier middleware.
+
+    SHARED by BOTH entrypoints (``start_dashboard`` and the ``--slack-only``
+    ``start_api_server``) so the two chains can never drift — same rationale as
+    :func:`_make_host_validation_middleware`. In particular this is the SINGLE
+    read point for ``token_auth.CSRF_EXEMPT_EXACT_METHODS``, so an exemption can
+    never be granted on one server and withheld on the other.
+
+    Blocks state-mutating requests that a cross-origin page issued. Loopback
+    local processes (mcp-core, cron, doctor) send no Origin header and are
+    trusted by ``check_origin``; a browser always sends Origin, so a cross-site
+    page is rejected here even before token auth runs.
+
+    Webhook exemption: a self-authenticating external webhook is a
+    server-to-server caller that sends neither ``Origin`` nor ``Referer``, which
+    ``check_origin`` can only accept from a loopback peer — so without the
+    exemption the route is unreachable in the topology that exposes the gateway
+    directly, with no configuration that fixes it. Those handlers ignore cookies
+    and authenticate a bearer credential a browser cannot forge, which is the
+    entire threat CSRF addresses; ``token_auth.CSRF_EXEMPT_EXACT_METHODS`` holds
+    the full decision, and any addition to it is a security review. The exempted
+    request is still audited — ``sel_audit_middleware`` logs every mutating
+    ``/api/`` call in both chains — so the carve-out writes no SEL event of its
+    own, matching ``PROBE_PATHS`` on the Host barrier.
+
+    ``caller`` labels the SEL audit line (``dashboard_user`` for the full
+    dashboard, ``mcp_tool`` for the headless API server).
+    """
+
+    @web.middleware  # type: ignore[misc]
+    async def csrf_middleware(
+        request: web.Request,
+        handler: object,
+    ) -> web.StreamResponse:
+        guarded = request.method not in _CSRF_SAFE_METHODS and not is_csrf_exempt(
+            request.path, request.method
+        )
+        if guarded and not check_origin(request, require=True, fallback_header="Referer"):
+            await _audit_denied(
+                caller,
+                request,
+                "CSRF check failed: origin not allowed: "
+                f"{request.headers.get('Origin', '')[:100]}",
+            )
+            raise web.HTTPForbidden(
+                text="CSRF check failed: request origin not allowed.",
+                content_type="text/plain",
+            )
+        return await handler(request)  # type: ignore[operator]
+
+    return csrf_middleware
 
 
 # Mixed internal API paths — called by BOTH internal processes (loopback +
@@ -607,6 +776,56 @@ _INSTANCES_FRAME_SRC_EXTRA = " http://*.localhost:*"
 # artifacts. Grant same-origin only; cross-origin remains denied.
 _PERMISSIONS_POLICY = "clipboard-write=(self), clipboard-read=(self)"
 
+# /vendor/* is fetched by sandboxed widget/artifact iframes, which are
+# null-origin (srcdoc/blob) documents and therefore NON-secure contexts. On the
+# default deployment the gateway is plain http on loopback — a "more-private
+# address space" under Chrome's Private Network Access policy — which blocks
+# the iframe's <script src> for the Tailwind runtime unless the load goes
+# through CORS with server approval: the tag carries
+# crossorigin="anonymous" (widgetSrcdoc.ts) and this response carries
+# Access-Control-Allow-Origin. Verified against real Chromium: with the
+# header the runtime loads; without it the load hard-fails (crossorigin
+# makes the header MANDATORY, not additive), the runtime never arrives,
+# Tailwind-classed widgets render unstyled, and the widget loading overlay
+# sits on its hang backstop (blank box), see issue #6181. `*` leaks nothing:
+# /vendor/ holds only public, non-secret static JS (already auth-exempt via
+# token_auth._BYPASS_PREFIXES) and the response carries no credentials or
+# user data.
+_VENDOR_PATH_PREFIX = "/vendor/"
+_VENDOR_CORS_HEADER_VALUE = "*"
+_PNA_REQUEST_HEADER = "Access-Control-Request-Private-Network"
+_PNA_RESPONSE_HEADER = "Access-Control-Allow-Private-Network"
+# Two hours — Chrome caps preflight cache entries at 7200s, so a larger value
+# documents a guarantee the browser does not honour. The vendor files are
+# stable, unversioned assets; caching the approval avoids a preflight per
+# widget for the cap's duration.
+_VENDOR_PREFLIGHT_MAX_AGE_SECS = 7200
+
+
+async def _vendor_preflight_handler(request: web.Request) -> web.Response:
+    """Answer the CORS / Private Network Access preflight for ``/vendor/*``.
+
+    Forward-compat: current Chromium blocks the insecure-initiator load at
+    the CORS layer WITHOUT sending a PNA preflight (verified empirically —
+    the GET-with-Access-Control-Allow-Origin path above is the live fix).
+    Chrome's PNA rollout answers a private-network subresource fetch with a
+    preflight OPTIONS carrying ``Access-Control-Request-Private-Network:
+    true``; ``add_static`` registers GET/HEAD only, so if/when that ships
+    for this initiator class the preflight would 405 and the runtime load
+    would fail closed again. The PNA grant header is echoed only when the
+    request actually asks for it, per the PNA spec's request/response
+    pairing.
+    """
+    headers = {
+        "Access-Control-Allow-Origin": _VENDOR_CORS_HEADER_VALUE,
+        "Access-Control-Allow-Methods": "GET, HEAD",
+        "Access-Control-Max-Age": str(_VENDOR_PREFLIGHT_MAX_AGE_SECS),
+    }
+    if request.headers.get(_PNA_REQUEST_HEADER, "").lower() == "true":
+        headers[_PNA_RESPONSE_HEADER] = "true"
+    return web.Response(status=204, headers=headers)
+
+
 # Content-hashed build output (Vite emits ``/assets/<name>-<hash>.<ext>``;
 # the URL changes whenever the content changes) is safe to cache forever.
 # Everything else — index.html, the SPA shell, /api — keeps the no-store
@@ -677,7 +896,16 @@ def _extra_frame_ancestors(
         if 1 <= _p <= 65535:
             port = _p
     if port is None:
-        token = request.query.get("token") or ""
+        # Prefer the credential token_auth actually VALIDATED (it publishes it
+        # as request["auth_token"]): its extraction can adopt the session cookie
+        # over an invalid query token, so a fixed query-then-cookie re-derivation
+        # could read an unverified value. Fall back to that order only when no
+        # credential was published (e.g. a surface that never reached the
+        # middleware's authenticated paths).
+        published = request.get("auth_token", "")
+        token = published if isinstance(published, str) else ""
+        if not token:
+            token = request.query.get("token") or ""
         if not token:
             port_fallback = app.get("port", _DEFAULT_PORT) if app is not None else _DEFAULT_PORT
             cookie_port = _cookie_port_from_host(request, port_fallback)
@@ -685,10 +913,13 @@ def _extra_frame_ancestors(
         port = token_embed_parent_port(token)
     if port is None:
         return []
-    return [
-        f"http://{host}:{port}"
-        for host in ("127.0.0.1", "localhost", "[::1]", "kirocrew.localhost")
-    ]
+    # A CSP host-source admits only letters, digits and hyphens in the host, so a
+    # bracketed IPv6 literal cannot be expressed: `http://[::1]:<port>` is refused by
+    # the browser ("the directive 'frame-ancestors' does not support the source
+    # expression") and dropped, so it never granted anything — it only logged a
+    # warning on every framed response. There is no valid spelling to substitute,
+    # so an IPv6-loopback parent cannot be authorized at all.
+    return [f"http://{host}:{port}" for host in ("127.0.0.1", "localhost", "kirocrew.localhost")]
 
 
 def _apply_security_headers(
@@ -750,7 +981,11 @@ def _apply_security_headers(
     # instance dashboard across loopback ports, while any local page without a
     # validly-signed token stays blocked (clickjacking).
     extra_ancestors = _extra_frame_ancestors(request, app)
-    frame_ancestors = " ".join(["'self'", *extra_ancestors])
+    # Same builder the sandboxed-document responses use. Hand-joining here instead
+    # would leave the shell as the one ancestor source nothing validates, which is
+    # exactly how an inexpressible entry (a bracketed IPv6 literal) reached a
+    # header before and made engines drop the whole directive.
+    frame_ancestors = frame_ancestors_value(extra_ancestors)
     resp.headers.setdefault(
         "Content-Security-Policy",
         _BASE_CSP.format(
@@ -760,6 +995,11 @@ def _apply_security_headers(
         ),
     )
     resp.headers.setdefault("Permissions-Policy", _PERMISSIONS_POLICY)
+    # CORS approval for the vendored runtime files fetched by null-origin
+    # sandboxed iframes; pairs with the /vendor OPTIONS preflight handler.
+    # See _VENDOR_PATH_PREFIX for the full Private-Network-Access rationale.
+    if path.startswith(_VENDOR_PATH_PREFIX):
+        resp.headers.setdefault("Access-Control-Allow-Origin", _VENDOR_CORS_HEADER_VALUE)
     # Defense-in-depth browser headers (CWE-1021/693/200/319). All via setdefault
     # so a handler can override. The clickjacking control is CSP ``frame-ancestors``
     # above. X-Frame-Options is origin-exact (SAMEORIGIN) and cannot express the
@@ -893,6 +1133,12 @@ def _register_dist_static_routes(app: web.Application, dist_dir: Path) -> None:
             show_index=False,
             append_version=False,  # stable URLs, no cache-busting
         )
+        # PNA/CORS preflight, forward-compat: add_static registers GET/HEAD
+        # only, so a private-network preflight OPTIONS would 405 and fail the
+        # widget iframe's runtime load closed if Chrome starts sending one for
+        # this initiator class (today it blocks at the CORS layer without a
+        # preflight — see _vendor_preflight_handler).
+        app.router.add_route("OPTIONS", "/vendor/{tail:.*}", _vendor_preflight_handler)
     # App Store brand assets — builtin app icons + hero images live at
     # dist/app-assets/ and are referenced by absolute url('/app-assets/...')
     # from each builtin's app.json (iconUrl / heroImage / heroImageDark).
@@ -968,6 +1214,27 @@ def _precompute_telemetry(state: "DashboardState") -> None:
         _log.debug("telemetry.record_event(gateway_start) failed", exc_info=True)
 
 
+def _deferred_session_control(handler_name: str) -> Callable:
+    """Bind a session-control route without importing the subsystem at boot.
+
+    Session control is feature-flagged (``agent.session_control``), and the
+    enabled check lives inside the handler -- so a module-level import would be
+    an eager import of an optional subsystem whose gate runs after it, which the
+    boot-path rule names explicitly. Route registration itself is allowed at
+    boot; only the import moves to first request, so an operator who disabled the
+    feature never pays for loading it.
+    """
+
+    async def _route(request: web.Request) -> web.StreamResponse:
+        from kiro_crew.dashboard.handlers import session_control
+
+        handler = getattr(session_control, handler_name)
+        return await handler(request)
+
+    _route.__name__ = handler_name
+    return _route
+
+
 def _register_mcp_routes(app: web.Application) -> None:
     """Register API routes used by MCP tools (spawn, lessons, crons, etc.)."""
     app.router.add_post("/api/spawn", handlers.api_spawn)
@@ -986,6 +1253,8 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_get("/api/lessons", handlers.api_lessons)
     app.router.add_post("/api/lessons", handlers.api_lessons_create)
     app.router.add_delete("/api/lessons", handlers.api_lessons_delete)
+    app.router.add_get("/api/session-ledger", handlers.api_session_ledger_get)
+    app.router.add_post("/api/session-ledger/record", handlers.api_session_ledger_record)
     app.router.add_get("/api/crons", handlers.api_crons)
     app.router.add_post("/api/crons", handlers.api_crons_create)
     app.router.add_delete("/api/crons", handlers.api_cron_batch_delete)
@@ -1013,6 +1282,25 @@ def _register_mcp_routes(app: web.Application) -> None:
     # here (not the dashboard-only block) so headless --slack-only mode
     # serves it too; it is on _STRICT_INTERNAL_API_PATHS like send-message.
     app.router.add_post("/api/notifications/agent", handlers.api_notification_agent_push)
+    # Session control. Registered here so the headless --slack-only server
+    # serves the same MCP surface as the dashboard; all three are on
+    # _STRICT_INTERNAL_API_PATHS, which test_session_control_routes_are_strict
+    # pins by deriving the route set from the router rather than a hand-copied list.
+    app.router.add_post(
+        "/api/session-control/create", _deferred_session_control("api_session_control_create")
+    )
+    app.router.add_post(
+        "/api/session-control/stop", _deferred_session_control("api_session_control_stop")
+    )
+    app.router.add_post(
+        "/api/session-control/close", _deferred_session_control("api_session_control_close")
+    )
+    app.router.add_post(
+        "/api/session-control/send", _deferred_session_control("api_session_control_send")
+    )
+    app.router.add_get(
+        "/api/session-control/read", _deferred_session_control("api_session_control_read")
+    )
     app.router.add_get("/api/browser/install", handlers.api_browser_install_get)
     app.router.add_put("/api/browser/token", handlers.api_browser_token_put)
     app.router.add_post("/api/browser/install", handlers.api_browser_install_start)
@@ -1062,9 +1350,13 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_patch("/api/autonudge/{loop_id}", api_autonudge_update)
     app.router.add_delete("/api/autonudge/{loop_id}", api_autonudge_delete)
 
-    # Agent questions — blocking question-card round-trip for the ask_question
-    # MCP tool. The POST holds open until the user answers, so it must not be
-    # wrapped in any short-timeout middleware.
+    # Agent questions. The MCP ask_question tool no longer posts here: it returns
+    # a session directive and the dashboard posts a NON-BLOCKING card (see
+    # mcp_tools.control.ask_question). This API stays live because the UI reads
+    # /pending to rehydrate cards after a reload and answers or dismisses them
+    # through the routes below, and POST /api/ask-question still opens a blocking
+    # wait for any caller that uses it — so it must not be wrapped in any
+    # short-timeout middleware.
     from kiro_crew.dashboard.handlers.ask_question import (
         api_ask_question,
         api_ask_question_answer,
@@ -1085,10 +1377,16 @@ def _register_mcp_routes(app: web.Application) -> None:
     # Dynamic Workflows (M6) — author, run, monitor, cancel, rerun
     from kiro_crew.dashboard.handlers.workflows import (
         api_workflow_author,
+        api_workflow_definition_get,
+        api_workflow_definition_run,
+        api_workflow_definition_update,
+        api_workflow_definitions,
+        api_workflow_definitions_create,
         api_workflow_run,
         api_workflow_run_cancel,
         api_workflow_run_get,
         api_workflow_run_intent,
+        api_workflow_run_promote,
         api_workflow_run_rerun,
         api_workflow_runs,
     )
@@ -1096,8 +1394,18 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/workflows/author", api_workflow_author)
     app.router.add_post("/api/workflows/run", api_workflow_run)
     app.router.add_post("/api/workflows/run_intent", api_workflow_run_intent)
+    app.router.add_get("/api/workflows/definitions", api_workflow_definitions)
+    app.router.add_post("/api/workflows/definitions", api_workflow_definitions_create)
+    app.router.add_post(
+        "/api/workflows/definitions/{workflow_ref}/run", api_workflow_definition_run
+    )
+    app.router.add_get("/api/workflows/definitions/{workflow_ref}", api_workflow_definition_get)
+    app.router.add_patch(
+        "/api/workflows/definitions/{workflow_ref}", api_workflow_definition_update
+    )
     app.router.add_get("/api/workflows/runs", api_workflow_runs)
     app.router.add_get("/api/workflows/runs/{run_id}", api_workflow_run_get)
+    app.router.add_post("/api/workflows/runs/{run_id}/promote", api_workflow_run_promote)
     app.router.add_post("/api/workflows/runs/{run_id}/cancel", api_workflow_run_cancel)
     app.router.add_post("/api/workflows/runs/{run_id}/rerun", api_workflow_run_rerun)
 
@@ -1110,6 +1418,11 @@ def _register_mcp_routes(app: web.Application) -> None:
     from kiro_crew.dashboard.handlers.webapp_preview import register_webapp_preview_routes
 
     register_webapp_preview_routes(app)
+    # The document channel artifact and widget frames load from — see
+    # handlers/sandbox_doc.py for why a blob: URL was not survivable.
+    from kiro_crew.dashboard.handlers.sandbox_doc import register_sandbox_doc_routes
+
+    register_sandbox_doc_routes(app)
     app.router.add_get("/api/artifacts/session-docs", api_artifact_session_docs)
     app.router.add_post("/api/artifacts/materialize", api_artifact_materialize)
     app.router.add_get("/api/artifacts/publish-providers", api_artifact_publish_providers)
@@ -1497,7 +1810,7 @@ def _write_secret_file(secret_path: Path, secret: str) -> None:
             # OSError, which would defeat the cleanup-and-reraise below — a
             # pre-existing file with loose perms would stay loose and the caller
             # never learns. On POSIX this applies chmod 0o600 by path;
-            # on Windows an owner-only DACL via icacls (fchmod doesn't exist on
+            # on Windows an owner-only DACL (fchmod doesn't exist on
             # Windows, where a raw fchmod would be a silent no-op).
             platform_compat.restrict_to_owner(secret_path)
             with os.fdopen(fd, "w") as f:
@@ -1534,6 +1847,23 @@ def _claimed_dashboard_slots(state: DashboardState) -> frozenset[str]:
     except Exception:
         logger.debug("could not read claimed dashboard slots", exc_info=True)
         return frozenset()
+
+
+def _take_prior_dropped_grant() -> Any:
+    """Consume the PREVIOUS process's safety-override record, if any.
+
+    Run off the event loop (the caller wraps it in ``asyncio.to_thread``): it is a
+    file open on a filesystem that may be slow, and nothing about boot should wait
+    on it. Ordering against ``_apply_startup_yolo`` does not matter, because the
+    record carries the writing pid and this process's own record is never read as
+    a dropped one. Never raises: the gateway must not fail to boot over a
+    notification, and the grant is off either way.
+    """
+    try:
+        return take_dropped_grant()
+    except Exception:
+        logger.debug("Could not read the prior safety-override record", exc_info=True)
+        return None
 
 
 def _apply_startup_yolo(state: DashboardState, cfg: Any) -> None:
@@ -1737,30 +2067,102 @@ def _dispatch_override_expiry_notification(state: DashboardState, notify_coro_fa
 
 
 async def _dm_owner(state: DashboardState, text: str) -> None:
-    """Best-effort owner Slack DM. No-op if Slack/owner are not configured.
+    """Best-effort owner notification, Slack first then any live channel.
 
-    The shared owner-notification exit point to Slack (currently the
+    The shared owner-notification exit point (currently the
     safety-override-expiry path), so the open_dm → post_message →
     swallow-and-log idiom lives in one place.
 
-    Defense-in-depth: because this is the single exit point to Slack for owner
+    **Slack is not the only place an operator lives.** This used to no-op entirely
+    without Slack, which made an expiring unattended grant invisible on a
+    Teams-only, Discord-only or Telegram-only install — silence about a security
+    grant lapsing is the one outcome this notice exists to prevent. So a Slack DM
+    is still preferred (it is the owner's direct address), and every registered
+    channel transport that advertises a reachable configured target is used as the
+    FALLBACK when Slack is absent or could not deliver. Not in addition: an
+    operator with Slack should get one notice, not one per channel.
+
+    Defense-in-depth: because this is the single exit point for owner
     notifications and is intended for reuse, ``text`` is passed through
     ``redact_exfiltration_urls()`` then ``redact_credentials()`` (same order as
     the rest of the Slack surface) so a future caller that forwards
     LLM/user-derived content can never leak credentials or exfil URLs, even
     though today's callers only pass static constants.
     """
-    slack_client = state.slack_client
-    owner_id = state.owner_id
-    if not (slack_client and owner_id):
-        return
     safe_text, _ = redact_exfiltration_urls(text)
     safe_text, _ = redact_credentials(safe_text)
+    slack_client = state.slack_client
+    owner_id = state.owner_id
+    if slack_client and owner_id:
+        try:
+            dm_channel = await slack_client.open_dm(owner_id)
+            await slack_client.post_message(dm_channel, safe_text)
+            return
+        except Exception:
+            logger.debug("Owner Slack DM failed; trying the channel transports", exc_info=True)
+    await _notify_owner_channels(state, safe_text)
+
+
+async def _notify_owner_channels(state: DashboardState, safe_text: str) -> None:
+    """Deliver an already-redacted owner notice to a channel that can NAME the owner.
+
+    "Reachable" is the transport's OWN answer (`configured_targets` →
+    `resolve_configured_target`), so this reaches only destinations that channel
+    already authorized — a Teams DM whose route was learned from an allow-listed
+    sender, never an address chosen here. Each channel is independent: one that
+    cannot deliver must not stop the next.
+
+    **Exactly one candidate across EVERY channel, or nothing.** This notice carries the
+    operator's own security state — an expiring unattended auto-approve grant, for
+    instance — and there is no channel-neutral owner identity to check it against: Slack
+    has an owner id and is preferred above; nothing else does. An allow-list is a list of
+    people permitted to TALK to the agent, not a claim that any of them is the operator.
+
+    So the only sound inference is a counting one, and it has to be counted across the
+    whole install rather than per channel. Two channels each holding a DIFFERENT single
+    identity is two people, and delivering to both hands one of them the other's security
+    state — a per-channel "exactly one target" rule misses that entirely. With exactly one
+    reachable person in the whole configuration, that person is the operator; with two or
+    more, refuse everybody. Same premise as `/sessions`' owner-only rule.
+
+    Counted over ALL configured targets, not just the reachable ones: a three-person
+    allow-list where only one route happens to have been learned is still a guess.
+
+    The false negative is deliberate and is the safe direction: the same human configured
+    on two channels reads as two candidates and gets no channel notice. The dashboard feed
+    carries the same notice unconditionally, so silence here costs a convenience, while
+    misdelivery would cost the operator's security state. Positively binding a channel
+    identity to the operator is a per-identity authority model that does not exist yet;
+    when it does, this becomes a lookup instead of a count.
+    """
+    candidates: list[tuple[str, Any, Any]] = []
+    for channel_type, transport in list(state.channel_transports.items()):
+        try:
+            if not transport.capabilities.supports_proactive_send:
+                continue
+            candidates.extend(
+                (channel_type, transport, target) for target in transport.configured_targets()
+            )
+        except Exception:
+            logger.debug("Owner notice enumeration failed for %s", channel_type, exc_info=True)
+    if len(candidates) != 1:
+        if candidates:
+            logger.debug(
+                "Owner notice skipped: %d channel targets, none positively the owner",
+                len(candidates),
+            )
+        return
+    channel_type, transport, target = candidates[0]
+    if not target.available:
+        return
     try:
-        dm_channel = await slack_client.open_dm(owner_id)
-        await slack_client.post_message(dm_channel, safe_text)
+        resolved = await transport.resolve_configured_target(target.target_id)
+        if not resolved:
+            return
+        conversation_id, thread_id = resolved
+        await transport.send_message(conversation_id, safe_text, thread_id)
     except Exception:
-        logger.debug("Owner Slack DM skipped", exc_info=True)
+        logger.debug("Owner notice skipped for %s", channel_type, exc_info=True)
 
 
 def _dispatch_owner_dm(state: DashboardState, text: str) -> None:
@@ -2030,8 +2432,87 @@ def _register_prevent_sleep_shutdown(app: web.Application, state: DashboardState
     app.on_cleanup.append(_prevent_sleep_shutdown)
 
 
-def _arm_prevent_sleep_poll(state: DashboardState) -> None:
+def _import_stt_engine() -> Any:
+    """Import the recogniser module. BLOCKING: 169 ms cold, numpy plus the binding.
+
+    A named module-level function rather than a closure so the call is observable: the
+    invariant a test has to pin is *which thread* this runs on, and there is no other
+    seam on an `import` statement.
+    """
+    from kiro_crew.stt import engine
+
+    return engine
+
+
+async def _stt_idle_sweep() -> None:
+    """Release the resident speech model once it has been idle past its window.
+
+    `WhisperEngine.maybe_evict` also runs on the paths that finish a decode, and that
+    call can never fire on its own: it runs microseconds after ``_last_used`` was
+    stamped. Idleness is by definition a stretch in which none of those paths run, so
+    noticing it needs something that runs anyway.
+
+    Two costs are kept off the gateway's loop, and they are separate problems with
+    separate fixes:
+
+    * The boot delay keeps the import out of ``runner.setup()``, which runs before
+      either socket binds. Importing there delays the moment the dashboard answers,
+      for a janitor whose first useful pass is minutes away.
+    * `asyncio.to_thread` keeps the import off the LOOP. Sleeping first moved it out
+      of boot but left it running inline on the event loop, where a measured 169 ms
+      (numpy plus the recogniser binding) stalls every socket and heartbeat the
+      gateway is serving at that moment.
+    """
+    await asyncio.sleep(_STT_SWEEP_BOOT_DELAY_SECS)
+    engine = await asyncio.to_thread(_import_stt_engine)
+    await engine.idle_sweep_loop()
+
+
+def _register_stt_hooks(app: web.Application) -> None:
+    """Register the STT idle sweep and the model release, for both server modes.
+
+    MUST be called BEFORE ``runner.setup()`` freezes the app's signal lists. Shared by
+    ``start_dashboard`` and the headless ``start_api_server`` rather than written out
+    in each: the two copies were identical, and an event-loop-blocking import in them
+    therefore had to be found and fixed twice.
+    """
+
+    async def _stt_startup(app_: web.Application) -> None:
+        task = asyncio.create_task(_stt_idle_sweep())
+        task.add_done_callback(lambda t: t.result() if not t.cancelled() else None)
+        app_["stt_idle_sweep"] = task  # prevent GC
+
+    async def _stt_shutdown(app_: web.Application) -> None:
+        sweep = app_.get("stt_idle_sweep")
+        if sweep is not None:
+            sweep.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sweep
+        # Gated on the engine module having been imported AT ALL, which is the cheap
+        # and exact test for "could a model be resident". `stt.close()` resolves
+        # through `stt.session`, which imports numpy at module scope and whose
+        # `shared_engine()` CREATES an engine if none exists -- so on a gateway that
+        # never transcribed anything, closing pulled the recogniser binding and built
+        # a WhisperEngine at shutdown purely to release nothing.
+        if "kiro_crew.stt.engine" not in sys.modules:
+            return
+        from kiro_crew import stt
+
+        await stt.close()
+
+    app.on_startup.append(_stt_startup)
+    app.on_cleanup.append(_stt_shutdown)
+
+
+def _arm_prevent_sleep_poll(state: DashboardState, port: int) -> None:
     """Create the sleep inhibitor and start its poll task on the running loop.
+
+    *port* is the port this server actually bound, needed because one of the two
+    awake reasons is "``tailscale serve`` is fronting this dashboard" — a question
+    that can only be asked about a specific port. It is the bound port rather than
+    the configured one for the same reason ``kirocrew tailnet up`` insists on
+    evidence: if the configured port was occupied the gateway moved, and asking
+    about the wrong port would report someone else's serve mapping as ours.
 
     Keeps the host awake while any session has a turn in flight, but only when
     the user opted in via ``dashboard.prevent_sleep``. Decoupled from the turn
@@ -2054,7 +2535,7 @@ def _arm_prevent_sleep_poll(state: DashboardState) -> None:
             while True:
                 await asyncio.sleep(_PREVENT_SLEEP_POLL_INTERVAL_SECS)
                 try:
-                    inhibitor.set_active(await _should_prevent_sleep(state))
+                    inhibitor.set_active(await _should_prevent_sleep(state, port))
                 except Exception:
                     logger.debug("prevent-sleep poll toggle failed", exc_info=True)
         except asyncio.CancelledError:
@@ -2079,7 +2560,7 @@ def _arm_prevent_sleep_poll(state: DashboardState) -> None:
 # the notification can offer the opt-out at the exact moment the user is being
 # asked to review yet another candidate. Same highlight=key:<configKey> format
 # the frontend's <SettingRef> builds, consumed by useSettingHighlight.
-_SKILL_APPROVAL_SETTING_URL = "/settings?tab=skills&highlight=key:skills.approval_required"
+_SKILL_APPROVAL_SETTING_URL = "/settings/skills?highlight=key:skills.approval_required"
 
 
 def _pending_skill_notification(info: dict) -> tuple[str, str, str, list[dict[str, str]]]:
@@ -2151,6 +2632,12 @@ def _pending_skill_notification(info: dict) -> tuple[str, str, str, list[dict[st
     return title, body, review_url, actions
 
 
+def _tailnet_origin_enabled() -> bool:
+    """Read the live recovery opt-in; callers offload this blocking config read."""
+
+    return bool(KiroCrewConfig.load().dashboard.tailscale.enabled)
+
+
 async def start_dashboard(
     sessions: SessionManager,
     crons: CronService,
@@ -2170,6 +2657,11 @@ async def start_dashboard(
     assume_kiro_ready: bool = False,
 ) -> tuple[web.AppRunner, DashboardState]:
     """Start the dashboard web server.  Returns ``(runner, state)``."""
+    # The generated service marker describes this launch, not every process the
+    # dashboard may later spawn. Snapshot it before starting app backends or
+    # child terminals, then use only that snapshot to choose the watchdog grace.
+    _launch_environment = consume_managed_service_launch_environment()
+
     # Auto-create consolidator if conversation_log available but no consolidator
     if consolidator is None and conversation_log is not None:
         try:
@@ -2430,6 +2922,9 @@ async def start_dashboard(
             nudge_authorizer=_wf_nudge_authorizer,
             timeout_secs=_wf_timeout_secs,
         )
+        if state.task_runner is not None:
+            state.workflow_service.attach_task_runner(state.task_runner)
+            state.task_runner.attach_workflow_service(state.workflow_service)
         logger.info(
             "WorkflowService ready (dynamic workflows, max parallel agents=%s, run ceiling=%ss)",
             _wf_concurrency,
@@ -2460,7 +2955,12 @@ async def start_dashboard(
 
     app = web.Application(
         client_max_size=60 * 1024 * 1024
-    )  # 60 MB: covers 50 MB upload + multipart overhead
+    )  # 60 MB: covers a 50 MB BUFFERED upload + multipart overhead. NOT a
+    # ceiling on every upload: aiohttp enforces this in Request.read()/.post(),
+    # not on the streaming multipart() reader, so the video path in
+    # handlers/files.py streams past it under its own _MAX_VIDEO_UPLOAD_BYTES
+    # (pinned by test_streaming_bypasses_the_app_client_max_size). Reading this
+    # number as a global request cap is the false invariant to avoid.
     app["state"] = state
     # Bind the serving loop once, here: this runs ON that loop, so every
     # surface that later hands work in from a foreign thread -- slots
@@ -2504,8 +3004,12 @@ async def start_dashboard(
     await asyncio.to_thread(state.load_cron_folders)
     # Off-loop: a large chat_pins.json must not block the event loop at startup.
     await asyncio.to_thread(state.load_chat_pins)
-    state.load_tags()
+    # Off-loop: load_tags runs a synchronous save_tags() during load (status
+    # back-fill / seed) which fsyncs on the event loop; a large tags.json —
+    # including preserved-but-malformed rows (#5792) — must not stall startup.
+    await asyncio.to_thread(state.load_tags)
     app["port"] = port
+    app["dashboard_url"] = dashboard_url
 
     # Route pull-request status deltas to owner websockets. Extracted so the
     # register + shutdown-cleanup contract is unit-testable without booting the
@@ -2634,6 +3138,8 @@ async def start_dashboard(
     setup_knowledge_routes(app)
     setup_weixin_routes(app)
     setup_feedback_routes(app)
+    setup_secrets_routes(app)
+    setup_whatsapp_routes(app)
 
     # Link previews (chat unfurl). Route is always registered; the handler gates
     # itself on cfg.dashboard.link_previews, so toggling the feature needs no
@@ -2772,9 +3278,6 @@ async def start_dashboard(
                 return await handlers.index(request)
             raise
 
-    # CSRF: block state-mutating requests from cross-origin pages
-    _safe_methods = {"GET", "HEAD", "OPTIONS"}
-
     # SEL: log mutating API operations
     _sel_log_methods = {"POST", "PUT", "DELETE", "PATCH"}
 
@@ -2824,14 +3327,9 @@ async def start_dashboard(
             "tailnet access enabled: trusting origin https://%s (bind and auth unchanged)",
             _tailnet_host,
         )
-    # Stashed on the app, not left a local, because GET /api/tailnet/status must
-    # report the value the running origin set was actually built from rather than
-    # re-probe the daemon (see handlers/tailnet.py). ``tailnet_resolved_at`` is
-    # stamped unconditionally — it timestamps the resolution ATTEMPT, so an
-    # "unresolved" card can say when we last looked; ``0`` means the derivation
-    # never ran (feature off, or pinned). Both start-up paths set both keys: only
-    # one of them serves this route today, but an earlier round of this feature
-    # already shipped a bug from touching one startup site and not the other.
+    # Keep the initial snapshot on both startup surfaces for compatibility.
+    # Runtime-aware handlers read the mutable state installed below, which can
+    # acquire one validated origin after a Tailscale/Gateway boot race.
     app["tailnet_host"] = _tailnet_host
     app["tailnet_resolved_at"] = int(time.time()) if _tailnet_host else 0
     # The governance-filtered identity-trust value the middleware was built
@@ -2849,25 +3347,9 @@ async def start_dashboard(
     # for the barrier AND the PROBE_PATHS exemption; see
     # _make_host_validation_middleware).
     host_validation_middleware = _make_host_validation_middleware("dashboard_user")
-
-    @web.middleware  # type: ignore[misc]
-    async def csrf_middleware(
-        request: web.Request,
-        handler: object,
-    ) -> web.StreamResponse:
-        if request.method not in _safe_methods:
-            if not check_origin(request, require=True, fallback_header="Referer"):
-                await _audit_denied(
-                    "dashboard_user",
-                    request,
-                    "CSRF check failed: origin not allowed: "
-                    f"{request.headers.get('Origin', '')[:100]}",
-                )
-                raise web.HTTPForbidden(
-                    text="CSRF check failed: request origin not allowed.",
-                    content_type="text/plain",
-                )
-        return await handler(request)  # type: ignore[operator]
+    # Same factory as the headless server's barrier, so the CSRF exemption set is
+    # one decision rather than two (see _make_csrf_middleware).
+    csrf_middleware = _make_csrf_middleware("dashboard_user")
 
     # Generate per-session secret for local app / IPC authentication.
     # NOTE: file write (and parent mkdir) deferred until after port bind
@@ -2898,7 +3380,7 @@ async def start_dashboard(
 
     # Warm the auth singletons (signing secret + revoked-nonce store) off the
     # event loop BEFORE building the middleware chain, so no blocking key-file
-    # I/O (or Windows icacls subprocess) lands on the loop on the first auth op.
+    # I/O lands on the loop on the first auth op.
     await warm_auth_singletons()
 
     # Explicit middleware ordering — self-documenting and immune to future insertions
@@ -2945,6 +3427,17 @@ async def start_dashboard(
             )
             raise RuntimeError("dashboard_url requires token auth middleware")
 
+    # Register only after the final allowed-origin set is selected.  The startup
+    # hook schedules a sleeping background task and returns immediately, so this
+    # cannot extend listener startup; cleanup owns cancellation before aiohttp
+    # freezes the signal lists in runner.setup().
+    tailnet.install_tailnet_origin_recovery(
+        app,
+        enabled=_ts_cfg.enabled,
+        initial_host=_tailnet_host,
+        load_enabled=_tailnet_origin_enabled,
+    )
+
     # ── Loop stall watchdog shutdown ─────────────────────────────────────────
     # Register the cleanup hook HERE, before ``runner.setup()`` freezes the
     # app's signal lists (appending after setup raises "Cannot modify frozen
@@ -2968,6 +3461,20 @@ async def start_dashboard(
         await app_["kiro_prerequisite_service"].close()
 
     app.on_cleanup.append(_kiro_prerequisite_shutdown)
+
+    async def _kas_login_shutdown(app_: web.Application) -> None:
+        # Releases the service's aiohttp session IF a KAS request created it. It is
+        # lazily built on first use (never at boot), so an app that never served a
+        # KAS request has nothing to close.
+        service = app_.get("kas_login_service")
+        if service is not None:
+            await service.close()
+
+    app.on_cleanup.append(_kas_login_shutdown)
+
+    # Releases the resident speech model (148MB default, 1.6GB largest) when idle
+    # and at shutdown. Registered here, before runner.setup freezes the signal lists.
+    _register_stt_hooks(app)
 
     # ── Instances (multi-instance management) ────────────────────────────────
     # Register the opt-in instances startup/cleanup hooks HERE, before
@@ -2999,8 +3506,8 @@ async def start_dashboard(
     _unix_socket_holder["path"] = await _start_unix_site(runner, port)
 
     # Port bind succeeded — now safe to write the secret file. Offloaded:
-    # _write_secret_file does blocking fs I/O (os.open/os.close and, on Windows,
-    # an icacls subprocess via restrict_to_owner), so it must not run on the
+    # _write_secret_file does blocking fs I/O (os.open/os.close, plus the
+    # owner-only lockdown on Windows), so it must not run on the
     # event loop (no-blocking-call-on-event-loop). The port is passed so the
     # credential is published per listener, not only into the shared file every
     # gateway in this data home writes (see _write_instance_credentials).
@@ -3046,11 +3553,14 @@ async def start_dashboard(
     # and a hard-coded 25s turned those into hard exits that lost in-flight
     # work. The default is unchanged; the loader clamps the range.
     try:
-        _exit_after = float(KiroCrewConfig.load().dashboard.loop_stall_exit_after_secs)
+        _exit_after = float(load_loop_stall_exit_after(_launch_environment))
     except Exception:
         logger.debug("loop-stall exit budget config unavailable; using default", exc_info=True)
-        _exit_after = 25.0
+        # Config failure must not erase the managed-service grace that protects
+        # the process while its config filesystem is itself under pressure.
+        _exit_after = float(resolve_loop_stall_exit_after(environ=_launch_environment))
     _loop_watchdog = LoopStallWatchdog(dump_file=_dump_file, exit_after=_exit_after)
+    _heap_trim_maintainer = platform_compat.HeapTrimMaintainer()
 
     async def _loop_heartbeat() -> None:
         # 5s (not 10s) so the watchdog's armed dump-then-exit timer is re-petted
@@ -3073,6 +3583,12 @@ async def start_dashboard(
             # block the loop this heartbeat exists to watch. After the lag
             # read so the await can't register as loop lag.
             await state.resource_pressure_notifier.maybe_sample()
+            released = await _heap_trim_maintainer.maybe_trim()
+            if released >= platform_compat.HEAP_TRIM_LOG_THRESHOLD_BYTES:
+                logger.info(
+                    "Gateway heap trim returned %.0f MiB to the OS",
+                    released / (1024 * 1024),
+                )
             if lag > 1.0:
                 logger.warning("event-loop heartbeat: lag %.1fs (loop was blocked)", lag)
             else:
@@ -3094,8 +3610,10 @@ async def start_dashboard(
 
     # ── Prevent-sleep poll ───────────────────────────────────────────────────
     # Keep the host awake while a turn is in flight (opt-in via
-    # dashboard.prevent_sleep). Shared with the headless --slack-only entrypoint.
-    _arm_prevent_sleep_poll(state)
+    # dashboard.prevent_sleep), or while the dashboard is published on the
+    # tailnet (opt-out via dashboard.tailscale.keep_awake). Shared with the
+    # headless --slack-only entrypoint.
+    _arm_prevent_sleep_poll(state, port)
 
     # Arm the stall watchdog only when faulthandler is enabled — i.e. under the
     # real gateway entrypoint (see cli `gateway` dispatch). Tests that spin up
@@ -3242,17 +3760,42 @@ async def start_dashboard(
         """Notify all interfaces when safety override expires."""
         state.broadcast_ws("yolo_expired", {"source": source})
         state.push_slots_update()
+        # Slots carrying STANDING trust keep their policy: that is a separate,
+        # longer-lived decision than the expiring override, and it is also what must
+        # survive the channel-trust revoke below.
+        standing_trust: set[str] = set()
         if state.sessions is not None:
+            from kiro_crew.dashboard.chat_utils import effective_session_key
+
             for slot in state._slots.values():
-                if not slot._trust and not slot._trust_reads:
-                    state.sessions.set_approval_policy(f"dashboard:{slot.key}", "")
+                if slot._trust or slot._trust_reads:
+                    # Excluded from the channel-trust revoke below, via the SAME
+                    # derivation the reset uses: a channel-born slot's turns run on
+                    # the channel's own session key, so a `dashboard:<slot>` spelling
+                    # names a key nothing on that path reads.
+                    standing_trust.add(effective_session_key(slot))
+                else:
+                    # The SAME derivation the grant used. A channel-born slot's
+                    # turns run on the channel's own session key, which is what
+                    # `linked_session_key` holds, so clearing `dashboard:<slot>`
+                    # here cleared a key nothing on the channel path ever reads:
+                    # the TTL could not expire the grant it had handed out, which
+                    # is worse than a missing off-switch because the operator was
+                    # told it was time-bounded.
+                    state.sessions.set_approval_policy(effective_session_key(slot), "")
         # Slack cleanup — isolated so failures don't block dashboard operations
         try:
-            from kiro_crew.slack.handler import (
-                _trusted_sessions,  # circular import: server.py is imported by slack/gateway.py which imports handler.py
-            )
+            # From `messaging`, not `slack.handler`: the grant is channel-neutral.
+            # This revokes the approval_policy half as well as the mapping, which is
+            # what a CHANNEL session needs -- the loop just above resets only the
+            # dashboard's own slots, and a subagent reads the policy rather than the
+            # mapping, so policy left at "auto" outlives the override it belonged to.
+            # ``keep_policy`` is what stops this from undoing the preservation above:
+            # a Trust press can file a ``dashboard:`` key in the shared grant, and
+            # resetting its policy here would revoke standing trust nobody expired.
+            from kiro_crew.messaging.session_trust import clear_trusted_sessions
 
-            _trusted_sessions.clear()
+            clear_trusted_sessions(keep_policy=standing_trust)
         except Exception:
             logger.debug("Could not clear trusted sessions", exc_info=True)
         # Slack notification (prevent GC with background_tasks set)
@@ -3262,6 +3805,40 @@ async def start_dashboard(
         _notify_unattended_expiry(state, source)
 
     safety_override().on_expired = _on_override_expired
+
+    # A grant that was live when the process went down is GONE -- grants are
+    # in-memory by design and this does not change that. What it changes is that
+    # the operator now hears about it. Without this, someone who granted six
+    # hours of auto-approval and restarted an hour later got no signal at all:
+    # the next unattended run just stopped on a prompt nobody was waiting for.
+    #
+    # Read OFF the loop and off the boot path: it is a file open on a filesystem
+    # that may be slow, and nothing about boot should wait on it (found in
+    # review). Safe to run after the startup grant because the record carries the
+    # writing pid, so this process's own record is never read as a dropped one.
+    #
+    # Notice only, never a restored grant, and withheld when auto-approve is live
+    # RIGHT NOW: a declared grant that the enterprise ceiling clamps to a timed
+    # one is re-established by _apply_startup_yolo above, and telling the operator
+    # it is "OFF" while it is on would be worse than saying nothing. A lapsed
+    # grant, a config-declared one and an ``until_shutdown`` one are all silent
+    # too -- see ``take_dropped_grant``.
+    try:
+        _dropped_grant = await asyncio.to_thread(_take_prior_dropped_grant)
+        if _dropped_grant is not None and not safety_override().is_active():
+            state.notify(
+                "safety",
+                "Auto-approve was dropped by a restart",
+                describe_dropped_grant(_dropped_grant),
+                meta={
+                    "source": _dropped_grant.source,
+                    "remaining_secs": _dropped_grant.remaining_secs,
+                },
+            )
+    except Exception:
+        # Startup must not fail over a notification. The grant is off either
+        # way; the worst case is the operator not being told.
+        logger.debug("Could not report a restart-dropped safety override", exc_info=True)
 
     # Restore exactly the tabs the user had open at last shutdown — these
     # come back regardless of mtime, so long-running tabs don't silently
@@ -3446,7 +4023,12 @@ async def start_api_server(
 
     app = web.Application(
         client_max_size=60 * 1024 * 1024
-    )  # 60 MB: covers 50 MB upload + multipart overhead
+    )  # 60 MB: covers a 50 MB BUFFERED upload + multipart overhead. NOT a
+    # ceiling on every upload: aiohttp enforces this in Request.read()/.post(),
+    # not on the streaming multipart() reader, so the video path in
+    # handlers/files.py streams past it under its own _MAX_VIDEO_UPLOAD_BYTES
+    # (pinned by test_streaming_bypasses_the_app_client_max_size). Reading this
+    # number as a global request cap is the false invariant to avoid.
     app["state"] = state
     # Bind the serving loop once, here: this runs ON that loop, so every
     # surface that later hands work in from a foreign thread -- slots
@@ -3480,7 +4062,10 @@ async def start_api_server(
     await asyncio.to_thread(state.load_cron_folders)
     # Off-loop: a large chat_pins.json must not block the event loop at startup.
     await asyncio.to_thread(state.load_chat_pins)
-    state.load_tags()
+    # Off-loop: load_tags runs a synchronous save_tags() during load (status
+    # back-fill / seed) which fsyncs on the event loop; a large tags.json —
+    # including preserved-but-malformed rows (#5792) — must not stall startup.
+    await asyncio.to_thread(state.load_tags)
     app["port"] = port
 
     _precompute_telemetry(state)
@@ -3514,6 +4099,14 @@ async def start_api_server(
     # re-bind a rotated access token to the same verified peer identity).
     app["tailnet_trust"] = _tailnet_trust
     app["local_only"] = local_only
+    # Parity with the full dashboard: headless gateways have the same live
+    # Origin/Host boundary and must recover the same boot race without restart.
+    tailnet.install_tailnet_origin_recovery(
+        app,
+        enabled=_ts_cfg.enabled,
+        initial_host=_tailnet_host,
+        load_enabled=_tailnet_origin_enabled,
+    )
 
     # Per-session internal secret for machine-to-machine (mcp-core, cron) auth.
     # Deferred file write (and parent mkdir) until after the port binds (mirrors
@@ -3526,7 +4119,6 @@ async def start_api_server(
 
     # SEL audit middleware — log mutating MCP tool calls
     _sel_methods = {"GET", "POST", "PUT", "PATCH", "DELETE"}
-    _safe_methods = {"GET", "HEAD", "OPTIONS"}
 
     @web.middleware  # type: ignore[misc]
     async def sel_audit_middleware(
@@ -3562,29 +4154,10 @@ async def start_api_server(
     # origin.PROBE_PATHS): headless gateways are the instances most likely to
     # sit behind an orchestrator addressing them by pod/container IP.
     host_validation_middleware = _make_host_validation_middleware("mcp_tool")
-
-    @web.middleware  # type: ignore[misc]
-    async def csrf_middleware(
-        request: web.Request,
-        handler: object,
-    ) -> web.StreamResponse:
-        # Cross-site CSRF barrier on state-changing routes, parity with
-        # start_dashboard. Loopback local processes (mcp-core, cron) send no
-        # Origin header and are trusted by check_origin; a browser always sends
-        # Origin, so a cross-site page is rejected here even before token auth.
-        if request.method not in _safe_methods:
-            if not check_origin(request, require=True, fallback_header="Referer"):
-                await _audit_denied(
-                    "mcp_tool",
-                    request,
-                    "CSRF check failed: origin not allowed: "
-                    f"{request.headers.get('Origin', '')[:100]}",
-                )
-                raise web.HTTPForbidden(
-                    text="CSRF check failed: request origin not allowed.",
-                    content_type="text/plain",
-                )
-        return await handler(request)  # type: ignore[operator]
+    # Cross-site CSRF barrier at parity with start_dashboard by construction —
+    # the SAME factory builds both, including the self-authenticating-webhook
+    # exemption (see _make_csrf_middleware).
+    csrf_middleware = _make_csrf_middleware("mcp_tool")
 
     # Warm the auth singletons off the event loop before building the chain
     # (parity with start_dashboard) so no blocking key-file I/O hits the loop.
@@ -3631,6 +4204,20 @@ async def start_api_server(
 
     app.on_cleanup.append(_kiro_prerequisite_shutdown)
 
+    async def _kas_login_shutdown(app_: web.Application) -> None:
+        # Releases the service's aiohttp session IF a KAS request created it. It is
+        # lazily built on first use (never at boot), so an app that never served a
+        # KAS request has nothing to close.
+        service = app_.get("kas_login_service")
+        if service is not None:
+            await service.close()
+
+    app.on_cleanup.append(_kas_login_shutdown)
+
+    # Releases the resident speech model (148MB default, 1.6GB largest) when idle
+    # and at shutdown. Registered here, before runner.setup freezes the signal lists.
+    _register_stt_hooks(app)
+
     # Prevent-sleep shutdown hook — registered before runner.setup freezes the
     # signal lists; the poll itself is armed after the port binds (below). This
     # is what makes headless --slack-only keep the host awake during a long
@@ -3665,7 +4252,7 @@ async def start_api_server(
     # Port bind succeeded — now safe to persist the secret file (parity with
     # start_dashboard: write deferred so a failed bind can't poison it).
     # Offloaded: _write_secret_file does blocking fs I/O (os.open/os.close and,
-    # on Windows, an icacls subprocess via restrict_to_owner), so it must not run
+    # on Windows, the owner-only DACL), so it must not run
     # on the event loop (no-blocking-call-on-event-loop). Same per-listener
     # publication as start_dashboard: both surfaces must pair the credential
     # with the port or a client cannot tell which generation it reached.
@@ -3686,7 +4273,7 @@ async def start_api_server(
     # Arm the prevent-sleep poll now the loop is up and the port is bound
     # (shutdown hook already registered above). Headless --slack-only mode keeps
     # the host awake during a long Slack task exactly as the full dashboard does.
-    _arm_prevent_sleep_poll(state)
+    _arm_prevent_sleep_poll(state, port)
 
     # Boot-to-ready (rec #1): headless API server is bound and ready. Privacy-safe
     # fixed labels only; best-effort.

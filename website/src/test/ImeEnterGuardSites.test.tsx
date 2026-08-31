@@ -44,9 +44,21 @@ vi.mock('../api/client', async (importOriginal) => {
   }
 })
 
+vi.mock('../apps/file-explorer/api', () => ({
+  fileExplorerApi: {
+    complete: vi.fn().mockResolvedValue({
+      entries: [{ name: 'src', path: '/home/user/src', type: 'dir', size: 0, mtime: 0 }],
+    }),
+  },
+}))
+
 import { api } from '../api/client'
 import TagManagerList from '../components/TagManagerList'
 import ProjectPicker from '../components/ProjectPicker'
+import SearchBar from '../components/SearchBar'
+import BroadcastBar from '../apps/meetings/components/BroadcastBar'
+import { BlockEditor } from '../apps/md-notebook/BlockEditor'
+import PathBar from '../apps/file-explorer/PathBar'
 
 /** Arm the hook's post-composition latch: the WebKit commit-Enter window. */
 function armLatch(el: Element) {
@@ -208,5 +220,246 @@ describe('ProjectPicker path input — rule 2: gate the Enter path only', () => 
     fireEvent.keyDown(input, { key: 'Enter' })
     await act(async () => { await vi.advanceTimersByTimeAsync(0) })
     expect(vi.mocked(api.browseDirs)).toHaveBeenCalledWith('/home/u/alpha')
+  })
+
+  // The Escape || Tab branch closes the picker and returns focus to the
+  // trigger — the composition-abort harm on a composable free-text path
+  // field: an IME candidate-cycling Tab (or candidate-cancelling Escape)
+  // must not be adopted as "leave the picker".
+  async function openBrowseWithSpy() {
+    const onOpenChange = vi.fn()
+    renderWithProviders(
+      <ProjectPicker open={true} onOpenChange={onOpenChange} anchorRect={rect(100, 50)} onSelect={vi.fn()} />,
+    )
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    return { input: screen.getByPlaceholderText('/path/to/project') as HTMLInputElement, onOpenChange }
+  }
+
+  it('does NOT close the picker on the committing Tab in the post-composition window', async () => {
+    const { input, onOpenChange } = await openBrowseWithSpy()
+    armLatch(input)
+    fireEvent.keyDown(input, { key: 'Tab' })
+    expect(onOpenChange).not.toHaveBeenCalled()
+  })
+
+  it('does NOT close the picker on an Escape that cancels a candidate', async () => {
+    const { input, onOpenChange } = await openBrowseWithSpy()
+    armLatch(input)
+    fireEvent.keyDown(input, { key: 'Escape' })
+    expect(onOpenChange).not.toHaveBeenCalled()
+  })
+
+  it('closes the picker on a plain Tab (positive control)', async () => {
+    const { input, onOpenChange } = await openBrowseWithSpy()
+    fireEvent.keyDown(input, { key: 'Tab' })
+    expect(onOpenChange).toHaveBeenCalledWith(false)
+  })
+})
+
+describe('BroadcastBar input — rule 1 single-line Enter-only site: bindEnter', () => {
+  // Representative of the #4292 sweep's bindEnter migrations: the handler is
+  // Enter-only, so the whole binding (composition tracking + claim + focus/blur
+  // recovery) comes from one spread and no hand-rolled spelling exists to copy.
+  it('does NOT send on the committing Enter in the post-composition window', () => {
+    const onSend = vi.fn()
+    render(<BroadcastBar onSend={onSend} />)
+    const input = screen.getByLabelText(/./, { selector: 'input' }) as HTMLInputElement
+    fireEvent.change(input, { target: { value: '你好' } })
+    armLatch(input)
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it('leaves a mid-composition Enter to the IME (native flag set)', () => {
+    const onSend = vi.fn()
+    render(<BroadcastBar onSend={onSend} />)
+    const input = screen.getByLabelText(/./, { selector: 'input' }) as HTMLInputElement
+    fireEvent.change(input, { target: { value: '你好' } })
+    fireEvent.compositionStart(input)
+    const defaultNotPrevented = fireEvent.keyDown(input, { key: 'Enter', isComposing: true })
+    expect(onSend).not.toHaveBeenCalled()
+    // The guard must not touch a key the IME is consuming.
+    expect(defaultNotPrevented).toBe(true)
+  })
+
+  it('sends on a plain Enter (positive control)', () => {
+    const onSend = vi.fn()
+    render(<BroadcastBar onSend={onSend} />)
+    const input = screen.getByLabelText(/./, { selector: 'input' }) as HTMLInputElement
+    fireEvent.change(input, { target: { value: 'hello' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onSend).toHaveBeenCalledWith('hello')
+  })
+
+  it('a stale latch from an abandoned composition clears on the next focus', () => {
+    // The C2 recovery: the reset now rides in the binding's onFocus, replacing
+    // the site-level `onFocus={() => ime.reset()}` copies. Abandon a composition
+    // (no compositionend), refocus, and the next Enter must send.
+    const onSend = vi.fn()
+    render(<BroadcastBar onSend={onSend} />)
+    const input = screen.getByLabelText(/./, { selector: 'input' }) as HTMLInputElement
+    fireEvent.change(input, { target: { value: 'hello' } })
+    fireEvent.compositionStart(input)   // abandoned: no compositionEnd follows
+    fireEvent.focus(input)
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onSend).toHaveBeenCalledWith('hello')
+  })
+})
+
+describe('SearchBar find input — rule 2 mixed handler: claim the Enter branch only', () => {
+  // Representative of the sweep's claim-in-mixed-handler sites: Enter steps the
+  // find while arrows/Home/End navigate, so only the Enter branch is claimed.
+  const renderBar = () => {
+    const next = vi.fn()
+    const prev = vi.fn()
+    render(
+      <SearchBar
+        term="查询" setTerm={vi.fn()} matches={[]} currentIdx={0}
+        next={next} prev={prev} close={vi.fn()}
+        caseSensitive={false} toggleCaseSensitive={vi.fn()}
+      />,
+    )
+    const input = screen.getByLabelText(/./, { selector: 'input' }) as HTMLInputElement
+    return { input, next, prev }
+  }
+
+  it('does NOT step the find on the committing Enter, and consumes it', () => {
+    const { input, next } = renderBar()
+    armLatch(input)
+    const defaultNotPrevented = fireEvent.keyDown(input, { key: 'Enter' })
+    expect(next).not.toHaveBeenCalled()
+    // claimEnter consumed the declined key (both native signals clear).
+    expect(defaultNotPrevented).toBe(false)
+  })
+
+  it('keeps arrow-key navigation working while the latch is armed', () => {
+    const { input, next } = renderBar()
+    armLatch(input)
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    expect(next).toHaveBeenCalledTimes(1)
+  })
+
+  it('steps the find on a plain Enter (positive control)', () => {
+    const { input, next, prev } = renderBar()
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(next).toHaveBeenCalledTimes(1)
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: true })
+    expect(prev).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('md-notebook BlockEditor — rule 3 textarea: claim before the Enter→blur commit', () => {
+  // The sweep's review caught this site declining WITHOUT claiming: inside the
+  // post-composition window the unclaimed Cmd/Ctrl+Enter neither committed nor
+  // stayed inert — the browser answered it with a literal newline into the
+  // note draft. The textarea rule of the source ratchet now pins the shape;
+  // this pins the behaviour.
+  function renderEditor() {
+    const onCommit = vi.fn()
+    render(<BlockEditor initial="草稿" onCommit={onCommit} onCancel={vi.fn()} />)
+    const ta = screen.getByRole('textbox') as HTMLTextAreaElement
+    return { ta, onCommit }
+  }
+
+  it('declines the committing Ctrl+Enter in the post-composition window AND consumes it', () => {
+    const { ta, onCommit } = renderEditor()
+    armLatch(ta)
+    const defaultNotPrevented = fireEvent.keyDown(ta, { key: 'Enter', ctrlKey: true })
+    expect(onCommit).not.toHaveBeenCalled()
+    // Consumption is the half the pre-fix decline dropped: unclaimed, the
+    // browser inserts a newline into the draft the user is still composing.
+    expect(defaultNotPrevented).toBe(false)
+  })
+
+  it('leaves a mid-composition Ctrl+Enter to the IME (native flag set)', () => {
+    const { ta, onCommit } = renderEditor()
+    fireEvent.compositionStart(ta)
+    const defaultNotPrevented = fireEvent.keyDown(ta, { key: 'Enter', ctrlKey: true, isComposing: true })
+    expect(onCommit).not.toHaveBeenCalled()
+    expect(defaultNotPrevented).toBe(true)
+  })
+
+  it('commits on a plain Ctrl+Enter via the blur it triggers (positive control)', () => {
+    const { ta, onCommit } = renderEditor()
+    fireEvent.keyDown(ta, { key: 'Enter', ctrlKey: true })
+    expect(onCommit).toHaveBeenCalledWith('草稿')
+  })
+
+  // The Tab branch of the same textarea, and the OTHER half of the
+  // boundary-Tab shape: it re-indents the list item by rewriting the whole
+  // value, so an IME cycling its candidate list with Tab replaced the text
+  // still being composed. No focus move to anchor on, which is why the source
+  // ratchet needed a second, act-anchored rule to see it.
+  function renderListEditor() {
+    const onCommit = vi.fn()
+    render(<BlockEditor initial="- item" onCommit={onCommit} onCancel={vi.fn()} />)
+    const ta = screen.getByRole('textbox') as HTMLTextAreaElement
+    return { ta, onCommit }
+  }
+
+  it('does NOT re-indent the list item on the committing Tab in the post-composition window', () => {
+    const { ta } = renderListEditor()
+    armLatch(ta)
+    const defaultNotPrevented = fireEvent.keyDown(ta, { key: 'Tab' })
+    expect(ta.value).toBe('- item')
+    // The decline consumes the key: in this window the browser would otherwise
+    // move focus out of the editor, abandoning the composition.
+    expect(defaultNotPrevented).toBe(false)
+  })
+
+  it('leaves a mid-composition Tab to the IME (native flag set)', () => {
+    const { ta } = renderListEditor()
+    fireEvent.compositionStart(ta)
+    const defaultNotPrevented = fireEvent.keyDown(ta, { key: 'Tab', isComposing: true })
+    expect(ta.value).toBe('- item')
+    expect(defaultNotPrevented).toBe(true)
+  })
+
+  it('re-indents the list item on a plain Tab (positive control)', () => {
+    const { ta } = renderListEditor()
+    fireEvent.keyDown(ta, { key: 'Tab' })
+    expect(ta.value).toBe('\t- item')
+  })
+})
+
+describe('file-explorer PathBar — Tab accepts a suggestion INTO the draft', () => {
+  // The path bar recorded its Tab as a deliberate exemption ("arrow/Tab
+  // navigation stays untouched"), which held only while Tab did nothing to the
+  // text. It accepts the highlighted suggestion into the draft, so with the
+  // latch armed the accept overwrote the composing path.
+  async function openEditor() {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
+    render(
+      <QueryClientProvider client={qc}>
+        <PathBar rootPath="/home/user" gitInfo={null} onChangeRoot={vi.fn()} onNavigate={vi.fn()} />
+      </QueryClientProvider>,
+    )
+    fireEvent.click(screen.getByTitle('Click to edit path'))
+    const input = screen.getByPlaceholderText('/path/to/folder') as HTMLInputElement
+    fireEvent.change(input, { target: { value: '/home/user/s' } })
+    // The suggestion query is debounced, so the row is what proves it arrived.
+    await waitFor(() => expect(screen.getByText('/home/user/src')).toBeInTheDocument())
+    return input
+  }
+
+  it('does NOT replace the draft on the committing Tab in the post-composition window', async () => {
+    const input = await openEditor()
+    armLatch(input)
+    const defaultNotPrevented = fireEvent.keyDown(input, { key: 'Tab' })
+    expect(input.value).toBe('/home/user/s')
+    expect(defaultNotPrevented).toBe(false)
+  })
+
+  it('accepts the highlighted suggestion on a plain Tab (positive control)', async () => {
+    const input = await openEditor()
+    fireEvent.keyDown(input, { key: 'Tab' })
+    expect(input.value).toBe('/home/user/src')
+  })
+
+  it('keeps arrow-key list navigation working while the latch is armed', async () => {
+    const input = await openEditor()
+    armLatch(input)
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    expect(screen.getByRole('option')).toHaveAttribute('aria-selected', 'true')
   })
 })

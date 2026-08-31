@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
+import os
+import sys
 import threading
 import time
 import urllib.error
 from functools import lru_cache
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -162,6 +165,163 @@ class TestPlatformLibsDirname:
         monkeypatch.setattr("kiro_crew.embeddings.sys.platform", platform_str)
         monkeypatch.setattr("kiro_crew.embeddings.platform.machine", lambda: machine)
         assert _platform_libs_dirname() is None
+
+
+def _stub_bundled_linux_libs(root: Path) -> None:
+    libs = root / embeddings_mod._LIBS_DIR_NAME / "linux_x86_64"
+    libs.mkdir(parents=True)
+    for name in embeddings_mod._REQUIRED_VENDORED_LIBS["linux_x86_64"]:
+        (libs / name).write_bytes(b"\x7fELF")
+
+
+def _load_bundled_linux_llama(monkeypatch, vendor: Path, cpu_probe):
+    env_was_set = embeddings_mod._LIB_PATH_ENV in os.environ
+    prior_env = os.environ.get(embeddings_mod._LIB_PATH_ENV)
+    monkeypatch.setattr(embeddings_mod, "_VENDOR_DIR", vendor)
+    monkeypatch.setattr(
+        embeddings_mod, "_platform_libs_dirname", lambda: "linux_x86_64"
+    )
+    monkeypatch.setattr(embeddings_mod, "_linux_x86_64_cpu_flags", cpu_probe)
+    embeddings_mod._load_llama_class.cache_clear()
+    try:
+        result = embeddings_mod._load_llama_class()
+        active_lib_path = os.environ.get(embeddings_mod._LIB_PATH_ENV)
+        return result, active_lib_path
+    finally:
+        embeddings_mod._load_llama_class.cache_clear()
+        if env_was_set:
+            assert prior_env is not None
+            os.environ[embeddings_mod._LIB_PATH_ENV] = prior_env
+        else:
+            os.environ.pop(embeddings_mod._LIB_PATH_ENV, None)
+
+
+class TestBundledLinuxX86CpuGate:
+    def test_cpuinfo_parser_normalizes_sse3_and_intersects_processors(
+        self, tmp_path: Path
+    ) -> None:
+        cpuinfo = tmp_path / "cpuinfo"
+        cpuinfo.write_text(
+            "processor: 0\nflags: pni ssse3 avx avx2 bmi2 f16c fma\n\n"
+            "processor: 1\nflags: pni ssse3 avx bmi2 f16c fma\n",
+            encoding="utf-8",
+        )
+
+        flags = embeddings_mod._linux_x86_64_cpu_flags(cpuinfo)
+
+        assert flags is not None
+        assert "sse3" in flags
+        assert "avx" in flags
+        assert "avx2" not in flags
+
+    def test_unreadable_cpuinfo_is_unknown(self, tmp_path: Path) -> None:
+        assert embeddings_mod._linux_x86_64_cpu_flags(tmp_path / "missing") is None
+
+    def test_compatible_cpu_continues_to_native_import(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.delenv(embeddings_mod._LIB_PATH_ENV, raising=False)
+        _stub_bundled_linux_libs(tmp_path)
+        fake_llama_cpp = ModuleType("llama_cpp")
+        expected = object()
+        setattr(fake_llama_cpp, "Llama", expected)
+        monkeypatch.setitem(sys.modules, "llama_cpp", fake_llama_cpp)
+
+        result, active_lib_path = _load_bundled_linux_llama(
+            monkeypatch,
+            tmp_path,
+            lambda: embeddings_mod._LINUX_X86_64_REQUIRED_CPU_FLAGS,
+        )
+
+        assert result is expected
+        assert active_lib_path is not None
+        assert Path(active_lib_path).parts[-2:] == ("llama_cpp_libs", "linux_x86_64")
+        assert embeddings_mod._LIB_PATH_ENV not in os.environ
+
+    def test_runtime_import_hardens_locale_encoded_null_streams(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.delenv(embeddings_mod._LIB_PATH_ENV, raising=False)
+        _stub_bundled_linux_libs(tmp_path)
+        fake_llama_cpp = ModuleType("llama_cpp")
+        expected = object()
+        setattr(fake_llama_cpp, "Llama", expected)
+        monkeypatch.setitem(sys.modules, "llama_cpp", fake_llama_cpp)
+
+        fake_utils = ModuleType("llama_cpp._utils")
+        stdout_sink = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+        stderr_sink = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+        setattr(fake_utils, "outnull_file", stdout_sink)
+        setattr(fake_utils, "errnull_file", stderr_sink)
+        monkeypatch.setitem(sys.modules, "llama_cpp._utils", fake_utils)
+
+        result, _active_lib_path = _load_bundled_linux_llama(
+            monkeypatch,
+            tmp_path,
+            lambda: embeddings_mod._LINUX_X86_64_REQUIRED_CPU_FLAGS,
+        )
+
+        assert result is expected
+        assert stdout_sink.encoding == "utf-8"
+        assert stderr_sink.encoding == "utf-8"
+        stdout_sink.write("👻")
+        stderr_sink.write("👻")
+
+    def test_missing_cpu_features_refuse_before_native_import(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        monkeypatch.delenv(embeddings_mod._LIB_PATH_ENV, raising=False)
+        _stub_bundled_linux_libs(tmp_path)
+
+        with caplog.at_level("WARNING", logger=embeddings_mod.__name__):
+            result, active_lib_path = _load_bundled_linux_llama(
+                monkeypatch, tmp_path, lambda: frozenset({"sse3", "ssse3"})
+            )
+
+        assert result is None
+        assert active_lib_path is None
+        assert "missing avx, avx2, bmi2, f16c, fma" in caplog.text
+        assert "SIGILL" in caplog.text
+        assert embeddings_mod._LIB_PATH_ENV not in os.environ
+
+    def test_unknown_cpu_features_fail_closed(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        monkeypatch.delenv(embeddings_mod._LIB_PATH_ENV, raising=False)
+        _stub_bundled_linux_libs(tmp_path)
+
+        with caplog.at_level("WARNING", logger=embeddings_mod.__name__):
+            result, active_lib_path = _load_bundled_linux_llama(
+                monkeypatch, tmp_path, lambda: None
+            )
+
+        assert result is None
+        assert active_lib_path is None
+        assert "Cannot verify CPU compatibility" in caplog.text
+        assert embeddings_mod._LIB_PATH_ENV not in os.environ
+
+    def test_operator_override_bypasses_the_bundled_cpu_gate(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        _stub_bundled_linux_libs(tmp_path)
+        override = tmp_path / "operator-libs"
+        override.mkdir()
+        monkeypatch.setenv(embeddings_mod._LIB_PATH_ENV, str(override))
+        fake_llama_cpp = ModuleType("llama_cpp")
+        expected = object()
+        setattr(fake_llama_cpp, "Llama", expected)
+        monkeypatch.setitem(sys.modules, "llama_cpp", fake_llama_cpp)
+
+        def unexpected_cpu_probe():
+            raise AssertionError("operator runtime must not use the bundled CPU gate")
+
+        result, active_lib_path = _load_bundled_linux_llama(
+            monkeypatch, tmp_path, unexpected_cpu_probe
+        )
+
+        assert result is expected
+        assert active_lib_path == str(override)
+        assert os.environ[embeddings_mod._LIB_PATH_ENV] == str(override)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -891,6 +1051,19 @@ class TestEmbedThreads:
         assert kwargs["n_threads"] == 3
         assert kwargs["n_threads_batch"] == 3
 
+    def test_physical_batch_bounds_scratch_without_reducing_context(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        fake_cls = _make_fake_llama_class()
+        monkeypatch.setattr("kiro_crew.embeddings._load_llama_class", lambda: fake_cls)
+        emb = LlamaCppEmbedder(model_path=_write_model_file(tmp_path / "model.gguf"))
+        assert emb.wait_ready(timeout=5)
+        kwargs = fake_cls.instances[0].kwargs
+        assert kwargs["n_ctx"] == embeddings_mod._N_CTX
+        assert kwargs["n_batch"] == embeddings_mod._N_CTX
+        assert kwargs["n_ubatch"] == embeddings_mod._N_UBATCH
+        assert kwargs["n_ubatch"] < kwargs["n_batch"]
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Embed timing + inference queue priority
@@ -1145,3 +1318,87 @@ class TestEmbedPriority:
         assert done.wait(timeout=5), "_submit_infer hung on a retired backend"
         assert out[0].error is not None
         assert "retired" in str(out[0].error)
+
+
+class TestBundledWindowsMsvcRuntimeGate:
+    """The vendored Windows libs import an MSVC runtime that is not shipped with them.
+
+    All four DLLs in ``win_amd64`` import ``MSVCP140``, ``VCRUNTIME140`` and
+    ``VCRUNTIME140_1``; ``ggml-base``/``ggml-cpu`` add ``VCOMP140`` (MSVC OpenMP).
+    Both Linux payloads DO vendor their OpenMP equivalent, so the omission is on the
+    Windows lane rather than a deliberate asymmetry — and on a host without the
+    redistributable the load failed as a bare ``WinError 126`` naming the library
+    being opened rather than the runtime it needs, which reads as an unsupported
+    platform. CI cannot see any of this: the ``windows-latest`` runner ships the
+    redistributable preinstalled.
+    """
+
+    def test_the_probe_is_a_no_op_off_windows(self, monkeypatch) -> None:
+        monkeypatch.setattr("kiro_crew.embeddings.sys.platform", "linux")
+        assert embeddings_mod._missing_windows_msvc_runtime() == []
+
+    def test_every_named_runtime_dll_is_probed(self, monkeypatch) -> None:
+        """Absence is reported per DLL, so the message can name what to install."""
+        monkeypatch.setattr("kiro_crew.embeddings.sys.platform", "win32")
+        asked: list[str] = []
+
+        def _fail(name):
+            asked.append(name)
+            raise OSError("[WinError 126] The specified module could not be found")
+
+        monkeypatch.setattr(embeddings_mod.ctypes, "WinDLL", _fail, raising=False)
+        missing = embeddings_mod._missing_windows_msvc_runtime()
+        assert asked == list(embeddings_mod._WINDOWS_MSVC_RUNTIME_DLLS)
+        assert missing == list(embeddings_mod._WINDOWS_MSVC_RUNTIME_DLLS)
+
+    def test_a_present_runtime_reports_nothing_missing(self, monkeypatch) -> None:
+        monkeypatch.setattr("kiro_crew.embeddings.sys.platform", "win32")
+        monkeypatch.setattr(embeddings_mod.ctypes, "WinDLL", lambda name: object(), raising=False)
+        assert embeddings_mod._missing_windows_msvc_runtime() == []
+
+    def test_the_loader_refuses_and_names_the_redistributable(
+        self, monkeypatch, tmp_path: Path, caplog
+    ) -> None:
+        """Refused BEFORE the import, so the log carries the fix rather than a WinError."""
+        libs = tmp_path / embeddings_mod._LIBS_DIR_NAME / "win_amd64"
+        libs.mkdir(parents=True)
+        for name in embeddings_mod._REQUIRED_VENDORED_LIBS["win_amd64"]:
+            (libs / name).write_bytes(b"MZ")
+        monkeypatch.setattr(embeddings_mod, "_VENDOR_DIR", tmp_path)
+        monkeypatch.setattr(embeddings_mod, "_platform_libs_dirname", lambda: "win_amd64")
+        monkeypatch.setattr(
+            embeddings_mod, "_missing_windows_msvc_runtime", lambda: ["VCOMP140.DLL"]
+        )
+        monkeypatch.delenv(embeddings_mod._LIB_PATH_ENV, raising=False)
+        embeddings_mod._load_llama_class.cache_clear()
+        try:
+            with caplog.at_level("WARNING"):
+                assert embeddings_mod._load_llama_class() is None
+        finally:
+            embeddings_mod._load_llama_class.cache_clear()
+            os.environ.pop(embeddings_mod._LIB_PATH_ENV, None)
+        assert "VCOMP140.DLL" in caplog.text
+        assert "Visual C++" in caplog.text
+        assert "keyword search" in caplog.text
+
+    def test_a_complete_runtime_does_not_refuse_on_the_windows_branch(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """Mutation guard: the refusal must be conditional on something real."""
+        libs = tmp_path / embeddings_mod._LIBS_DIR_NAME / "win_amd64"
+        libs.mkdir(parents=True)
+        for name in embeddings_mod._REQUIRED_VENDORED_LIBS["win_amd64"]:
+            (libs / name).write_bytes(b"MZ")
+        monkeypatch.setattr(embeddings_mod, "_VENDOR_DIR", tmp_path)
+        monkeypatch.setattr(embeddings_mod, "_platform_libs_dirname", lambda: "win_amd64")
+        monkeypatch.setattr(embeddings_mod, "_missing_windows_msvc_runtime", lambda: [])
+        monkeypatch.delenv(embeddings_mod._LIB_PATH_ENV, raising=False)
+        embeddings_mod._load_llama_class.cache_clear()
+        try:
+            # Reaches the import (which then resolves the real vendored copy on this
+            # host); the point is only that the runtime gate did not short-circuit it.
+            embeddings_mod._load_llama_class()
+            assert os.environ.get(embeddings_mod._LIB_PATH_ENV) == str(libs)
+        finally:
+            embeddings_mod._load_llama_class.cache_clear()
+            os.environ.pop(embeddings_mod._LIB_PATH_ENV, None)

@@ -282,8 +282,18 @@ is what makes nightlies read as previews of the *next* release:
 | `pyproject.toml` | `[project] version` — what the wheel carries |
 | `website/electron/package.json` | `version` — the updater's version compare |
 
-Keep it a bare `X.Y.Z`: `nightly.yml` builds both a semver and a PEP 440 stamp
-from it, and a suffixed base (`.dev0`) produces invalid versions.
+Keep it a bare `X.Y.Z` **on `main`**: `nightly.yml` builds both a semver and a
+PEP 440 stamp from it, and a suffixed base (`.dev0`) produces invalid versions.
+
+On an **insider release branch** the in-code version instead carries the RC, so
+a source/dev checkout reads as the candidate it is. All three files use the
+**same dual-valid spelling** `X.Y.Z-rc.N` (e.g. `0.4.0-rc.4`): it is valid
+SemVer for `package.json` **and** valid (non-canonical) PEP 440, which pip and
+setuptools normalize to `X.Y.ZrcN`. Do not use the canonical PEP 440 spelling
+(`0.4.0rc4`) in `__init__.py` — `packaging/build-desktop.sh` greps `__version__`
+straight into electron-builder's `extraMetadata.version`, which rejects
+non-SemVer and kills a local `make desktop`. The tag still overrides all three
+at build time (see `docs/build/release.md` → "Version numbering policy").
 
 ### One trap worth knowing
 
@@ -437,7 +447,7 @@ When your change is ready, the workflow is already codified rather than left to
 taste. See Development Skills above: `kirocrew-worktree-dev` covers building and
 verifying in a worktree, and `prepare-pr` takes it from there, driving the change
 to a review-ready pull request by committing, syncing onto the base, squashing to
-the single commit this repo requires, opening or updating the PR, then polling CI
+the one or two commits this repo allows, opening or updating the PR, then polling CI
 and the review bots and fixing what they find. An agent that loads it follows the
 same route a maintainer would, which is why the process holds regardless of who or
 what wrote the code. If you are contributing with an agent, point it at that skill
@@ -520,6 +530,37 @@ you to fix — flag it to a maintainer.
 Types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`
 
 Rules: imperative mood, lowercase summary, no trailing period, wrap body at 72 chars.
+
+## Recognizing Contributions
+
+There is one contributor list, the Contributors block in [README.md](README.md).
+Deliberately one: a second table for "other" contributions would rank one kind of
+help above another, and split recognition across two places nobody reads twice.
+
+Two things are credited automatically by a daily job: authoring a merged pull
+request, and reporting an issue that a merged pull request closed. You do not need
+to ask for either.
+
+The second rule is deliberately about outcome, not volume. Credit follows a report
+that changed the product, which is why the job reads each merged PR's closing
+references rather than listing every issue — that keeps duplicates, invalid
+reports, and issues opened to farm a credit out of the list. It undercounts on
+purpose: if a pull request fixed your report without writing a closing keyword,
+the link does not exist and the job cannot see it. Ask, and it gets added by hand.
+
+Everything else is credited in the same block on request: a code review, a
+translation, an idea, a design, a private security report. Open an issue naming
+the person (yourself is fine), and a maintainer records it:
+
+```sh
+python3 scripts/update_contributors.py --login <github-login> --name "Display Name"
+```
+
+The daily job re-derives the full contributor set and rebuilds its branch
+from scratch, but it never rewrites or drops an existing line, so a
+manually-added entry survives every later run. A login listed in
+`.github/contributors-optout.txt` is never added by the job, which is how a
+removal request stays honored.
 
 ## Questions?
 

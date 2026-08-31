@@ -13,7 +13,7 @@
  *
  * Mock setup mirrors ChatSidebar.sourceLinkChip.test.tsx.
  */
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
@@ -100,6 +100,11 @@ function renderSidebar() {
  *  <img> a row can hold is the origin glyph. */
 const row = (title: string) => screen.getByText(title).closest('.session-row') as HTMLElement
 
+// Fixtures here carry fixed old timestamps; keep the stale-session collapse
+// off so every row stays queryable (its own behavior is pinned in
+// ChatSidebar.staleCollapse.test.tsx).
+beforeEach(() => localStorage.setItem('mc-session-stale-collapse-ms', '0'))
+
 describe('ChatSidebar – channel-origin glyph', () => {
   it('badges a channel-origin session with that channel brand mark', () => {
     renderSidebar()
@@ -156,8 +161,8 @@ describe('hasChannelBrandIcon', () => {
       expect(hasChannelBrandIcon(ch)).toBe(true)
     }
     // Both fall through to the Link2 default, which callers must not mistake for
-    // a brand mark: `whatsapp` has no asset yet, `unified` never will.
-    expect(hasChannelBrandIcon('whatsapp')).toBe(false)
+    // a brand mark: `unified` never will.
+    expect(hasChannelBrandIcon('whatsapp')).toBe(true)
     expect(hasChannelBrandIcon('unified')).toBe(false)
     expect(hasChannelBrandIcon('')).toBe(false)
   })

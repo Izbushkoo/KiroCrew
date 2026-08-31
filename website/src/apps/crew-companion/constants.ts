@@ -21,6 +21,8 @@ export const REMINDERS_PATH = `${API_BASE}/reminders`
 export const STATS_PATH = `${API_BASE}/stats`
 /** Turn the companion on. The app manager's generic per-app enable route. */
 export const ENABLE_PATH = `${API_BASE}/enable`
+/** Turn the companion off. Same path Library Disable and the pet menu already POST. */
+export const DISABLE_PATH = `${API_BASE}/disable`
 /**
  * Ask the always-running overlay to open one of its Electron windows. The
  * dashboard page has no bridge to the desktop main process, so it records the
@@ -46,9 +48,9 @@ export const BREATHING_DONE_PATH = `${API_BASE}/breathing-done`
 export const POLL_MS = 10_000
 
 /**
- * Break-interval choices offered as one-tap presets. The panel renders this same
- * list, and `BREAK_PRESETS` in reminders.py holds the same values for the backend,
- * so the surfaces cannot drift.
+ * Break-interval choices offered as one-tap presets. They are a UI affordance,
+ * so the backend has no use for the list: what it enforces is the RANGE below,
+ * via `clamp_break_mins`.
  */
 export const BREAK_PRESETS = [30, 45, 60, 90]
 

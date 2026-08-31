@@ -1,18 +1,32 @@
-const { app, BaseWindow, BrowserWindow, WebContentsView, shell, dialog, Tray, Menu, nativeImage, nativeTheme, Notification, ipcMain, webContents, session, desktopCapturer, systemPreferences, screen } = require("electron");
+const { app, BaseWindow, BrowserWindow, WebContentsView, shell, dialog, Tray, Menu, nativeImage, nativeTheme, Notification, ipcMain, webContents, session, desktopCapturer, systemPreferences, screen, crashReporter, contentTracing } = require("electron");
 const Store = require("electron-store");
 const fs = require("fs");
 const os = require("os");
-const { spawn, execFile } = require("child_process");
+const { spawn, execFile, execFileSync } = require("child_process");
 const path = require("path");
 const http = require("http");
 
 const { findKirocrewBin } = require("./find-bin");
+const { buildGatewayEnvironment, gatewayBytecodeEnvironment } = require("./gateway-env");
+const { resolveGatewayPath } = require("./mac-env");
+const {
+  findMissingBundleParts,
+  describeIncompleteBundle,
+  shouldReclassifyAsInstalling,
+  currentAttemptLog,
+  SPAWN_MARKER,
+} = require("./bundle-integrity");
 const { findConfiguredDashboardPort } = require("./data-home");
-const { createTokenRetryHandler } = require("./token-retry");
+const { createTokenRetryHandler, dashboardRetryPath } = require("./token-retry");
+const { createRendererRecovery } = require("./renderer-recovery");
 const { classifyAuthBlock, defaultedPort } = require("./gateway-auth-hint");
 const { exitImmersiveModes } = require("./blocking-prompt");
+const { armSplashHistoryClear } = require("./splash-history");
+const { hideToTray, cancelPendingTrayHide } = require("./hide-to-tray");
+const { attachHtmlFullScreen } = require("./html-fullscreen");
 const { shouldRetryLocalTokenMint, tokenMintRetryDelayMs, TOKEN_MINT_MAX_RETRIES } = require("./token-acquire");
 const { createDisplayMediaHandler } = require("./display-media");
+const { applyFocusModeChrome } = require("./focus-chrome");
 const {
   createPermissionRequestHandler,
   createPermissionCheckHandler,
@@ -39,7 +53,13 @@ const {
   windowsProcessCommand,
   windowsTaskkill,
 } = require("./windows-port");
-const { waitForGateway, describeGatewayFailure, tailLines, isPortInUse } = require("./gateway-wait");
+const {
+  gatewayWaitTimeoutMs,
+  waitForGateway,
+  describeGatewayFailure,
+  tailLines,
+  isPortInUse,
+} = require("./gateway-wait");
 const { describeSandboxProfileNeed } = require("./sandbox-profile");
 const { sanitizeWindowState, captureWindowState } = require("./window-state");
 const {
@@ -54,6 +74,7 @@ const { createLivenessMonitor } = require("./gateway-liveness");
 const {
   chooseRecoveryStrategy,
   classifyAdoptedGateway,
+  revealWindowForConnect,
   waitForServiceRebind,
   waitForProcessExit,
   snapshotPortPids,
@@ -61,9 +82,12 @@ const {
   unrecoverableGatewayDialog,
 } = require("./gateway-recovery");
 const { capturePySpyDump } = require("./pyspy-dump");
-const { createMetricsRecorder } = require("./perf-metrics");
+const { createMetricsRecorder, profilingEnabled } = require("./perf-metrics");
+const { createMemoryWatchLog } = require("./memory-watch-log");
+const { createCageTrace } = require("./cage-trace");
 const { identityFamily, decideGatewayAction, classifyGatewayReadiness, FAMILY_META, HEALTH_IDENTITY_PATH, READY_PATH } = require("./instance-guard");
 const { initMochi, shutdownMochi } = require("./mochi/index");
+const { borrowSessionToken } = require("./mochi-session-token");
 const { initCrewCompanion, shutdownCrewCompanion } = require("./crew-companion/index");
 const { clampZoomFactor, stepZoomFactor } = require("./zoom");
 const { createBrowserViewManager, isUntrustedContents } = require("./browser-view");
@@ -115,7 +139,20 @@ const {
 
 const { migrateRemoteHostConfig, getRemoteHostConfig, setRemoteHostConfig } = require("./host-config");
 
+const { seedRenamedStore } = require("./store-rename");
+
 const { isLocalGatewayEnabled, setLocalGatewayEnabled, classifyStartFailure } = require("./local-gateway");
+
+const { initNativeLogging } = require("./native-logging");
+const { initGpuPolicy } = require("./disable-gpu");
+
+// Carry settings across the npm `name` rename, by writing the new store's file
+// BEFORE electron-store opens it. Order is load-bearing: construction writes the
+// defaults, after which the file always exists and the seed can never run. It only
+// ever writes a file that does not exist, so it cannot overwrite anything.
+seedRenamedStore(app.getPath("userData"), {
+  log: (m) => console.log(`store migration: ${m}`),
+});
 
 const store = new Store({
   defaults: {
@@ -127,11 +164,13 @@ const store = new Store({
     globalHotkey: null,                    // system-wide summon accelerator: null = platform default, "" = disabled, string = custom (see global-hotkey.js)
     lastNudgedVersion: "",                 // last update version announced via native notification (nudge once per version)
     themeAccent: "",                       // user's resolved theme accent hex; injected into the boot splash
-    updateChannel: "",                     // "" = follow build stamp; "insider"|"stable" = user opt-in (Settings > About)
+    updateChannel: "",                     // "" = follow the stable default; "insider"|"stable" = user opt-in (Settings > About)
+    autoDownloadUpdates: true,             // ON by default: a discovered update downloads in the background and installs on the next quit. false = notify only, download on request (Settings > About)
     runLocalGateway: true,                 // false = act as a pure client; never start a gateway on this machine
     linuxFrameless: null,                  // Linux window chrome: true = frameless, false = native frame, null = follow the desktop environment (see linux-frame.js)
   },
 });
+
 
 // Read ONCE at launch, because the setting takes effect on the next launch.
 // startGateway() is also the recovery path for a gateway that died mid-session,
@@ -142,13 +181,10 @@ const store = new Store({
 // that IS the user asking for a gateway right now.
 let runLocalGateway = isLocalGatewayEnabled(store);
 
-// The PRE-SPAWN read home (see home-dir.js for the full contract): whichever
-// directory's config.json governs this launch under the backend's migration
-// rules -- legacy ~/.kirocrew when it exists (the backend force-copies it
-// over ~/.kiro/crew, marker or not), canonical otherwise. Parity with
-// config/paths.py is gated by test/fixtures/home-resolution-cases.json.
-// Boot-time WRITES (mkdir, pycache prefix) use canonicalHome() instead --
-// writing into the legacy dir re-arms the migration every launch (#483).
+// The data home whose config.json governs this launch (see home-dir.js): a
+// valid KIROCREW_HOME override, else the default ~/.kiro/crew -- mirroring the
+// backend resolver in config/paths.py. Boot-time WRITES (mkdir, pycache prefix)
+// use canonicalHome() so an override is honored without a stray write.
 const { resolveHome, canonicalHome } = require("./home-dir");
 const { fetchLocalToken: fetchTokenFromHome } = require("./local-token");
 const KIROCREW_HOME = resolveHome();
@@ -166,8 +202,7 @@ function resolvePort() {
   // No env override — derive the gateway port from config.json. The fork's
   // DashboardConfig has no `dashboard.port` key; the port lives in
   // `dashboard.url` (see backend cli_server.resolve_client_port /
-  // dashboard/origin.parse_dashboard_url). A real legacy home is checked first
-  // because the backend migration makes legacy data authoritative on conflict.
+  // dashboard/origin.parse_dashboard_url). Read it from the resolved data home.
   const configuredPort = findConfiguredDashboardPort(fs, path, [KIROCREW_HOME]);
   if (configuredPort) return configuredPort;
   console.debug("No usable dashboard.url port in the data home, falling back to 5476");
@@ -183,7 +218,6 @@ if (migrateRemoteHostConfig(store, PORT)) {
 }
 const HEALTH_URL = `${BACKEND_URL}/api/status`;
 const POLL_INTERVAL_MS = 500;
-const MAX_WAIT_MS = 30_000; // 30s max wait for backend
 const IS_MAC = process.platform === "darwin";
 const IS_WINDOWS = process.platform === "win32";
 const IS_WIN = IS_WINDOWS;
@@ -207,6 +241,10 @@ const LINUX_FRAME_DECISION = IS_LINUX
   : null;
 const LINUX_FRAMELESS = !!(LINUX_FRAME_DECISION && LINUX_FRAME_DECISION.frameless);
 const DEFAULT_THEME_ACCENT = "#8E48FF";
+// Loading-screen status for a refused spawn on a bundle that is still being
+// written. Deliberately not "Gateway failed": nothing failed, so the line must
+// not contradict the dialog that follows.
+const INSTALLING_STATUS = "Finishing installation…";
 const THEME_ACCENT_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
 
 function currentThemeAccent() {
@@ -256,8 +294,49 @@ if (IS_WIN) {
 if (!app.requestSingleInstanceLock()) {
   app.exit(0);
 } else {
+  // Arm native diagnostic capture as the FIRST thing the winning instance does:
+  // early enough that Chromium still reads the logging switches (it reads them
+  // during initialization, so a call after app-ready is accepted and ignored),
+  // but strictly INSIDE the lock-won branch. A rejected second instance must not
+  // reach this: it would rotate `chromium.log` out from under the primary — the
+  // primary's open fd follows the renamed inode, and the genuine previous
+  // generation is destroyed — so double-clicking the icon of a running app would
+  // wipe exactly the retained evidence this capture exists to keep. `app.exit(0)`
+  // above is synchronous, so placing it here is what makes that unreachable
+  // rather than merely unlikely.
+  //
+  // `gatewayLogPath` is a hoisted function declaration needing only the modules
+  // required at the top of this file, so calling it here reuses its logs-dir
+  // resolution (including the tmpdir fallback) rather than duplicating it.
+  initNativeLogging({
+    logsDir: path.dirname(gatewayLogPath()),
+    appendSwitch: (name, value) => app.commandLine.appendSwitch(name, value),
+    startCrashReporter: (opts) => crashReporter.start(opts),
+    fs,
+    log: (m) => glog(m),
+  });
+
+  // Opt-in GPU-disable, applied through the SAME pre-app-ready appendSwitch
+  // seam as native logging above (Chromium reads switches during init, so a
+  // later append is ignored). OFF by default; enabled by KIROCREW_DISABLE_GPU
+  // or the --disable-gpu flag. This is the supported fix for hosts with no
+  // usable GPU — VM guests, Windows RDP sessions, headless/X11-forwarded Linux
+  // — where the renderer otherwise dies with launch-failed / exitCode 18 and
+  // renderer-recovery.js loops. Reading it here (not from forwarded argv on a
+  // second launch, which the single-instance lock drops) is what makes it take
+  // effect on the launch that actually renders.
+  initGpuPolicy({
+    appendSwitch: (name) => app.commandLine.appendSwitch(name),
+    env: process.env,
+    argv: process.argv,
+    log: (m) => glog(m),
+  });
+
   app.on("second-instance", () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
+      // Relaunching the app is a request for the window back; it must win over
+      // a hide still deferred to the fullscreen exit (see hide-to-tray.js).
+      cancelPendingTrayHide(mainWindow);
       if (mainWindow.isMinimized()) mainWindow.restore();
       mainWindow.show();
       mainWindow.focus();
@@ -353,6 +432,38 @@ function glog(line) {
   try { fs.appendFileSync(gatewayLogPath(), entry); } catch { /* never let logging break launch */ }
   console.log(`[gateway-launch] ${line}`);
 }
+
+// Renderer memory trajectory for the crash post-mortem. Module scope because the
+// samples arrive on an ipcMain channel while the flush happens in the window's
+// render-process-gone handler. Holds only plain numbers, bounded to its capacity,
+// and writes nothing until a crash.
+//
+// This one buffer replaces the two identical ones that preceded it
+// (pierre-perf-log + big-alloc-log). They measured allocation PATHS in committed
+// bytes; the renderer dies on the V8 cage's ADDRESS SPACE at 0.5% object-heap
+// occupancy, so both were reading a quantity that can stay flat through the
+// failure. See memory-watch-log.js for the full reasoning.
+const memoryWatchLog = createMemoryWatchLog();
+
+// The authoritative cage figure, armed by the trajectory above rather than run
+// continuously. `external` growth is committed bytes and can miss a cage
+// exhausted purely by RESERVATION (a wasm guard region, a resizable
+// ArrayBuffer's maxByteLength), so when growth appears this records
+// memory-infra's `partition_alloc/partitions/array_buffer` virtual_size — the one
+// figure that is reserved address space. Bounded, cooled down, and capped per
+// run; see cage-trace.js.
+//
+// The path is keyed by the capture's ordinal, NOT by a timestamp: a timestamped
+// name is unique per launch, so repeated capture-triggering runs would pile up
+// multi-MB traces in the logs directory forever. Reusing a fixed set of slots
+// caps the traces on disk at `maxCaptures` files for the lifetime of the install,
+// and the `[cage-trace] capture N written` line in gateway-launch.log carries the
+// timestamp that correlates a slot back to the crash it belongs to.
+const cageTrace = createCageTrace({
+  contentTracing,
+  tracePath: (slot) => path.join(app.getPath("logs"), `cage-trace-${slot}.json`),
+  log: (msg) => glog(msg),
+});
 
 // ── Cross-app gateway ownership (shared ~/.kiro/crew, shared port) ─────────
 // The nightly app and the production app are different bundles sharing one
@@ -783,12 +894,10 @@ function resolveProjectDir() {
 }
 
 function spawnGateway(resolve) {
-        // Pre-create the backend's POST-migration data root so the pycache
-        // prefix below has a live target. Deliberately NOT resolveHome():
-        // that answers "which config content governs this launch" and can be
-        // the legacy dir -- pre-creating or writing into ~/.kirocrew re-arms
-        // the backend's legacy migration on every launch (issue #483 class).
-        // The gateway creates/owns its home and .local_secret regardless.
+        // Pre-create the backend's data root so the pycache prefix below has a
+        // live target. Honor a KIROCREW_HOME override, else the default home
+        // (canonicalHome()). The gateway creates/owns its home and
+        // .local_secret regardless.
         const kirocrewDir = process.env.KIROCREW_HOME || canonicalHome();
         try {
           fs.mkdirSync(kirocrewDir, { recursive: true, mode: 0o700 });
@@ -801,6 +910,36 @@ function spawnGateway(resolve) {
         let execState = "executable";
         try { fs.accessSync(bin, fs.constants.X_OK); } catch (e) { execState = `NOT-EXECUTABLE(${e.code})`; }
         glog(`no gateway on :${PORT} — spawning bundled backend: bin=${bin} bundled=${bundled} ${execState}`);
+
+        // Refuse to exec a bundled interpreter whose stdlib is only partly on
+        // disk. The installer extracts backend-dist/ incrementally and starts the
+        // app as it finishes (runAfterFinish), so a launch inside that window
+        // finds python.exe present but late-alphabet stdlib packages missing --
+        // the interpreter then dies on `from urllib.parse import ...` from inside
+        // pathlib, which reads as a corrupt install rather than an unfinished one.
+        //
+        // This is PREVENTIVE and unsound; the launch-log backstop in the failure
+        // handler is sound but after-the-fact. They cover different halves, so
+        // neither replaces the other: refusing before spawn() keeps a doomed
+        // interpreter from running module-scope work against the user's live data
+        // home (it creates the home and .local_secret, and writes bytecode caches)
+        // and from failing in messier ways than ModuleNotFoundError while
+        // extraction is still writing underneath it -- the backstop only ever
+        // explains a crash that already happened.
+        if (bundled) {
+          const backendRoot = path.resolve(path.dirname(bin), "..");
+          const missingParts = findMissingBundleParts(fs, path, backendRoot);
+          if (missingParts.length) {
+            const errMsg = describeIncompleteBundle(missingParts);
+            glog(`spawn REFUSED: incomplete bundle at ${backendRoot} — missing: ${missingParts.join(", ")}`);
+            gatewayStartFailure = { error: errMsg, incompleteBundle: true, bundled: true };
+            // Neutral status: nothing failed, the install has not finished.
+            sendStatus(INSTALLING_STATUS);
+            resolve(false);
+            return;
+          }
+        }
+
         sendStatus("Starting gateway…");
 
         // Linux AppImage only: this process is about to exec the backend with no
@@ -837,13 +976,34 @@ function spawnGateway(resolve) {
         // served on.
         const { KIROCREW_PORT: _ignored, ...cleanEnv } = process.env;
 
+        // macOS: a GUI-launched .app inherits launchd's minimal environment, so
+        // cleanEnv.PATH is typically /usr/bin:/bin:/usr/sbin:/sbin. Recover the
+        // user's configured PATH from the launchd user domain and APPEND the
+        // directories it adds, so agent shell tools and MCP servers can resolve
+        // user-installed CLIs instead of reporting "command not found" for a
+        // binary that works in Terminal (issue #2367). No-op off darwin, when
+        // the domain is unset, or when it adds nothing — in which case
+        // gatewayPath is null and the inherited environment is left untouched.
+        //
+        // This only fixes the environment of a Gateway spawned FROM HERE.
+        // Already-running Gateway/ACP/MCP children keep the environment they
+        // were started with, so changing the domain still needs a Gateway
+        // restart to take effect.
+        const gatewayPath = resolveGatewayPath({
+          execFileSync,
+          basePath: cleanEnv.PATH || "",
+        });
+        if (gatewayPath) {
+          glog(`PATH recovered from launchd domain: +${gatewayPath.added.length} dir(s) appended`);
+        }
+
         // Tee the child's stdout+stderr straight to the launch log via a file
         // descriptor — no JS pipe to drain, no backpressure on a long-running
         // child. This is what surfaces a Python traceback / dylib load error /
         // "killed: 9" on a recipient's machine.
         let childOut = "ignore";
         try { childOut = fs.openSync(gatewayLogPath(), "a"); } catch (e) { glog(`WARN could not open child log fd: ${e.message}`); }
-        glog("---- spawning gateway; child stdout+stderr follows ----");
+        glog(SPAWN_MARKER);
         gatewayStartFailure = null; // re-arm for this spawn attempt
 
         // Bind handlers to THIS child via a captured reference, not the
@@ -868,14 +1028,24 @@ function spawnGateway(resolve) {
             spawnBin = pyExe;
             spawnArgs = ["-s", "-m", "kiro_crew", ...spawnArgs];
           } else {
-            // Bundled layout is present but python.exe is missing/corrupted.
-            // Surface this as a clear error instead of letting spawn() hang or
-            // emit a cryptic ENOENT for the .cmd shim.
-            const errMsg = `Bundled Python interpreter not found at ${pyExe}. `
-              + `The installation may be corrupted — reinstall the app.`;
-            glog(`spawn ERROR: ${errMsg}`);
-            gatewayStartFailure = { error: errMsg };
-            sendStatus(`Gateway failed: ${errMsg}`);
+            // The .cmd shim is here but python.exe is not. That is the same
+            // extraction race as the incomplete-stdlib case above, caught one
+            // wave earlier — bin/ lands before the interpreter — so it gets the
+            // same "still installing, retry" framing.
+            //
+            // A mid-extraction tree and a permanently truncated one are
+            // indistinguishable at this instant, so this deliberately reads the
+            // ambiguity as transient. Mid-extraction is the common state (every
+            // install and update passes through it) and the costs are asymmetric:
+            // guessing "installing" wrongly costs a retry, after which the copy's
+            // "if this persists, reinstall" gives the right instruction anyway,
+            // while guessing "corrupted" wrongly sends the user to reinstall a
+            // bundle that needed a few more seconds — the harm this whole path
+            // exists to prevent, and not undoable once done.
+            const errMsg = describeIncompleteBundle([]);
+            glog(`spawn REFUSED: bundled interpreter absent at ${pyExe} — install likely still extracting`);
+            gatewayStartFailure = { error: errMsg, incompleteBundle: true, bundled: true };
+            sendStatus(INSTALLING_STATUS);
             resolve(false);
             return;
           }
@@ -887,24 +1057,27 @@ function spawnGateway(resolve) {
           // without this every app launch opens a persistent console window
           // beside the Electron app. Ignored on POSIX.
           windowsHide: true,
-          env: {
+          env: buildGatewayEnvironment({
             ...cleanEnv,
+            // Overrides the inherited PATH only when the launchd domain
+            // actually contributed a directory (see resolveGatewayPath above);
+            // otherwise this spreads nothing and cleanEnv.PATH stands.
+            ...(gatewayPath ? { PATH: gatewayPath.path } : {}),
             // Windows source layout puts agents/ + skills/ at the repo root
             // (two levels up from electron/), so resolve by markers there.
             // macOS/Linux keep the original one-level-up path unchanged.
             KIROCREW_PROJECT_DIR: IS_WIN ? resolveProjectDir() : path.resolve(__dirname, ".."),
-            // Keep CPython bytecode caches OUT of the signed app bundle.
-            // Without this, the embedded interpreter writes __pycache__/*.pyc
-            // next to the bundled sources on first import, breaking the
-            // codesign seal ("a sealed resource is missing or invalid") --
-            // Gatekeeper then fails the installed app, and Squirrel's
-            // installer can trip over the corrupted target during updates.
-            // CPython creates the directory tree on demand (PEP 3147 /
-            // sys.pycache_prefix). Inherited by every Python child the
-            // gateway spawns (app servers run on the same interpreter), so
-            // the whole process tree stays out of the bundle.
-            PYTHONPYCACHEPREFIX: path.join(kirocrewDir, "cache", "pycache"),
-          },
+            // macOS code signing seals the app tree and Linux packages may be
+            // read-only, so those platforms redirect runtime bytecode. Windows
+            // consumes checked-hash pycs generated during packaging instead;
+            // avoiding the redirected-cache population is the main cold-start
+            // win on a freshly installed, Defender-scanned bundle.
+            ...gatewayBytecodeEnvironment(
+              process.platform,
+              path.join(kirocrewDir, "cache", "pycache"),
+              app.isPackaged,
+            ),
+          }),
         });
         gatewayProcess = child;
         // We own this child — recovery may kill+respawn it. Ownership
@@ -918,13 +1091,19 @@ function spawnGateway(resolve) {
           // ENOENT = bin not found on disk; EACCES = present but not executable.
           glog(`spawn ERROR code=${err.code || "?"} msg=${err.message}`);
           if (gatewayProcess !== child) return; // stale child we already replaced
-          gatewayStartFailure = { error: err.message };
+          gatewayStartFailure = { error: err.message, bundled };
           sendStatus(`Gateway failed: ${err.message}`);
           resolve(false);
         });
         child.on("exit", (code, signal) => {
           glog(`gateway child exited code=${code} signal=${signal}`);
-          if (signal === "SIGKILL") {
+          // macOS only. The hint is the right first thing to say there, but on
+          // Windows this signalCode is produced by OUR OWN teardown -- Node maps
+          // both .kill("SIGTERM") and .kill("SIGKILL") onto TerminateProcess --
+          // so an ungated hint prints a mac remedy on every wedge recovery and
+          // every fallback stop, in the very log the unrecoverable-gateway dialog
+          // tells the user to read.
+          if (signal === "SIGKILL" && IS_MAC) {
             glog("HINT: SIGKILL on a freshly-spawned bundled binary almost always means macOS Gatekeeper blocked an unsigned/quarantined nested executable. On the recipient's Mac run: xattr -cr <path to KiroCrew.app>");
           }
           // Only the CURRENT child may mutate the shared state. A stale child's
@@ -937,32 +1116,28 @@ function spawnGateway(resolve) {
           // user-initiated Retry clears it so a re-probe can genuinely succeed.
           // Guard: preserve the root cause from the 'error' handler if it fired
           // first (Node fires both 'error' then 'exit' on spawn failure).
-          if (!gatewayStartFailure) gatewayStartFailure = { code, signal };
+          if (!gatewayStartFailure) gatewayStartFailure = { code, signal, bundled };
           gatewayProcess = null;
         });
         resolve(true);
 }
 
 /**
- * Gracefully stop the embedded gateway and await its exit (POST /api/shutdown
- * -> SIGTERM -> SIGKILL). Core logic lives in gateway-stop.js for testability;
- * this thin wrapper binds the module-level child process + config.
+ * Gracefully stop the embedded gateway and await its exit: POST /api/shutdown,
+ * then on POSIX SIGTERM -> SIGKILL, and on Windows a tree kill (no real signals
+ * there, so the escalation is scope rather than force — see gateway-stop.js).
+ * Core logic lives in gateway-stop.js for testability; this thin wrapper binds
+ * the module-level child process + config.
  *
  * Uses call-time home resolution (secretCandidates) rather than the boot-time
- * KIROCREW_HOME pin, because on the migration launch the boot-time dir may
- * have been deleted by the backend — the secret lives in whichever candidate
- * still exists at shutdown time.
+ * KIROCREW_HOME pin, so a KIROCREW_HOME change between boot and shutdown is
+ * honored when locating the secret.
  */
 async function stopGatewayGracefully({ timeoutMs = 15000 } = {}) {
   const proc = gatewayProcess;
   if (!proc || proc.exitCode !== null) { gatewayProcess = null; return; }
   console.log("Stopping gateway gracefully...");
-  // Resolve the secret location at call time: try each candidate in order
-  // (canonical first, legacy second) so graceful stop works even when the
-  // boot-time home was moved/deleted during migration.
-  // Resolve the secret location at call time: a migration may have moved or
-  // deleted the boot-time home, and a partial migration can leave BOTH a
-  // canonical and a legacy `.local_secret`. Collect every readable candidate
+  // Resolve the secret location at call time. Collect every readable candidate
   // value and let gateway-stop POST each one — the gateway answers 200 only to
   // the secret it actually loaded, so a stale copy can't force a hard SIGTERM.
   const candidates = secretCandidates();
@@ -979,8 +1154,81 @@ async function stopGatewayGracefully({ timeoutMs = 15000 } = {}) {
     kirocrewHome,
     secrets,
     timeoutMs,
+    // Windows fallback scope: when /api/shutdown does not take, a single-pid kill
+    // frees the port but leaves the gateway's detached kiro-cli / MCP / app-server
+    // children alive and reparented, holding the data home's locks. Windows has no
+    // process group to signal, so the tree kill is the only way to take them with
+    // the parent. Gated on the same identity check the port sweep uses, so a
+    // recycled pid is refused rather than killed.
+    //
+    // TIMEOUTS ARE PINNED, not defaulted. windowsTaskkill's defaults are sized for
+    // the interactive port sweep (8s PowerShell + 5s WMIC + 10s taskkill = 23s),
+    // which exceeds stopGatewayGracefully's own deadline of timeoutMs + 3000. The
+    // tree kill is awaited rather than pre-empted -- cutting it short would kill
+    // the parent alone and orphan the tree -- so it is the BUDGET that has to fit:
+    // 3+2+5 = 10s, comfortably inside 18s, and still generous for probes that
+    // normally answer in well under a second.
+    killTreeFn: killGatewayTreeOnWindowsBounded,
   });
   gatewayProcess = null;
+}
+
+/**
+ * Tree-kill the gateway pid on Windows for the SHUTDOWN path only, with the
+ * timeouts that path's deadline can afford.
+ *
+ * windowsTaskkill's DEFAULTS (8s PowerShell + 5s WMIC + 10s taskkill = 23s) suit
+ * a caller with no deadline, but exceed stopGatewayGracefully's own
+ * timeoutMs + 3000. The kill is awaited rather than pre-empted — cutting it short
+ * would kill the parent alone and orphan the very descendants it exists to reap —
+ * so the BUDGET is what has to fit: 3+2+5 = 10s, inside 18s, and still generous
+ * for probes that normally answer in well under a second.
+ *
+ * Do NOT reuse this anywhere without such a deadline: shorter probe timeouts only
+ * make an early fallback to the parent-only kill MORE likely, which is the outcome
+ * the tree kill exists to prevent. Unbounded callers use
+ * killGatewayProcessTree().
+ */
+function killGatewayTreeOnWindowsBounded(pid) {
+  return windowsTaskkill(pid, {
+    isTrustedCommand: isTrustedWindowsGatewayCommand,
+    getCommandFn: (probePid) => windowsProcessCommand(probePid, {
+      powershellTimeoutMs: 3000,
+      wmicTimeoutMs: 2000,
+    }),
+    timeoutMs: 5000,
+  });
+}
+
+/**
+ * Kill a gateway child and, on Windows, everything it spawned.
+ *
+ * POSIX needs no tree walk here: the signal reaches the gateway, which reaps its
+ * own children on the way out. Windows has neither — no signal semantics (Node
+ * maps every name onto TerminateProcess) and no process group — so the detached
+ * kiro-cli / MCP / app-server descendants survive a single-pid kill, reparented
+ * and still holding the data home's locks.
+ *
+ * Falls back to the single-pid kill whenever the tree kill refuses (identity
+ * probe unavailable, or a recycled pid): losing the descendants is a leak, while
+ * losing the parent too would leave a live gateway behind a caller that believes
+ * it is gone.
+ */
+async function killGatewayProcessTree(proc, signal) {
+  if (!proc || proc.exitCode !== null) return;
+  const killPid = () => {
+    try { proc.kill(signal); } catch (e) { glog(`${signal} failed: ${e && e.message}`); }
+  };
+  if (!IS_WIN || !proc.pid) { killPid(); return; }
+  try {
+    // windowsTaskkill's OWN defaults: this path has no deadline to fit, so the
+    // identity probe gets its full budget rather than the shutdown path's
+    // shortened one.
+    await windowsTaskkill(proc.pid, { isTrustedCommand: isTrustedWindowsGatewayCommand });
+  } catch (e) {
+    glog(`tree kill refused (${e && e.message}) — falling back to a single-pid kill`);
+    killPid();
+  }
 }
 
 /** Best-effort synchronous-ish stop for the before-quit path (can't await). */
@@ -1019,8 +1267,8 @@ function fetchRemoteToken(port) {
 }
 
 async function fetchLocalToken(backendUrl = BACKEND_URL) {
-  // Re-resolve the authoritative home at call time: migration may move or pin
-  // the live secret after Electron starts. Send exactly that one secret to the
+  // Re-resolve the authoritative home at call time so a KIROCREW_HOME change
+  // after Electron starts is honored. Send exactly that one secret to the
   // gateway's literal IPv4 bind address; never probe alternate homes/addresses.
   return fetchTokenFromHome({
     backendUrl,
@@ -1031,6 +1279,25 @@ async function fetchLocalToken(backendUrl = BACKEND_URL) {
   });
 }
 
+/**
+ * Resolve a gateway credential for Mochi's poller, trying the same paths (in
+ * the same order) the main window itself would: the local secret first
+ * (same machine, unchanged), then an explicitly configured SSH remote host
+ * for this port (unchanged), then — new — the session the main window has
+ * ALREADY established. That third path only runs when the first two come
+ * back empty, so an ordinary same-machine or SSH-remote install never
+ * reaches it at all. See mochi-session-token.js for why it exists and why it
+ * cannot weaken auth: it only ever hands back a credential a genuine prior
+ * authentication already produced.
+ */
+async function fetchMochiGatewayAuth(backendUrl = BACKEND_URL) {
+  const localValue = await fetchLocalToken(backendUrl);
+  if (localValue) return { value: localValue, viaCookie: false };
+  const { token: remoteValue } = await fetchRemoteToken(new URL(backendUrl).port);
+  if (remoteValue) return { value: remoteValue, viaCookie: false };
+  const borrowed = await borrowSessionToken({ electronSession: session.defaultSession, backendUrl });
+  return borrowed ? { value: borrowed, viaCookie: true } : { value: "" };
+}
 
 function checkBackend(healthUrl = HEALTH_URL) {
   return new Promise((resolve, reject) => {
@@ -1052,7 +1319,13 @@ function waitForBackend(targetWin, healthUrl = HEALTH_URL, { watchSpawn = false 
     getFailure: watchSpawn ? (() => gatewayStartFailure) : (() => null),
     isWindowAlive: () => !targetWin?.isDestroyed(),
     onStatus: (msg) => { try { targetWin?.webContents?.send("status", msg); } catch { /* window gone */ } },
-    maxWaitMs: MAX_WAIT_MS,
+    // Windows may spend well past the ordinary deadline importing a newly
+    // installed bundled Python tree. Keep showing live splash progress only for
+    // the gateway child we spawned; exits still fail immediately via getFailure.
+    maxWaitMs: gatewayWaitTimeoutMs({
+      platform: process.platform,
+      watchSpawn: watchSpawn && gatewayOwnership === "spawned",
+    }),
     pollIntervalMs: POLL_INTERVAL_MS,
   });
 }
@@ -1242,6 +1515,17 @@ function setupWindowContents(win, backendUrl) {
   view.setBackgroundColor("#00000000");
   win.contentView.addChildView(view);
 
+  // Keep the boot splash / token prompt out of reachable navigation history:
+  // once the dashboard commits, prune the transient shell entries so mouse
+  // button 4 (Chromium's built-in history-back) cannot land the user on a
+  // dead-end loading.html with no way forward. Armed once per window; covers
+  // boot, the gateway reconnect/recovery re-paints, and the renderer-driven
+  // token-prompt handoff. See splash-history.js and #5538.
+  armSplashHistoryClear(view.webContents, {
+    isAlive: () => !win.isDestroyed() && !view.webContents.isDestroyed(),
+    log: glog,
+  });
+
   // Clean up views when window is closed
   win.on("closed", () => {
     if (win._mcAgentChannel) void win._mcAgentChannel.stop();
@@ -1271,8 +1555,40 @@ function setupWindowContents(win, backendUrl) {
     if (win.isDestroyed() || view.webContents.isDestroyed()) return;
     view.webContents.send("fullscreen-changed", win.isFullScreen());
   };
-  win.on("enter-full-screen", () => { updateViewBounds(); sendFullScreen(); });
-  win.on("leave-full-screen", () => { updateViewBounds(); sendFullScreen(); });
+  // Fullscreen transitions fire before the window finishes reflowing, so the
+  // synchronous updateViewBounds() in the handlers below can read a pre-reflow
+  // content rect — the same stale-getContentBounds hazard the did-finish-load
+  // settle pass below documents. Observed on Linux, where the in-window menu
+  // bar's ~28px is reclaimed only after `leave-full-screen`, leaving the view
+  // taller than the window and clipping bottom-anchored rows until some other
+  // resize. Keep the synchronous call (already correct where reflow is
+  // immediate) and follow it with bounded deferred recomputes so the settled
+  // bounds win: a quick pass for the common fast reflow and a late backstop
+  // matching the startup settle delay for slow window managers. Re-reading
+  // bounds on an already-correct window is a no-op, so this runs on every
+  // platform rather than behind a process.platform gate. updateViewBounds()
+  // itself no-ops on a destroyed window; the timers are also cleared on
+  // "closed" so nothing fires into a torn-down window.
+  let fullscreenSettleTimers = [];
+  const scheduleFullscreenSettle = () => {
+    for (const t of fullscreenSettleTimers) clearTimeout(t);
+    fullscreenSettleTimers = [250, 1500].map((ms) => setTimeout(updateViewBounds, ms));
+  };
+  win.on("closed", () => { for (const t of fullscreenSettleTimers) clearTimeout(t); });
+  win.on("enter-full-screen", () => { updateViewBounds(); sendFullScreen(); scheduleFullscreenSettle(); });
+  win.on("leave-full-screen", () => { updateViewBounds(); sendFullScreen(); scheduleFullscreenSettle(); });
+  // DOM fullscreen (an inline <video>'s fullscreen button, the media viewer) is
+  // a SEPARATE pair of events from the two above, raised on the WebContents
+  // rather than the window. Without this bridge the element goes :fullscreen
+  // inside a WebContentsView still clamped to the un-fullscreened window, so
+  // nothing visibly happens. `enter-full-screen` above then re-runs
+  // updateViewBounds() so the view grows into the new content rect.
+  //
+  // Parked on the window (same pattern as _mcBrowserPanels) because
+  // persistMainWindowState() must ask whether the CURRENT fullscreen is one the
+  // bridge raised: a video's fullscreen is not a window preference and must not
+  // be what a quit mid-playback relaunches into.
+  win._mcHtmlFullScreen = attachHtmlFullScreen({ win, webContents: view.webContents });
   // The initial updateViewBounds() above runs before win.show() and before the
   // dashboard finishes loading, so getContentBounds() can return a pre-layout
   // size — leaving the WebContentsView mis-sized (content overflows / gets cut
@@ -1648,6 +1964,25 @@ function setupWindowContents(win, backendUrl) {
         [role="button"], [tabindex], iframe {
           -webkit-app-region: no-drag;
         }
+        /* Focus mode (see website/src/hooks/useFocusMode.ts) hides the dashboard
+           header, so this bar would be a 42px drag region sitting on top of the
+           content focus mode just reclaimed -- the session title, the sidebar
+           toggles, the transcript. pointer-events:none does NOT save that: a
+           drag region is resolved by the compositor before hit-testing, so the
+           band stops answering hover and swallows the press.
+           An app-region:no-drag child DOES subtract (this bar is prepended to
+           body, so it comes FIRST in tree order and every later no-drag element
+           wins), which is what keeps buttons clickable -- but there is nothing to
+           hang that on for the transcript itself.
+           So the region collapses with the header, and comes back with it: the
+           renderer sets mc-focus-chrome while the header is on screen, which is
+           when the bar is the drag surface the user expects. */
+        body.mc-focus-mode #electron-drag-bar {
+          height: 0;
+        }
+        body.mc-focus-mode.mc-focus-chrome #electron-drag-bar {
+          height: 42px;
+        }
       `);
       view.webContents.executeJavaScript(`
         if (!document.getElementById('electron-drag-bar')) {
@@ -1882,7 +2217,13 @@ function syncLinuxMaximizeState(win, view) {
 // menu's Keep on Top toggle can trigger a save. No-op while mainWindow is
 // absent/destroyed (captureWindowState returns null).
 function persistMainWindowState() {
-  const s = captureWindowState(mainWindow);
+  const s = captureWindowState(mainWindow, {
+    // A fullscreen the DOM-fullscreen bridge raised for a `<video>` is the app's
+    // doing, not the user's preference, so it must never be the state we relaunch
+    // into after a quit or crash mid-playback. The bridge is the only thing that
+    // knows which transitions are its own.
+    transientFullScreen: mainWindow?._mcHtmlFullScreen?.raisedWindow() === true,
+  });
   if (s) store.set("windowState", s);
 }
 
@@ -1934,10 +2275,11 @@ function createWindow() {
     // out of the resting chrome while Alt still reveals it.
     opts.autoHideMenuBar = true;
   }
-  // Window + taskbar icon (Windows only): running unpackaged (`electron .`)
-  // otherwise shows the default Electron icon. macOS takes its icon from the
-  // .app bundle and Linux from the .desktop/AppImage, so leave those untouched.
-  if (IS_WIN) {
+  // Window + taskbar icon: the explicit BrowserWindow icon is required on
+  // Linux too. Some GNOME/AppImage launches do not associate the generated
+  // desktop entry with the live window and otherwise fall back to Electron's
+  // generic X icon. macOS takes its icon from the .app bundle.
+  if (IS_WIN || IS_LINUX) {
     const iconFile = identityFamily(app.getVersion()) === "nightly"
       && fs.existsSync(path.join(__dirname, "icon-nightly.png"))
       ? "icon-nightly.png" : "icon.png";
@@ -1992,10 +2334,100 @@ function createWindow() {
     onNavigate(httpCode).catch((err) => console.error("Token retry failed:", err));
   });
 
+  // Renderer-crash self-healing. Without this a dead renderer leaves the window
+  // mapped but permanently BLACK — the SPA and its top tab strip both lived in
+  // that process, so the user is left with no UI and no way back short of
+  // quitting. Re-load through the same fresh-token path `did-navigate` uses, so
+  // recovery also survives a gateway secret that rotated while we were down.
+  // Bounded (see renderer-recovery.js): repeated deaths inside the window stop
+  // the loop instead of spinning on a broken build.
+  const rendererRecovery = createRendererRecovery({
+    isQuitting: () => isQuitting,
+    log: glog,
+    // Snapshot every Electron process at the moment of death. A macOS crash
+    // report names the thread that aborted but NOT what the process had grown
+    // to, so without this a post-mortem cannot tell "renderer hit a memory
+    // ceiling" from "renderer was pegged on CPU" — the two hypotheses this
+    // window's black-screen crashes leave open. Totals plus the worst offender
+    // keep it to one log line.
+    describeProcesses: () => {
+      const metrics = app.getAppMetrics() || [];
+      let totalCpu = 0;
+      let totalMb = 0;
+      let worst = null;
+      for (const m of metrics) {
+        const cpu = (m.cpu && m.cpu.percentCPUUsage) || 0;
+        const mb = ((m.memory && m.memory.workingSetSize) || 0) / 1024;
+        totalCpu += cpu;
+        totalMb += mb;
+        if (!worst || mb > worst.mb) worst = { type: m.type, pid: m.pid, mb, cpu };
+      }
+      const parts = [
+        `procs=${metrics.length}`,
+        `totalCpu=${totalCpu.toFixed(1)}%`,
+        `totalWorkingSet=${Math.round(totalMb)}MB`,
+      ];
+      if (worst) {
+        parts.push(
+          `largest=${worst.type}:${worst.pid}@${Math.round(worst.mb)}MB/${worst.cpu.toFixed(1)}%`
+        );
+      }
+      return parts.join(" ");
+    },
+    reload: () => {
+      if (mainWindow.isDestroyed()) return;
+      (async () => {
+        let token = await fetchLocalToken(BACKEND_URL);
+        if (!token) ({ token } = await fetchRemoteToken(PORT));
+        if (mainWindow.isDestroyed()) return;
+        mainWindow.webContents.loadURL(
+          token ? `${BACKEND_URL}?token=${token}` : BACKEND_URL
+        );
+      })().catch((err) => glog(`renderer recovery reload failed: ${err && err.message}`));
+    },
+    onGiveUp: ({ reason }) => {
+      // Deliberately log-only. Reloading again is the thing we must NOT do here
+      // (that is the loop this budget exists to stop), and the window is already
+      // showing the failure — it is blank. The log line is what tells a human
+      // WHY it stayed blank, which a silent give-up would not.
+      glog(`renderer recovery exhausted (reason=${reason}); leaving the window as-is`);
+    },
+  });
+  mainWindow.webContents.on("render-process-gone", (_e, details) => {
+    // Flush the memory trajectory FIRST so the log reads in causal order: how
+    // memory was moving, then the death and what the processes had grown to.
+    // Unconditional -- this is the moment the buffer was kept for, and it is also
+    // the one moment the write cost is justified.
+    //
+    // How to read the summary. `externalDelta` climbing into the hundreds of MB
+    // while `peakJsHeap` stays flat is backing-store growth, and the culprit is a
+    // cage resident: the trace file (if one armed) names the partition.
+    // `externalDelta` near zero does NOT exonerate buffers on its own -- external
+    // memory is COMMITTED bytes, and a cage can be exhausted by RESERVATION alone
+    // (a wasm32 guard region, a resizable ArrayBuffer's maxByteLength), which only
+    // the cage trace's virtual_size can see. And `externalMoved=NO-FROZEN-VALUE`
+    // means the instrument itself is not measuring: performance.memory is
+    // bucketized and cached for 20 minutes unless precise memory info is on, so
+    // treat that verdict as a broken probe, not as a flat trend.
+    for (const line of memoryWatchLog.flush()) glog(line);
+    // Then land any capture that was in flight. A renderer dying mid-capture is
+    // the most valuable trace there is, and an unstopped recording is never
+    // written to disk at all -- so this must run even though the process is
+    // already gone.
+    void cageTrace.stopForCrash();
+    rendererRecovery.handleGone(details || {});
+  });
+
   mainWindow.on("close", (e) => {
     if (!isQuitting) {
       e.preventDefault();
-      mainWindow.hide();
+      // Not a quit — hide to the tray. On macOS this MUST leave a native
+      // fullscreen Space first, or the Space is orphaned as a black surface and
+      // the window later re-shows at a degenerate frame (see hide-to-tray.js).
+      // The hide is deferred to `leave-full-screen` in that case; the existing
+      // geometry listener fires on the same event, so the persisted state
+      // truthfully records the window as windowed at its normal bounds.
+      hideToTray(mainWindow);
       return;
     }
     // Real quit — capture the final geometry synchronously before teardown so
@@ -2008,6 +2440,13 @@ function createWindow() {
 }
 
 function createTray() {
+  // A tray gesture asking for the window back must first disarm any hide that
+  // hideToTray() deferred to the fullscreen exit, or the show is undone moments
+  // later when the exit completes (see hide-to-tray.js CANCELLATION).
+  const showFromTray = () => {
+    cancelPendingTrayHide(mainWindow);
+    mainWindow?.show();
+  };
   // Nightly ships its own icon (night-sky variant) so the menu-bar presence
   // matches the Dock identity; app.name was set channel-aware at boot.
   const nightly = identityFamily(app.getVersion()) === "nightly";
@@ -2045,7 +2484,7 @@ function createTray() {
   // tabs were removed with the single-surface shell redesign).
   tray.setContextMenu(
     Menu.buildFromTemplate([
-      { label: `Show ${app.name}`, click: () => mainWindow?.show() },
+      { label: `Show ${app.name}`, click: showFromTray },
       { type: "separator" },
       { label: "New Connection Window…", click: () => openNewConnectionWindow() },
       { type: "separator" },
@@ -2054,7 +2493,7 @@ function createTray() {
       { label: "Quit", click: () => { isQuitting = true; app.quit(); } },
     ])
   );
-  tray.on("click", () => mainWindow?.show());
+  tray.on("click", showFromTray);
 }
 
 // ── Remote host settings ──
@@ -2394,11 +2833,11 @@ function startLivenessMonitor(win) {
  * Recover a gateway that is alive-but-unresponsive (wedged event loop). A
  * graceful /api/shutdown can't help — that endpoint runs on the very loop that
  * is frozen — so SIGKILL the child, clear the port, respawn, and re-run the
- * boot flow. showLoadingThenConnect shows the loading screen + status (a visible
- * "restarting" state instead of an eternal spinner) and starts a fresh monitor
- * on success; its own catch handles a restart that fails.
+ * boot flow. showLoadingThenConnect loads the loading screen + status into the
+ * window (without raising it — this is a liveness reconnect, see #6373) and
+ * starts a fresh monitor on success; its own catch handles a restart that fails.
  */
-async function recoverWedgedGateway(win) {
+async function recoverWedgedGateway(win, { userInitiated = false } = {}) {
   // We only OWN (and may kill/respawn) a gateway we spawned. On the reuse path
   // the port-holder is someone else's process — in the remote-tunnel setup it is
   // our own SSH forward, whose backend lives on a remote host. An unresponsive
@@ -2436,7 +2875,13 @@ async function recoverWedgedGateway(win) {
       log: (m) => glog(`liveness: ${m}`),
     }).catch((e) => glog(`liveness: py-spy capture threw: ${e && e.message}`));
   }
-  try { if (gatewayProcess) gatewayProcess.kill("SIGKILL"); } catch (e) { glog(`SIGKILL failed: ${e && e.message}`); }
+  // TREE-scoped on Windows. This path deliberately skips /api/shutdown (it runs on
+  // the frozen loop), so it is the one trigger where nothing else reaps the
+  // gateway's detached kiro-cli / MCP children -- and the port sweep below cannot
+  // cover for it, because a single-pid kill FREES the port, after which the sweep
+  // finds no owner and its own /T taskkill is never reached. Awaited so the tree is
+  // gone before the respawn, and it falls back to the pid kill on any refusal.
+  await killGatewayProcessTree(gatewayProcess, "SIGKILL");
   gatewayProcess = null;
   let freed = true;
   let foreignHolder = false;
@@ -2461,7 +2906,12 @@ async function recoverWedgedGateway(win) {
   gatewayStartFailure = null; // re-arm so waitForGateway doesn't fail-fast on the kill we just did
   await startGateway(); // spawn a fresh child before re-waiting
   if (win.isDestroyed() || isQuitting) return;
-  return showLoadingThenConnect(win, BACKEND_URL);
+  // A user-initiated recovery (failed update install — the user clicked
+  // Install and is watching) keeps the raise; a liveness-triggered one stays
+  // silent (#6373). The reconnect fork branches above are liveness-only in
+  // practice (an install only ever stops a gateway we spawned) and stay
+  // silent either way — their needs-user states escalate on their own.
+  return showLoadingThenConnect(win, BACKEND_URL, { reconnect: !userInitiated });
 }
 
 /**
@@ -2477,8 +2927,11 @@ async function recoverWedgedGateway(win) {
 async function reconnectExternalGateway(win) {
   const wc = win.webContents;
   try { wc.loadFile(path.join(__dirname, "loading.html")); } catch { /* window may be mid-teardown */ }
-  if (!win || win.isDestroyed() || isQuitting) return; // loadFile may have thrown on a torn-down window; show() would too
-  win.show();
+  if (!win || win.isDestroyed() || isQuitting) return; // loadFile may have thrown on a torn-down window
+  // Deliberately NO reveal here: this is liveness-triggered, not user-initiated,
+  // so the window must not be raised, focused, or re-surfaced (#6373 — every
+  // tunnel drop stole focus on reconnect). The splash above loads fine into a
+  // background or hidden window.
   sendStatus("Connection lost — waiting for the gateway to come back…");
   for (;;) {
     if (!win || win.isDestroyed() || isQuitting) return;
@@ -2490,7 +2943,7 @@ async function reconnectExternalGateway(win) {
   if (!win || win.isDestroyed() || isQuitting) return;
   glog("liveness: external gateway reachable again — refetching token and reconnecting");
   gatewayStartFailure = null;
-  return showLoadingThenConnect(win, BACKEND_URL);
+  return showLoadingThenConnect(win, BACKEND_URL, { reconnect: true });
 }
 
 // How long recovery waits for an ADOPTED local gateway to answer again before
@@ -2517,7 +2970,7 @@ async function reconnectOrRespawnAdoptedGateway(win) {
   const wc = win.webContents;
   try { wc.loadFile(path.join(__dirname, "loading.html")); } catch { /* window may be mid-teardown */ }
   if (!win || win.isDestroyed() || isQuitting) return;
-  win.show();
+  // Deliberately NO reveal: liveness-triggered, not user-initiated (#6373).
   sendStatus("Gateway stopped responding — waiting for it to recover…");
   const deadline = Date.now() + ADOPTED_RECOVERY_WAIT_MS;
   while (Date.now() < deadline) {
@@ -2525,9 +2978,12 @@ async function reconnectOrRespawnAdoptedGateway(win) {
     let healthy = false;
     try { await checkBackend(HEALTH_URL); healthy = true; } catch { /* still down */ }
     if (healthy) {
+      // The probe just awaited — the window may have been torn down meanwhile,
+      // and showLoadingThenConnect would loadFile against a destroyed window.
+      if (!win || win.isDestroyed() || isQuitting) return;
       glog("liveness: adopted local gateway answering again — reconnecting");
       gatewayStartFailure = null;
-      return showLoadingThenConnect(win, BACKEND_URL);
+      return showLoadingThenConnect(win, BACKEND_URL, { reconnect: true });
     }
     await new Promise((r) => setTimeout(r, 2500));
   }
@@ -2570,11 +3026,13 @@ async function reconnectOrRespawnAdoptedGateway(win) {
       const health = await fetchHealthInfo();
       const decision = decideGatewayAction(app.getVersion(), health, { localOwner: owner });
       const readiness = await fetchGatewayReadiness();
+      // Three awaits since the last check — re-verify before touching the window.
+      if (win.isDestroyed() || isQuitting) return;
       if (decision.action === "reuse" && readiness !== "shutting-down") {
         glog(`liveness: service manager re-bound :${PORT} (owner=${owner}, reason=${decision.reason}, readiness=${readiness}) — reconnecting to the restarted gateway`);
         gatewayOwnership = classifyAdoptedGateway({ reason: decision.reason, localOwner: owner });
         gatewayStartFailure = null;
-        return showLoadingThenConnect(win, BACKEND_URL);
+        return showLoadingThenConnect(win, BACKEND_URL, { reconnect: true });
       }
       glog(`liveness: :${PORT} was re-bound by an unusable holder (owner=${owner}, action=${decision.action}, readiness=${readiness}) — cannot reconnect or spawn over it`);
       return showUnrecoverableGatewayError(win, PORT, "held");
@@ -2588,7 +3046,28 @@ async function reconnectOrRespawnAdoptedGateway(win) {
   gatewayStartFailure = null;
   await startGateway(); // spawn a fresh child (port is confirmed free)
   if (win.isDestroyed() || isQuitting) return;
-  return showLoadingThenConnect(win, BACKEND_URL);
+  return showLoadingThenConnect(win, BACKEND_URL, { reconnect: true });
+}
+
+/**
+ * Reveal a window because recovery reached a state that NEEDS the user (token
+ * prompt, terminal failure dialog). Silent reconnects (#6373) deliberately
+ * leave the window hidden/minimized while self-healing, so an escalation must
+ * do the full reveal the repo's other show paths do: cancel a deferred
+ * tray-hide first (hide-to-tray.js: every show expressing intent to see the
+ * window must, or the pending hide re-hides it — exitImmersiveModes can fire
+ * that very listener), un-minimize, show + focus, and on macOS steal app
+ * activation — the app is in the background by definition here, and without
+ * activation the window rises behind the frontmost app without keyboard
+ * focus (see the global-hotkey summon path). Idempotent on a visible window.
+ */
+function revealForUserDecision(win) {
+  if (!win || win.isDestroyed() || isQuitting) return;
+  cancelPendingTrayHide(win);
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+  if (IS_MAC) app.focus({ steal: true });
 }
 
 /**
@@ -2609,6 +3088,12 @@ async function showUnrecoverableGatewayError(win, port, options = {}) {
     ? { variant: options }
     : options;
   if (!win || win.isDestroyed()) return;
+  // Terminal needs-the-user state: the dialog below is a modal child of `win`,
+  // and a modal child of a hidden parent is ordered out with it. Liveness
+  // paths reach here with the window deliberately un-revealed (#6373's silent
+  // reconnect), so reveal it now — every branch of this dialog requires a
+  // human decision and quits afterwards, so raising is always right here.
+  revealForUserDecision(win);
   let logTail = "";
   try { logTail = tailLines(fs.readFileSync(gatewayLogPath(), "utf8"), 60); } catch { /* no log yet */ }
   const action = await showGatewayErrorDialog(win, {
@@ -2631,7 +3116,17 @@ async function showUnrecoverableGatewayError(win, port, options = {}) {
   if (win === mainWindow) { isQuitting = true; app.quit(); } else { win.destroy(); }
 }
 
-async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
+function dashboardEntryUrl(backendUrl, initialPath = "", token = "") {
+  const target = initialPath ? new URL(initialPath, backendUrl) : new URL(backendUrl);
+  if (token) target.searchParams.set("token", token);
+  return target.toString();
+}
+
+async function showLoadingThenConnect(
+  win,
+  backendUrl = BACKEND_URL,
+  { reconnect = false, initialPath = "" } = {},
+) {
   const healthUrl = `${backendUrl}/api/status`;
   const wc = win.webContents;
   // Paint the splash in the user's chosen accent (persisted from a prior session
@@ -2639,7 +3134,9 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
   wc.loadFile(path.join(__dirname, "loading.html"), {
     query: { accent: currentThemeAccent() },
   });
-  win.show();
+  // Cold launch and user-initiated connects raise as before; liveness-recovery
+  // reconnects (reconnect: true) stay silent — no raise, no focus steal (#6373).
+  revealWindowForConnect(win, { reconnect });
 
   try {
     await waitForBackend(win, healthUrl, { watchSpawn: backendUrl === BACKEND_URL });
@@ -2662,8 +3159,8 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
         // gateway is ready, then fade out and hand off to the dashboard.
         await fadeLoadingScreen(wc);
         if (win.isDestroyed()) return;
-        wc.loadURL(`${backendUrl}?token=${token}`);
-        if (backendUrl === BACKEND_URL) startLivenessMonitor(win);
+        wc.loadURL(dashboardEntryUrl(backendUrl, initialPath, token));
+        if (backendUrl === BACKEND_URL && win === mainWindow) startLivenessMonitor(win);
         return;
       }
 
@@ -2678,8 +3175,8 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
 
       if (status !== 403) {
         // Not an auth block — the gateway serves without a token.
-        wc.loadURL(backendUrl);
-        if (backendUrl === BACKEND_URL) startLivenessMonitor(win);
+        wc.loadURL(dashboardEntryUrl(backendUrl, initialPath));
+        if (backendUrl === BACKEND_URL && win === mainWindow) startLivenessMonitor(win);
         return;
       }
 
@@ -2720,6 +3217,14 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
       // `window.close()` in the page would destroy the VIEW and leave a blank
       // shell behind. A keyboard exit has to go through the main process
       // (windowForWebContents) to close the host window.
+      // A prompt is a state that genuinely NEEDS the user, whatever path led
+      // here: a silent reconnect leaves the window hidden (#6373), and even a
+      // cold boot's window can be hidden/minimized by the time a slow install
+      // reaches this point. Reveal unconditionally — idempotent when already
+      // visible. BEFORE exitImmersiveModes: leaving fullscreen fires a
+      // deferred tray-hide's listener, so the cancel inside the reveal must
+      // come first.
+      revealForUserDecision(win);
       exitImmersiveModes(win);
       wc.loadFile(path.join(__dirname, "token-prompt.html"), {
         query: { port: promptPort, kind, host: remoteHost },
@@ -2745,9 +3250,36 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
     // Nothing was spawned in the client-only case, so it is classified before
     // the port-conflict probe — see classifyStartFailure for why the log tail
     // cannot be trusted to mean "a holder exists right now".
-    const failureKind = classifyStartFailure({
+    // The pre-spawn check cannot be complete: extraction order within a package
+    // is not ours to control, so a spawn can still die on a stdlib import that
+    // was a moment away from existing. The interpreter's own traceback settles
+    // what no filesystem probe could, so a missing-stdlib crash is reclassified
+    // here as an unfinished install rather than reported as a defect.
+    //
+    // Requires the tail to be free of a bound-port report. The launch log is
+    // append-only across launches, so a stdlib traceback left by an EARLIER run
+    // would otherwise relabel today's "address already in use" exit as
+    // "installing" and hide the force-stop path — the port holder is still
+    // there, so Retry alone would loop. When both signals appear, the port
+    // conflict is the actionable one. This guard applies only to the log-sniffed
+    // path; a pre-spawn refusal sets `incompleteBundle` explicitly and keeps
+    // outranking a stale port line, since nothing was spawned in that case.
+    const failureRecord = shouldReclassifyAsInstalling({
       failedToStart,
       failure: err.failure,
+      logTail,
+      // Scoped to THIS attempt, like the crash match itself: a bound-port line
+      // left by an earlier launch must not suppress a genuine current stdlib
+      // crash. The port-conflict branch below keeps using the whole tail, since
+      // its own guard is about not offering force-stop for a port nothing holds.
+      portInUseInLog: isPortInUse(currentAttemptLog(logTail)),
+      bundled: !!(err.failure && err.failure.bundled),
+    })
+      ? { ...err.failure, incompleteBundle: true }
+      : err.failure;
+    const failureKind = classifyStartFailure({
+      failedToStart,
+      failure: failureRecord,
       isOwnPort: backendUrl === BACKEND_URL,
       portInUseInLog: isPortInUse(logTail),
     });
@@ -2755,7 +3287,15 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
     const portConflict = failureKind === "port-conflict";
 
     let title, message;
-    if (localGatewayOff) {
+    if (failureKind === "installing") {
+      // The bundled backend is still being written to disk, so the honest
+      // framing is "not ready yet" and Retry is the whole remedy. Use the
+      // unfinished-install copy rather than err.message: on the reclassified
+      // path err.message is the interpreter's own exit report, which is what
+      // this branch exists to stop showing as the headline.
+      title = "Kiro Crew — installation still finishing";
+      message = err.failure?.incompleteBundle ? err.message : describeIncompleteBundle([]);
+    } else if (localGatewayOff) {
       // Nothing failed here — the app was told not to start a gateway and the
       // port is silent. "Failed to start" would send the user hunting a crash.
       title = `Kiro Crew — no gateway on port ${PORT}`;
@@ -2775,6 +3315,11 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
     }
 
     // Loop so "Reveal Log" can re-show the dialog after opening Finder.
+    // The dialog is a modal child of `win` and needs the user: a hidden parent
+    // orders the modal out with it. Reveal unconditionally, whatever path led
+    // here — a silent reconnect leaves the window hidden (#6373), and even a
+    // cold boot's window can be hidden by now. Idempotent when visible.
+    revealForUserDecision(win);
     for (;;) {
       const action = await showGatewayErrorDialog(win, {
         title, message, logTail, logPath, portConflict, port: PORT, localGatewayOff,
@@ -2815,9 +3360,11 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
         }
         // The dialog, force-stop, and respawn above are all async — the user may
         // have closed the window meanwhile. Re-check before showLoadingThenConnect,
-        // which calls win.show()/loadFile and would throw on a destroyed window.
+        // which reveals the window / calls loadFile and would throw on a destroyed one.
+        // Deliberately NOT flagged as a reconnect: every path here goes through a
+        // dialog button the user just clicked, so the re-entry may raise (#6373).
         if (win.isDestroyed()) return;
-        return showLoadingThenConnect(win, backendUrl);
+        return showLoadingThenConnect(win, backendUrl, { initialPath });
       }
       // Quit
       if (win === mainWindow) {
@@ -2831,10 +3378,76 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
   }
 }
 
+// ── Standalone dashboard windows ──
+
+function createConnectionWindow(backendUrl, port, initialPath = "") {
+  const connOpts = {
+    width: 1280,
+    height: 860,
+    minWidth: 550,
+    minHeight: 600,
+    backgroundColor: "#0f1117",
+  };
+  // Same platform-conditional chrome as the main window (see createWindow):
+  // frameless + inset traffic lights on macOS, titleBarOverlay on Windows,
+  // frame:false on CSD-preferring Linux desktops, native frame elsewhere.
+  if (IS_MAC) connOpts.titleBarStyle = "hidden";
+  if (IS_MAC) connOpts.trafficLightPosition = trafficLightPositionForZoom(1);
+  if (IS_WINDOWS) {
+    connOpts.titleBarStyle = "hidden";
+    connOpts.autoHideMenuBar = true;
+    connOpts.titleBarOverlay = {
+      color: WINDOWS_TITLEBAR_BACKGROUND,
+      symbolColor: nativeTheme.shouldUseDarkColors
+        ? WINDOWS_TITLEBAR_SYMBOL_DARK
+        : WINDOWS_TITLEBAR_SYMBOL_LIGHT,
+      height: HEADER_CSS_PX,
+    };
+  }
+  if (LINUX_FRAMELESS) {
+    connOpts.frame = false;
+    connOpts.autoHideMenuBar = true; // same rationale as createWindow
+  }
+  const connWin = new BaseWindow(connOpts);
+  if (IS_WINDOWS && typeof connWin.setMenuBarVisibility === "function") {
+    connWin.setMenuBarVisibility(false);
+  }
+
+  setupWindowContents(connWin, backendUrl);
+
+  // `initialPath` may carry a one-shot intent ("/chat?new=1" mints a blank
+  // session), so the 403 retry must re-request where the window ACTUALLY is --
+  // replaying a consumed intent would mint a second session over the one on
+  // screen. Updated before onNavigate runs, so a 403 uses the URL that failed.
+  let retryTarget = initialPath;
+  const onNavigate = createTokenRetryHandler(async () => {
+    let token = await fetchLocalToken(backendUrl);
+    if (!token) ({ token } = await fetchRemoteToken(port));
+    if (token && !connWin.isDestroyed()) {
+      connWin.webContents.loadURL(dashboardEntryUrl(backendUrl, retryTarget, token));
+    }
+  });
+  connWin.webContents.on("did-navigate", (_e, url, httpCode) => {
+    retryTarget = dashboardRetryPath(url, backendUrl, retryTarget);
+    onNavigate(httpCode).catch((err) => console.error("Token retry failed:", err));
+  });
+
+  return connWin;
+}
+
+async function openNewSessionWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const win = createConnectionWindow(BACKEND_URL, PORT, "/chat?new=1");
+  await showLoadingThenConnect(win, BACKEND_URL, { initialPath: "/chat?new=1" });
+}
+
 // ── New Connection Window ──
 
 async function openNewConnectionWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
+  // Reachable from the tray menu during the deferred fullscreen-exit hide; the
+  // pending hide would otherwise take the parent away from under the modal.
+  cancelPendingTrayHide(mainWindow);
   mainWindow.show();
 
   const css = await getModalCSS();
@@ -2868,51 +3481,7 @@ async function openNewConnectionWindow() {
     if (!mainWindow || mainWindow.isDestroyed()) return;
 
     const backendUrl = `http://localhost:${port}`;
-    const connOpts = {
-      width: 1280,
-      height: 860,
-      minWidth: 550,
-      minHeight: 600,
-      backgroundColor: "#0f1117",
-    };
-    // Same platform-conditional chrome as the main window (see createWindow):
-    // frameless + inset traffic lights on macOS, titleBarOverlay on Windows,
-    // frame:false on CSD-preferring Linux desktops, native frame elsewhere.
-    if (IS_MAC) connOpts.titleBarStyle = "hidden";
-    if (IS_MAC) connOpts.trafficLightPosition = trafficLightPositionForZoom(1);
-    if (IS_WINDOWS) {
-      connOpts.titleBarStyle = "hidden";
-      connOpts.autoHideMenuBar = true;
-      connOpts.titleBarOverlay = {
-        color: WINDOWS_TITLEBAR_BACKGROUND,
-        symbolColor: nativeTheme.shouldUseDarkColors
-          ? WINDOWS_TITLEBAR_SYMBOL_DARK
-          : WINDOWS_TITLEBAR_SYMBOL_LIGHT,
-        height: HEADER_CSS_PX,
-      };
-    }
-    if (LINUX_FRAMELESS) {
-      connOpts.frame = false;
-      connOpts.autoHideMenuBar = true; // same rationale as createWindow
-    }
-    const connWin = new BaseWindow(connOpts);
-    if (IS_WINDOWS && typeof connWin.setMenuBarVisibility === "function") {
-      connWin.setMenuBarVisibility(false);
-    }
-
-    setupWindowContents(connWin, backendUrl);
-
-    const onNavigate = createTokenRetryHandler(async () => {
-      let token = await fetchLocalToken(backendUrl);
-      if (!token) ({ token } = await fetchRemoteToken(port));
-      if (token && !connWin.isDestroyed()) {
-        connWin.webContents.loadURL(`${backendUrl}?token=${token}`);
-      }
-    });
-    connWin.webContents.on("did-navigate", (_e, _url, httpCode) => {
-      onNavigate(httpCode).catch((err) => console.error("Token retry failed:", err));
-    });
-
+    const connWin = createConnectionWindow(backendUrl, port);
     // Every connection is a standalone window (tracked for menu actions).
     await showLoadingThenConnect(connWin, backendUrl);
   });
@@ -3134,12 +3703,15 @@ app.whenReady().then(async () => {
   const openSettingsPage = (tab) => {
     const win = focusedDashboardWindow();
     if (!win) return;
+    // The window may be mid deferred-hide (still visible, still focusable);
+    // opening settings on it is a request to keep it, not lose it 2s later.
+    cancelPendingTrayHide(win);
     if (win.isMinimized()) win.restore();
     win.show();
     win.focus();
     const wc = win._mcView.webContents;
     if (wc && !wc.isDestroyed()) {
-      wc.send("navigate", tab ? `/settings?tab=${tab}` : "/settings");
+      wc.send("navigate", tab ? `/settings/${tab}` : "/settings");
     }
   };
   // View > Keep on Top: flip always-on-top on the focused dashboard window,
@@ -3173,6 +3745,7 @@ app.whenReady().then(async () => {
       // same persisted state createWindow() restores from.
       alwaysOnTop: !!(store.get("windowState") || {}).alwaysOnTop,
       toggleAlwaysOnTop,
+      openNewSessionWindow: () => openNewSessionWindow(),
       openNewConnectionWindow: () => openNewConnectionWindow(),
       renameCurrentWindow: () => renameCurrentWindow(),
       promptRemoteHost: () => promptRemoteHost(),
@@ -3253,6 +3826,33 @@ app.whenReady().then(async () => {
     if (typeof hex === "string" && /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(hex)) {
       store.set("themeAccent", hex);
     }
+  });
+
+  // Focus mode: the renderer reports whether the dashboard header is currently
+  // on screen, and the native macOS traffic lights follow it.
+  //
+  // Driven from here because AppKit paints them at a WINDOW coordinate, not in
+  // the DOM — nothing the renderer hides moves them, so with the header gone they
+  // were left floating over the sessions sidebar and the chat title row, clipping
+  // both. Hiding them is what lets focus mode reclaim the whole top row on macOS
+  // instead of reserving 42px for controls the user did not ask to keep.
+  //
+  // Resolved from the SENDER's own window, never a broadcast: a connection window
+  // running the same SPA must not hide the main window's buttons. Skipped in
+  // fullscreen, where macOS owns the buttons itself (they live in the auto-hiding
+  // menu-bar overlay) and there is no title bar to hide them from.
+  // `positionTrafficLights` is re-asserted on the way back because a visibility
+  // round-trip can drop the custom inset.
+  ipcMain.on("focus-mode-chrome", (event, visible) => {
+    if (!IS_MAC) return;
+    const win = windowForWebContents(event.sender);
+    if (!win) return;
+    // applyFocusModeChrome (focus-chrome.js) also re-declares the renderer's
+    // draggable regions after the native change: setWindowButtonVisibility
+    // mutates the titlebar styleMask and DROPS the declared regions, which is
+    // why every renderer-side drag surface for the peeked header went dead on
+    // macOS while the CSS was provably correct.
+    applyFocusModeChrome(win, visible, { positionTrafficLights });
   });
 
   // Caption controls for the frameless Linux window (see the injected
@@ -3528,6 +4128,44 @@ app.whenReady().then(async () => {
     }
   });
 
+  // Renderer memory-trajectory samples (src/lib/memoryWatch.ts). Buffered in
+  // memory and flushed to the log only when the renderer dies -- see
+  // memory-watch-log.js for why nothing is written in steady state (glog has no
+  // rotation, so a line every few seconds would grow the user's log without
+  // bound).
+  //
+  // The payoff over the two probes this replaces: every future renderer crash
+  // carries the five minutes of MEMORY MOVEMENT that preceded it, measured on the
+  // resource that actually runs out. The previous instruments recorded allocation
+  // paths in committed bytes, and the crash is a cage ADDRESS-SPACE exhaustion at
+  // 0.5% object-heap occupancy -- so they could report healthy right up to the
+  // abort, which is what they did across 11 consecutive crashes.
+  //
+  // KIROCREW_DEBUG additionally logs each sample as it arrives, for watching a
+  // live reproduction instead of reading a post-mortem. Checked per message so
+  // toggling the variable needs no rebuild.
+  ipcMain.on("memory-sample", (_event, s) => {
+    // Only the primary renderer's trajectory belongs in this buffer. The channel
+    // is reachable from any window that loads the shared preload (companion
+    // panels, secondary dashboards), but the flush is triggered by THIS window's
+    // render-process-gone -- so accepting a sibling's samples would file its
+    // memory growth under the primary renderer's crash history and point the
+    // post-mortem at the wrong process. Mis-attributed evidence is worse than
+    // none, because it is acted upon.
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (_event.sender !== mainWindow.webContents) return;
+    if (!memoryWatchLog.record(s)) return;
+    // Let the cheap always-on series decide when the expensive authoritative one
+    // runs. A detailed memory-infra dump walks every allocator in every process,
+    // so it is not something to hold on continuously for a crash that happens a
+    // few times a week -- but the run-up to this crash IS growth, which is exactly
+    // the signal available here.
+    void cageTrace.considerArming(memoryWatchLog.oldestExternalKB(), memoryWatchLog.latestExternalKB());
+    if (!profilingEnabled(process.env)) return;
+    const line = memoryWatchLog.lastLine();
+    if (line) glog(line);
+  });
+
   createTray();
   const win = createWindow();
   // Bind the summon hotkey only now that the main window exists: registering
@@ -3581,18 +4219,31 @@ app.whenReady().then(async () => {
     Notification,
     getFlavor: () => "stable",
     getChannelPreference: () => store.get("updateChannel", ""),
-    // Once-per-version nudge: tell the user an update exists; downloading and
-    // installing stay in Settings > About (the in-app dot guides them there).
-    notifyUpdateFound: (version) => {
+    // ON by default (see the store defaults). The updater reads this per
+    // discovery, so a Settings toggle takes effect on the next check.
+    getAutoDownloadPreference: () => store.get("autoDownloadUpdates", true) !== false,
+    // Once-per-version nudge. The copy has to match what actually happens next,
+    // so it branches on the mode the updater already decided and passed in --
+    // re-reading the store here could disagree with that decision if the
+    // preference changed between the two reads.
+    notifyUpdateFound: (version, { autoDownload = false } = {}) => {
       if (!version || store.get("lastNudgedVersion", "") === version) return;
       store.set("lastNudgedVersion", version);
       try {
         const n = new Notification({
           title: `${app.name} update available`,
-          body: `Version ${version} is ready. Open Settings > About to download and install.`,
+          body: autoDownload
+            // Names the opt-out. This notification is where an existing user
+            // first learns the default flipped, so it is the one place that
+            // must not assert the new behaviour without saying how to decline
+            // it -- the consent-mode sibling already points at the same panel.
+            ? `Version ${version} is downloading and will install the next time you quit. `
+              + "Manage in Settings > About."
+            : `Version ${version} is ready. Open Settings > About to download and install.`,
         });
         n.on("click", () => {
           if (mainWindow && !mainWindow.isDestroyed()) {
+            cancelPendingTrayHide(mainWindow);
             if (mainWindow.isMinimized()) mainWindow.restore();
             mainWindow.show();
             mainWindow.focus();
@@ -3620,7 +4271,7 @@ app.whenReady().then(async () => {
       if (!installingUpdate) return; // deferred-quit path: app is quitting anyway
       installingUpdate = false;
       glog("update install failed — restoring gateway and liveness recovery");
-      recoverWedgedGateway(mainWindow).catch((e) => glog(`post-install-failure recovery failed: ${e && e.message}`));
+      recoverWedgedGateway(mainWindow, { userInitiated: true }).catch((e) => glog(`post-install-failure recovery failed: ${e && e.message}`));
     },
     onUpdateState: broadcastUpdateState,
     log: makeUpdaterLogger(glog),
@@ -3661,6 +4312,21 @@ app.whenReady().then(async () => {
     updater.check();
     return { ok: true, info: updaterInfo() };
   });
+  // Auto-download opt-out. Turning it ON re-checks so a version already
+  // discovered this session starts downloading now instead of waiting up to
+  // four hours for the next poll. Turning it OFF keeps any bytes already
+  // fetched -- discarding a verified stage would leave the user with nothing to
+  // show for the transfer -- but it DOES disarm the install-on-quit for a stage
+  // that was downloaded automatically, so the update the user just declined
+  // does not land on their next quit. An explicit Install still applies it.
+  ipcMain.handle("update:set-auto-download", (_e, enabled) => {
+    if (typeof enabled !== "boolean") {
+      return { ok: false, error: `invalid value: ${typeof enabled}` };
+    }
+    store.set("autoDownloadUpdates", enabled);
+    if (enabled) updater.check();
+    return { ok: true, info: updaterInfo() };
+  });
 
   await startGateway();
   await showLoadingThenConnect(win);
@@ -3671,16 +4337,35 @@ app.whenReady().then(async () => {
   // be answering before we ask it whether Mochi is on, and the pet page is
   // loaded from the gateway origin. Best-effort -- a failure here must never
   // block the dashboard, so everything is inside a catch that only logs.
-  initMochi({ backendUrl: BACKEND_URL, fetchLocalToken, glog, getMainWindow: () => mainWindow });
+  initMochi({
+    backendUrl: BACKEND_URL,
+    fetchGatewayAuth: fetchMochiGatewayAuth,
+    glog,
+    getMainWindow: () => mainWindow,
+  });
   // Same shape and the same best-effort contract: the companion's windows follow
   // the app's enabled state, and a failure here must never block the dashboard.
   try {
-    initCrewCompanion({ backendUrl: BACKEND_URL, fetchLocalToken, glog });
+    // `getDashboardWindow` is what lets the companion's "Open session" CTA reach a
+    // dashboard route: the same window the app menu's Settings…/About items target,
+    // resolved here because main.js owns window lifecycle.
+    initCrewCompanion({
+      backendUrl: BACKEND_URL,
+      fetchLocalToken,
+      glog,
+      getDashboardWindow: () => focusedDashboardWindow() || null,
+    });
   } catch (err) {
     glog(`crew-companion: init failed — ${err && err.message}`);
   }
 
   app.on("activate", () => {
+    // An activate landing while hideToTray() is still waiting out the
+    // fullscreen-exit animation must win over the pending hide: the window is
+    // still visible at this point, so the isVisible() guard below would skip
+    // the show and the deferred hide would then take the window away — the
+    // user clicked the Dock icon and watched the window vanish.
+    cancelPendingTrayHide(mainWindow);
     if (!mainWindow?.isVisible()) mainWindow?.show();
   });
 });
@@ -3689,6 +4374,14 @@ app.on("before-quit", () => {
   isQuitting = true;
   // Flush the final metrics window before the gateway teardown begins.
   try { if (desktopMetricsRecorder) desktopMetricsRecorder.stop(); } catch { /* best effort */ }
+  // Land an armed cage capture before teardown. Its window timer is unref'd so it
+  // will never fire during shutdown, and stopRecording is the only thing that
+  // writes the trace -- without this call the capture still running when the
+  // session ended, often the most interesting one, is discarded outright.
+  // Best-effort by design: before-quit cannot await, and we deliberately do NOT
+  // preventDefault to buy time, because a diagnostic that can stall a user's quit
+  // is worse than a trace that occasionally loses the race.
+  void cageTrace.stopForQuit();
   shutdownMochi();
   try { shutdownCrewCompanion(); } catch { /* best effort */ }
   stopGateway();

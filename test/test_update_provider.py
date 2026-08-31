@@ -187,12 +187,8 @@ class TestResolveProvider:
         would silently fall through to the built-in updater and bypass the
         administrator-selected package manager."""
         key = _current_platform_key()
-        pins = UpdatePins(
-            platform_commands={key: {"check_command": "c", "apply_command": "a"}}
-        )
-        with patch(
-            "kiro_crew.platform.governance.active_update_pins", return_value=pins
-        ):
+        pins = UpdatePins(platform_commands={key: {"check_command": "c", "apply_command": "a"}})
+        with patch("kiro_crew.platform.governance.active_update_pins", return_value=pins):
             provider = resolve_provider()
         assert isinstance(provider, CommandProvider)
         assert provider._resolve_command("check_command") == "c"
@@ -201,12 +197,8 @@ class TestResolveProvider:
         """Presence is policy-wide, not host-specific: a policy naming only other
         platforms must NOT fall through to the built-in updater. The provider is
         returned and refuses on this host instead."""
-        pins = UpdatePins(
-            platform_commands={"some-other-platform": {"apply_command": "a"}}
-        )
-        with patch(
-            "kiro_crew.platform.governance.active_update_pins", return_value=pins
-        ):
+        pins = UpdatePins(platform_commands={"some-other-platform": {"apply_command": "a"}})
+        with patch("kiro_crew.platform.governance.active_update_pins", return_value=pins):
             provider = resolve_provider()
         assert isinstance(provider, CommandProvider)
         assert provider._resolve_command("check_command") == ""
@@ -214,9 +206,7 @@ class TestResolveProvider:
     def test_empty_platform_entry_is_not_presence(self) -> None:
         """A platform key carrying no commands is not a configured provider."""
         pins = UpdatePins(platform_commands={"linux-x86_64": {}})
-        with patch(
-            "kiro_crew.platform.governance.active_update_pins", return_value=pins
-        ):
+        with patch("kiro_crew.platform.governance.active_update_pins", return_value=pins):
             assert resolve_provider() is None
 
     def test_platform_commands_passed_through(self) -> None:
@@ -612,15 +602,35 @@ class TestCommandProviderNoShellAndTimeout:
         ):
             assert await p.apply() is False
 
-    @pytest.mark.asyncio
-    async def test_apply_failure_redacts_stderr(self) -> None:
-        import types
+    # -- stderr redaction goes through the platform context --
+    #
+    # An installer failure is prime territory for a host-specific credential
+    # shape (an internal registry cookie, an SSO token in a fetch URL), and those
+    # live in a companion's regexes rather than in the OSS baseline. These assert
+    # the OBSERVABLE outcome -- what does and does not reach the log line -- and
+    # deliberately not "which redaction function was called": the previous
+    # version of this test stubbed the whole ``kiro_crew.security`` module and
+    # asserted two specific calls, so it pinned the old spelling rather than the
+    # guarantee, and any change of redactor broke it whether or not the log was
+    # still safe.
 
+    @staticmethod
+    def _install_policy(policy) -> None:
+        import dataclasses
+
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.platform import PROFILE_ENTERPRISE, build_default_context, set_context
+
+        set_context(
+            dataclasses.replace(
+                build_default_context(KiroCrewConfig(), profile=PROFILE_ENTERPRISE),
+                credentials=policy,
+            )
+        )
+
+    async def _apply_with_stderr(self, stderr: bytes) -> None:
         p = CommandProvider(check_command="echo hi", apply_command="fail")
-        proc = _fake_proc(returncode=1, stderr=b"token=secret123 failed")
-        sec = types.ModuleType("kiro_crew.security")
-        sec.redact_credentials = MagicMock(side_effect=lambda t: (t, 0))  # type: ignore[attr-defined]
-        sec.redact_exfiltration_urls = MagicMock(side_effect=lambda t: (t, 0))  # type: ignore[attr-defined]
+        proc = _fake_proc(returncode=1, stderr=stderr)
         with (
             patch(
                 "kiro_crew.platform.update_provider._shell_exec_args",
@@ -631,11 +641,61 @@ class TestCommandProviderNoShellAndTimeout:
                 return_value="/usr/bin:/bin",
             ),
             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
-            patch.dict(sys.modules, {"kiro_crew.security": sec}),
         ):
             assert await p.apply() is False
-        sec.redact_credentials.assert_called_once()
-        sec.redact_exfiltration_urls.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_apply_failure_scrubs_stderr_through_the_context(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from kiro_crew import security
+        from kiro_crew.platform import reset_context
+
+        class _Policy:
+            def redact(self, text: str) -> str:
+                return security.redact(text).replace("SSO-COOKIE", "[REDACTED-SSO]")
+
+        self._install_policy(_Policy())
+        try:
+            with caplog.at_level(logging.ERROR):
+                await self._apply_with_stderr(
+                    b"fetch rejected SSO-COOKIE=abc123 key=AKIAIOSFODNN7EXAMPLE"
+                )
+        finally:
+            reset_context()
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert "CommandProvider.apply: failed" in logged
+        # The companion's extra reach -- the whole point of routing via context.
+        assert "SSO-COOKIE" not in logged
+        # ...without losing the baseline pass underneath it.
+        assert "AKIAIOSFODNN7EXAMPLE" not in logged
+
+    @pytest.mark.asyncio
+    async def test_apply_failure_withholds_stderr_when_composition_fails(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A host that cannot compose its companion still reports the failure.
+
+        ``apply()`` must return False and log the return code -- the operator's
+        actionable part -- with only the untrusted stderr text withheld.
+        """
+        from kiro_crew.platform import PlatformCompositionError, reset_context
+        from kiro_crew.platform.context import LOG_WITHHELD_PLACEHOLDER
+
+        class _Unprovable:
+            def redact(self, text: str) -> str:
+                raise PlatformCompositionError("companion could not be composed")
+
+        self._install_policy(_Unprovable())
+        try:
+            with caplog.at_level(logging.ERROR):
+                await self._apply_with_stderr(b"fetch rejected token=secret123")
+        finally:
+            reset_context()
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert "rc=1" in logged
+        assert LOG_WITHHELD_PLACEHOLDER in logged
+        assert "secret123" not in logged
 
 
 class TestCancellationKillsUpdaterChild:
@@ -736,17 +796,13 @@ class TestCancellationKillsUpdaterChild:
         proc.stdout = _stream(b"")
         proc.stderr = _stream(b"")
         proc.wait = AsyncMock(return_value=proc.returncode)
-        with patch(
-            "kiro_crew.platform_compat.kill_process_tree_async", AsyncMock()
-        ) as tree:
+        with patch("kiro_crew.platform_compat.kill_process_tree_async", AsyncMock()) as tree:
             await _kill_and_reap(proc)
         tree.assert_awaited_once()
         assert tree.await_args.args[0] == 4242
 
     @pytest.mark.asyncio
-    async def test_kill_and_reap_bounds_the_reap(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_kill_and_reap_bounds_the_reap(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A descendant ignoring the signal must not turn cleanup into a hang."""
         # The ceiling this test drives to expiry is a real wait, so state the
         # production bound directly instead of spending it: cleanup runs on the
@@ -972,9 +1028,7 @@ class TestManualEntryPointsHonourPolicy:
 
         pins = UpdatePins(check_command="c", apply_command="a")
         with (
-            patch(
-                "kiro_crew.platform.governance.active_update_pins", return_value=pins
-            ),
+            patch("kiro_crew.platform.governance.active_update_pins", return_value=pins),
             patch.object(CommandProvider, "apply", AsyncMock(return_value=True)) as ap,
         ):
             assert await apply_policy_update() is True
@@ -988,9 +1042,7 @@ class TestManualEntryPointsHonourPolicy:
 
         pins = UpdatePins(apply_command="a")
         with (
-            patch(
-                "kiro_crew.platform.governance.active_update_pins", return_value=pins
-            ),
+            patch("kiro_crew.platform.governance.active_update_pins", return_value=pins),
             patch.object(CommandProvider, "apply", AsyncMock(return_value=False)),
         ):
             assert await apply_policy_update() is False
@@ -1016,7 +1068,7 @@ class TestWheelUpdateCommandPropagatesDownloadFailure:
         assert "set -e" in cmd
         # curl's status is consumed by an assignment that `set -e` can abort on,
         # so its output is never piped straight into sh.
-        assert "_kc_body=\"$(curl" in cmd
+        assert '_kc_body="$(curl' in cmd
         assert "curl" not in cmd.split("|", 1)[1], "curl must not sit inside the pipeline"
 
     @_needs_posix_shell
@@ -1047,9 +1099,7 @@ class TestWheelUpdateCommandPropagatesDownloadFailure:
         env = dict(os.environ)
         env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
         env["TMPDIR"] = str(tmp_path)
-        result = subprocess.run(
-            shell, capture_output=True, cwd=tmp_path, env=env
-        )
+        result = subprocess.run(shell, capture_output=True, cwd=tmp_path, env=env)
         assert result.returncode != 0, "a failed download must fail the command"
 
 
@@ -1060,8 +1110,14 @@ class TestTrustedEnvDropsLoaderInjection:
     wrapper would execute agent-writable code as the gateway."""
 
     def test_loader_variables_are_removed(self, monkeypatch) -> None:
-        for var in ("PYTHONPATH", "PYTHONHOME", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES",
-                    "BASH_ENV", "IFS"):
+        for var in (
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "BASH_ENV",
+            "IFS",
+        ):
             monkeypatch.setenv(var, "/tmp/agent-writable")
         monkeypatch.setenv("LANG", "C.UTF-8")
         with patch(
@@ -1070,8 +1126,14 @@ class TestTrustedEnvDropsLoaderInjection:
         ):
             env = _trusted_path_env()
         assert env is not None
-        for var in ("PYTHONPATH", "PYTHONHOME", "LD_PRELOAD",
-                    "DYLD_INSERT_LIBRARIES", "BASH_ENV", "IFS"):
+        for var in (
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "BASH_ENV",
+            "IFS",
+        ):
             assert var not in env, f"{var} must not reach the update command"
         # Benign variables a package manager needs still survive.
         assert env["LANG"] == "C.UTF-8"
@@ -1144,9 +1206,7 @@ class TestOutputIsBounded:
             _read_bounded_output,
         )
 
-        proc = _fake_proc(
-            stdout=b"chatter" * 5000, stderr=b"e" * (_MAX_CAPTURED_OUTPUT * 2)
-        )
+        proc = _fake_proc(stdout=b"chatter" * 5000, stderr=b"e" * (_MAX_CAPTURED_OUTPUT * 2))
         out, err = await _read_bounded_output(proc, timeout=5, want_stdout=False)
         assert out == b"", "installer chatter nobody reads must not be buffered"
         assert len(err) == _MAX_CAPTURED_OUTPUT
@@ -1278,9 +1338,15 @@ class TestPosixOnlyMarkerIsNotForgotten:
             # Walk UP from the def to collect its contiguous decorator lines.
             decorators = []
             j = idx - 1
-            while j >= 0 and lines[j].strip().startswith(("@", ")", '"', "'")) or (
-                j >= 0 and lines[j].strip() and not lines[j].strip().startswith("#")
-                and lines[j].startswith("        ")
+            while (
+                j >= 0
+                and lines[j].strip().startswith(("@", ")", '"', "'"))
+                or (
+                    j >= 0
+                    and lines[j].strip()
+                    and not lines[j].strip().startswith("#")
+                    and lines[j].startswith("        ")
+                )
             ):
                 decorators.append(lines[j])
                 j -= 1
@@ -1292,7 +1358,11 @@ class TestPosixOnlyMarkerIsNotForgotten:
             end = len(lines)
             for k in range(idx + 1, len(lines)):
                 stripped = lines[k]
-                if stripped.strip() and not stripped.startswith("        ") and not stripped.startswith("    )"):
+                if (
+                    stripped.strip()
+                    and not stripped.startswith("        ")
+                    and not stripped.startswith("    )")
+                ):
                     end = k
                     break
             body = "\n".join(lines[idx:end])
@@ -1356,9 +1426,7 @@ class TestWhitespaceCommandsAreNotPresence:
                 "platform_commands": {_current_platform_key(): {"apply_command": "  "}},
             }
         )
-        with patch(
-            "kiro_crew.platform.governance.active_update_pins", return_value=pins
-        ):
+        with patch("kiro_crew.platform.governance.active_update_pins", return_value=pins):
             assert resolve_provider() is None
 
 
@@ -1409,6 +1477,45 @@ class TestRedactionHappensBeforeTruncation:
 
         for module in (provider_mod, gateway_mod):
             src = inspect.getsource(module)
-            assert 'decode(errors="replace")[:500]' not in src, (
-                f"{module.__name__} truncates before redacting"
-            )
+            assert (
+                'decode(errors="replace")[:500]' not in src
+            ), f"{module.__name__} truncates before redacting"
+
+
+class TestCanApply:
+    """``can_apply`` must mean "an Update button would actually work here".
+
+    Two halves: an ``apply_command`` is configured, AND :func:`_shell_exec_args`
+    can produce an argv for it. The second half is what keeps Windows honest —
+    ``_shell_exec_args`` refuses every command there, so a configured
+    ``apply_command`` must not render a button whose only possible outcome is
+    ``policy_update_failed``.
+    """
+
+    def test_false_when_no_apply_command(self):
+        assert update_provider.CommandProvider(check_command="check-cmd").can_apply() is False
+
+    def test_true_when_apply_command_is_runnable(self):
+        provider = update_provider.CommandProvider(apply_command="apply-cmd")
+        with patch.object(
+            update_provider, "_shell_exec_args", return_value=["/bin/sh", "-c", "apply-cmd"]
+        ):
+            assert provider.can_apply() is True
+
+    def test_false_when_no_trusted_shell_can_run_it(self):
+        # The Windows shape: _shell_exec_args fails closed (None) for every
+        # command, so a configured apply_command still reports "cannot apply".
+        provider = update_provider.CommandProvider(apply_command="apply-cmd")
+        with patch.object(update_provider, "_shell_exec_args", return_value=None):
+            assert provider.can_apply() is False
+
+    def test_platform_override_supplies_the_apply_command(self):
+        key = update_provider._current_platform_key()
+        provider = update_provider.CommandProvider(
+            platform_commands={key: {"apply_command": "platform-apply"}}
+        )
+        with patch.object(
+            update_provider, "_shell_exec_args", return_value=["/bin/sh", "-c", "platform-apply"]
+        ) as argv:
+            assert provider.can_apply() is True
+        argv.assert_called_once_with("platform-apply")

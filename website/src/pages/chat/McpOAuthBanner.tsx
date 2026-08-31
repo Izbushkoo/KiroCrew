@@ -1,16 +1,28 @@
-import type { ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { Lock, ExternalLink, CheckCircle, XCircle } from 'lucide-react'
 import type { ChatMessage } from '../../types'
 
 import { i18nT } from '../../i18n/t'
+import OAuthRelayAffordance, { isSafeOAuthUrl } from '../../components/OAuthRelayAffordance'
+
 /**
  * Inline banner for kiro-cli MCP OAuth flow. `meta.completed` flips it to the
  * authenticated state; `meta.failed` flips it to the error state.
  */
-function isSafeOAuthUrl(url: string): boolean {
-  if (!url) return false
-  const lower = url.toLowerCase()
-  return lower.startsWith('https://') || lower.startsWith('http://')
+
+/** The chat banner's relay strings — its own `pages.chat.mcpOAuthBanner.*` keys.
+ *  The MCP-table sign-in reuses these same keys rather than duplicating them. */
+function bannerRelayStrings() {
+  return {
+    disclosure: i18nT('pages.chat.mcpOAuthBanner.relay_disclosure'),
+    remoteGatewayHint: i18nT('pages.chat.mcpOAuthBanner.remote_gateway_hint'),
+    completeConnection: i18nT('pages.chat.mcpOAuthBanner.complete_connection'),
+    relaying: i18nT('pages.chat.mcpOAuthBanner.relaying'),
+    codeDelivered: i18nT('pages.chat.mcpOAuthBanner.code_delivered'),
+    deliveryTimeout: i18nT('pages.chat.mcpOAuthBanner.delivery_timeout'),
+    relayFailed: i18nT('pages.chat.mcpOAuthBanner.relay_failed'),
+    relaySuperseded: i18nT('pages.chat.mcpOAuthBanner.relay_superseded'),
+  }
 }
 
 /** Render an mcp_oauth message into a banner, or null if there's nothing to show.
@@ -56,6 +68,10 @@ export default function McpOAuthBanner({
   error?: string
 }) {
   const label = serverName || i18nT('pages.chat.mcpOAuthBanner.mcp_server')
+  // Probe-confirmed grant when `meta.completed` never arrived (gateway hiccup):
+  // the exchange succeeded, so render the same authenticated state that the
+  // meta update would have produced instead of stranding on the relay spinner.
+  const [confirmedSignedIn, setConfirmedSignedIn] = useState(false)
 
   if (failed) {
     return (
@@ -68,7 +84,7 @@ export default function McpOAuthBanner({
     )
   }
 
-  if (completed) {
+  if (completed || confirmedSignedIn) {
     return (
       <div className="flex items-center gap-2 px-4 py-3 rounded-lg ring-1 ring-inset forced-colors:border ring-ok/40 bg-ok/10 text-sm leading-5">
         <CheckCircle className="shrink-0 text-ok lucide-inline" />
@@ -99,6 +115,24 @@ export default function McpOAuthBanner({
       >
         {i18nT('pages.chat.mcpOAuthBanner.authorize')} {label} <ExternalLink className="lucide-inline" size={13} />
       </a>
+      <RelayAffordance serverName={serverName} onConfirmedSignedIn={() => setConfirmedSignedIn(true)} />
     </div>
   )
 }
+
+/** The banner's relay affordance: the shared component wired to the banner's own
+ *  strings, with NO onDeadEnd — the whole banner flips on `meta.completed`, so the
+ *  inline directive message is the right terminal state here. `onConfirmedSignedIn`
+ *  covers the one gap that leaves: an exchange that SUCCEEDED while the
+ *  `meta.completed` update never arrived — the bounded-wait probe observes the
+ *  grant and the banner flips to its authenticated state anyway. */
+function RelayAffordance({ serverName, onConfirmedSignedIn }: { serverName: string; onConfirmedSignedIn: () => void }) {
+  return (
+    <OAuthRelayAffordance
+      serverName={serverName}
+      strings={bannerRelayStrings()}
+      onConfirmedSignedIn={onConfirmedSignedIn}
+    />
+  )
+}
+

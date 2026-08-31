@@ -278,6 +278,104 @@ def test_persist_returns_empty_when_the_write_fails(spool: Path, monkeypatch: py
     assert capture_macos.persist_jpeg(_JPEG) == ""
 
 
+def test_a_failed_write_removes_the_partial_frame(spool: Path, monkeypatch: pytest.MonkeyPatch):
+    """A write failure must not strand the just-allocated frame in the spool.
+
+    ``mkstemp`` succeeds and the SUBSEQUENT write raises: the caller is handed
+    ``""`` and can never learn the path, so a leftover here is an invisible,
+    partially-written file of the operator's screen pixels that nothing owns —
+    it sits in the spool until the ring trim happens to reach it. The path is
+    this invocation's own allocation, so removing exactly it is safe.
+    """
+    allocated: list[str] = []
+    allocated_fds: list[int] = []
+    real_mkstemp = capture_macos.tempfile.mkstemp
+
+    def _recording_mkstemp(*args, **kwargs):
+        fd, path = real_mkstemp(*args, **kwargs)
+        allocated_fds.append(fd)
+        allocated.append(path)
+        return fd, path
+
+    closed_by_os_close: list[int] = []
+    real_close = capture_macos.os.close
+
+    def _recording_close(fd):
+        closed_by_os_close.append(fd)
+        real_close(fd)
+
+    real_fdopen = capture_macos.os.fdopen
+
+    def _failing_fdopen(fd, *args, **kwargs):
+        handle = real_fdopen(fd, *args, **kwargs)
+
+        class _FailingHandle:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                # Close like the real ``with`` would, so the unlink under test
+                # runs against a closed file — the same state Windows requires.
+                handle.close()
+                return False
+
+            def write(self, data):
+                raise OSError("disk full")
+
+        return _FailingHandle()
+
+    monkeypatch.setattr(capture_macos.tempfile, "mkstemp", _recording_mkstemp)
+    monkeypatch.setattr(capture_macos.os, "fdopen", _failing_fdopen)
+    monkeypatch.setattr(capture_macos.os, "close", _recording_close)
+    assert capture_macos.persist_jpeg(_JPEG) == ""
+    assert allocated, "the seam never allocated a file, so the test exercised nothing"
+    assert not Path(allocated[0]).exists()
+    assert _spooled(spool) == []
+    # ``fdopen`` ADOPTED the descriptor, so the ``with`` owns closing it. An
+    # explicit ``os.close`` on the raw number here would be a double-close that
+    # can hit an unrelated descriptor another thread was just handed.
+    assert not (set(allocated_fds) & set(closed_by_os_close))
+
+
+def test_a_failed_fdopen_closes_the_fd_and_removes_the_frame(
+    spool: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """``fdopen`` raising BEFORE adopting the fd must not leak it or the file.
+
+    Nothing else will ever close that descriptor, and Windows refuses to unlink
+    a file with an open handle — so this branch (and only this branch) closes
+    the raw fd before the unlink.
+    """
+    allocated: list[str] = []
+    allocated_fds: list[int] = []
+    real_mkstemp = capture_macos.tempfile.mkstemp
+
+    def _recording_mkstemp(*args, **kwargs):
+        fd, path = real_mkstemp(*args, **kwargs)
+        allocated_fds.append(fd)
+        allocated.append(path)
+        return fd, path
+
+    closed_by_os_close: list[int] = []
+    real_close = capture_macos.os.close
+
+    def _recording_close(fd):
+        closed_by_os_close.append(fd)
+        real_close(fd)
+
+    def _boom_fdopen(fd, *args, **kwargs):
+        raise OSError("out of file descriptors")
+
+    monkeypatch.setattr(capture_macos.tempfile, "mkstemp", _recording_mkstemp)
+    monkeypatch.setattr(capture_macos.os, "fdopen", _boom_fdopen)
+    monkeypatch.setattr(capture_macos.os, "close", _recording_close)
+    assert capture_macos.persist_jpeg(_JPEG) == ""
+    assert allocated, "the seam never allocated a file, so the test exercised nothing"
+    assert not Path(allocated[0]).exists()
+    assert _spooled(spool) == []
+    assert closed_by_os_close.count(allocated_fds[0]) == 1
+
+
 def test_frame_names_never_collide_even_within_one_millisecond(
     spool: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -772,3 +870,28 @@ def test_attaching_a_screenshot_preserves_EVERY_other_snapshot_field(spool: Path
         if f.name in image_fields:
             continue
         assert getattr(result, f.name) == getattr(snap, f.name), f.name
+
+
+class TestScreenshotCeilingCannotOutgrowTheInlineImageCap:
+    """The capture ceiling is bounded by what the model can actually be shown.
+
+    A capture is written to disk and its path handed back to the agent, which
+    can then open it with the native read tool. The provider rejects the whole
+    request once a many-image conversation carries any image over
+    ``MAX_IMAGE_EDGE_PX``, and history is replayed every turn, so one oversized
+    capture wedges every later turn. A ceiling above the inline cap therefore
+    lets a configured value guarantee session death -- and it fails LATE, on an
+    unrelated turn, long after the capture that caused it.
+
+    Pinned as a relationship rather than a literal so raising either constant
+    reddens here, which is the drift that produced the original defect.
+    """
+
+    def test_the_ceiling_is_within_the_inline_image_cap(self) -> None:
+        from kiro_crew.imaging import MAX_IMAGE_EDGE_PX
+
+        assert MAX_SCREENSHOT_MAX_PX <= MAX_IMAGE_EDGE_PX
+
+    def test_the_default_and_floor_still_sit_under_the_ceiling(self) -> None:
+        """Lowering the ceiling must not invert the floor/default/ceiling order."""
+        assert MIN_SCREENSHOT_MAX_PX <= DEFAULT_SCREENSHOT_MAX_PX <= MAX_SCREENSHOT_MAX_PX

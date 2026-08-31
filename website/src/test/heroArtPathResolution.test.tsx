@@ -3,9 +3,8 @@
  * through the blob proxy on every surface that renders it, while absolute paths
  * pass through byte-for-byte so built-ins keep working.
  *
- * The surface exercised here is `FeatureCard`, one of the EDITORIAL surfaces.
- * It used to be `AppListRow`, and the Library's card had its own copy of these
- * assertions — neither renders hero art now: a list row shows the app's icon,
+ * The surface exercised here is `FeaturedSpotlight`, the EDITORIAL surface.
+ * A list row and the Library card render no hero art: a list row shows the app's icon,
  * because a 96x54 crop of marketing art is too small to read as art and too
  * large to scan as an identity. Retargeting rather than deleting is the point:
  * the resolution RULES did not change, only which component still reaches them,
@@ -19,8 +18,8 @@ vi.mock('../components/AppIcon', () => ({
   default: () => <div data-testid="app-icon" />,
 }))
 
-import FeatureCard from '../components/appstore/FeatureCard'
-import { resolveArtPath } from '../components/appstore/useHeroArt'
+import FeaturedSpotlight from '../components/appstore/FeaturedSpotlight'
+import { classifyManifestArt, clientLocalArt, installedArt, resolveArtPath } from '../components/appstore/useHeroArt'
 import type { RegistryApp } from '../components/appstore/types'
 
 function registryApp(over: Partial<RegistryApp> = {}): RegistryApp {
@@ -71,13 +70,109 @@ describe('resolveArtPath', () => {
   })
 })
 
-describe('FeatureCard hero art (editorial)', () => {
+describe('classifyManifestArt', () => {
+  /*
+   * These cases outlived `manifestArt`, which this change deleted as a
+   * caller-less export. They were never really about that wrapper: what they pin
+   * is the CLASSIFIER, which every art resolver still routes through, and three
+   * of the refusal families below each defeated a successive prefix test during
+   * review. Deleting them alongside the wrapper would have retired the evidence
+   * and kept the rule.
+   */
+  it('REFUSES every spelling the URL parser resolves off-origin', () => {
+    // Measured against a real parser, resolving each against a same-origin base.
+    // Four families, three of which defeated a successive prefix test here:
+    const offOrigin = [
+      'https://example.com/icon.png', 'http://example.com/icon.png',
+      'data:image/png;base64,AAAA',
+      // protocol-relative, and the backslash forms the parser reads as slashes
+      '//example.com/icon.png', '/\\example.com/icon.png',
+      '\\\\example.com/icon.png', '\\/example.com/icon.png',
+      // ASCII tab / newline split the two slashes; the parser strips them first
+      '/\t/example.com/icon.png', '/\n/example.com/icon.png',
+      '/\r/example.com/icon.png', '/\t\\example.com/icon.png',
+      '/\t\t/example.com/icon.png',
+      // leading C0 / space is trimmed, so position 0 is not where the value starts
+      '\t//example.com/icon.png', ' //example.com/icon.png',
+      ' /\\example.com/icon.png', '\u0000//example.com/icon.png',
+      '\u000b//example.com/icon.png', ' https://example.com/icon.png',
+    ]
+    for (const bad of offOrigin) {
+      expect(classifyManifestArt(bad)).toBe('refused')
+      // And the live resolvers must both act on that answer, not re-derive it.
+      expect(installedArt(bad, 'some-app')).toBe('')
+      expect(clientLocalArt(bad)).toBe('')
+    }
+  })
+
+  it('does not over-reject a value that stays on this origin', () => {
+    // The mirror of the rule above: a single leading backslash, a mid-path
+    // backslash, a mid-value space and a trailing tab all resolve same-origin, so
+    // rejecting them would be a rule nobody could predict from the symptom.
+    expect(classifyManifestArt('/app-assets/x\\y.svg')).toBe('same-origin')
+    expect(classifyManifestArt('\\example.com/x.png')).toBe('relative')
+    expect(classifyManifestArt('/app-assets/a b.svg')).toBe('same-origin')
+    expect(clientLocalArt('/app-assets/x.svg\t')).toBe('/app-assets/x.svg')
+  })
+
+  it('emits the string it classified, not the raw one', () => {
+    // Classifying a normalized value and handing <img> the raw one is the gap a
+    // tab-splitting value walks through.
+    expect(installedArt('\tassets/a.png', 'some-app'))
+      .toBe('/apps/some-app/art/assets/a.png')
+  })
+
+  it('classifies each path shape', () => {
+    expect(classifyManifestArt('/app-assets/x.svg')).toBe('same-origin')
+    expect(classifyManifestArt('assets/x.svg')).toBe('relative')
+    expect(classifyManifestArt('https://example.com/x.svg')).toBe('refused')
+    expect(classifyManifestArt('//example.com/x.svg')).toBe('refused')
+    expect(classifyManifestArt('/\\example.com/x.svg')).toBe('refused')
+    expect(classifyManifestArt('\\\\example.com/x.svg')).toBe('refused')
+    expect(classifyManifestArt('\\/example.com/x.svg')).toBe('refused')
+    expect(classifyManifestArt('')).toBe('refused')
+    expect(classifyManifestArt(undefined)).toBe('refused')
+  })
+
+  it('refuses a non-string value instead of throwing', () => {
+    // A manifest is JSON from disk and the installed-app normalizer passes
+    // unknown keys through verbatim, so `"iconPath": {}` reaches this as an
+    // object. A bare `startsWith` would throw and blank the whole surface.
+    for (const bad of [{}, [], 42, true, null] as unknown[]) {
+      expect(classifyManifestArt(bad)).toBe('refused')
+      expect(installedArt(bad, 'some-app')).toBe('')
+      expect(clientLocalArt(bad)).toBe('')
+    }
+  })
+})
+
+describe('clientLocalArt', () => {
+  /*
+   * `iconUrl` means "a builtin's absolute client-local path". The backend's
+   * declared-field set carries `iconPath`, NOT `iconUrl`, so building an art-route
+   * URL out of a RELATIVE `iconUrl` produces a path the route refuses by
+   * construction -- a guaranteed 404 dressed as a fallback. That is what this
+   * refuses, and it is the whole reason the helper exists separately.
+   */
+  it('passes a builtin absolute client-local path through', () => {
+    expect(clientLocalArt('/app-assets/dev-fleet/icon.svg'))
+      .toBe('/app-assets/dev-fleet/icon.svg')
+  })
+
+  it('REFUSES a relative value rather than building a URL the route cannot serve', () => {
+    expect(clientLocalArt('assets/icon.webp')).toBe('')
+    expect(clientLocalArt('./assets/icon.webp')).toBe('')
+  })
+})
+
+describe('FeaturedSpotlight hero art (editorial)', () => {
   const noop = () => {}
 
   const card = (over: Partial<RegistryApp>) => render(
-    <FeatureCard
-      app={registryApp(over)}
-      onOpen={noop} onGet={noop} onEnable={noop}
+    <FeaturedSpotlight
+      type="app"
+      apps={[registryApp(over)]}
+      onOpenApp={noop} onGet={noop} onEnable={noop}
     />,
   )
 

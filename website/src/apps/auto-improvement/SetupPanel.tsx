@@ -22,6 +22,7 @@ import SimpleSelect from '../../components/SimpleSelect'
 import { Badge, Btn, Card, CardTitle, Input } from '../../components/ui'
 import { fmtDateFields } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
+import { useImeGuard } from '../../hooks/useImeGuard'
 
 const API = '/api/apps/auto-improvement'
 
@@ -110,6 +111,7 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
 }
 
 export default function SetupPanel({ config }: { config?: Record<string, unknown> }) {
+  const ime = useImeGuard()
   const qc = useQueryClient()
   const configured = Boolean(config?.clone)
   const display = String(config?.target_display || config?.target_url || '')
@@ -194,9 +196,7 @@ export default function SetupPanel({ config }: { config?: Record<string, unknown
             placeholder={i18nT('apps.autoImprovement.setupPanel.https_github_com_owner_repo')}
             className="flex-1"
             aria-label={i18nT('autoImprovement.repoLabel')}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && url.trim()) clone.mutate(url.trim())
-            }}
+            {...ime.bindEnter({ onEnter: () => { if (url.trim()) clone.mutate(url.trim()) } })}
           />
           <Btn
             primary
@@ -299,7 +299,7 @@ export default function SetupPanel({ config }: { config?: Record<string, unknown
 
       {/* Live activity feed while a run is going */}
       {running && run?.activity && run.activity.length > 0 ? (
-        <div className="mt-3 max-h-40 overflow-auto rounded border border-border bg-panel p-2 font-mono text-[11px] text-muted">
+        <div className="mt-3 max-h-40 overflow-auto rounded border border-border bg-card p-2 font-mono text-[11px] text-muted">
           {run.activity.slice(-30).map((item, i) => (
             <div key={i} className="whitespace-pre-wrap">
               {activityLine(item)}

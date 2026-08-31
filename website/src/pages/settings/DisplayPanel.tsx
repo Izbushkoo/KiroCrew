@@ -1,15 +1,16 @@
-import { X, Loader2 } from 'lucide-react'
-import { useState } from 'react'
+import { Loader2 } from 'lucide-react'
+import { useState, useMemo } from 'react'
 import { motion, useReducedMotion } from 'framer-motion'
 import { useZoomCtx } from '../../hooks/ZoomProvider'
+import type { FontFamily } from '../../hooks/useZoom'
 import { useTheme } from '../../hooks/useTheme'
 import type { ColorTheme } from '../../hooks/useTheme'
 import { useUIMode } from '../../hooks/useUIMode'
-import { SettingsSection, SettingsCard, SettingsSelect, SettingsStepper, SettingsButtonGroup, SettingsInput } from '../../components/settings'
+import { SettingsSection, SettingsCard, SettingsSelect, SettingsStepper, SettingsButtonGroup, SettingsInput, SettingsCombobox } from '../../components/settings'
 import SimpleSelect from '../../components/SimpleSelect'
 import { Input } from '../../components/ui'
 import { useThemeEditor, ThemeEditorPanel } from '../../components/themeEditor'
-import Clickable from '../../components/Clickable'
+import Modal from '../../components/Modal'
 import { useAppSelector, useAppDispatch } from '../../store'
 import { setSessionDefaultColor, setSessionColorsMode, setSessionColorsPalette, setSessionColorsIntensity } from '../../store/dashboardSlice'
 import { useSessionPalette } from '../../hooks/useSessionPalette'
@@ -17,6 +18,7 @@ import { PALETTE_NAMES, INTENSITY_NAMES } from '../../utils/sessionColors'
 import type { DefaultColorSetting, PaletteName, IntensityName, SessionColorMode } from '../../utils/sessionColors'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api, ApiError } from '../../api/client'
+import { useOptimisticConfigPaths, setConfigPathValue } from './useOptimisticConfigPaths'
 import { parseErrorCode } from '../../utils/errorReport'
 import { clampTintCount, RECENT_TINT_COUNT } from '../../utils/recencyTint'
 import { useLanguage } from '../../i18n/LanguageProvider'
@@ -27,10 +29,14 @@ import {
   setTerminalFontSize,
   DEFAULT_TERMINAL_FONT_SIZE,
 } from '../../hooks/useTerminalFont'
+import { FONT_FAMILY_OPTIONS, OPENDYSLEXIC_MONO_FAMILY_NAME } from '../../utils/fontFamilyOptions'
+import { useFontOptions } from '../../hooks/useFontOptions'
+import { isFontInstalled, monospaceFontStack } from '../../utils/fontDetect'
 
 import { i18nT } from '../../i18n/t'
 import { ThemeDroppedRulesNotice } from './ThemeDroppedRulesNotice'
 import ErrorNotice from '../../components/ErrorNotice'
+import { useImeGuard } from '../../hooks/useImeGuard'
 /**
  * Lightweight inline spinner (no modal / progress bar — matches the "status,
  * not ceremony" preference). Colors come from theme CSS vars via Tailwind
@@ -65,6 +71,7 @@ function StatusIndicator({ label }: { label: string }) {
 }
 
 export function DisplayPanel() {
+  const ime = useImeGuard()
   const { language, detected: detectedLanguage, setLanguage, syncFailed: langSyncFailed } = useLanguage()
   const { zoom, zoomSupported, zoomIn, zoomOut, reset, family, setFontFamily } = useZoomCtx()
   // Shortcut label for the zoom hint/description: ⌘ on macOS, Ctrl elsewhere.
@@ -73,69 +80,118 @@ export function DisplayPanel() {
   const { uiMode, setUIMode } = useUIMode()
   const editor = useThemeEditor()
   const termFont = useTerminalFont()
+  // Probed families become picker rows previewed in their own family, so the
+  // Powerline sample answers "will my prompt theme render" before the choice is
+  // committed. The default row's value is the empty string the store already uses
+  // for "no explicit family" — see useTerminalFont.
+  const { families: fontFamilies, accessSupported: fontAccessSupported, lastResult: fontDetectResult, enumerate: enumerateFonts } = useFontOptions()
+  // The row's own name, rendered in its own family, IS the preview. No specimen
+  // string beside it: a 5-glyph sample is the part a reader would have to
+  // scrutinise, yet it sits in the sublabel slot the component styles as
+  // recede-into-the-background metadata — and the trigger folds a sublabel into
+  // "<family> (<sample>)" once a font is picked.
+  const fontPreview = (family: string) => ({
+    previewFontFamily: monospaceFontStack(family),
+  })
+  // Only the font names are memoized. The default row's label is a CATALOG
+  // string, and caching one across renders is what makes it stick in the wrong
+  // language: i18next resolves its resources after the first paint, so a label
+  // captured in a memo keeps the English fallback that first render returned and
+  // no dep change ever invalidates it. Resolved inline instead, like the
+  // description beside it.
+  const fontRows = useMemo(
+    () => fontFamilies.map(family => ({ value: family, label: family, ...fontPreview(family) })),
+    [fontFamilies],
+  )
+  // The bundled OpenDyslexicMono row sits between the Default row and the OS-
+  // detected list. Always selectable regardless of what Local Font Access
+  // reports, because the browser has the family loaded from the page's own
+  // @font-face declaration. Users who pick OpenDyslexic for the dashboard can
+  // apply OpenDyslexicMono to the terminal without having to type the family
+  // name. A future bundled mono face becomes a second inlined row.
+  const fontOptions = [
+    { value: '', label: i18nT('pages.settings.displayPanel.terminal_font_default') },
+    {
+      value: OPENDYSLEXIC_MONO_FAMILY_NAME,
+      label: OPENDYSLEXIC_MONO_FAMILY_NAME,
+      ...fontPreview(OPENDYSLEXIC_MONO_FAMILY_NAME),
+    },
+    ...fontRows,
+  ]
+  // A literal key per branch, never an assembled one: a key built from parts is
+  // invisible to the catalog reference scanner, so a missing translation would
+  // ship as a raw identifier instead of failing the gate.
+  //
+  // `added` reports too, even though the list grows: the user most likely to run
+  // this action is the one whose filter matched nothing, and a filter that also
+  // hides every newly added family leaves the popup pixel-identical after a
+  // permission grant — which reads as the grant having failed.
+  const fontDetectStatus = fontDetectResult === 'checking'
+    ? i18nT('pages.settings.displayPanel.terminal_font_detect_checking')
+    : fontDetectResult === 'added'
+      ? i18nT('pages.settings.displayPanel.terminal_font_detect_added')
+      : fontDetectResult === 'denied'
+        ? i18nT('pages.settings.displayPanel.terminal_font_detect_denied')
+        : fontDetectResult === 'none'
+          ? i18nT('pages.settings.displayPanel.terminal_font_detect_none')
+          : undefined
 
   const dispatch = useAppDispatch()
   const { paletteColors: colors, colorMode, paletteName, intensity, boost } = useSessionPalette()
   const defaultColor = useAppSelector(s => s.dashboard.sessionDefaultColor) as DefaultColorSetting
 
   // Recency-tint count is persisted server-side (dashboard.recent_tint_count) via the shared
-  // kirocrewConfig query, so the choice follows the user across browsers/restarts. Optimistic
-  // cache write makes the sidebar tint (which reads the same query) re-rank instantly.
+  // kirocrewConfig query, so the choice follows the user across browsers/restarts.
   const qc = useQueryClient()
-  const mcQ = useQuery<{ dashboard?: { recent_tint_count?: number; terminal?: { shell?: string } } }>({
+  type KirocrewCfg = { dashboard?: { recent_tint_count?: number; terminal?: { shell?: string } } }
+  const mcQ = useQuery<KirocrewCfg>({
     queryKey: ['kirocrewConfig'],
     queryFn: () => api.kirocrewConfig(),
   })
+  // Per-path optimistic display shared by the tint and shell saves below.
+  // Both PATCH the same ['kirocrewConfig'] object, so a whole-object
+  // onMutate snapshot here is a live race: a tint rollback would restore a
+  // pre-shell-save snapshot, transiently reverting an in-flight shell save
+  // (and vice versa). Each control instead renders `shown(path, server)`;
+  // full lifecycle contract in useOptimisticConfigPaths.ts. The sidebar tint
+  // (which reads the same query) re-ranks when the save is accepted rather
+  // than at click time — the stepper itself stays instant via the overlay.
+  const overlay = useOptimisticConfigPaths(qc)
   const recentTintCount = clampTintCount(mcQ.data?.dashboard?.recent_tint_count)
-  const tintMut = useMutation({
+  const shownTintCount = overlay.shown('dashboard.recent_tint_count', recentTintCount)
+  const tintMut = useMutation(overlay.mutationOpts<number>({
+    queryKey: ['kirocrewConfig'],
     mutationFn: (value: number) => api.patchConfig('dashboard.recent_tint_count', value),
-    onMutate: async (value: number) => {
-      await qc.cancelQueries({ queryKey: ['kirocrewConfig'] })
-      const prev = qc.getQueryData<{ dashboard?: { recent_tint_count?: number } }>(['kirocrewConfig'])
-      const next = structuredClone(prev ?? {})
-      next.dashboard = { ...(next.dashboard ?? {}), recent_tint_count: value }
-      qc.setQueryData(['kirocrewConfig'], next)
-      return { prev }
-    },
-    onError: (_e, _v, ctx) => { if (ctx?.prev) qc.setQueryData(['kirocrewConfig'], ctx.prev) },
-    onSettled: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
-  })
+    path: () => 'dashboard.recent_tint_count',
+    displayValue: v => v,
+    applyToCache: (cached, value) => setConfigPathValue(cached as KirocrewCfg, 'dashboard.recent_tint_count', value),
+  }))
+  // Steps are computed from the SHOWN count so rapid clicks stack on the
+  // in-flight value instead of re-incrementing a stale server value.
   const setTintCount = (n: number) => tintMut.mutate(clampTintCount(n))
 
   // Default shell for the built-in terminal — persisted server-side
   // (dashboard.terminal.shell) because the SHELL is spawned by the gateway
   // host, unlike the terminal font above, which is a per-client rendering
   // choice and stays in localStorage. Drafted locally and committed on blur so
-  // a half-typed path is never persisted. The write mirrors tintMut above:
-  // optimistic cache write + rollback, because onSuccess clears the draft and
-  // React Query serves the stale cache while refetching — without the
-  // optimistic write the just-saved value blinks back to the previous one for
-  // a round-trip, which reads as a failed save. Errors are mapped from the
-  // response's machine-readable `code` to catalog keys: the backend's English
-  // sentence must never render verbatim in a 12-language dashboard.
-  type KirocrewCfg = { dashboard?: { recent_tint_count?: number; terminal?: { shell?: string } } }
+  // a half-typed path is never persisted. The overlay keeps the just-saved
+  // value shown after onSuccess clears the draft, because React Query serves
+  // the stale cache while refetching — without it the value would blink back
+  // to the previous one for a round-trip, which reads as a failed save.
+  // Errors are mapped from the response's machine-readable `code` to catalog
+  // keys: the backend's English sentence must never render verbatim in a
+  // 12-language dashboard.
   const serverShell = mcQ.data?.dashboard?.terminal?.shell ?? ''
+  const shownShell = overlay.shown('dashboard.terminal.shell', serverShell)
   const [shellDraft, setShellDraft] = useState<string | null>(null)
   const [shellError, setShellError] = useState<string | null>(null)
-  const shellMut = useMutation({
+  const shellOpts = overlay.mutationOpts<string>({
+    queryKey: ['kirocrewConfig'],
     mutationFn: (value: string) => api.patchConfig('dashboard.terminal.shell', value),
-    onMutate: async (value: string) => {
-      await qc.cancelQueries({ queryKey: ['kirocrewConfig'] })
-      const prev = qc.getQueryData<KirocrewCfg>(['kirocrewConfig'])
-      const next = structuredClone(prev ?? {})
-      next.dashboard = {
-        ...(next.dashboard ?? {}),
-        terminal: { ...(next.dashboard?.terminal ?? {}), shell: value },
-      }
-      qc.setQueryData(['kirocrewConfig'], next)
-      return { prev }
-    },
-    onSuccess: () => {
-      setShellDraft(null)
-      setShellError(null)
-    },
-    onError: (e, _value, ctx) => {
-      if (ctx?.prev) qc.setQueryData(['kirocrewConfig'], ctx.prev)
+    path: () => 'dashboard.terminal.shell',
+    displayValue: v => v,
+    applyToCache: (cached, value) => setConfigPathValue(cached as KirocrewCfg, 'dashboard.terminal.shell', value),
+    onFailure: e => {
       const code = e instanceof ApiError ? parseErrorCode(e.body) : undefined
       setShellError(i18nT(
         code === 'shell_not_executable'
@@ -143,12 +199,20 @@ export function DisplayPanel() {
           : 'pages.settings.displayPanel.terminal_shell_save_failed',
       ))
     },
-    onSettled: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onSupersede: () => setShellError(null),
+  })
+  const shellMut = useMutation({
+    ...shellOpts,
+    onSuccess: (data: unknown, value: string, token: number) => {
+      setShellDraft(null)
+      setShellError(null)
+      return shellOpts.onSuccess(data, value, token)
+    },
   })
   const commitShell = () => {
     if (shellDraft === null) return
     const value = shellDraft.trim()
-    if (value === serverShell) {
+    if (value === shownShell) {
       setShellDraft(null)
       setShellError(null)
       return
@@ -255,27 +319,50 @@ export function DisplayPanel() {
             </div>
           )}
           <SettingsButtonGroup label={i18nT('pages.settings.displayPanel.font_family')} description={i18nT('pages.settings.displayPanel.ui_font_family_for_the_dashboard_code_font_follo')} value={family}
-            options={[{ value: 'sans', label: 'Sans' }, { value: 'mono', label: 'Mono' }, { value: 'system', label: 'System' }]}
-            onChange={v => setFontFamily(v as 'sans' | 'mono' | 'system')} />
+            options={FONT_FAMILY_OPTIONS.map(o => ({ value: o.value, label: o.labelKey ? i18nT(o.labelKey) : o.label! }))}
+            onChange={v => setFontFamily(v as FontFamily)} />
         </SettingsCard>
       </SettingsSection>
 
       <SettingsSection title={i18nT('pages.settings.displayPanel.terminal')}>
         <SettingsCard index={2}>
-          {/* Free-text family: the browser cannot enumerate OS-installed fonts, so
-              the user names the font (a monospace / Nerd Font they have installed).
+          {/* Detected families, not free text alone: the fonts that matter are the
+              ones installed on the machine RENDERING the terminal, which is the
+              browser's machine — xterm rasterizes client-side while the pty lives on
+              the gateway host, so a host-side enumeration would list the wrong
+              computer whenever the dashboard is reached over a tunnel. Hence probing
+              in the browser (see useFontOptions), with the typed value still
+              committable because the probe can only confirm names it is handed.
               resolveTerminalFontFamily quotes multi-word names and appends a
               monospace fallback, and the change is pushed live onto open terminals
-              by CliPanel's font subscription. No placeholder or unit suffix: a raw
-              font stack / "px" is Latin the en-XA i18n-render gate flags as
-              untranslated, and neither is translatable copy that could be a catalog
-              value — the descriptions carry the guidance and the unit instead. */}
-          <SettingsInput
+              by CliPanel's font subscription. */}
+          <SettingsCombobox
             label={i18nT('pages.settings.displayPanel.terminal_font_family')}
             description={i18nT('pages.settings.displayPanel.terminal_font_family_desc')}
             value={termFont.fontFamily}
+            options={fontOptions}
             onChange={setTerminalFontFamily}
-            aria-label={i18nT('pages.settings.displayPanel.terminal_font_family')}
+            triggerFallback={termFont.fontFamily || i18nT('pages.settings.displayPanel.terminal_font_default')}
+            searchPlaceholder={i18nT('pages.settings.displayPanel.terminal_font_search')}
+            customValueOption={typed => (isFontInstalled(typed)
+              ? {
+                label: i18nT('pages.settings.displayPanel.terminal_font_use_typed', { value: typed }),
+                ...fontPreview(typed),
+              }
+              // No preview for a name that did not resolve. Styling the sample
+              // with an uninstalled family renders it in the fallback, which is
+              // indistinguishable from a confirmed font — the row would quietly
+              // confirm a typo, which is the failure this picker exists to end.
+              // Still committable: the family may be installed later, or on
+              // another machine this preference is not synced to.
+              : {
+                label: i18nT('pages.settings.displayPanel.terminal_font_use_typed', { value: typed }),
+                sublabel: i18nT('pages.settings.displayPanel.terminal_font_not_detected'),
+              })}
+            action={fontAccessSupported
+              ? { label: i18nT('pages.settings.displayPanel.terminal_font_detect'), onSelect: enumerateFonts }
+              : undefined}
+            actionStatus={fontDetectStatus}
           />
           <SettingsStepper
             label={i18nT('pages.settings.displayPanel.terminal_font_size')}
@@ -299,10 +386,10 @@ export function DisplayPanel() {
           <SettingsInput
             label={i18nT('pages.settings.displayPanel.terminal_shell')}
             description={i18nT('pages.settings.displayPanel.terminal_shell_desc')}
-            value={shellDraft ?? serverShell}
+            value={shellDraft ?? shownShell}
             onChange={setShellDraft}
             onBlur={commitShell}
-            disabled={shellMut.isPending}
+            disabled={shellMut.isPending || !mcQ.isSuccess}
             configKey="dashboard.terminal.shell"
             aria-label={i18nT('pages.settings.displayPanel.terminal_shell')}
           />
@@ -378,7 +465,7 @@ export function DisplayPanel() {
                   and sat visibly shorter and darker than the picker. */}
               <Input aria-label={i18nT('pages.settings.displayPanel.theme_source_location')} value={installValue}
                 onChange={e => setInstallValue(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter') handleInstall() }}
+                {...ime.bindEnter({ onEnter: () => handleInstall() })}
                 placeholder={installType === 'github' ? 'https://github.com/user/theme' : '/path/to/theme'}
                 className="min-w-0" />
               <button onClick={handleInstall} disabled={installBusy || !installValue.trim()}
@@ -393,17 +480,29 @@ export function DisplayPanel() {
         </SettingsCard>
       </SettingsSection>
 
-      {editor.editorOpen && (
-        <Clickable className="fixed inset-0 z-[49] flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={e => { if (!e || e.target === e.currentTarget) editor.closeEditor() }}>
-          <div role="dialog" aria-modal="true" aria-label={editor.isEditing ? i18nT('pages.settings.displayPanel.edit_theme') : i18nT('pages.settings.displayPanel.create_theme')} className="relative z-10 w-full max-w-2xl max-h-[85vh] overflow-y-auto mx-4 bg-card border border-border rounded-xl p-6 shadow-xl animate-rise">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-sm font-bold text-text-strong">{editor.isEditing ? i18nT('pages.settings.displayPanel.edit_theme') : i18nT('pages.settings.displayPanel.create_theme')}</h3>
-              <button className="text-muted text-[13px] cursor-pointer hover:text-text bg-transparent border-none" onClick={editor.closeEditor}><X className="lucide-inline" /></button>
-            </div>
-            <ThemeEditorPanel editor={editor} />
-          </div>
-        </Clickable>
-      )}
+      {/* The shared Modal owns the backdrop, Escape dismissal, the focus
+          trap/restore, the scroll lock and the keyboard isolation the
+          hand-rolled overlay lacked, and it portals to document.body so the
+          editor still escapes the SettingsCard's card-glow stacking context.
+          The panel rises from z-[49] to Modal's own z-[100]/[101] layer, which
+          is what puts it above the floating theme-experience toggle instead of
+          under it. The dialog keeps its accessible name from its own title.
+
+          `guardAccidentalDismiss` is gated on the editor being dirty, because
+          Escape dismissal is a path this conversion ADDS and `closeEditor`
+          discards the draft unconditionally: on an untouched form both
+          accidental exits still work (Escape is the capability the issue asks
+          for), and once a name or a colour has been entered only the explicit
+          exits — the header close button and the panel's own Cancel — close it. */}
+      <Modal
+        open={editor.editorOpen}
+        onClose={editor.closeEditor}
+        title={editor.isEditing ? i18nT('pages.settings.displayPanel.edit_theme') : i18nT('pages.settings.displayPanel.create_theme')}
+        maxWidth={672}
+        guardAccidentalDismiss={editor.isDirty}
+      >
+        <ThemeEditorPanel editor={editor} />
+      </Modal>
 
       {/* Sidebar Colors */}
       <SettingsSection title={i18nT('pages.settings.displayPanel.sidebar_colors')}>
@@ -432,13 +531,14 @@ export function DisplayPanel() {
           <SettingsStepper
             label={i18nT('pages.settings.displayPanel.highlight_recent_sessions')}
             description={i18nT('pages.settings.displayPanel.highlight_the_n_most_recently_active_sessions_wi')}
-            value={recentTintCount}
-            onIncrement={() => setTintCount(recentTintCount + 1)}
-            onDecrement={() => setTintCount(recentTintCount - 1)}
+            value={shownTintCount}
+            onIncrement={() => setTintCount(shownTintCount + 1)}
+            onDecrement={() => setTintCount(shownTintCount - 1)}
             onReset={() => setTintCount(RECENT_TINT_COUNT)}
+            disabled={!mcQ.isSuccess}
           />
           {/* Color swatches use raw buttons — circular color dots don't fit SettingsButtonGroup's text-button pattern */}
-          <div className="flex flex-col gap-1.5 py-1.5">
+          <div className="flex flex-col gap-1.5 py-1.5" data-setting-label={i18nT('pages.settings.displayPanel.default_for_new_sessions')}>
             <span className="text-[13px] font-semibold text-text">{i18nT('pages.settings.displayPanel.default_for_new_sessions')}</span>
             <div className="text-[12px] text-muted">{i18nT('pages.settings.displayPanel.none_auto_cycle_or_pick_a_fixed_color')}</div>
             <div className="flex flex-wrap items-center gap-1.5">

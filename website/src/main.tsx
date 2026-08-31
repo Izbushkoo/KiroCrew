@@ -2,6 +2,7 @@
 // FIRST (before store/providers/App) so seam registrations run before render.
 // Empty in the stock build. See website/src/extensions.ts.
 import './extensions'
+import { startMemoryWatch } from './lib/memoryWatch'
 import React, { StrictMode, Suspense, lazy } from 'react'
 import { createRoot } from 'react-dom/client'
 import { withCommitProfiler, installCommitProfilerConsoleApi } from './lib/commitProfiler'
@@ -15,14 +16,18 @@ import { ThemeProvider } from './hooks/useTheme'
 import { UIModeProvider } from './hooks/useUIMode'
 import ThemeExperienceLayer from './components/ThemeExperienceLayer'
 import { initRum } from './rum'
+import { isEmbeddedPane } from './lib/embedded'
 // i18n must initialize before the first render — a component rendering ahead of
-// init would emit its bare translation key instead of text.
-import { initI18n } from './i18n'
+// init would emit its bare translation key instead of text. The `/all` entry is
+// what registers every language; plain `./i18n` is English-only, so importing it
+// here would render English for every user whatever language they picked.
+import { initI18n } from './i18n/all'
 import { LanguageProvider } from './i18n/LanguageProvider'
 import App from './App'
 import { queryClient } from './api/queryClient'
 import ErrorBoundary from './components/ErrorBoundary'
 import DashboardBootstrap from './components/DashboardBootstrap'
+import { installPageZoomSuppression } from './utils/pageZoom'
 import 'katex/dist/katex.min.css'
 import './index.css'
 import './styles/cli-mode.css'
@@ -36,6 +41,12 @@ initRum(__APP_VERSION__)
 // the very first paint is already in the right language; LanguageProvider then
 // reconciles against the server-authoritative config value.
 initI18n()
+
+// Page zoom is off on touch: the shell is an application, not a document. The
+// viewport meta and the root `touch-action` cover Blink/Gecko; this covers
+// WebKit, which ignores both for user gestures. Installed before render so the
+// very first pinch is already suppressed. See utils/pageZoom.ts.
+installPageZoomSuppression()
 
 // Auto-recover from stale lazy-chunk errors after a frontend rebuild.
 // Vite fires `vite:preloadError` on window when a dynamic import() of a
@@ -78,6 +89,13 @@ window.addEventListener('vite:preloadError', (event) => {
 
 // Accessibility: runtime DOM scanning in dev mode (logs violations to console)
 if (import.meta.env.DEV) {
+  // The `meta-viewport` rule is deliberately NOT waived, even though this shell ships
+  // `maximum-scale=1, user-scalable=no` and axe therefore reports a critical WCAG 1.4.4
+  // finding on every dev render. A waiver was written and removed; do not re-add one.
+  // The finding is not noise — it is the only recurring reminder that suppressing page
+  // zoom is an accessibility trade nobody has yet accepted in writing, and "nobody can
+  // action it" was wrong: it is a decision, and a decision stays owed.
+  // See the page-zoom section of website/docs/page-layout.md for the policy.
   import('react-dom').then(ReactDOM => import('@axe-core/react').then(axe => axe.default(React, ReactDOM, 1000)))
 }
 
@@ -85,11 +103,35 @@ if (import.meta.env.DEV) {
 // creates the module-level highlight worker pool, so the first code surface a
 // user opens paints immediately instead of paying chunk + worker + grammar
 // startup on click.
+//
+// NOT in an embedded remote-instance pane. Each warm pane is a full copy of this
+// SPA in its own realm, and every realm that evaluates PierreImpl spawns
+// PIERRE_WORKER_POOL_SIZE workers, each loading its own highlighter bundle + WASM
+// regex engine. With the default warm-set cap that is 4 workers x 5 panes = 20
+// eagerly-spawned workers in one renderer process, and the background panes paint
+// nothing, so 16 of them buy no responsiveness at all. Observed consequence: the
+// renderer accumulated 20 DedicatedWorker threads and was killed by a V8 fatal
+// abort raised on one of them, taking the whole window black.
+//
+// Panes are not left slower than before in any case a user can see: the lazy
+// import in pierre/index.tsx still creates the pool on the first real code
+// surface, so a pane the user actually opens a diff in pays exactly the
+// pre-warm cost it used to pay on click.
 const idle: (cb: () => void) => void =
   typeof requestIdleCallback === 'function' ? cb => requestIdleCallback(cb) : cb => setTimeout(cb, 2000)
-idle(() => { import('./pierre/PierreImpl').catch(() => { /* warmed on first use instead */ }) })
+if (!isEmbeddedPane()) {
+  idle(() => { import('./pierre/PierreImpl').catch(() => { /* warmed on first use instead */ }) })
+}
 
 const WorldsPopout = lazy(() => import('./pages/WorldsPopout'))
+
+// Sample this renderer's memory trajectory so a V8 cage OOM has a before, not
+// just an after. Reports V8 external memory (backing stores + external strings),
+// which is where EVERY ArrayBuffer lands regardless of which API created it --
+// unlike the constructor wrap this replaces, which saw one of ~25 allocation
+// paths in one realm. Cheap (four integers per 5s), and no-ops when there is no
+// main process to report to (a plain-browser dashboard).
+startMemoryWatch('main')
 
 // Debug-only, and inert unless explicitly armed with ?profile=commits. When
 // disarmed withCommitProfiler returns the children untouched, so no Profiler

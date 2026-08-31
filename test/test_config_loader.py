@@ -6,10 +6,13 @@ for property-based testing.
 
 from __future__ import annotations
 
+import dataclasses
+import inspect
 import json
 import logging
 import os
 import platform
+import re
 import tempfile
 import unittest.mock
 from pathlib import Path
@@ -21,6 +24,7 @@ from hypothesis import strategies as st
 import kiro_crew.config.loader as loader_module
 from kiro_crew.config.loader import (
     _HAS_JSONSCHEMA,
+    STT_PROVIDER_LOCAL,
     AgentConfig,
     DashboardConfig,
     KiroCrewAgentConfig,
@@ -33,12 +37,16 @@ from kiro_crew.config.loader import (
     SttConfig,
     WorkspaceConfig,
     _migrate_workspaces,
+    _validated_stt_model,
+    _validated_stt_provider,
     config_dir,
     resolve_agent_bindings,
     resolve_memory_store_config,
     validate_kiro_agent_references,
     workspace_dir_for,
 )
+from kiro_crew.stt import limits as stt_limits
+from kiro_crew.stt import models as stt_models
 
 # Logger used by the loader module — needed for capturing warnings in tests
 logger = logging.getLogger("kiro_crew.config.loader")
@@ -88,6 +96,28 @@ def _load_from_dict(data: object) -> KiroCrewConfig:
             return KiroCrewConfig.load()
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def _load_absent_config() -> KiroCrewConfig:
+    """Load with NEITHER config.json nor config.local.json present.
+
+    This is the only path that reaches the dataclass field defaults, so it is
+    what a default must be compared against.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        missing = Path(d) / "config.json"
+        missing_local = Path(d) / "config.local.json"
+        with (
+            unittest.mock.patch(
+                "kiro_crew.config.loader.config_path",
+                return_value=missing,
+            ),
+            unittest.mock.patch(
+                "kiro_crew.config.loader.config_local_path",
+                return_value=missing_local,
+            ),
+        ):
+            return KiroCrewConfig.load()
 
 
 def _load_from_raw_string(content: str) -> KiroCrewConfig:
@@ -312,6 +342,31 @@ def test_slack_home_tab_sessions_per_kind_parsed_and_round_trips():
     # Survives a to_dict() -> load() round-trip.
     reloaded = _load_from_dict(loaded.to_dict())
     assert reloaded.slack.home_tab_sessions_per_kind == 42
+
+
+class TestFallbackModelLoad:
+    """agent.fallback_model flows through the explicit load() kwargs."""
+
+    def test_load_coerces_registry_alias(self) -> None:
+        loaded = _load_from_dict({"agent": {"fallback_model": "opus-4.8-1m"}})
+        assert loaded.agent.fallback_model == "claude-opus-4.8"
+
+    def test_load_default_is_auto(self) -> None:
+        # DEFAULT PIN: a config without the key loads "auto" — fallback ON via
+        # the backend's availability-aware routing.
+        assert _load_from_dict({}).agent.fallback_model == "auto"
+
+    def test_load_explicit_empty_disables(self) -> None:
+        # ROLLBACK PIN: fallback_model "" is the opt-out — pre-feature behavior.
+        assert _load_from_dict({"agent": {"fallback_model": ""}}).agent.fallback_model == ""
+
+    def test_load_malformed_value_never_crashes(self) -> None:
+        loaded = _load_from_dict({"agent": {"fallback_model": {"not": "a string"}}})
+        assert loaded.agent.fallback_model == "auto"
+
+    def test_round_trips_through_to_dict(self) -> None:
+        loaded = _load_from_dict({"agent": {"fallback_model": "claude-opus-5"}})
+        assert loaded.to_dict()["agent"]["fallback_model"] == "claude-opus-5"
 
 
 class TestMalformedConfigValuesNeverCrashLoad:
@@ -1527,6 +1582,23 @@ class TestEdgeCases:
         cfg = _load_from_dict({})
         assert cfg.dashboard.recent_tint_count == 0
 
+    def test_update_nudge_loaded_from_config(self) -> None:
+        """The popup's snooze/skip record round-trips through load, so a GET
+        after a PATCH reads back what was written."""
+        rec = {"version": "0.5.0", "snoozed_until": 1756000000.0, "skipped": True}
+        cfg = _load_from_dict({"dashboard": {"update_nudge": rec}})
+        assert cfg.dashboard.update_nudge == rec
+
+    def test_update_nudge_defaults_to_empty_dict(self) -> None:
+        cfg = _load_from_dict({})
+        assert cfg.dashboard.update_nudge == {}
+
+    def test_update_nudge_non_dict_coerces_to_empty(self) -> None:
+        """A hand-edited scalar must not crash load or leak a non-dict to the
+        dashboard's config read-back."""
+        cfg = _load_from_dict({"dashboard": {"update_nudge": "corrupt"}})
+        assert cfg.dashboard.update_nudge == {}
+
     def test_embedding_provider_defaults_to_llama_cpp(self) -> None:
         """embedding_provider defaults to 'llama_cpp' (in-process, default-on)."""
         cfg = _load_from_dict({})
@@ -2156,27 +2228,394 @@ class TestReactionsNullSuppression:
         assert cfg.slack.reactions["tool"] == "ok"
 
 
-class TestSttStreamingDefault:
-    """Pin the fresh-install default for `stt.streaming` to False."""
+def _loaded_stt(tmp_path: Path, section: dict) -> SttConfig:
+    """Load a config carrying *section* under ``stt`` and return the parsed block.
 
-    def test_stt_config_dataclass_default_is_false(self) -> None:
-        assert SttConfig().streaming is False
+    Goes through ``KiroCrewConfig.load()`` rather than constructing an
+    ``SttConfig``: every coercion under test here (the provider degrade, the model
+    canonicalisation, the millisecond clamps) lives on the load path, so a
+    dataclass built by hand skips all of them and proves nothing about what a
+    hand-edited ``config.json`` actually produces.
+    """
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps({"stt": section}))
+    with unittest.mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path):
+        return KiroCrewConfig.load().stt
 
-    def test_missing_stt_key_loads_streaming_false(self, tmp_path: Path) -> None:
+
+#: Every superseded ``stt.model`` name, and the catalog entry it must select.
+#: Written out as literals on purpose: reading the expectations out of the loader's
+#: own alias table would assert only that a dict maps to itself, and the rows worth
+#: guarding are the ones that look like substitutions and are not. ``medium`` and
+#: the whole full-size ``large`` lineage land on ``large-v3-turbo``, which is at
+#: least as accurate as what was asked for and decodes faster; the English-only
+#: names drop to the multilingual model of the SAME size rather than to the
+#: default, which is the difference between losing a little English accuracy and
+#: silently demoting someone from the accuracy ceiling to the second-smallest model.
+_SUPERSEDED_STT_MODELS: dict[str, str] = {
+    "turbo": "large-v3-turbo",
+    "large": "large-v3-turbo",
+    "large-v1": "large-v3-turbo",
+    "large-v2": "large-v3-turbo",
+    "large-v3": "large-v3-turbo",
+    "large-v3-turbo-q5_0": "large-v3-turbo",
+    "large-v3-turbo-q8_0": "large-v3-turbo",
+    "medium": "large-v3-turbo",
+    "medium.en": "large-v3-turbo",
+    "small.en": "small",
+    "base.en": "base",
+    "tiny.en": "tiny",
+}
+
+#: Fields ``stt`` carried while each retired provider needed its own out-of-band
+#: install: a whisper CLI path, two HuggingFace repo ids, and a compute device.
+_REMOVED_STT_FIELDS = ("whisper_path", "mlx_model", "parakeet_model", "device")
+
+
+class TestSttStreamingDefaultsOn:
+    """Pin the fresh-install default for ``stt.streaming`` to True.
+
+    The default recogniser runs inside this process on every supported OS, with no
+    account and no per-word bill, so live partials are what voice input is for
+    rather than an extra to be earned: a fresh install shows words while the user
+    is still speaking.
+
+    The last case is the other half of the rule and the reason the flip is safe. A
+    stored ``false`` is a deliberate trade (less CPU locally, fewer API calls on
+    ``transcribe``), and a moved default must never overrule a written-down choice.
+    """
+
+    def test_stt_config_dataclass_default_is_true(self) -> None:
+        assert SttConfig().streaming is True
+
+    def test_missing_stt_key_loads_streaming_true(self, tmp_path: Path) -> None:
         cfg_file = tmp_path / "config.json"
         cfg_file.write_text(json.dumps({}))
         with unittest.mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path):
             cfg = KiroCrewConfig.load()
-        assert cfg.stt.streaming is False
+        assert cfg.stt.streaming is True
 
-    def test_partial_stt_block_without_streaming_key_loads_false(self, tmp_path: Path) -> None:
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(
-            json.dumps({"stt": {"provider": "transcribe", "language_code": "en-US"}})
+    def test_partial_stt_block_without_streaming_key_loads_true(self, tmp_path: Path) -> None:
+        stt = _loaded_stt(tmp_path, {"provider": "transcribe", "language_code": "en-US"})
+        assert stt.streaming is True
+
+    def test_explicitly_stored_false_still_wins(self, tmp_path: Path) -> None:
+        assert _loaded_stt(tmp_path, {"streaming": False}).streaming is False
+
+
+class TestSttFreshInstallPosture:
+    """Voice input is on, and on-device, out of the box.
+
+    These defaults only make sense together: recognition costs one model download
+    and then nothing, so ``enabled`` is honest rather than an opt-in hiding a
+    working feature, and the provider it turns on is the one with no precondition.
+    Pinning ``enabled`` alone would leave room for the one combination that is
+    wrong for a fresh install, on by default and pointing at a recogniser that
+    bills an AWS account.
+    """
+
+    def test_enabled_by_default(self) -> None:
+        assert SttConfig().enabled is True
+
+    def test_the_default_model_is_one_the_downloader_can_fetch(self) -> None:
+        """``model`` is a key into the sha256-pinned catalog, so a default missing
+        from it would leave a fresh install unable to dictate at all."""
+        assert SttConfig().model == stt_models.DEFAULT_MODEL
+        assert SttConfig().model in {m.name for m in stt_models.CATALOG}
+
+    def test_a_config_with_no_stt_block_loads_that_same_posture(self, tmp_path: Path) -> None:
+        """The load path and the dataclass are separate statements of every default,
+        and the load path is the only one an install actually reads."""
+        stt = _loaded_stt(tmp_path, {})
+        assert (stt.enabled, stt.provider, stt.model) == (
+            True,
+            STT_PROVIDER_LOCAL,
+            stt_models.DEFAULT_MODEL,
         )
+
+
+class TestSttRetiredProviders:
+    """A retired provider name degrades to ``local``, and the warning names it.
+
+    Each retired recogniser needed an install the user performed themselves (a
+    whisper CLI on ``PATH``, an ``mlx`` or ``faster-whisper`` wheel) and has no
+    dispatcher behind it now, so a stored value has to land on the resident engine
+    rather than leave voice input pointing at nothing. It degrades instead of
+    raising for the same reason an unusable persisted backend does: this value
+    arrives from ``config.json``, and failing the load would take the whole
+    gateway down over a setting.
+
+    The old value has to appear in the warning. It is the only place an operator
+    learns why the provider they chose is not the one running, and "unknown
+    provider" without the name is unactionable.
+    """
+
+    @pytest.mark.parametrize("retired", loader_module._RETIRED_STT_PROVIDERS)
+    def test_retired_provider_degrades_to_local(self, retired: str, caplog) -> None:
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
+            assert _validated_stt_provider(retired) == STT_PROVIDER_LOCAL
+        assert retired in caplog.text
+        assert "retired" in caplog.text
+
+    @pytest.mark.parametrize("retired", loader_module._RETIRED_STT_PROVIDERS)
+    def test_stored_retired_provider_loads_as_local(self, retired: str, tmp_path: Path) -> None:
+        assert _loaded_stt(tmp_path, {"provider": retired}).provider == STT_PROVIDER_LOCAL
+
+    def test_the_load_path_says_which_retired_value_it_replaced(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """The reason has to reach the log through schema validation, not around it.
+
+        A retired name is deliberately absent from the schema's enum, so the plain
+        validation path would report "enum violation" and drop the key, leaving the
+        operator told that a value was rejected and not that the recogniser they
+        chose no longer exists. The absence of that generic line is the assertion:
+        it is what shows the degrade ran first.
+        """
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
+            caplog.clear()
+            stt = _loaded_stt(tmp_path, {"provider": "parakeet"})
+        assert stt.provider == STT_PROVIDER_LOCAL
+        assert "parakeet" in caplog.text
+        assert "retired" in caplog.text
+        assert "enum violation" not in caplog.text
+
+    def test_a_retired_name_is_not_also_selectable(self) -> None:
+        """The two lists have to stay disjoint: a name in both would be accepted by
+        the validator and never reach the branch that explains it is gone."""
+        assert not set(loader_module._RETIRED_STT_PROVIDERS) & set(
+            loader_module._VALID_STT_PROVIDERS
+        )
+
+    def test_an_unknown_provider_is_told_what_it_could_have_been(self, caplog) -> None:
+        """A typo gets the selectable list; a retired name gets the reason instead,
+        because "mlx is not one of local/apple/transcribe" answers the wrong
+        question for someone who had it working yesterday."""
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
+            assert _validated_stt_provider("whispr") == STT_PROVIDER_LOCAL
+        assert "whispr" in caplog.text
+        for selectable in loader_module._VALID_STT_PROVIDERS:
+            assert selectable in caplog.text
+
+    def test_a_non_string_provider_degrades_rather_than_raising(self, tmp_path: Path) -> None:
+        """The membership tests take an ``object``, so a hand-edited number or a
+        JSON ``null`` has to fall through to the default instead of a TypeError."""
+        assert _loaded_stt(tmp_path, {"provider": None}).provider == STT_PROVIDER_LOCAL
+        assert _loaded_stt(tmp_path, {"provider": 7}).provider == STT_PROVIDER_LOCAL
+
+
+class TestSttRemovedFieldsAreInert:
+    """A config written for the retired providers still loads, and is not degraded.
+
+    The removed keys named the out-of-band installs those providers needed. An
+    unknown key inside a section must be IGNORED rather than treated as a section
+    the loader could not read: marking ``stt`` degraded would stop the write-back
+    migration from normalising the file (it refuses to overwrite evidence) and
+    would tell every consumer the operator's voice settings are unknown, when only
+    four dead keys are.
+    """
+
+    _LEGACY_SECTION = {
+        "provider": "mlx",
+        "whisper_path": "/usr/local/bin/whisper",
+        "mlx_model": "mlx-community/whisper-large-v3-turbo",
+        "parakeet_model": "mlx-community/parakeet-tdt-0.6b-v3",
+        "device": "cpu",
+        "language_code": "fr-FR",
+    }
+
+    def test_the_legacy_section_loads_without_degrading_anything(self, tmp_path: Path) -> None:
+        """An empty degraded set is exactly what the write-back migration checks.
+
+        So a legacy section counted as degraded would keep the dead keys on disk for
+        every future load, and the publish gate, which fails closed on that set,
+        would start denying over four inert keys.
+        """
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"stt": dict(self._LEGACY_SECTION)}))
         with unittest.mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path):
             cfg = KiroCrewConfig.load()
-        assert cfg.stt.streaming is False
+        assert cfg.degraded_sections == frozenset()
+
+    def test_the_settings_that_still_exist_are_honoured(self, tmp_path: Path) -> None:
+        """The dead keys must not poison the live ones sharing the section."""
+        stt = _loaded_stt(tmp_path, dict(self._LEGACY_SECTION))
+        assert stt.language_code == "fr-FR"
+        assert stt.provider == STT_PROVIDER_LOCAL
+
+    def test_the_removed_fields_are_not_attributes(self, tmp_path: Path) -> None:
+        stt = _loaded_stt(tmp_path, dict(self._LEGACY_SECTION))
+        for name in _REMOVED_STT_FIELDS:
+            assert not hasattr(stt, name), name
+
+    def test_a_round_trip_does_not_carry_them_forward(self, tmp_path: Path) -> None:
+        """``to_dict`` is what a save writes back, so a key it still emitted would
+        be re-persisted forever and keep offering the dashboard a setting with
+        nothing behind it."""
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"stt": dict(self._LEGACY_SECTION)}))
+        with unittest.mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path):
+            written = KiroCrewConfig.load().to_dict()["stt"]
+        assert set(written).isdisjoint(_REMOVED_STT_FIELDS)
+        assert written["provider"] == STT_PROVIDER_LOCAL
+
+
+class TestSttModelCatalog:
+    """``stt.model`` always resolves onto a name the catalog carries.
+
+    The value becomes a filename under the models directory and the key to a
+    sha256 pin, so an arbitrary string must never reach a path, and a name the
+    downloader cannot fetch must never reach the dashboard's menu. Superseded
+    names are mapped rather than dropped, because dropping them downgrades
+    whoever deliberately picked the accuracy ceiling.
+    """
+
+    @pytest.mark.parametrize("name", [m.name for m in stt_models.CATALOG])
+    def test_every_catalog_name_is_accepted_unchanged(self, name: str) -> None:
+        assert _validated_stt_model(name) == name
+
+    @pytest.mark.parametrize(("stored", "target"), sorted(_SUPERSEDED_STT_MODELS.items()))
+    def test_a_superseded_name_maps_to_its_target(self, stored: str, target: str) -> None:
+        assert _validated_stt_model(stored) == target
+
+    def test_every_alias_the_loader_knows_states_its_target_here(self) -> None:
+        """An alias added to the catalog has to declare its intent in this file.
+
+        Without this ratchet a new alias is exercised by nothing and may point
+        anywhere, including at the default, which is the silent downgrade the alias
+        table exists to prevent.
+        """
+        assert set(stt_models._ALIASES) == set(_SUPERSEDED_STT_MODELS)
+
+    def test_no_superseded_name_shadows_a_real_catalog_entry(self) -> None:
+        """An alias keyed on a live name would redirect that model away from itself,
+        so ``base`` could stop meaning ``base``."""
+        assert {m.name for m in stt_models.CATALOG}.isdisjoint(_SUPERSEDED_STT_MODELS)
+
+    def test_every_target_is_downloadable(self) -> None:
+        assert set(_SUPERSEDED_STT_MODELS.values()) <= {m.name for m in stt_models.CATALOG}
+
+    def test_the_advertised_menu_is_the_catalog(self) -> None:
+        """The enum the schema publishes drives the dashboard picker. Anything it
+        offers beyond the catalog is a model the downloader cannot fetch."""
+        assert set(loader_module._VALID_STT_MODELS) == {m.name for m in stt_models.CATALOG}
+
+    def test_an_unknown_name_degrades_to_the_default(self, caplog) -> None:
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.stt.models"):
+            assert _validated_stt_model("ggml-enormous") == stt_models.DEFAULT_MODEL
+        assert "ggml-enormous" in caplog.text
+
+    def test_a_non_string_or_empty_name_degrades_to_the_default(self, caplog) -> None:
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
+            assert _validated_stt_model(7) == stt_models.DEFAULT_MODEL
+            assert _validated_stt_model("") == stt_models.DEFAULT_MODEL
+            assert _validated_stt_model(None) == stt_models.DEFAULT_MODEL
+
+    def test_a_stored_superseded_name_loads_as_its_target(self, tmp_path: Path) -> None:
+        """The mapping has to happen on the load path, not only in the validator:
+        this is where an install that predates the catalog reads its model from."""
+        assert _loaded_stt(tmp_path, {"model": "turbo"}).model == "large-v3-turbo"
+
+    def test_a_stored_unknown_name_loads_as_the_default(self, tmp_path: Path) -> None:
+        assert _loaded_stt(tmp_path, {"model": "../../etc/passwd"}).model == (
+            stt_models.DEFAULT_MODEL
+        )
+
+
+class TestSttIntervalClamps:
+    """A stored millisecond value is already the effective one.
+
+    ``vad.Endpointer`` raises ``silence_ms`` to ``MIN_SILENCE_MS`` and a live
+    session raises ``partial_interval_ms`` to ``MIN_PARTIAL_INTERVAL_MS`` when the
+    recogniser is built. If the loader stored anything below those floors, the
+    settings panel would read back a number nothing honours, which is the worst
+    available shape: the operator sees their choice, and the recogniser runs a
+    different one.
+
+    Every bound here is read from ``kiro_crew.stt.limits``, which owns them. A
+    literal in a test is how the two copies drift apart without either side
+    noticing, and this test is what would have to notice.
+    """
+
+    def test_silence_ms_is_raised_to_the_floor_the_vad_enforces(self, tmp_path: Path) -> None:
+        stt = _loaded_stt(tmp_path, {"silence_ms": 1})
+        assert stt.silence_ms == stt_limits.MIN_SILENCE_MS
+
+    def test_partial_interval_ms_is_raised_to_the_session_floor(self, tmp_path: Path) -> None:
+        stt = _loaded_stt(tmp_path, {"partial_interval_ms": 1})
+        assert stt.partial_interval_ms == stt_limits.MIN_PARTIAL_INTERVAL_MS
+
+    def test_the_vad_does_not_re_clamp_what_the_loader_stored(self, tmp_path: Path, caplog) -> None:
+        """Run the loaded value through the real enforcer.
+
+        ``Endpointer`` warns whenever it has to raise the window it was handed, so
+        silence is the observable proof that the two floors are one number rather
+        than two that happen to match today.
+        """
+        from kiro_crew.stt.vad import Endpointer
+
+        stt = _loaded_stt(tmp_path, {"silence_ms": 1})
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.stt.vad"):
+            caplog.clear()
+            Endpointer(silence_ms=stt.silence_ms)
+        assert [r.message for r in caplog.records if r.name == "kiro_crew.stt.vad"] == []
+
+    def test_a_numeric_string_is_coerced_and_then_clamped(self, tmp_path: Path) -> None:
+        """Older writers stored these as strings, and the raw-dict bounds pass skips
+        anything that is not already an int, so the coercion site is the only place
+        the range is actually enforced."""
+        stt = _loaded_stt(tmp_path, {"silence_ms": "1", "partial_interval_ms": "1"})
+        assert stt.silence_ms == stt_limits.MIN_SILENCE_MS
+        assert stt.partial_interval_ms == stt_limits.MIN_PARTIAL_INTERVAL_MS
+
+    def test_a_value_inside_the_range_is_stored_verbatim(self, tmp_path: Path) -> None:
+        """The clamp must not be a blanket overwrite: a deliberate setting between
+        the floor and the ceiling has to survive untouched."""
+        inside = stt_limits.MIN_SILENCE_MS + 1
+        cadence = stt_limits.MIN_PARTIAL_INTERVAL_MS + 1
+        stt = _loaded_stt(tmp_path, {"silence_ms": inside, "partial_interval_ms": cadence})
+        assert (stt.silence_ms, stt.partial_interval_ms) == (inside, cadence)
+
+    def test_both_knobs_are_capped_at_the_shared_ceiling(self, tmp_path: Path) -> None:
+        stt = _loaded_stt(
+            tmp_path,
+            {
+                "silence_ms": stt_limits.MAX_INTERVAL_MS * 10,
+                "partial_interval_ms": stt_limits.MAX_INTERVAL_MS * 10,
+            },
+        )
+        assert stt.silence_ms == stt_limits.MAX_INTERVAL_MS
+        assert stt.partial_interval_ms == stt_limits.MAX_INTERVAL_MS
+
+    def test_idle_evict_secs_is_clamped_to_the_range_limits_declares(self, tmp_path: Path) -> None:
+        """Zero is legal and means "release the model as soon as it goes idle", so
+        the floor cannot be raised to 1 without taking away the setting a
+        memory-constrained host needs."""
+        assert _loaded_stt(tmp_path, {"idle_evict_secs": -1}).idle_evict_secs == (
+            stt_limits.MIN_IDLE_EVICT_SECS
+        )
+        assert _loaded_stt(tmp_path, {"idle_evict_secs": 0}).idle_evict_secs == 0
+        assert _loaded_stt(
+            tmp_path, {"idle_evict_secs": stt_limits.MAX_IDLE_EVICT_SECS + 1}
+        ).idle_evict_secs == (stt_limits.MAX_IDLE_EVICT_SECS)
+
+    def test_the_loader_bounds_are_the_ones_limits_owns(self) -> None:
+        """``limits`` exists so a bound is stated once. The floors are imported from
+        it; these three are still spelled out in the loader, so this is the only
+        thing standing between them and a silent divergence.
+        """
+        assert loader_module._STT_INTERVAL_MS_MAX == stt_limits.MAX_INTERVAL_MS
+        assert loader_module._STT_IDLE_EVICT_SECS_MIN == stt_limits.MIN_IDLE_EVICT_SECS
+        assert loader_module._STT_IDLE_EVICT_SECS_MAX == stt_limits.MAX_IDLE_EVICT_SECS
+
+    def test_a_bool_is_not_a_millisecond_count(self, tmp_path: Path) -> None:
+        """``bool`` subclasses ``int``, so a checkbox value that leaked into this key
+        would read as a 1 ms window unless something refuses it. It lands on the
+        default rather than on the floor, which is the difference between "this
+        setting was not usable" and "this setting asked for the fastest cadence"."""
+        stt = _loaded_stt(tmp_path, {"silence_ms": True, "partial_interval_ms": True})
+        assert stt.silence_ms == stt_limits.DEFAULT_SILENCE_MS
+        assert stt.partial_interval_ms == stt_limits.DEFAULT_PARTIAL_INTERVAL_MS
 
 
 # ---------------------------------------------------------------------------
@@ -2727,6 +3166,53 @@ class TestSecurityBoundClamping:
             cfg = _load_from_dict({"session": {"pool_size": 1000}})
         assert cfg.session.pool_size == POOL_SIZE_MAX == 10
 
+    def test_chat_entry_cache_bounds_default_when_absent(self) -> None:
+        """Omitted from config.json, the entry-cache bounds are byte-identical
+        to the previous hardcoded constants (4096 entries / 32 MiB)."""
+        cfg = _load_from_dict({})
+        assert cfg.dashboard.chat_entry_cache_max_entries == 4096
+        assert cfg.dashboard.chat_entry_cache_max_bytes == 32 * 1024 * 1024
+
+    def test_chat_entry_cache_max_entries_clamped_at_both_ends(self) -> None:
+        from kiro_crew.config.loader import (
+            CHAT_ENTRY_CACHE_ENTRIES_MAX,
+            CHAT_ENTRY_CACHE_ENTRIES_MIN,
+        )
+
+        with unittest.mock.patch("kiro_crew.config.loader._log_config_clamp_event"):
+            low = _load_from_dict({"dashboard": {"chat_entry_cache_max_entries": 1}})
+            high = _load_from_dict({"dashboard": {"chat_entry_cache_max_entries": 10**9}})
+        assert low.dashboard.chat_entry_cache_max_entries == CHAT_ENTRY_CACHE_ENTRIES_MIN == 256
+        assert high.dashboard.chat_entry_cache_max_entries == CHAT_ENTRY_CACHE_ENTRIES_MAX == 262144
+
+    def test_chat_entry_cache_max_bytes_clamped_at_both_ends(self) -> None:
+        from kiro_crew.config.loader import (
+            CHAT_ENTRY_CACHE_BYTES_MAX,
+            CHAT_ENTRY_CACHE_BYTES_MIN,
+        )
+
+        with unittest.mock.patch("kiro_crew.config.loader._log_config_clamp_event"):
+            low = _load_from_dict({"dashboard": {"chat_entry_cache_max_bytes": 1024}})
+            high = _load_from_dict({"dashboard": {"chat_entry_cache_max_bytes": 10**12}})
+        assert low.dashboard.chat_entry_cache_max_bytes == CHAT_ENTRY_CACHE_BYTES_MIN
+        assert CHAT_ENTRY_CACHE_BYTES_MIN == 4 * 1024 * 1024
+        assert high.dashboard.chat_entry_cache_max_bytes == CHAT_ENTRY_CACHE_BYTES_MAX
+        assert CHAT_ENTRY_CACHE_BYTES_MAX == 512 * 1024 * 1024
+
+    def test_chat_entry_cache_bounds_in_range_preserved(self) -> None:
+        """A deliberate in-range setting is preserved verbatim -- the clamp must
+        not be a blanket overwrite."""
+        cfg = _load_from_dict(
+            {
+                "dashboard": {
+                    "chat_entry_cache_max_entries": 16384,
+                    "chat_entry_cache_max_bytes": 64 * 1024 * 1024,
+                }
+            }
+        )
+        assert cfg.dashboard.chat_entry_cache_max_entries == 16384
+        assert cfg.dashboard.chat_entry_cache_max_bytes == 64 * 1024 * 1024
+
     def test_session_start_timeout_default(self) -> None:
         """Omitted from config.json, the budget is the built-in 90s default."""
         cfg = _load_from_dict({})
@@ -2923,6 +3409,123 @@ class TestSecurityBoundClamping:
             _log_config_clamp_event("agent.subagent_auto_max", 200, 64, 1, 64)
 
 
+class TestAutocompactPctLoadClamp:
+    """session.autocompact_pct clamps into the documented 5-90 range at load
+    time (issue #4734).
+
+    The dashboard config API rejected out-of-range writes but a hand-edited
+    config.json loaded verbatim: at 500 the autocompactor trigger
+    (``pct >= autocompact_pct``) can never fire, silently disabling the
+    context-window backstop, and at 0 or below it fires on every turn.
+    """
+
+    def test_above_range_clamped_to_max(self) -> None:
+        from kiro_crew.config.loader import AUTOCOMPACT_PCT_MAX
+
+        cfg = _load_from_dict({"session": {"autocompact_pct": 500}})
+        assert cfg.session.autocompact_pct == AUTOCOMPACT_PCT_MAX == 90.0
+
+    def test_negative_clamped_to_min(self) -> None:
+        from kiro_crew.config.loader import AUTOCOMPACT_PCT_MIN
+
+        cfg = _load_from_dict({"session": {"autocompact_pct": -10}})
+        assert cfg.session.autocompact_pct == AUTOCOMPACT_PCT_MIN == 5.0
+
+    def test_zero_clamped_to_min(self) -> None:
+        """0 would fire auto-compaction on every turn; clamped UP to the floor."""
+        cfg = _load_from_dict({"session": {"autocompact_pct": 0}})
+        assert cfg.session.autocompact_pct == 5.0
+
+    def test_in_range_value_preserved(self) -> None:
+        cfg = _load_from_dict({"session": {"autocompact_pct": 75.5}})
+        assert cfg.session.autocompact_pct == 75.5
+
+    def test_default_when_omitted(self) -> None:
+        """An omitted key takes the module default, not a clamp bound. Asserted
+        against the constant rather than a literal so the two cannot drift: a
+        ``load()`` fallback restated as its own literal still fails here."""
+        from kiro_crew.config.loader import DEFAULT_AUTOCOMPACT_PCT
+
+        cfg = _load_from_dict({})
+        assert cfg.session.autocompact_pct == DEFAULT_AUTOCOMPACT_PCT
+
+    def test_load_range_and_dashboard_validator_share_one_constant(self) -> None:
+        """Drift guard: the dashboard write-gate bounds for
+        ``session.autocompact_pct`` must BE the loader's clamp constants — the
+        same objects, not two sets of literals that can drift apart (the drift
+        is exactly how the load path lost the range in the first place)."""
+        from kiro_crew.config.loader import AUTOCOMPACT_PCT_MAX, AUTOCOMPACT_PCT_MIN
+        from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
+
+        spec = _EDITABLE_CONFIG["session.autocompact_pct"]
+        assert spec["type"] == "float"
+        assert spec["min"] is AUTOCOMPACT_PCT_MIN
+        assert spec["max"] is AUTOCOMPACT_PCT_MAX
+        assert (AUTOCOMPACT_PCT_MIN, AUTOCOMPACT_PCT_MAX) == (5.0, 90.0)
+
+
+class TestPoolSizeDefaultSingleSource:
+    """``session.pool_size`` has TWO independent paths to its default and they
+    must not be able to disagree.
+
+    A home with no ``config.json`` at all constructs ``SessionConfig()`` and
+    takes the dataclass field default; a home WITH a ``config.json`` that omits
+    the key reaches ``load()``'s file-parse fallback instead. An install that has
+    run setup is always the second case, so a literal at the parse site decides
+    the real default for essentially every host while the field default decides
+    what the schema, the docs, and a never-set-up home report. The disagreement
+    is invisible on disk: nothing serializes the difference, and each pooled slot
+    it silently buys is a kiro-cli process plus that agent's MCP stdio servers.
+    """
+
+    def test_field_default_reads_the_shared_constant(self) -> None:
+        assert loader_module.DEFAULT_POOL_SIZE == 0
+        assert (
+            SessionConfig.__dataclass_fields__["pool_size"].default
+            == loader_module.DEFAULT_POOL_SIZE
+        )
+        assert SessionConfig().pool_size == loader_module.DEFAULT_POOL_SIZE
+
+        # A dataclass default is bound at class creation, so no runtime
+        # assertion can tell a literal that happens to equal the constant from
+        # the constant itself. Read the declaration to close that gap: a literal
+        # here is exactly how the two spellings come apart.
+        decl = re.search(
+            r"pool_size:\s*int\s*=\s*field\(\s*default=([^,\s]+)\s*,",
+            inspect.getsource(SessionConfig),
+        )
+        assert decl is not None, "SessionConfig.pool_size field declaration not found"
+        assert decl.group(1) == "DEFAULT_POOL_SIZE"
+
+    def test_omitted_key_and_absent_file_agree(self) -> None:
+        """The behavioural invariant, stated without naming a value: whether a
+        config file omits ``pool_size``, omits the whole ``session`` block, or
+        does not exist, all three land on the same warm-pool size."""
+        omits_key = _load_from_dict({"session": {"timeout_secs": 1800}}).session.pool_size
+        omits_section = _load_from_dict({"agent": {"provider": "acp"}}).session.pool_size
+        no_file = _load_absent_config().session.pool_size
+
+        assert omits_key == omits_section == no_file == loader_module.DEFAULT_POOL_SIZE
+
+    def test_parse_fallback_holds_no_literal_of_its_own(self) -> None:
+        """Repoint the constant and the file-parse path must follow it.
+
+        This is what makes the constant the ONLY definition rather than merely
+        one that happens to agree today: with a literal at the parse site, the
+        loaded value ignores the repoint and this fails.
+        """
+        with unittest.mock.patch.object(loader_module, "DEFAULT_POOL_SIZE", 7):
+            assert _load_from_dict({"session": {}}).session.pool_size == 7
+            # The same fallback catches an unparseable value, so it must be
+            # sourced from the constant there too.
+            assert _load_from_dict({"session": {"pool_size": "two"}}).session.pool_size == 7
+
+    def test_explicit_value_still_wins_over_the_default(self) -> None:
+        """The reconciliation must not swallow a configured pool."""
+        assert _load_from_dict({"session": {"pool_size": 2}}).session.pool_size == 2
+        assert _load_from_dict({"session": {"pool_size": 0}}).session.pool_size == 0
+
+
 class TestConfigWriteProtection:
     """config.json / config.local.json are WRITE-protected (reads allowed)."""
 
@@ -2964,62 +3567,6 @@ class TestConfigWriteProtection:
         assert is_sensitive_write_path("~/.kiro/crew/sessions.db") is False
         assert is_sensitive_write_path("~/.kirocrew/sessions.db") is False
 
-    def test_migration_marker_is_write_protected(self) -> None:
-        # The data-home completion marker is authoritative: an agent that could
-        # plant it in a pre-migration new home would make the next boot skip
-        # migration and ignore the legacy home's governance + secrets. Writes
-        # blocked; reads allowed (doctor/diagnostics read it).
-        from kiro_crew.config.paths import MIGRATION_MARKER_NAME
-        from kiro_crew.security import is_sensitive_path, is_sensitive_write_path
-
-        for prefix in ("~/.kiro/crew", "~/.kirocrew"):
-            marker = f"{prefix}/{MIGRATION_MARKER_NAME}"
-            assert is_sensitive_write_path(marker), marker
-            assert is_sensitive_write_path(str(Path.home() / prefix[2:] / MIGRATION_MARKER_NAME))
-            # reads are not blocked (superset gate is write-only for this leaf)
-            assert is_sensitive_path(marker) is False, marker
-
-    def test_migration_marker_shell_writes_blocked_reads_allowed(self) -> None:
-        # Bash-layer protection: unlike config.json (whose inflated values the
-        # loader clamps at load time), the marker's mere PRESENCE is the trust
-        # signal, so a shell command that plants/removes it must be blocked at
-        # the bash gate too — the file-edit tool gate alone is not enough. We
-        # block it VERB-INDEPENDENTLY (any command naming it), so a quoted
-        # redirect / cp / python open / novel write verb cannot bypass an
-        # enumerated allowlist. Reads are incidentally blocked too — harmless:
-        # the marker holds no secret and legitimate readers (doctor, migration)
-        # use Python os calls, not bash.
-        from kiro_crew.config.paths import MIGRATION_MARKER_NAME
-        from kiro_crew.security import (
-            _WRITE_PROTECTED_BASH_LEAVES,
-            is_sensitive_bash_command,
-        )
-
-        # drift guard: the bash leaf list must stay pinned to the real marker
-        assert MIGRATION_MARKER_NAME in _WRITE_PROTECTED_BASH_LEAVES
-
-        for prefix in ("~/.kiro/crew", "~/.kirocrew"):
-            marker = f"{prefix}/{MIGRATION_MARKER_NAME}"
-            blocked = [
-                f"touch {marker}",
-                f"echo done > {marker}",
-                f"echo done >> {marker}",
-                f"rm {marker}",
-                f"tee {marker}",
-                f"mv /tmp/x {marker}",
-                # bypasses an enumerated write-verb allowlist would miss:
-                f'echo done > "{marker}"',  # quoted redirect target
-                f"cp /tmp/x {marker}",  # copy write verb
-                f"python -c \"open('{marker}','w')\"",  # script open
-                f"mkdir -p {marker}/x",  # marker-as-dir also exists()
-                f"cat {marker}",  # read (blocked too — no secret)
-            ]
-            for cmd in blocked:
-                assert is_sensitive_bash_command(cmd) is not None, cmd
-            # unrelated writes under the crew home stay allowed
-            assert is_sensitive_bash_command(f"touch {prefix}/sessions.db") is None
-            assert is_sensitive_bash_command(f"ls {prefix}/") is None
-
 
 class TestConfigEditToolBlocked:
     """The file-edit tool gate (HookManager.on_tool_call) denies edits to config."""
@@ -3053,6 +3600,56 @@ class TestConfigEditToolBlocked:
             raw_params={"path": "~/.kirocrew/workspace/notes.md"},
         )
         assert result.action != "deny"
+
+
+class TestFeishuConfigCoercionFailsClosed:
+    """A malformed feishu section must degrade to deny, never open a gate.
+
+    Two layers hold this: the schema type check rejects a wrong-typed value and
+    substitutes the field default, and the per-channel parse uses ``_safe_bool``
+    / ``_coerce_opaque_str_ids`` rather than raw ``bool()`` and comprehensions.
+    These tests pin the OBSERVABLE end state, so the guarantee survives either
+    layer being refactored.
+    """
+
+    def test_string_false_does_not_open_the_group_gate(self) -> None:
+        cfg = _load_from_dict(
+            {
+                "feishu": {
+                    "enabled": "true",
+                    "allow_group": "false",
+                    "allowed_group_ids": ["oc_g1"],
+                }
+            }
+        )
+        assert cfg.feishu.allow_group is False
+        assert cfg.feishu.enabled is False
+
+    def test_real_bools_are_preserved(self) -> None:
+        cfg = _load_from_dict({"feishu": {"enabled": True, "allow_group": True}})
+        assert cfg.feishu.enabled is True
+        assert cfg.feishu.allow_group is True
+
+    def test_null_id_lists_do_not_crash_config_load(self) -> None:
+        # A null or non-list value must yield the deny-everybody default rather
+        # than reaching an iteration that would raise during gateway startup.
+        cfg = _load_from_dict({"feishu": {"allowed_open_ids": None, "allowed_group_ids": "oc_g1"}})
+        assert cfg.feishu.allowed_open_ids == []
+        assert cfg.feishu.allowed_group_ids == []
+
+    def test_opaque_ids_survive_and_are_deduped(self) -> None:
+        # Feishu ids are opaque (ou_/oc_ prefixes), so a digit-only filter would
+        # drop every entry and lock out the intended senders.
+        cfg = _load_from_dict(
+            {
+                "feishu": {
+                    "allowed_open_ids": ["ou_abc123", "  ou_abc123 ", "", "ou_zzz"],
+                    "allowed_group_ids": ["oc_g1"],
+                }
+            }
+        )
+        assert cfg.feishu.allowed_open_ids == ["ou_abc123", "ou_zzz"]
+        assert cfg.feishu.allowed_group_ids == ["oc_g1"]
 
 
 class TestTelegramAllowedUserIdsGuard:
@@ -3157,6 +3754,41 @@ class TestAppsAllowThirdParty:
     def test_non_boolean_values_fail_closed(self, value) -> None:
         cfg = _load_from_dict({"agent": {"apps_allow_third_party": value}})
         assert cfg.agent.apps_allow_third_party is False
+
+
+class TestTrustedAppRepositories:
+    def test_defaults_to_empty(self) -> None:
+        assert AgentConfig().apps_trusted_repositories == {}
+        assert _load_from_dict({}).agent.apps_trusted_repositories == {}
+
+    def test_string_bindings_round_trip_and_junk_is_dropped(self) -> None:
+        cfg = _load_from_dict(
+            {
+                "agent": {
+                    "apps_trusted_repositories": {
+                        "good-app": "https://example.test/owner/repo",
+                        "bad-value": 5,
+                    }
+                }
+            }
+        )
+        assert cfg.agent.apps_trusted_repositories == {
+            "good-app": "https://example.test/owner/repo"
+        }
+        assert cfg.to_dict()["agent"]["apps_trusted_repositories"] == {
+            "good-app": "https://example.test/owner/repo"
+        }
+
+
+class TestTrustedLocalApps:
+    def test_defaults_to_empty(self) -> None:
+        assert AgentConfig().apps_trusted_local == []
+        assert _load_from_dict({}).agent.apps_trusted_local == []
+
+    def test_string_markers_round_trip_and_junk_is_dropped(self) -> None:
+        cfg = _load_from_dict({"agent": {"apps_trusted_local": ["local-app", 5, "", None]}})
+        assert cfg.agent.apps_trusted_local == ["local-app"]
+        assert cfg.to_dict()["agent"]["apps_trusted_local"] == ["local-app"]
 
 
 def test_heartbeat_default_deliver_default_is_slack():
@@ -3549,9 +4181,7 @@ class TestOrchestratorWatchdogThemeAreParsed:
                 captured.append(kwargs)
 
         monkeypatch.setattr(acp_mod, "AcpProvider", _FakeProvider)
-        cfg = _load_from_dict(
-            {"agents": {"pr-reviewer": {"kiro_agent": "pr-reviewer-kiro"}}}
-        )
+        cfg = _load_from_dict({"agents": {"pr-reviewer": {"kiro_agent": "pr-reviewer-kiro"}}})
         factory = cfg.create_provider_factory()
 
         factory("k1", agent="pr-reviewer-kiro", crew_agent="pr-reviewer")
@@ -3659,8 +4289,10 @@ class TestMalformedConfigNeverBricksLoad:
 
     def test_non_numeric_int_field_falls_back(self) -> None:
         # Pre-fix: ValueError: invalid literal for int() with base 10: 'two'.
+        # The fallback is the field's own default, read from the one constant
+        # that defines it rather than restated here.
         cfg = _load_from_dict({"session": {"pool_size": "two"}})
-        assert cfg.session.pool_size == 2
+        assert cfg.session.pool_size == loader_module.DEFAULT_POOL_SIZE
 
     def test_non_numeric_float_field_falls_back(self) -> None:
         cfg = _load_from_dict({"agent": {"subagent_cost_gb": "lots"}})
@@ -4971,10 +5603,9 @@ class TestMigrationBackupContainment:
     _LEGACY = {"telegram": {"allow_forum": True}}
 
     def _load_with(self, home: Path, cfg_file: Path) -> KiroCrewConfig:
-        with unittest.mock.patch(
-            "kiro_crew.config.loader.config_dir", return_value=home
-        ), unittest.mock.patch(
-            "kiro_crew.config.loader.config_path", return_value=cfg_file
+        with (
+            unittest.mock.patch("kiro_crew.config.loader.config_dir", return_value=home),
+            unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_file),
         ):
             return KiroCrewConfig.load()
 
@@ -4994,8 +5625,8 @@ class TestMigrationBackupContainment:
         # Guard the guard: assert the migration branch actually ran, otherwise
         # this test would pass for the wrong reason if that branch stops firing.
         assert cfg.agents, "migration write-back did not run, test is vacuous"
-        assert after == before, (
-            "load() left orphans beside the caller's config: %s" % sorted(after - before)
+        assert after == before, "load() left orphans beside the caller's config: %s" % sorted(
+            after - before
         )
 
     def test_real_config_in_the_data_home_is_still_backed_up(self, tmp_path: Path) -> None:
@@ -5050,3 +5681,359 @@ class TestMigrationBackupContainment:
         # But the on-disk config is untouched, so the migration retries next load.
         assert json.loads(cfg_file.read_text(encoding="utf-8")) == json.loads(original)
         assert not (home / "config.json.bak").exists()
+
+
+# Transports carrying a soft/hard context-threshold pair, and those carrying
+# only the soft nudge (their hard backstop is the backend autocompactor).
+# A future transport that forgets _threshold_pct / _normalize_threshold_pair
+# fails these tests rather than shipping an unclamped read.
+_THRESHOLD_PAIR_TRANSPORTS = ["weixin", "webex", "teams", "wecom", "whatsapp", "imessage"]
+_THRESHOLD_SOFT_ONLY_TRANSPORTS = ["telegram", "discord"]
+
+
+class TestTransportThresholdConsistency:
+    """Every transport's context thresholds share ONE validation.
+
+    Locks in the invariant that validity is a property of the type: the loader
+    coerces every read through _threshold_pct (clamped to 1..100) and each
+    dataclass's __post_init__ normalizes its fields (pair transports also
+    enforce soft <= hard), so neither a hand-edited config nor a
+    code-constructed object can hold an out-of-range or inverted value.
+    """
+
+    @staticmethod
+    def _section(cfg, transport: str):
+        return getattr(cfg, transport)
+
+    @pytest.mark.parametrize(
+        "transport", _THRESHOLD_PAIR_TRANSPORTS + _THRESHOLD_SOFT_ONLY_TRANSPORTS
+    )
+    def test_defaults_when_missing(self, transport: str) -> None:
+        section = self._section(_load_from_dict({transport: {}}), transport)
+        assert section.soft_threshold_pct == 80
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            assert section.hard_threshold_pct == 95
+
+    @pytest.mark.parametrize(
+        "transport", _THRESHOLD_PAIR_TRANSPORTS + _THRESHOLD_SOFT_ONLY_TRANSPORTS
+    )
+    @pytest.mark.parametrize("raw", [-5, 0, 101, 10_000])
+    def test_out_of_range_values_are_clamped(self, transport: str, raw: int) -> None:
+        payload: dict = {"soft_threshold_pct": raw}
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            payload["hard_threshold_pct"] = raw
+        section = self._section(_load_from_dict({transport: payload}), transport)
+        assert 1 <= section.soft_threshold_pct <= 100
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            assert 1 <= section.hard_threshold_pct <= 100
+            assert section.soft_threshold_pct <= section.hard_threshold_pct
+
+    @pytest.mark.parametrize("transport", _THRESHOLD_PAIR_TRANSPORTS)
+    def test_soft_above_hard_is_corrected(self, transport: str) -> None:
+        # An inverted pair (soft=90, hard=50) would make the soft nudge
+        # unreachable -- the transports check pct >= hard first.
+        section = self._section(
+            _load_from_dict({transport: {"soft_threshold_pct": 90, "hard_threshold_pct": 50}}),
+            transport,
+        )
+        assert section.hard_threshold_pct == 50
+        assert section.soft_threshold_pct == 50
+
+    @pytest.mark.parametrize(
+        "transport", _THRESHOLD_PAIR_TRANSPORTS + _THRESHOLD_SOFT_ONLY_TRANSPORTS
+    )
+    def test_non_numeric_values_fall_back_to_defaults(self, transport: str) -> None:
+        payload: dict = {"soft_threshold_pct": "abc"}
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            payload["hard_threshold_pct"] = None
+        section = self._section(_load_from_dict({transport: payload}), transport)
+        assert section.soft_threshold_pct == 80
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            assert section.hard_threshold_pct == 95
+
+    @pytest.mark.parametrize(
+        "transport", _THRESHOLD_PAIR_TRANSPORTS + _THRESHOLD_SOFT_ONLY_TRANSPORTS
+    )
+    def test_code_constructed_object_is_normalized(self, transport: str) -> None:
+        # __post_init__ makes an object constructed in code valid too, not just
+        # one loaded from disk.
+        cls = {
+            "telegram": loader_module.TelegramConfig,
+            "weixin": loader_module.WeixinConfig,
+            "discord": loader_module.DiscordConfig,
+            "webex": loader_module.WebexConfig,
+            "teams": loader_module.TeamsConfig,
+            "wecom": loader_module.WeComConfig,
+            "whatsapp": loader_module.WhatsAppConfig,
+            "imessage": loader_module.IMessageConfig,
+        }[transport]
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            obj = cls(soft_threshold_pct=150, hard_threshold_pct=-3)
+            assert obj.hard_threshold_pct == 1
+            assert obj.soft_threshold_pct == 1
+        else:
+            obj = cls(soft_threshold_pct=150)
+            assert obj.soft_threshold_pct == 100
+
+    @pytest.mark.parametrize(
+        "transport", _THRESHOLD_PAIR_TRANSPORTS + _THRESHOLD_SOFT_ONLY_TRANSPORTS
+    )
+    def test_an_integral_float_is_honoured_on_a_shipped_install(
+        self, transport: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A threshold written as ``90.0`` is the value the operator chose.
+
+        Asserted with the schema layer OFF, because that is the shipped
+        configuration: ``jsonschema`` is a dev-only dependency, so on a user's
+        install ``validate_config_data`` returns early and its
+        ``_coerce_legacy_numeric_values`` pre-pass -- which is what turns an
+        integral float into an int -- never runs. The loader's own coercion is
+        then the only one there is, and the shared ``_threshold_pct`` accepts an
+        integral float where a hand-rolled ``int(str(raw))`` raises on ``"90.0"``
+        and silently substitutes the default. That channel would keep firing at
+        80 for someone who configured 90, with nothing logged.
+
+        Leaving jsonschema installed here (as CI does) makes this pass against a
+        hand-rolled clamp too, which is exactly the mistake that hides the bug.
+        """
+        import kiro_crew.config.validation as validation
+
+        monkeypatch.setattr(validation, "_HAS_JSONSCHEMA", False)
+        payload: dict = {"soft_threshold_pct": 90.0}
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            payload["hard_threshold_pct"] = 99.0
+        section = self._section(_load_from_dict({transport: payload}), transport)
+        assert section.soft_threshold_pct == 90
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            assert section.hard_threshold_pct == 99
+
+    def test_telegram_account_soft_threshold_clamped(self) -> None:
+        # Deprecated/inert telegram.accounts entries still parse through the
+        # same coercion so a round-tripped config stays in range.
+        cfg = _load_from_dict(
+            {
+                "telegram": {
+                    "accounts": {"acct-1": {"bot_token": "123:abc", "soft_threshold_pct": 400}}
+                }
+            }
+        )
+        assert cfg.telegram.accounts["acct-1"].soft_threshold_pct == 100
+
+
+#: One non-default sample per ``WeComConfig`` field, keyed by field name. The map
+#: must cover EVERY field: ``load()`` enumerates the section's keys by hand, so a
+#: field added to the dataclass but forgotten there loads as its default and is
+#: then written back as its default — the operator's setting is both ignored and
+#: erased, with nothing failing — a key that looks wired (it appears in the config
+#: schema, which IS derived from the dataclass) while being discarded at load. This
+#: map is the ratchet: a new field fails the test below until a sample is added,
+#: which forces the author through the load path.
+_WECOM_FIELD_SAMPLES: dict[str, object] = {
+    "enabled": True,
+    "allowed_users": [{"userid": "zhangsan", "name": "Z"}],
+    "allow_all_users": True,
+    "ws_url": "wss://example.invalid/ws",
+    "soft_threshold_pct": 71,
+    "hard_threshold_pct": 91,
+    "session_folder": "wecom-folder",
+}
+
+
+class TestWeComSectionSurvivesLoad:
+    def test_the_sample_map_covers_every_field(self) -> None:
+        import dataclasses
+
+        declared = {f.name for f in dataclasses.fields(loader_module.WeComConfig)}
+        missing = declared - set(_WECOM_FIELD_SAMPLES)
+        assert not missing, (
+            f"WeComConfig gained field(s) {sorted(missing)} with no sample here. Add one, "
+            "and check KiroCrewConfig.load() actually reads the key -- it enumerates them "
+            "by hand, so an omission silently discards the operator's value."
+        )
+        assert not set(_WECOM_FIELD_SAMPLES) - declared, "sample for a field that no longer exists"
+
+    @pytest.mark.parametrize("field_name", sorted(_WECOM_FIELD_SAMPLES))
+    def test_each_configured_value_survives_load(self, field_name: str) -> None:
+        sample = _WECOM_FIELD_SAMPLES[field_name]
+        cfg = _load_from_dict({"wecom": {field_name: sample}})
+        loaded = getattr(cfg.wecom, field_name)
+        default = getattr(loader_module.WeComConfig(), field_name)
+        assert loaded != default, (
+            f"wecom.{field_name} loaded as its default {default!r} despite being configured "
+            f"as {sample!r} -- KiroCrewConfig.load() is not reading the key"
+        )
+
+    @pytest.mark.parametrize("junk", [None, 7, "zhangsan", {"a": 1}, True])
+    def test_a_non_list_allow_list_degrades_to_empty_rather_than_crashing_load(
+        self, junk: object
+    ) -> None:
+        # An explicit `null`, or any non-list, must not raise out of load(): a
+        # config file the operator can write is not a trusted type, and a TypeError
+        # here prevents STARTUP rather than degrading one setting. A bare string is
+        # the subtle one -- iterating it would char-split into single-letter userids.
+        cfg = _load_from_dict({"wecom": {"allowed_users": junk}})
+        assert cfg.wecom.allowed_users == []
+
+    @pytest.mark.parametrize("field", ["enabled", "allow_all_users"])
+    @pytest.mark.parametrize("junk", ["false", "off", "0", 0, 1, [], {}, None, "true"])
+    def test_a_non_bool_never_turns_a_switch_ON(self, field: str, junk: object) -> None:
+        # `bool("false")` is True, so a JSON string would invert the operator's
+        # intent -- enabling the channel, or opening it to every org member, from a
+        # value that says the opposite. Even the "helpfully" correct-looking "true"
+        # must not enable it: a parse that guesses at a string is the same parse that
+        # cannot refuse "false".
+        cfg = _load_from_dict({"wecom": {field: junk}})
+        assert getattr(cfg.wecom, field) is False
+
+    @pytest.mark.parametrize("field", ["enabled", "allow_all_users"])
+    def test_a_real_bool_still_works(self, field: str) -> None:
+        cfg = _load_from_dict({"wecom": {field: True}})
+        assert getattr(cfg.wecom, field) is True
+
+
+# Every field same_dispatch_binding() compares — the fields that change what
+# answers a turn. Must stay in lockstep with the method body in
+# config/loader.py.
+_DISPATCH_COMPARED = {
+    "kiro_agent",
+    "workspace_dir",
+    "memory_store_name",
+    "model",
+}
+
+# Fields deliberately EXCLUDED from the comparison. Each reason mirrors the
+# rationale in same_dispatch_binding()'s docstring; the docstring pin below
+# asserts the docstring still names every exempt field.
+_DISPATCH_EXEMPT = {
+    # Two names resolving to one alias's target ARE the same binding.
+    "resolved_alias",
+    # Request metadata the caller checks separately, not dispatch identity.
+    "requested_resolved",
+    # Derived from memory_store_name plus global config shared by both sides.
+    "effective_memory_config",
+}
+
+
+def _dispatch_field_mutations() -> dict[str, object]:
+    """A type-correct replacement value per field, distinct from the baseline.
+
+    Built fresh per call so no test can corrupt a shared module-level table
+    (the effective_memory_config value is a mutable dict). Passing one entry
+    to dataclasses.replace() changes exactly that field. A new dataclass
+    field must gain an entry here too — the coverage test asserts it.
+    """
+    return {
+        "kiro_agent": "drift-pin-other-agent",
+        "workspace_dir": Path("drift-pin-other-workspace"),
+        "memory_store_name": "drift-pin-other-store",
+        "model": "drift-pin-other-model",
+        "resolved_alias": "drift-pin-other-alias",
+        "requested_resolved": False,
+        "effective_memory_config": {"embedding_provider": "drift-pin-other"},
+    }
+
+
+def _dispatch_bindings() -> ResolvedBindings:
+    """A fully-populated baseline for the dispatch-identity pins below."""
+    return ResolvedBindings(
+        workspace_dir=Path("drift-pin-workspace"),
+        memory_store_name="drift-pin-store",
+        effective_memory_config={"embedding_provider": "drift-pin-base"},
+        kiro_agent="drift-pin-agent",
+        model="drift-pin-model",
+        requested_resolved=True,
+        resolved_alias="drift-pin-alias",
+    )
+
+
+class TestSameDispatchBindingDriftPin:
+    """Pin same_dispatch_binding()'s field set against dataclass drift.
+
+    The method compares the dispatch-relevant fields of ResolvedBindings to
+    decide whether two agent NAMES may share a chat slot (the dashboard's
+    slot agent-conflict guard). Its docstring documents which fields are
+    deliberately excluded, but only these tests ENFORCE that every field IS
+    classified: a new dataclass field fails here and forces the author to
+    decide — dispatch-relevant (add it to _DISPATCH_COMPARED AND to the
+    method body) or exempt (add it to _DISPATCH_EXEMPT with a one-line
+    reason). The pin cannot judge whether that decision is right; its value
+    is that the decision becomes explicit and reviewable instead of silent.
+    """
+
+    def test_every_dataclass_field_is_classified(self) -> None:
+        field_names = {f.name for f in dataclasses.fields(ResolvedBindings)}
+        assert field_names == _DISPATCH_COMPARED | _DISPATCH_EXEMPT, (
+            "ResolvedBindings grew or lost a field without a dispatch-identity "
+            "decision. Classify every field: dispatch-relevant fields go in "
+            "_DISPATCH_COMPARED AND in same_dispatch_binding()'s body; "
+            "non-identity fields go in _DISPATCH_EXEMPT with a one-line reason. "
+            "Either way, add a distinct replacement value to "
+            "_dispatch_field_mutations() "
+            f"(unclassified: {sorted(field_names - _DISPATCH_COMPARED - _DISPATCH_EXEMPT)}, "
+            f"stale: {sorted((_DISPATCH_COMPARED | _DISPATCH_EXEMPT) - field_names)})"
+        )
+        assert (
+            _DISPATCH_COMPARED & _DISPATCH_EXEMPT == set()
+        ), "a field cannot be both compared and exempt — remove it from one set"
+
+    def test_mutation_table_covers_every_field(self) -> None:
+        field_names = {f.name for f in dataclasses.fields(ResolvedBindings)}
+        assert set(_dispatch_field_mutations()) == field_names, (
+            "_dispatch_field_mutations() must hold exactly one replacement "
+            "value per ResolvedBindings field — the behavior pins below "
+            "iterate it"
+        )
+
+    def test_mutation_table_actually_changes_each_field(self) -> None:
+        # Guards the pins below: a mutation equal to the baseline value would
+        # make the compared-field test pass vacuously.
+        base = _dispatch_bindings()
+        for name, value in _dispatch_field_mutations().items():
+            assert value != getattr(base, name), name
+
+    def test_equal_but_distinct_instances_are_the_same_binding(self) -> None:
+        # Reflexivity/symmetry floor: dispatch identity must come from field
+        # VALUES, not object identity.
+        a = _dispatch_bindings()
+        b = _dispatch_bindings()
+        assert a is not b
+        assert a.same_dispatch_binding(a)
+        assert a.same_dispatch_binding(b)
+        assert b.same_dispatch_binding(a)
+
+    @pytest.mark.parametrize("field_name", sorted(_DISPATCH_COMPARED))
+    def test_mutating_a_compared_field_breaks_dispatch_identity(self, field_name: str) -> None:
+        base = _dispatch_bindings()
+        mutations = _dispatch_field_mutations()
+        mutated = dataclasses.replace(base, **{field_name: mutations[field_name]})
+        assert not base.same_dispatch_binding(mutated), (
+            f"same_dispatch_binding() ignored {field_name!r}, which "
+            "_DISPATCH_COMPARED declares dispatch-relevant — the method body "
+            "and the declared set have drifted apart"
+        )
+        assert not mutated.same_dispatch_binding(
+            base
+        ), f"same_dispatch_binding() is asymmetric on {field_name!r}"
+
+    @pytest.mark.parametrize("field_name", sorted(_DISPATCH_EXEMPT))
+    def test_mutating_an_exempt_field_keeps_dispatch_identity(self, field_name: str) -> None:
+        base = _dispatch_bindings()
+        mutations = _dispatch_field_mutations()
+        mutated = dataclasses.replace(base, **{field_name: mutations[field_name]})
+        assert base.same_dispatch_binding(mutated), (
+            f"same_dispatch_binding() compares {field_name!r}, which "
+            "_DISPATCH_EXEMPT declares excluded — update the exempt set or "
+            "the method, and keep the docstring rationale in sync"
+        )
+
+    def test_every_exempt_field_is_named_in_the_method_docstring(self) -> None:
+        # The exempt comments above claim to mirror the method's docstring
+        # rationale; enforce at least that the docstring still names each
+        # exempt field, so the two cannot silently drift apart.
+        doc = ResolvedBindings.same_dispatch_binding.__doc__ or ""
+        for name in sorted(_DISPATCH_EXEMPT):
+            assert name in doc, (
+                "same_dispatch_binding()'s docstring no longer mentions the "
+                f"exempt field {name!r} — restore the exclusion rationale or "
+                "reclassify the field"
+            )

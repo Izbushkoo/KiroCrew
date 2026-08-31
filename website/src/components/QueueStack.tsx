@@ -7,6 +7,7 @@ import { useImeGuard } from '../hooks/useImeGuard'
 import { i18nT } from '../i18n/t'
 import { parseRecoveryMessage } from '../pages/chat/RecoveryCard'
 import { hasSubagentCompletionPrefix } from '../pages/chat/subagentCompletion'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 /** System-injected sub-agent completion deliveries waiting for the busy slot.
  *  These are NOT user messages: they must not be editable/cancellable (either
  *  would silently lose a finished agent's result) and rendering each as a
@@ -65,7 +66,14 @@ export function SubagentDeliveryProgress({ count }: { count: number }) {
   if (count <= 0) return null
   return (
     <div
-      className="mx-auto w-full px-4"
+      // `relative z-[2]` clears the transcript's bottom mask. That mask is
+      // `z-[1]` and deliberately overshoots COMPOSER_MASK_OVERSHOOT_PX BELOW the
+      // scrollport edge to sit flush against the composer box — an overshoot
+      // sized for an EMPTY composer status stack. This bar is the first thing in
+      // that stack, so at auto z-index the mask's opaque tail painted over its
+      // top 10px: top border, both top corners and the first line's ascenders
+      // were shaved, which reads as the card being clipped by the UI.
+      className="relative z-[2] mx-auto w-full px-4"
       style={{ maxWidth: 'var(--mc-content-width, 900px)' }}
       data-testid="subagent-delivery-progress"
     >
@@ -126,10 +134,8 @@ function EditInput({ initial, onCommit, onCancel }: {
         onKeyDown={e => {
           e.stopPropagation()
           if (e.key === 'Enter' && !e.shiftKey) {
-            // Rule 1: single-line input — decline the IME's committing Enter,
-            // nothing else. The commit's own emptiness check stays in commit().
-            if (ime.isComposing(e)) return
-            e.preventDefault(); commit()
+            // The commit's own emptiness check stays in commit().
+            if (ime.claimEnter(e)) commit()
           } else if (e.key === 'Escape') { e.preventDefault(); ime.reset(); cancel() }
         }}
         {...ime.bindComposition({ onBlur: commit })}
@@ -168,6 +174,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
    *  of overlapping it. */
   fuseBelow?: boolean
 }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [_expanded, setExpanded] = useState(false)
   const expanded = _expanded && messages.length > 1
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -228,7 +235,14 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
   }
 
   return (
-    <div className="px-4 mx-auto w-full relative" style={{ maxWidth: 'var(--mc-content-width, 900px)', zIndex: 0 }}>
+    // `zIndex: 2` clears the transcript's bottom mask (`z-[1]`), whose
+    // COMPOSER_MASK_OVERSHOOT_PX tail reaches below the scrollport edge on the
+    // premise that the composer's own gap is what sits there. When this stack is
+    // the first thing under the transcript the tail lands on the front card
+    // instead and shaved its top border and corners. Still far below the
+    // composer's own `z-10`, so the collapsed card's -OVERLAP fuse keeps sliding
+    // UNDER the input box rather than over it.
+    <div className="px-4 mx-auto w-full relative" style={{ maxWidth: 'var(--mc-content-width, 900px)', zIndex: 2 }}>
       <motion.div
         className="relative cursor-pointer"
         animate={{ height: targetHeight }}

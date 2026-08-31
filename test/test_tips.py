@@ -756,6 +756,51 @@ class TestStateFilePermissions:
             _save_state(TipsState())
             assert (st_file.stat().st_mode & 0o777) == 0o600
 
+    def test_lockdown_precedes_content(self, tmp_path: Path, monkeypatch) -> None:
+        """The memory-derived payload must never exist in a file that has not
+        been locked down yet.
+
+        On Windows the POSIX mode bits are a no-op, so the owner-only DACL from
+        ``restrict_to_owner`` is the only protection; applying it after the
+        rename left the state readable under the inherited ACL for the write
+        window (issue #5285). Asserted by measuring the file's SIZE at lockdown
+        time — zero means no payload byte existed yet. A post-write stat passes
+        on the buggy ordering too, so it would not be a regression test.
+        """
+        from kiro_crew import platform_compat
+
+        sizes: list[int] = []
+        real_restrict = platform_compat.restrict_to_owner
+
+        def _measuring_restrict(target):
+            sizes.append(Path(target).stat().st_size)
+            return real_restrict(target)
+
+        monkeypatch.setattr(platform_compat, "restrict_to_owner", _measuring_restrict)
+        with patch.dict(os.environ, {"KIROCREW_HOME": str(tmp_path)}):
+            _save_state(TipsState(tips=[{"id": "x", "why": "references user projects"}]))
+
+        assert sizes, "premise: the lockdown ran at all"
+        assert sizes[0] == 0, (
+            f"the file already held payload bytes when it was locked down: {sizes[0]} bytes"
+        )
+
+    def test_a_failed_lockdown_still_persists_the_state(self, tmp_path: Path, monkeypatch) -> None:
+        """``restrict_on_error="warn"`` keeps this site's established policy: a
+        lockdown failure must not break tips persistence, but it must be
+        visible (the helper logs it)."""
+        from kiro_crew import platform_compat
+
+        def _refuse(_target):
+            raise OSError("read-only ACL store")
+
+        monkeypatch.setattr(platform_compat, "restrict_to_owner", _refuse)
+        with patch.dict(os.environ, {"KIROCREW_HOME": str(tmp_path)}):
+            _save_state(TipsState(dismissed_docs=["a.md"]))
+            st_file = tmp_path / "tips_state.json"
+            assert st_file.is_file(), "warn policy must keep the write"
+            assert json.loads(st_file.read_text())["dismissed_docs"] == ["a.md"]
+
 
 class TestTipFieldAllowlist:
     """Codex round-12 (HIGH): unknown/extra LLM fields must never survive parse.
@@ -1461,8 +1506,15 @@ class TestCuratedTips:
         ids = [t["id"] for t in tips]
         assert len(ids) == len(set(ids)), "curated tip ids must be unique"
         # A few known KiroCrew-native features must be present.
-        for expected in ("split-view", "command-palette", "warm-pool"):
+        for expected in ("split-view", "command-palette", "warm-pool", "secrets-vault"):
             assert expected in ids
+        # The secrets-vault tip routes to the Secrets settings tab.
+        by_id = {t["id"]: t for t in tips}
+        assert by_id["secrets-vault"]["action"] == {
+            "kind": "route",
+            "label": "Open Secrets settings",
+            "route": "/settings/secrets",
+        }
         for t in tips:
             for k in _TIP_ALLOWED_FIELDS:
                 assert isinstance(t.get(k), str), f"{t.get('id')}.{k} must be a string"
@@ -1729,9 +1781,16 @@ class TestCuratedTips:
                     f"use highlight=key:{entry['configKey']} so the highlight "
                     f"survives a translated dashboard"
                 )
-            assert query["tab"][0] == entry["tab"], (
+            # Navigation state lives in the path now (/settings/<tab>), not in
+            # a ?tab= query param — read the tab from the first segment.
+            route_path = urlparse(route).path
+            assert route_path.startswith("/settings/"), (
+                f"{tip['id']} action route {route!r} is not a settings path URL"
+            )
+            route_tab = route_path.split("/")[2]
+            assert route_tab == entry["tab"], (
                 f"{tip['id']} highlights {anchor!r}, which lives on the "
-                f"{entry['tab']!r} tab, not {query['tab'][0]!r}"
+                f"{entry['tab']!r} tab, not {route_tab!r}"
             )
 
     @pytest.mark.asyncio
@@ -2031,3 +2090,118 @@ class TestRelinkedStateMigration:
         st = self._load(tmp_path, {"tips": [bad]})
         assert st.tips[0]["doc"] == ""
         assert st.tips[0]["doc_link"] == ""
+
+
+class TestFeedbackErrorCodes:
+    """Every refusal from ``POST /api/tips/feedback`` carries a machine-readable
+    ``code``, per the contract gate in ``test/test_error_code_contract.py``.
+
+    The prose stays where it is and keeps its meaning — it is demoted to
+    advisory, not removed — so an existing client that only reads ``error`` is
+    unaffected. What changes is that a client no longer has to match English to
+    tell "the body was not JSON" from "that action does not exist".
+    """
+
+    @staticmethod
+    async def _refuse(tmp_path: Path, raw: bytes) -> tuple[int, dict]:
+        """Drive the REAL handler with *raw* as the request body."""
+        import types
+        from unittest.mock import Mock
+
+        from aiohttp import streams
+        from aiohttp.test_utils import make_mocked_request
+
+        from kiro_crew.tips import TipsCache, api_tips_feedback
+
+        with patch.dict(os.environ, {"KIROCREW_HOME": str(tmp_path)}):
+            cache = TipsCache()
+            cache.state = TipsState()
+            state = types.SimpleNamespace(_tips_cache=cache)
+
+            payload = streams.StreamReader(Mock(_reading_paused=False), 2 ** 16,
+                                           loop=asyncio.get_event_loop())
+            payload.feed_data(raw)
+            payload.feed_eof()
+            req = make_mocked_request("POST", "/api/tips/feedback", payload=payload)
+            req.app["state"] = state
+            resp = await api_tips_feedback(req)
+            return resp.status, json.loads(resp.body)
+
+    @pytest.mark.asyncio
+    async def test_body_is_not_json(self, tmp_path: Path) -> None:
+        status, body = await self._refuse(tmp_path, b"not json at all")
+        assert status == 400
+        assert body["code"] == "invalid_json"
+
+    @pytest.mark.asyncio
+    async def test_body_is_json_but_not_an_object(self, tmp_path: Path) -> None:
+        status, body = await self._refuse(tmp_path, b'["id", "action"]')
+        assert status == 400
+        assert body["code"] == "body_not_object"
+
+    @pytest.mark.asyncio
+    async def test_non_string_id_is_a_type_refusal(self, tmp_path: Path) -> None:
+        status, body = await self._refuse(
+            tmp_path, json.dumps({"id": 7, "action": "ack"}).encode()
+        )
+        assert status == 400
+        assert body["code"] == "invalid_field_type"
+
+    @pytest.mark.asyncio
+    async def test_non_string_action_is_a_type_refusal(self, tmp_path: Path) -> None:
+        status, body = await self._refuse(
+            tmp_path, json.dumps({"id": "t", "action": ["ack"]}).encode()
+        )
+        assert status == 400
+        assert body["code"] == "invalid_field_type"
+
+    @pytest.mark.asyncio
+    async def test_oversized_id_is_a_length_refusal_not_a_type_refusal(
+        self, tmp_path: Path
+    ) -> None:
+        """The 100-char cap and the isinstance checks share one prose string on
+        main. They are different failures — the client fixes them differently —
+        so they must not share one code: a code is API surface that cannot be
+        narrowed later.
+        """
+        status, body = await self._refuse(
+            tmp_path, json.dumps({"id": "x" * 101, "action": "ack"}).encode()
+        )
+        assert status == 400
+        assert body["code"] == "tip_id_too_long"
+
+    @pytest.mark.asyncio
+    async def test_id_at_the_cap_is_accepted(self, tmp_path: Path) -> None:
+        """Boundary: 100 characters is still valid — the split must not move it."""
+        status, _ = await self._refuse(
+            tmp_path, json.dumps({"id": "x" * 100, "action": "helpful"}).encode()
+        )
+        assert status == 200
+
+    @pytest.mark.asyncio
+    async def test_unknown_action(self, tmp_path: Path) -> None:
+        status, body = await self._refuse(
+            tmp_path, json.dumps({"id": "t", "action": "explode"}).encode()
+        )
+        assert status == 400
+        assert body["code"] == "invalid_action"
+
+    @pytest.mark.asyncio
+    async def test_every_refusal_carries_both_a_code_and_its_prose(
+        self, tmp_path: Path
+    ) -> None:
+        """The ratchet for this file: no refusal path may regress to prose-only,
+        and none may drop the advisory text an existing client still reads.
+        """
+        for raw in (
+            b"not json at all",
+            b'["id", "action"]',
+            json.dumps({"id": 7, "action": "ack"}).encode(),
+            json.dumps({"id": "t", "action": ["ack"]}).encode(),
+            json.dumps({"id": "x" * 101, "action": "ack"}).encode(),
+            json.dumps({"id": "t", "action": "explode"}).encode(),
+        ):
+            status, body = await self._refuse(tmp_path, raw)
+            assert status == 400, raw
+            assert isinstance(body.get("code"), str) and body["code"], raw
+            assert isinstance(body.get("error"), str) and body["error"], raw

@@ -2,23 +2,19 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import re
 from pathlib import Path
 from types import ModuleType
+
+from skill_script_helpers import load_skill_script
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "prepare-pr" / "scripts" / "pr_status.py"
 
 
 def _load_script() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("prepare_pr_status", SCRIPT)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_skill_script("prepare_pr_status", SCRIPT)
 
 
 def _pr_payload(checks: list[dict[str, str]], **overrides: object) -> str:
@@ -49,6 +45,7 @@ def _install_fake_gh(
     payload: str,
     comments: str = "[]",
     head_run_events: list[str] | None = None,
+    permissions: dict[str, str] | None = None,
 ) -> None:
     events = ["pull_request"] if head_run_events is None else head_run_events
 
@@ -59,6 +56,11 @@ def _install_fake_gh(
             return 0, payload, ""
         if args[:3] == ["gh", "repo", "view"]:
             return 0, "example/repo", ""
+        if args[:2] == ["gh", "api"] and "/collaborators/" in args[2]:
+            if permissions is None:
+                raise AssertionError("unexpected command: {}".format(args))
+            login = args[2].split("/")[4]
+            return 0, json.dumps({"permission": permissions.get(login, "none")}), ""
         if args[:2] == ["gh", "api"] and "/issues/" in args[2] and "/comments" in args[2]:
             return 0, comments, ""
         if args[:2] == ["gh", "api"] and "/actions/runs" in args[2]:
@@ -317,6 +319,7 @@ def test_report_emits_only_the_consumed_surface(capsys) -> None:
     assert set(report["advisory"]) == {
         "blocking_reviewers",
         "bot_comments_readable",
+        "elided_stamp_reviewers",
         "findings",
         "stale_reviewers",
         "unresolved_threads",
@@ -533,6 +536,198 @@ def test_resolved_closing_reference_silences_the_notice() -> None:
     assert module.closing_link_reason("Fixes #7", [{"number": 7}]) is None
 
 
+def _assert_host_closure_is_unconfirmed(module: ModuleType, body: str, number: int = 7) -> None:
+    reason = module.closing_link_reason(body, [{"number": number}])
+    assert reason is not None
+    assert "no explicit closing trailer" in reason
+    assert "#{}".format(number) in reason
+
+
+def test_backtick_fenced_trailer_does_not_confirm_host_closure() -> None:
+    module = _load_script()
+    body = "```markdown\nFixes #7\n```\nVisible prose accidentally fixes #7."
+    _assert_host_closure_is_unconfirmed(module, body)
+
+
+def test_tilde_fenced_trailer_does_not_confirm_host_closure() -> None:
+    module = _load_script()
+    body = "~~~markdown\nFixes #7\n~~~\nVisible prose accidentally fixes #7."
+    _assert_host_closure_is_unconfirmed(module, body)
+
+
+def test_indented_variable_length_fences_mask_their_contents() -> None:
+    module = _load_script()
+    bodies = (
+        "   ````markdown\nFixes #7\n```\n   `````\nVisible prose fixes #7.",
+        "  ~~~~~text\nFixes #7\n  ~~~~~~\nVisible prose fixes #7.",
+    )
+
+    for body in bodies:
+        _assert_host_closure_is_unconfirmed(module, body)
+
+
+def test_crlf_fenced_trailer_does_not_confirm_host_closure() -> None:
+    module = _load_script()
+    body = "```markdown\r\nFixes #7\r\n```\r\nVisible prose fixes #7."
+    _assert_host_closure_is_unconfirmed(module, body)
+
+
+def test_multiline_html_commented_trailer_does_not_confirm_host_closure() -> None:
+    module = _load_script()
+    body = "<!-- example\nFixes #7\n-->\nVisible prose accidentally fixes #7."
+    _assert_host_closure_is_unconfirmed(module, body)
+
+
+def test_single_line_html_commented_trailer_does_not_confirm_host_closure() -> None:
+    module = _load_script()
+    body = "<!-- Fixes #7 -->\nVisible prose accidentally fixes #7."
+    _assert_host_closure_is_unconfirmed(module, body)
+
+
+def test_visible_trailer_after_fence_still_confirms_host_closure() -> None:
+    module = _load_script()
+    body = "```markdown\nFixes #99\n```\nFixes #7"
+    assert module.closing_link_reason(body, [{"number": 7}]) is None
+
+
+def test_visible_trailer_with_trailing_html_comment_still_confirms() -> None:
+    module = _load_script()
+    body = "Fixes #7 <!-- this explanation is not part of the trailer -->"
+    assert module.closing_link_reason(body, [{"number": 7}]) is None
+
+
+def test_fenced_opt_out_example_does_not_silence_notice() -> None:
+    module = _load_script()
+    body = "```markdown\nno linked issue: example only\n```"
+    reason = module.closing_link_reason(body, [])
+    assert reason is not None
+    assert "no issue link" in reason
+
+
+def test_html_commented_opt_out_example_does_not_silence_notice() -> None:
+    module = _load_script()
+    body = "<!--\nno linked issue: example only\n-->"
+    reason = module.closing_link_reason(body, [])
+    assert reason is not None
+    assert "no issue link" in reason
+
+
+def test_fence_markers_inside_html_comment_do_not_hide_visible_trailer() -> None:
+    module = _load_script()
+    body = "<!--\n```markdown\nFixes #99\n```\n-->\nFixes #7"
+    assert module.closing_link_reason(body, [{"number": 7}]) is None
+
+
+def test_html_comment_markers_inside_fence_do_not_hide_visible_trailer() -> None:
+    module = _load_script()
+    body = "```markdown\n<!--\nFixes #99\n-->\n```\nFixes #7"
+    assert module.closing_link_reason(body, [{"number": 7}]) is None
+
+
+def test_each_host_closure_requires_a_visible_matching_trailer() -> None:
+    module = _load_script()
+    body = (
+        "Fixes #7\n"
+        "```markdown\n"
+        "Fixes #3257\n"
+        "```\n"
+        "Visible prose accidentally fixes #3257."
+    )
+    reason = module.closing_link_reason(body, [{"number": 7}, {"number": 3257}])
+    assert reason is not None
+    assert "#3257" in reason
+    assert "#7" not in reason
+
+
+def test_hidden_issue_examples_do_not_trigger_specific_no_host_warning() -> None:
+    module = _load_script()
+    bodies = (
+        "```markdown\nFixes #7\n```",
+        "<!-- Fixes #7 -->",
+        "The literal example is `Fixes #7`.",
+        "```markdown\n#7\n```",
+    )
+
+    for body in bodies:
+        reason = module.closing_link_reason(body, [])
+        assert reason is not None
+        assert "no issue link" in reason
+
+
+def test_multiline_inline_code_trailer_does_not_confirm_host_closure() -> None:
+    module = _load_script()
+    body = "`\nFixes #7\n`\nVisible prose accidentally fixes #7."
+    _assert_host_closure_is_unconfirmed(module, body)
+
+
+def test_comment_like_fence_info_does_not_hide_visible_trailer() -> None:
+    module = _load_script()
+    body = "```text <!-- example\nFixes #99\n```\nFixes #7"
+    assert module.closing_link_reason(body, [{"number": 7}]) is None
+
+
+def test_empty_or_null_body_stays_advisory() -> None:
+    module = _load_script()
+    for body in (None, ""):
+        reason = module.closing_link_reason(body, [])
+        assert reason is not None
+        assert "no issue link" in reason
+
+
+def test_unterminated_fence_masks_through_end_of_body() -> None:
+    module = _load_script()
+    body = "```markdown\nFixes #7"
+    _assert_host_closure_is_unconfirmed(module, body)
+
+
+def test_visible_prose_mask_preserves_offsets_and_line_boundaries() -> None:
+    module = _load_script()
+    body = "before\r\n```markdown\r\nFixes #7\r\n```\r\nFixes #8"
+    masked = module._visible_markdown_prose(body)
+
+    assert len(masked) == len(body)
+    assert [i for i, char in enumerate(masked) if char == "\n"] == [
+        i for i, char in enumerate(body) if char == "\n"
+    ]
+    assert "Fixes #7" not in masked
+    assert masked.endswith("Fixes #8")
+
+
+def test_oversized_explicit_trailer_degrades_to_advisory() -> None:
+    module = _load_script()
+    runtime = __import__("sys")
+    get_digit_limit = getattr(runtime, "get_int_max_str_digits", None)
+    previous_digit_limit = get_digit_limit() if get_digit_limit is not None else None
+
+    # Python 3.10 has no integer-string digit limit. Disable the 3.11+ limit
+    # while exercising this path so the regression cannot pass merely because
+    # an interpreter-level ValueError happens to protect the parser.
+    if previous_digit_limit is not None:
+        runtime.set_int_max_str_digits(0)
+    try:
+        oversized_number = "9" * 5000
+        body = "Fixes #7\nFixes #{}".format(oversized_number)
+        reason = module.closing_link_reason(body, [{"number": 7}])
+    finally:
+        if previous_digit_limit is not None:
+            runtime.set_int_max_str_digits(previous_digit_limit)
+
+    assert reason is not None
+    assert "malformed explicit closing trailer" in reason
+
+
+def test_malformed_host_issue_numbers_stay_unconfirmed() -> None:
+    module = _load_script()
+    malformed_numbers = (None, "not-a-number", " 7 ", 7.5, True, [], {})
+
+    for malformed_number in malformed_numbers:
+        reason = module.closing_link_reason(
+            "Fixes #7",
+            [{"number": malformed_number}],
+        )
+        assert reason is not None, repr(malformed_number)
+
+
 def test_bare_reference_without_a_verb_is_reported() -> None:
     """The exact shape that merged in #2433/#2439 and closed nothing.
 
@@ -670,16 +865,413 @@ def test_no_reference_at_all_is_reported_with_the_opt_out_named() -> None:
     assert "no linked issue" in reason
 
 
+def test_safe_explicit_opt_out_silences_notice_when_reason_names_an_issue() -> None:
+    module = _load_script()
+    body = (
+        "A follow-up that deliberately closes nothing.\n\n"
+        "no linked issue: #3257 is resolved by the release, not this change."
+    )
+    assert module.closing_link_reason(body, []) is None
+
+
 def test_explicit_opt_out_silences_the_notice() -> None:
     module = _load_script()
     body = "A pure refactor.\n\nno linked issue: no ticket exists for this cleanup."
     assert module.closing_link_reason(body, []) is None
 
 
+def test_host_closure_without_an_explicit_trailer_is_reported() -> None:
+    module = _load_script()
+    body = "no issue closed: #3257 is resolved by the release, not this change."
+    reason = module.closing_link_reason(body, [{"number": 3257}])
+    assert reason is not None
+    assert "no explicit closing trailer" in reason
+
+
+def test_each_host_closure_requires_a_matching_explicit_trailer() -> None:
+    module = _load_script()
+    body = (
+        "Fixes #7\n\n"
+        "no issue closed: #3257 is resolved by the release, not this change."
+    )
+    reason = module.closing_link_reason(body, [{"number": 7}, {"number": 3257}])
+    assert reason is not None
+    assert "#3257" in reason
+    assert "#7" not in reason
+
+    explicit_body = "Fixes #7\nResolves: #3257"
+    assert (
+        module.closing_link_reason(explicit_body, [{"number": 7}, {"number": 3257}])
+        is None
+    )
+
+
+def test_same_number_in_different_repositories_stays_unconfirmed() -> None:
+    module = _load_script()
+    body = "Fixes #7\n\nThe release fixes other/repo#7, not this change."
+    closing_refs = [
+        {
+            "number": 7,
+            "repository": {"name": "repo", "owner": {"login": "example"}},
+        },
+        {
+            "number": 7,
+            "repository": {"name": "repo", "owner": {"login": "other"}},
+        },
+    ]
+    reason = module.closing_link_reason(body, closing_refs)
+    assert reason is not None
+    # One unqualified `Fixes #7` covers ONE closure, so the second repository's
+    # #7 -- named only in prose, never in a trailer -- is reported as undeclared.
+    # This used to read "the same number resolved in multiple repositories",
+    # which said the shape was ambiguous; naming the unaccounted-for closure is
+    # both narrower and true.
+    assert "no explicit closing trailer" in reason
+    assert "#7" in reason
+
+
+def test_two_qualified_trailers_for_one_number_do_not_trigger_a_notice() -> None:
+    """The false positive the "same number twice" notice used to produce.
+
+    Once matching became repository-aware this body was fully accounted for --
+    `Fixes #7` declares this repository's #7 and `Fixes other/repo#7` declares
+    the other one, and the host resolved exactly those two -- yet a
+    duplicate-number branch still fired. An advisory that fires on a correct body
+    is how authors learn to ignore advisories, so the branch is gone: genuine
+    ambiguity is already covered by the undeclared-closure case.
+    """
+    module = _load_script()
+    body = "Fixes #7\nFixes other/repo#7"
+    refs = [_host_ref(7, "example"), _host_ref(7, "other")]
+    assert module.closing_link_reason(body, refs, "example/repo") is None
+
+
+def test_one_wildcard_trailer_cannot_vouch_for_two_repositories() -> None:
+    """A bare `#<n>` with no known repository covers exactly ONE reference.
+
+    The complement of the test above: without a caller-supplied repository the
+    trailer is a wildcard, and one wildcard honestly accounts for one closure.
+    The second is reported rather than silently absorbed.
+    """
+    module = _load_script()
+    refs = [_host_ref(7, "example"), _host_ref(7, "other")]
+    reason = module.closing_link_reason("Fixes #7", refs)
+    assert reason is not None
+    assert "no explicit closing trailer" in reason
+
+    # Repeating the same unqualified trailer does NOT buy a second cover.
+    # `Fixes #7` and `Closes #7` name the same issue in the same (unknown)
+    # repository, so they are one declaration, not two -- writing the trailer
+    # twice cannot account for a closure in a repository the body never names.
+    repeated = module.closing_link_reason("Fixes #7\nCloses #7", refs)
+    assert repeated is not None
+    assert "no explicit closing trailer" in repeated
+
+    # Naming the second repository explicitly is what accounts for it.
+    assert (
+        module.closing_link_reason("Fixes #7\nCloses other/repo#7", refs, "example/repo")
+        is None
+    )
+
+
+def test_full_trailer_grammar_satisfies_the_host_closure_confirmation() -> None:
+    """Any form the accept path calls a trailer must also COUNT as declared.
+
+    One grammar governs both directions. If the confirmation path recognised a
+    narrower set than ``_CLOSING_KW_RE`` accepts, every legitimate bulleted,
+    qualified, URL or multi-reference trailer would be reported as a missing
+    declaration -- an advisory that fires on correct bodies teaches authors to
+    ignore advisories.
+    """
+    module = _load_script()
+    for body in (
+        "Fixes #7",
+        "- Fixes #7",
+        "  * Resolves: #7",
+        "Closes example/repo#7",
+        "Fixes https://github.com/example/repo/issues/7",
+        "Fixes #7.",
+        "Fixes #7 <!-- tracked -->",
+    ):
+        assert module.closing_link_reason(body, [{"number": 7}]) is None, body
+
+    multi = "Fixes #7 and Closes example/repo#8"
+    assert (
+        module.closing_link_reason(multi, [{"number": 7}, {"number": 8}]) is None
+    ), multi
+
+
+def _host_ref(number: int, owner: str, name: str = "repo") -> dict:
+    return {"number": number, "repository": {"name": name, "owner": {"login": owner}}}
+
+
+def test_stale_qualified_trailer_does_not_vouch_for_a_local_closure() -> None:
+    """A trailer for ANOTHER repository must not cover this repository's close.
+
+    The expensive shape: the body carries a stale `Fixes other/repo#7` (which
+    resolves to nothing — wrong or deleted issue) while separate prose forms a
+    close-on-merge trigger for THIS repository's own #7. Matching on the bare
+    number alone let the stale trailer vouch for the resolved closure, so the
+    notice was suppressed and an unrelated issue closed on merge — precisely
+    the failure this advisory exists to catch.
+    """
+    module = _load_script()
+    body = "Fixes other/repo#7\n\nThis also fixes #7 in passing."
+    reason = module.closing_link_reason(
+        body, [_host_ref(7, "example")], "example/repo"
+    )
+    assert reason is not None
+    assert "no explicit closing trailer" in reason
+    assert "#7" in reason
+
+
+def test_qualified_trailer_covers_its_own_repository_closure() -> None:
+    """The same tightening must not fire when the repositories AGREE."""
+    module = _load_script()
+    assert (
+        module.closing_link_reason(
+            "Fixes other/repo#7", [_host_ref(7, "other")], "example/repo"
+        )
+        is None
+    )
+    assert (
+        module.closing_link_reason(
+            "Fixes https://github.com/other/repo/issues/7",
+            [_host_ref(7, "other")],
+            "example/repo",
+        )
+        is None
+    )
+
+
+def test_unqualified_trailer_resolves_to_the_prs_own_repository() -> None:
+    """A bare `#<n>` means THIS repository — it covers a local closure and not
+    a foreign one."""
+    module = _load_script()
+    assert (
+        module.closing_link_reason("Fixes #7", [_host_ref(7, "example")], "example/repo")
+        is None
+    )
+    foreign = module.closing_link_reason(
+        "Fixes #7", [_host_ref(7, "other")], "example/repo"
+    )
+    assert foreign is not None
+    assert "no explicit closing trailer" in foreign
+
+
+def test_repository_matching_is_case_insensitive() -> None:
+    """GitHub owner/repo names are case-insensitive, so the match must be too —
+    otherwise a correctly-cased trailer reads as a foreign repository."""
+    module = _load_script()
+    assert (
+        module.closing_link_reason(
+            "Fixes OTHER/Repo#7", [_host_ref(7, "other", "repo")], "Example/Repo"
+        )
+        is None
+    )
+
+
+def test_unknown_repository_on_either_side_stays_a_wildcard() -> None:
+    """An unknown repository must not manufacture a notice on a correct body.
+
+    A caller that passes no ``repo`` cannot know what a bare `#<n>` means, and a
+    host payload with no ``repository`` object cannot be reconciled — both must
+    keep matching, so the tightening only ever fires on a known disagreement.
+    """
+    module = _load_script()
+    assert module.closing_link_reason("Fixes #7", [{"number": 7}]) is None
+    assert module.closing_link_reason("Fixes other/repo#7", [{"number": 7}]) is None
+    assert (
+        module.closing_link_reason("Fixes #7", [_host_ref(7, "other")], None) is None
+    )
+
+
+def test_space_indented_example_does_not_confirm_host_closure() -> None:
+    """A four-space-indented example is CODE — GitHub resolves nothing from it.
+
+    Companion to the fenced cases: this is Markdown's other code block, and it
+    is how a body written without fences shows an author what a trailer looks
+    like. Crediting it as a declaration suppresses the unrelated-closure notice
+    for a closure that came from somewhere else entirely.
+    """
+    module = _load_script()
+    body = "Write the trailer like this:\n\n    Fixes #7\n\nThis also fixes #7."
+    reason = module.closing_link_reason(body, [{"number": 7}])
+    assert reason is not None
+    assert "no explicit closing trailer" in reason
+
+
+def test_tab_indented_example_does_not_confirm_host_closure() -> None:
+    """A tab reaches the four-column stop, so one tab of indent is refused."""
+    module = _load_script()
+    body = "Example:\n\n\tFixes #7\n\nSeparately this fixes #7 in prose."
+    reason = module.closing_link_reason(body, [{"number": 7}])
+    assert reason is not None
+    assert "no explicit closing trailer" in reason
+
+
+def test_indented_example_spanning_a_blank_line_is_still_refused() -> None:
+    """A blank line inside an indented example changes nothing.
+
+    Under the old block-state approach this pinned "interior blank lines do not
+    end the block". The cap makes that question irrelevant: the trailer's own
+    indentation is what disqualifies it, so no surrounding state has to be
+    modelled correctly for this body to be safe.
+    """
+    module = _load_script()
+    body = "Example:\n\n    first\n\n    Fixes #7\n\nAnd this fixes #7."
+    reason = module.closing_link_reason(body, [{"number": 7}])
+    assert reason is not None
+    assert "no explicit closing trailer" in reason
+
+
+def test_visible_trailer_after_an_indented_example_still_confirms() -> None:
+    """A real trailer that merely FOLLOWS an indented example is still credited --
+    the cap disqualifies the indented line, not everything after it."""
+    module = _load_script()
+    body = "Example:\n\n    Fixes #999\n\nFixes #7"
+    assert module.closing_link_reason(body, [{"number": 7}]) is None
+
+
+def test_a_code_indented_trailer_is_never_a_declaration() -> None:
+    """Four columns of indent is refused REGARDLESS of what precedes it.
+
+    An earlier revision credited this, on the reasoning that a line continuing an
+    open paragraph is lazy continuation which GitHub does resolve. Keeping that
+    carve-out required knowing whether a paragraph was open, and that question is
+    a Markdown parser's job — the approximation was wrong for every block type
+    that closes itself (see the sibling test). The bound replaces the state: a
+    trailer at four or more columns is not a declaration, full stop.
+
+    The cost is this body no longer being credited, which prints an advisory
+    notice on an odd shape. The benefit is that no block type can smuggle an
+    EXAMPLE through as a declaration, which silently suppresses a real warning.
+    """
+    module = _load_script()
+    reason = module.closing_link_reason("Some sentence\n    Fixes #7", [{"number": 7}])
+    assert reason is not None
+    assert "no explicit closing trailer" in reason
+
+    # A tab reaches the same four-column stop, so it is refused identically.
+    tabbed = module.closing_link_reason("Some sentence\n\tFixes #7", [{"number": 7}])
+    assert tabbed is not None
+
+
+def test_self_closing_blocks_cannot_smuggle_an_indented_example() -> None:
+    """The four block types that leaked while paragraph state was tracked.
+
+    An ATX heading, a blockquote, a thematic break and a setext underline all
+    CLOSE their block, so the indented line after them is code — but a tracker
+    that only asked "was the previous line non-blank?" judged each one an open
+    paragraph and let the example through as a declaration. Each was found by
+    probing the shipped function, not by review, which is why they are pinned
+    together: they are one defect, not four.
+    """
+    module = _load_script()
+    for label, body in (
+        ("atx heading", "## Example\n    Fixes #7\n\nSeparately this fixes #7."),
+        ("blockquote", "> Example\n    Fixes #7\n\nSeparately this fixes #7."),
+        ("thematic break", "---\n    Fixes #7\n\nSeparately this fixes #7."),
+        ("setext", "Example\n=======\n    Fixes #7\n\nSeparately this fixes #7."),
+    ):
+        reason = module.closing_link_reason(body, [{"number": 7}])
+        assert reason is not None, label
+        assert "no explicit closing trailer" in reason, label
+
+
+def test_trailer_indent_up_to_three_columns_is_still_accepted() -> None:
+    """The cap is at FOUR — three columns is still prose, and a bulleted trailer
+    indented under the cap must keep working."""
+    module = _load_script()
+    for body in ("Fixes #7", " Fixes #7", "   Fixes #7", "   - Fixes #7"):
+        assert module.closing_link_reason(body, [{"number": 7}]) is None, body
+
+
+def test_list_nested_fenced_example_does_not_confirm_host_closure() -> None:
+    """CommonMark measures fence indent RELATIVE to the container, so a fence
+    inside a list item legitimately sits four or more columns in."""
+    module = _load_script()
+    body = (
+        "- Example:\n"
+        "\n"
+        "      ```\n"
+        "      Fixes #7\n"
+        "      ```\n"
+        "\n"
+        "Separately this fixes #7 in prose."
+    )
+    reason = module.closing_link_reason(body, [{"number": 7}])
+    assert reason is not None
+    assert "no explicit closing trailer" in reason
+
+
+def test_nested_fence_closes_at_its_own_indent() -> None:
+    """A nested block must END at its own closing fence — otherwise the mask
+    runs to the end of the body and swallows a real trailer after it."""
+    module = _load_script()
+    body = (
+        "- Example:\n"
+        "\n"
+        "      ```\n"
+        "      Fixes #999\n"
+        "      ```\n"
+        "\n"
+        "Fixes #7"
+    )
+    assert module.closing_link_reason(body, [{"number": 7}]) is None
+
+
+def test_fence_closer_indent_is_capped_at_three_columns() -> None:
+    """A closer indented four columns is not a closer -- CommonMark's own bound,
+    and the same four-column line the trailer cap draws."""
+    module = _load_script()
+    assert module._is_closing_fence("```", "`", 3) is True
+    assert module._is_closing_fence("   ```", "`", 3) is True
+    assert module._is_closing_fence("    ```", "`", 3) is False
+
+
+def test_list_nested_tilde_fence_example_is_refused() -> None:
+    """A tilde fence nested in a list, with no blank line before it.
+
+    Worth pinning separately because it defeats every mechanism EXCEPT the cap.
+    The fence sits past the three-column fence bound so it is not recognised as
+    a fence; a tilde run has no `_mask_inline_code` equivalent (the backtick
+    version of this body is masked by backtick pairing, which is why it is not
+    the interesting case); and modelling it as code would need the list's own
+    content column. The trailer's indentation settles it without any of that.
+    """
+    module = _load_script()
+    body = (
+        "- Example:\n"
+        "      ~~~\n"
+        "      Fixes #7\n"
+        "      ~~~\n"
+        "\n"
+        "Separately this fixes #7 in prose."
+    )
+    reason = module.closing_link_reason(body, [{"number": 7}])
+    assert reason is not None
+    assert "no explicit closing trailer" in reason
+
+
+def test_an_unterminated_nested_fence_does_not_swallow_a_real_trailer() -> None:
+    """Guards the false-positive an earlier revision introduced.
+
+    Recognising fences at ANY indent meant an unterminated indented fence-looking
+    line masked the rest of the body, so a genuine column-0 `Fixes #7` after it
+    stopped being credited and the notice fired on a correct body. Keeping the
+    three-column fence bound is what prevents that; the trailer cap covers the
+    example case the widening was reaching for, so nothing is lost.
+    """
+    module = _load_script()
+    body = "- Example:\n\n      ~~~\n      stuff\n\nFixes #7"
+    assert module.closing_link_reason(body, [{"number": 7}]) is None
+
+
 def test_opt_out_must_be_a_trailer_not_a_mention() -> None:
     """Prose that merely discusses the check must NOT read as a declaration.
 
-    An unanchored substring match let any body containing the phrase pass —
+    An unanchored substring match lets any body containing the phrase pass —
     including a body that only explains what the phrase is for.
     """
     module = _load_script()
@@ -852,6 +1444,134 @@ def test_stale_reviewer_stamp_blocks_a_would_be_clean_pr() -> None:
     _install_fake_gh(module, _pr_payload(_clean_checks()), comments=comments)
 
     assert module.main(["pr_status.py", "42"]) == 20
+
+
+# A realistic head: the all-`f` fixture cannot exercise elision, because any
+# splice of it is also a prefix of it.
+_MIXED_HEAD = "db7c4361f0a92be5147c3d8e6b0af215934cde78"
+# The shape the Design lane actually emitted on PR 4107: the head's first 14
+# characters spliced to its last 11, middle dropped, 25 characters total.
+_ELIDED = _MIXED_HEAD[:14] + _MIXED_HEAD[-11:]
+
+
+class TestShaMatches:
+    """The stamp is model-transcribed, so the freshness test has to tell a
+    MANGLED head from a reference to a DIFFERENT commit."""
+
+    def test_exact_and_prefix_forms_match(self) -> None:
+        module = _load_script()
+        assert module.sha_matches(_MIXED_HEAD, _MIXED_HEAD)
+        assert module.sha_matches(_MIXED_HEAD[:7], _MIXED_HEAD)
+        assert module.sha_matches(_MIXED_HEAD[:12], _MIXED_HEAD)
+
+    def test_prefix_shorter_than_seven_is_not_a_reference(self) -> None:
+        module = _load_script()
+        assert not module.sha_matches(_MIXED_HEAD[:6], _MIXED_HEAD)
+
+    def test_elided_middle_matches_the_head_it_mangles(self) -> None:
+        """PR 4107's exact failure: 25 characters, prefix+suffix of this head."""
+        module = _load_script()
+        assert len(_ELIDED) == 25
+        assert not _MIXED_HEAD.startswith(_ELIDED)  # the old test rejected it
+        assert module.sha_matches(_ELIDED, _MIXED_HEAD)
+
+    def test_another_commit_is_still_rejected(self) -> None:
+        """The freshness guard survives: a well-formed reference to a different
+        commit cannot pass, in full or short form."""
+        module = _load_script()
+        other = "a" * 40
+        assert not module.sha_matches(other, _MIXED_HEAD)
+        assert not module.sha_matches(other[:12], _MIXED_HEAD)
+        # Same length as the head but not equal -- no elision can be claimed.
+        cousin = _MIXED_HEAD[:39] + ("0" if _MIXED_HEAD[39] != "0" else "1")
+        assert not module.sha_matches(cousin, _MIXED_HEAD)
+
+    def test_elision_needs_seven_head_characters_of_its_own(self) -> None:
+        """A splice whose prefix half is too short identifies nothing: it would
+        let a token borrow the head's tail with almost no head of its own."""
+        module = _load_script()
+        assert not module.sha_matches(_MIXED_HEAD[:3] + _MIXED_HEAD[-11:], _MIXED_HEAD)
+        assert not module.sha_matches(_MIXED_HEAD[-11:], _MIXED_HEAD)
+
+    def test_empty_inputs_are_not_a_match(self) -> None:
+        module = _load_script()
+        assert not module.sha_matches("", _MIXED_HEAD)
+        assert not module.sha_matches(None, _MIXED_HEAD)
+        assert not module.sha_matches(_MIXED_HEAD, "")
+
+
+def test_elided_design_stamp_no_longer_reads_as_stale() -> None:
+    """The reported harm: the Design lane mangled its own stamp and every
+    prepare-pr/babysit loop read exit 20 BLOCKED while PR Readiness was green."""
+    module = _load_script()
+    comments = json.dumps(
+        [
+            _bot_comment(f"No findings.\n[GPT-REVIEWED] {_MIXED_HEAD}"),
+            _bot_comment(
+                f"Design-Verdict: PASS\n[DESIGN-REVIEWED] {_ELIDED}",
+                key="design-review",
+            ),
+        ]
+    )
+    _install_fake_gh(
+        module,
+        _pr_payload(_clean_checks(), headRefOid=_MIXED_HEAD),
+        comments=comments,
+    )
+
+    assert module.main(["pr_status.py", "42"]) == 0
+
+
+def test_elided_stamp_is_reported_rather_than_silently_accepted(capsys) -> None:
+    """Tolerance without a trace would hide the emitter defect for good, so the
+    reviewer is named in the advisory block and in the prose line."""
+    module = _load_script()
+    comments = json.dumps(
+        [
+            _bot_comment(
+                f"Design-Verdict: PASS\n[DESIGN-REVIEWED] {_ELIDED}",
+                key="design-review",
+            ),
+        ]
+    )
+    _install_fake_gh(
+        module,
+        _pr_payload(_clean_checks(), headRefOid=_MIXED_HEAD),
+        comments=comments,
+    )
+
+    assert module.main(["pr_status.py", "42", "--json"]) == 0
+    out = capsys.readouterr().out
+    report = json.loads([ln for ln in out.strip().splitlines() if ln.strip()][-1])
+    assert report["advisory"]["elided_stamp_reviewers"] == ["DESIGN"]
+    assert "stamp elided the head's middle" in out
+    # The note is advisory only: it must not enter progress_key, which a polling
+    # loop compares byte-for-byte to tell a stalled PR from a moving one.
+    assert "elided" not in json.dumps(report["progress_key"])
+
+
+def test_an_exact_stamp_reports_no_elision(capsys) -> None:
+    """The audit line is not decoration: it appears only for a mangled stamp."""
+    module = _load_script()
+    comments = json.dumps(
+        [
+            _bot_comment(
+                f"Design-Verdict: PASS\n[DESIGN-REVIEWED] {_MIXED_HEAD}",
+                key="design-review",
+            ),
+        ]
+    )
+    _install_fake_gh(
+        module,
+        _pr_payload(_clean_checks(), headRefOid=_MIXED_HEAD),
+        comments=comments,
+    )
+
+    assert module.main(["pr_status.py", "42", "--json"]) == 0
+    out = capsys.readouterr().out
+    report = json.loads([ln for ln in out.strip().splitlines() if ln.strip()][-1])
+    assert report["advisory"]["elided_stamp_reviewers"] == []
+    assert "stamp elided" not in out
 
 
 def test_block_merge_for_current_head_blocks_even_when_readiness_passed() -> None:
@@ -1170,3 +1890,670 @@ def test_stampless_advisory_lane_comment_does_not_block_discovery_mode() -> None
     assert module.main(["pr_status.py", "42"]) == 0
     # Pinned: UX is explicitly required -> its stampless state blocks.
     assert module.main(["pr_status.py", "42", "--reviewers", "GPT,UX"]) == 20
+
+
+def test_checks_blind_token_degrades_softly_instead_of_aborting(capsys) -> None:
+    """A token that cannot read Checks (any fine-grained PAT) fails EVERY gh
+    request naming statusCheckRollup -- gh resolves a --json field set
+    atomically. The core read must survive by not naming the field; the
+    rollup-only read fails and degrades: the script completes with a visible
+    notice and fails closed, never aborting with 'could not read PR'. Both
+    failure shapes are exercised: a non-zero exit and unparseable stdout.
+    """
+    raw = json.loads(_pr_payload([]))
+    del raw["statusCheckRollup"]  # a Checks-blind token never returns the field
+    payload = json.dumps(raw)
+
+    failure_shapes = (
+        (1, "", "Resource not accessible by personal access token"),
+        (0, "not json", ""),
+    )
+    for rollup_response in failure_shapes:
+        module = _load_script()
+
+        def fake_run(
+            args: list[str], _rollup: tuple[int, str, str] = rollup_response
+        ) -> tuple[int, str, str]:
+            if args[:3] == ["gh", "auth", "status"]:
+                return 0, "", ""
+            if args[:3] == ["gh", "pr", "view"]:
+                fields = args[args.index("--json") + 1] if "--json" in args else ""
+                if "statusCheckRollup" in fields:
+                    return _rollup
+                return 0, payload, ""
+            if args[:2] == ["gh", "api"] and "/issues/" in args[2] and "/comments" in args[2]:
+                return 0, "[]", ""
+            raise AssertionError("unexpected command: {}".format(args))
+
+        module.run = fake_run
+        module.unresolved_thread_count = lambda _number: 0
+
+        code = module.main(["pr_status.py", "42"])
+        captured = capsys.readouterr()
+
+        # Fail-closed, not a false CLEAN: unknown CI reads as BLOCKED.
+        assert code == 20
+        # The core read survived: the report still carries the PR metadata.
+        assert "PR #42" in captured.out
+        assert "NOTICE: " + module.ROLLUP_UNAVAILABLE_NOTICE in captured.out
+        assert "could not read PR" not in captured.err
+        # The verdict names the environment cause; the genuine no-checks
+        # reason is reserved for a healthy read that returned zero checks.
+        assert "CI status unreadable - the rollup fetch failed" in captured.out
+        assert "no CI checks reported" not in captured.out
+
+
+def test_head_moved_between_reads_discards_the_rollup_not_reports_clean(capsys) -> None:
+    """The core read and the rollup read are two gh calls, so a push can land
+    between them. A rollup snapshotted from the NEW head must never be paired
+    with the OLD head's metadata: even when that rollup would read fully green,
+    the result is a discard notice and a fail-closed exit, never CLEAN."""
+    module = _load_script()
+    old_head = "a" * 40
+    new_head = "b" * 40
+    core = json.loads(_pr_payload([]))
+    del core["statusCheckRollup"]
+    core["headRefOid"] = old_head
+    green_rollup = json.dumps(
+        {
+            "headRefOid": new_head,
+            "statusCheckRollup": [{"context": "PR Readiness", "state": "SUCCESS"}],
+        }
+    )
+
+    def fake_run(args: list[str]) -> tuple[int, str, str]:
+        if args[:3] == ["gh", "auth", "status"]:
+            return 0, "", ""
+        if args[:3] == ["gh", "pr", "view"]:
+            fields = args[args.index("--json") + 1] if "--json" in args else ""
+            if "statusCheckRollup" in fields:
+                return 0, green_rollup, ""
+            return 0, json.dumps(core), ""
+        if args[:2] == ["gh", "api"] and "/issues/" in args[2] and "/comments" in args[2]:
+            return 0, "[]", ""
+        raise AssertionError("unexpected command: {}".format(args))
+
+    module.run = fake_run
+    module.unresolved_thread_count = lambda _number: 0
+
+    code = module.main(["pr_status.py", "42"])
+    captured = capsys.readouterr()
+
+    assert code == 20
+    assert "NOTICE: " + module.ROLLUP_HEAD_MOVED_NOTICE in captured.out
+    # The green rollup from the wrong head must not leak into the report.
+    assert "aggregate readiness: not published" in captured.out
+    # The verdict names the discard, not a genuine absence of checks.
+    assert "CI status unreadable - the PR head moved between reads" in captured.out
+    assert "no CI checks reported" not in captured.out
+
+
+def test_degraded_rollup_reason_is_distinct_from_a_genuine_no_checks_pr(capsys) -> None:
+    """An environment gap (a Checks-blind token, a 403, a rate limit) and a
+    genuine no-checks-yet PR both leave the rollup empty, but they demand
+    opposite responses: fix the environment vs wait for or configure CI. The
+    fail-closed reason travels in ``progress_key.status``, which a polling
+    loop compares byte-for-byte -- a shared reason string would make the loop
+    re-poll a token problem until its stall detector fired instead of
+    escalating it. The exit code stays 20 for both: only the reason differs.
+    """
+    # Degraded: the core read survives, the rollup-only read fails.
+    core = json.loads(_pr_payload([]))
+    del core["statusCheckRollup"]
+    core_payload = json.dumps(core)
+
+    module = _load_script()
+
+    def fake_run(args: list[str]) -> tuple[int, str, str]:
+        if args[:3] == ["gh", "auth", "status"]:
+            return 0, "", ""
+        if args[:3] == ["gh", "pr", "view"]:
+            fields = args[args.index("--json") + 1] if "--json" in args else ""
+            if "statusCheckRollup" in fields:
+                return 1, "", "Resource not accessible by personal access token"
+            return 0, core_payload, ""
+        if args[:2] == ["gh", "api"] and "/issues/" in args[2] and "/comments" in args[2]:
+            return 0, "[]", ""
+        raise AssertionError("unexpected command: {}".format(args))
+
+    module.run = fake_run
+    module.unresolved_thread_count = lambda _number: 0
+    assert module.main(["pr_status.py", "42", "--json"]) == 20
+    degraded_status = _last_line_json(capsys)["progress_key"]["status"]
+
+    # Genuine: the rollup read succeeds and truly contains zero checks.
+    module = _load_script()
+    _install_fake_gh(module, _pr_payload([]))
+    assert module.main(["pr_status.py", "42", "--json"]) == 20
+    genuine_status = _last_line_json(capsys)["progress_key"]["status"]
+
+    assert "CI status unreadable" in degraded_status
+    assert "no CI checks reported" not in degraded_status
+    assert "no CI checks reported" in genuine_status
+    assert "CI status unreadable" not in genuine_status
+    assert degraded_status != genuine_status
+
+
+# ---------------------------------------------------------------------------
+# Issue #4187: the disposition gate -- one lane, one rationale per finding.
+# The computation is pinned byte-identical to pr_findings.py's copy by
+# test_prepare_pr_findings.py; these tests cover the GATING half.
+# ---------------------------------------------------------------------------
+
+_GREEN_CHECKS = [{"context": "PR Readiness", "state": "SUCCESS"}]
+
+
+def _gpt_finding_comment(module: ModuleType) -> tuple[dict, str]:
+    """A trusted GPT-lane comment with one advisory finding for the head."""
+    span = module.span_hash("src/x.py", "gpt/FINDING")
+    comment = {
+        "user": {"type": "Bot", "login": "github-actions[bot]"},
+        "body": (
+            "<!-- codex-ai-review -->\n"
+            "FINDING -- src/x.py:10 -- tighten -> Fix: x\n"
+            "[GPT-REVIEWED] " + "f" * 40
+        ),
+    }
+    return comment, span
+
+
+def _disposition(author: str, target: str, body_tail: str, comment_id: int = 11) -> dict:
+    return {
+        "id": comment_id,
+        "user": {"type": "User", "login": author},
+        "body": (
+            "<!-- ai-review-disposition target=" + target + " head=" + "f" * 40 + " -->\n"
+            + body_tail
+        ),
+    }
+
+
+def test_cross_lane_disposition_from_a_writer_blocks_readiness(capsys) -> None:
+    """A writer-authored record whose target= lane differs from the lane of
+    the span it claims is exactly the blanket ruling the rule forbids."""
+    module = _load_script()
+    bot_comment, span = _gpt_finding_comment(module)
+    disposition = _disposition("alice", "opus", f"- **rebutted** span={span}\n> reason")
+    _install_fake_gh(
+        module,
+        _pr_payload(_GREEN_CHECKS),
+        comments=json.dumps([bot_comment, disposition]),
+        permissions={"alice": "write"},
+    )
+
+    code = module.main(["pr_status.py", "42", "--json"])
+
+    assert code == 20
+    report = _last_line_json(capsys)
+    assert "disposition rule:" in report["progress_key"]["status"]
+    assert "cross-lane" in report["progress_key"]["status"]
+
+
+def test_per_finding_same_lane_disposition_stays_clean(capsys) -> None:
+    module = _load_script()
+    bot_comment, span = _gpt_finding_comment(module)
+    disposition = _disposition("alice", "gpt", f"- **rebutted** span={span}\n> reason")
+    _install_fake_gh(
+        module,
+        _pr_payload(_GREEN_CHECKS),
+        comments=json.dumps([bot_comment, disposition]),
+        permissions={"alice": "write"},
+    )
+
+    assert module.main(["pr_status.py", "42"]) == 0
+
+
+def test_spanless_disposition_for_a_lane_with_findings_blocks(capsys) -> None:
+    """The observed #3963 shape: a blanket ruling naming no finding identity
+    while its lane has findings on the current head."""
+    module = _load_script()
+    bot_comment, _span = _gpt_finding_comment(module)
+    disposition = _disposition("alice", "gpt", "> out of scope for this fix")
+    _install_fake_gh(
+        module,
+        _pr_payload(_GREEN_CHECKS),
+        comments=json.dumps([bot_comment, disposition]),
+        permissions={"alice": "write"},
+    )
+
+    code = module.main(["pr_status.py", "42", "--json"])
+
+    assert code == 20
+    assert "claims no span=" in _last_line_json(capsys)["progress_key"]["status"]
+
+
+def test_non_writer_disposition_cannot_block_the_pr(capsys) -> None:
+    """A drive-by commenter's crafted marker must not hold the PR hostage:
+    authority comes from the collaborators permission, as in the ledger."""
+    module = _load_script()
+    bot_comment, span = _gpt_finding_comment(module)
+    disposition = _disposition("mallory", "opus", f"- **rebutted** span={span}")
+    _install_fake_gh(
+        module,
+        _pr_payload(_GREEN_CHECKS),
+        comments=json.dumps([bot_comment, disposition]),
+        permissions={"mallory": "read"},
+    )
+
+    assert module.main(["pr_status.py", "42"]) == 0
+
+
+def test_unreadable_disposition_comments_fail_closed_in_decide() -> None:
+    module = _load_script()
+
+    code, status = module.decide(
+        state="OPEN",
+        mergeable="MERGEABLE",
+        merge_state="CLEAN",
+        decision="NONE",
+        draft=False,
+        readiness_kind="pass",
+        n_running=0,
+        n_fail=0,
+        n_checks=1,
+        readiness_context="PR Readiness",
+        disposition_eval={"ok": False, "violations": []},
+    )
+
+    assert code == 20
+    assert "disposition records could not be established" in status
+
+
+def test_unreadable_disposition_evaluation_outranks_the_running_round() -> None:
+    """"Could not read" is not "no violations": while an unknown evaluation
+    waits behind an in-flight round, the bots rewrite their stamped comments
+    and the judged-head evidence a re-read would need is gone. It must gate
+    NOW, exactly like a known violation."""
+    module = _load_script()
+
+    code, status = module.decide(
+        state="OPEN",
+        mergeable="MERGEABLE",
+        merge_state="CLEAN",
+        decision="NONE",
+        draft=False,
+        readiness_kind="running",
+        n_running=3,
+        n_fail=0,
+        n_checks=5,
+        readiness_context="PR Readiness",
+        disposition_eval={"ok": False, "violations": []},
+    )
+
+    assert code == 20
+    assert "disposition records could not be established" in status
+
+
+def test_clean_disposition_eval_does_not_change_the_verdict() -> None:
+    module = _load_script()
+
+    code, _status = module.decide(
+        state="OPEN",
+        mergeable="MERGEABLE",
+        merge_state="CLEAN",
+        decision="NONE",
+        draft=False,
+        readiness_kind="pass",
+        n_running=0,
+        n_fail=0,
+        n_checks=1,
+        readiness_context="PR Readiness",
+        disposition_eval={"ok": True, "violations": []},
+    )
+
+    assert code == 0
+
+
+def test_disposition_violation_outranks_the_running_round(capsys) -> None:
+    """Precedence: a violation is a condition waiting cannot fix -- only the
+    author editing the comment clears it -- and deferring it behind an
+    in-flight round loses the evidence, because the reviewer bots rewrite
+    their stamped comments in place when the round completes. It must gate
+    NOW, like a conflict or a draft, not after the checks settle."""
+    module = _load_script()
+    bot_comment, span = _gpt_finding_comment(module)
+    disposition = _disposition("alice", "opus", f"span={span}")
+    _install_fake_gh(
+        module,
+        _pr_payload([{"context": "PR Readiness", "state": "PENDING"}]),
+        comments=json.dumps([bot_comment, disposition]),
+        permissions={"alice": "write"},
+    )
+
+    code = module.main(["pr_status.py", "42", "--json"])
+
+    assert code == 20
+    assert "disposition rule:" in _last_line_json(capsys)["progress_key"]["status"]
+
+
+def test_prior_head_record_still_blocks_after_the_fix_push(capsys) -> None:
+    """The ordinary flow: the writer stamps head=<prior-reviewed-sha> and then
+    pushes, so the PR head has moved by the time the gate polls. The record
+    must be validated against the head it judged -- skipping it as history is
+    exactly how the blanket ruling shipped green on #3963."""
+    module = _load_script()
+    prior = "f" * 40
+    current = "e" * 40
+    span = module.span_hash("src/x.py", "gpt/FINDING")
+    bot_comment = {
+        "user": {"type": "Bot", "login": "github-actions[bot]"},
+        "body": (
+            "<!-- codex-ai-review -->\n"
+            "FINDING -- src/x.py:10 -- tighten -> Fix: x\n"
+            "[GPT-REVIEWED] " + prior
+        ),
+    }
+    disposition = {
+        "id": 12,
+        "user": {"type": "User", "login": "alice"},
+        "body": (
+            "<!-- ai-review-disposition target=opus head=" + prior + " -->\n"
+            + f"- **rebutted** span={span}\n> reason"
+        ),
+    }
+    _install_fake_gh(
+        module,
+        _pr_payload(_GREEN_CHECKS, headRefOid=current),
+        comments=json.dumps([bot_comment, disposition]),
+        permissions={"alice": "write"},
+    )
+
+    code = module.main(["pr_status.py", "42", "--json"])
+
+    assert code == 20
+    status = _last_line_json(capsys)["progress_key"]["status"]
+    assert "disposition rule:" in status
+    assert "cross-lane" in status
+
+
+# ---------------------------------------------------------------------------
+# Issue #6658: the disposition rule is enforced server-side, in pr-readiness.yml,
+# by calling THIS script's --disposition-gate mode -- so the rule keeps one
+# definition instead of gaining a workflow-side copy of the grammar. These pin
+# the JSON contract that workflow step parses.
+# ---------------------------------------------------------------------------
+
+_GATE_HEAD = "f" * 40
+
+
+def _gate_bot_comment(head: str = _GATE_HEAD) -> dict:
+    return {
+        "user": {"type": "Bot", "login": "github-actions[bot]"},
+        "body": (
+            "<!-- codex-ai-review -->\n"
+            "FINDING -- src/x.py:10 -- tighten -> Fix: x\n"
+            "[GPT-REVIEWED] " + head
+        ),
+    }
+
+
+def _gate_argv() -> list[str]:
+    return [
+        "pr_status.py",
+        "--disposition-gate",
+        "--repo",
+        "example/repo",
+        "--pr",
+        "42",
+        "--head",
+        _GATE_HEAD,
+    ]
+
+
+def test_disposition_gate_reports_a_blanket_record_as_a_violation(capsys) -> None:
+    """The gap this closes: a writer skipping the prepare-pr loop posts a
+    single-rationale record naming a lane but claiming no span, and the
+    adjudication ledger admits it with full downgrade power. The gate must name
+    it so the required status can fail."""
+    module = _load_script()
+    blanket = {
+        "id": 900,
+        "user": {"type": "User", "login": "alice"},
+        "body": "<!-- ai-review-disposition target=gpt head=" + _GATE_HEAD + " -->\nall fine",
+    }
+    _install_fake_gh(
+        module,
+        _pr_payload(_GREEN_CHECKS),
+        comments=json.dumps([_gate_bot_comment(), blanket]),
+        permissions={"alice": "write"},
+    )
+
+    assert module.main(_gate_argv()) == 0
+
+    report = json.loads(capsys.readouterr().out.strip())
+    assert report["ok"] is True
+    assert report["records"] == 1
+    assert report["unverified"] == 0
+    assert len(report["violations"]) == 1
+    assert "claims no span= finding identity" in report["violations"][0]
+
+
+def test_disposition_gate_is_clean_when_the_record_claims_one_span(capsys) -> None:
+    module = _load_script()
+    span = module.span_hash("src/x.py", "gpt/FINDING")
+    ruling = {
+        "id": 901,
+        "user": {"type": "User", "login": "alice"},
+        "body": (
+            "<!-- ai-review-disposition target=gpt head=" + _GATE_HEAD + " -->\n"
+            + f"- **rebutted** span={span}\n> reason"
+        ),
+    }
+    _install_fake_gh(
+        module,
+        _pr_payload(_GREEN_CHECKS),
+        comments=json.dumps([_gate_bot_comment(), ruling]),
+        permissions={"alice": "write"},
+    )
+
+    assert module.main(_gate_argv()) == 0
+
+    report = json.loads(capsys.readouterr().out.strip())
+    assert report["ok"] is True
+    assert report["violations"] == []
+    assert report["error"] == ""
+
+
+def test_disposition_gate_drops_a_record_whose_author_is_not_a_writer(capsys) -> None:
+    """Enforcement scope equals the ledger's admission scope. An author the
+    permission API does not confirm is dropped exactly as codex-review.yml
+    drops them, so the gate never blocks on a record with no downgrade power --
+    and that includes the case where the permission call itself fails."""
+    module = _load_script()
+    blanket = {
+        "id": 902,
+        "user": {"type": "User", "login": "mallory"},
+        "body": "<!-- ai-review-disposition target=gpt head=" + _GATE_HEAD + " -->\nlooks fine",
+    }
+    _install_fake_gh(
+        module,
+        _pr_payload(_GREEN_CHECKS),
+        comments=json.dumps([_gate_bot_comment(), blanket]),
+        permissions={},
+    )
+
+    assert module.main(_gate_argv()) == 0
+
+    report = json.loads(capsys.readouterr().out.strip())
+    assert report["ok"] is True
+    assert report["violations"] == []
+    assert report["comments"] == 1
+    assert report["records"] == 0
+    assert report["unverified"] == 1
+
+
+def test_disposition_gate_reports_unreadable_comments_as_not_ok(capsys) -> None:
+    """An unreadable comment list is UNKNOWN, never a clean rule: the workflow
+    turns ok=false into a pending verdict, so a transient API failure can never
+    red the repository's required status."""
+    module = _load_script()
+
+    def failing_run(args: list[str]) -> tuple[int, str, str]:
+        if args[:2] == ["gh", "api"]:
+            return 1, "", "gh: Server Error (HTTP 500)"
+        raise AssertionError("unexpected command: {}".format(args))
+
+    module.run = failing_run
+
+    assert module.main(_gate_argv()) == 0
+
+    report = json.loads(capsys.readouterr().out.strip())
+    assert report["ok"] is False
+    assert "could not be read" in report["error"]
+    assert report["violations"] == []
+
+
+def test_disposition_gate_requires_repo_pr_and_head(capsys) -> None:
+    module = _load_script()
+
+    assert module.main(["pr_status.py", "--disposition-gate", "--repo", "example/repo"]) == 0
+
+    report = json.loads(capsys.readouterr().out.strip())
+    assert report["ok"] is False
+    assert "required" in report["error"]
+
+
+def test_disposition_gate_flattens_newlines_out_of_each_violation(capsys) -> None:
+    """The workflow reads one violation per line, so a newline inside one would
+    forge an extra blocker line. Flattening is what makes that unrepresentable."""
+    module = _load_script()
+    module.fetch_disposition_comments = lambda *_a: []
+    module.fetch_bot_comments = lambda *_a: []
+    module.writer_disposition_records = lambda *_a: []
+    module.disposition_violations = lambda *_a: ["first\nsecond   third"]
+
+    assert module.main(_gate_argv()) == 0
+
+    report = json.loads(capsys.readouterr().out.strip())
+    assert report["violations"] == ["first second third"]
+
+
+# ---------------------------------------------------------------------------
+# GPT round 2 on #7014: an INDETERMINATE writer lookup must not read as "not a
+# writer". The adjudication ledger makes the identical lookup at review time, so
+# it can have admitted a record whose later verification here fails transiently
+# -- dropping it would leave the record's downgrade power intact while the
+# required status published success.
+# ---------------------------------------------------------------------------
+
+
+def _verdict_module(rc: int, out: str, err: str) -> ModuleType:
+    module = _load_script()
+    module.run = lambda _args: (rc, out, err)
+    return module
+
+
+def test_a_transient_permission_failure_is_unknown_not_a_denial() -> None:
+    module = _verdict_module(1, "", "gh: Server Error (HTTP 500)")
+    assert module.author_write_verdict("o/r", "alice") == "unknown"
+    # The boolean face still reads False, so a record is never ACTED on without
+    # positive confirmation -- the two answers differ only for a caller that
+    # must distinguish "no" from "cannot tell".
+    assert module.author_is_repo_writer("o/r", "alice") is False
+
+
+def test_a_404_is_a_definitive_non_collaborator() -> None:
+    module = _verdict_module(1, "", "gh: Not Found (HTTP 404)")
+    assert module.author_write_verdict("o/r", "mallory") == "other"
+
+
+def test_a_403_is_definitive_so_a_scoped_token_cannot_block_every_pr() -> None:
+    """Calling a token-permission state "unknown" would turn it into a permanent
+    cannot-evaluate on every PR carrying any disposition comment -- trading a
+    missing enforcement for a repository-wide merge block."""
+    module = _verdict_module(1, "", "gh: Resource not accessible by integration (HTTP 403)")
+    assert module.author_write_verdict("o/r", "alice") == "other"
+
+
+def test_a_rate_limit_403_is_transient_not_definitive() -> None:
+    """The one 403 that is NOT a stable token property. GitHub's primary and
+    secondary rate limits surface as 403 with rate-limit text, which is transient
+    exactly like a 429 -- the same carve-out pr-readiness.yml's gh_retry helper
+    already makes. Treating it as definitive would drop a valid writer's record
+    under load and publish a clean verdict over a real violation."""
+    module = _verdict_module(
+        1, "", "gh: API rate limit exceeded for installation (HTTP 403)"
+    )
+    assert module.author_write_verdict("o/r", "alice") == "unknown"
+
+
+def test_a_secondary_rate_limit_403_is_also_transient() -> None:
+    module = _verdict_module(
+        1, "", "gh: You have exceeded a secondary rate limit (HTTP 403)"
+    )
+    assert module.author_write_verdict("o/r", "alice") == "unknown"
+
+
+def test_an_abuse_detection_403_is_also_transient() -> None:
+    module = _verdict_module(
+        1, "", "gh: You have triggered an abuse detection mechanism (HTTP 403)"
+    )
+    assert module.author_write_verdict("o/r", "alice") == "unknown"
+
+
+def test_a_write_permission_is_a_writer() -> None:
+    module = _verdict_module(0, json.dumps({"permission": "write"}), "")
+    assert module.author_write_verdict("o/r", "alice") == "writer"
+
+
+def test_a_read_permission_is_definitively_other() -> None:
+    module = _verdict_module(0, json.dumps({"permission": "read"}), "")
+    assert module.author_write_verdict("o/r", "alice") == "other"
+
+
+def test_an_unparseable_body_is_unknown() -> None:
+    module = _verdict_module(0, "not json", "")
+    assert module.author_write_verdict("o/r", "alice") == "unknown"
+
+
+def test_an_indeterminate_author_makes_the_record_set_unestablished() -> None:
+    module = _load_script()
+    module.author_write_verdict = lambda _repo, _login: "unknown"
+    comments = [
+        {
+            "id": 1,
+            "user": {"type": "User", "login": "alice"},
+            "body": "<!-- ai-review-disposition target=gpt head=" + _HEAD + " -->\nruling",
+        }
+    ]
+    assert module.writer_disposition_records("o/r", comments) is None
+
+
+def test_a_definitive_non_writer_is_still_just_dropped() -> None:
+    module = _load_script()
+    module.author_write_verdict = lambda _repo, _login: "other"
+    comments = [
+        {
+            "id": 1,
+            "user": {"type": "User", "login": "mallory"},
+            "body": "<!-- ai-review-disposition target=gpt head=" + _HEAD + " -->\nruling",
+        }
+    ]
+    assert module.writer_disposition_records("o/r", comments) == []
+
+
+def test_the_gate_reports_an_indeterminate_permission_as_not_ok(capsys) -> None:
+    """End to end: the workflow reads ok=false as WAITING, so a transient
+    permission failure holds the required status pending instead of publishing a
+    clean rule it could not verify."""
+    module = _load_script()
+    blanket = {
+        "id": 903,
+        "user": {"type": "User", "login": "alice"},
+        "body": "<!-- ai-review-disposition target=gpt head=" + _GATE_HEAD + " -->\nno span",
+    }
+
+    def flaky_run(args: list[str]) -> tuple[int, str, str]:
+        if "/collaborators/" in args[2]:
+            return 1, "", "gh: Server Error (HTTP 500)"
+        if "/issues/" in args[2] and "/comments" in args[2]:
+            return 0, json.dumps([_gate_bot_comment(), blanket]), ""
+        raise AssertionError("unexpected command: {}".format(args))
+
+    module.run = flaky_run
+
+    assert module.main(_gate_argv()) == 0
+
+    report = json.loads(capsys.readouterr().out.strip())
+    assert report["ok"] is False
+    assert report["violations"] == []

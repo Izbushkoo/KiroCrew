@@ -26,6 +26,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -79,6 +81,56 @@ jobs:
           name: wheel
           path: dist/*.whl
 
+  # Keep the native installer fast without coupling the check to a custom UI.
+  # This builds the real Windows artifact, installs it silently, verifies the
+  # registration and payload, and fails if extraction exceeds five minutes.
+  build-windows-installer:
+    name: Build Windows Installer (x64)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: website/electron/package-lock.json
+
+      - name: Install Electron packaging dependencies
+        working-directory: website/electron
+        run: npm ci --no-audit --no-fund
+
+      - name: Create minimal backend payload
+        shell: pwsh
+        working-directory: website/electron
+        run: |
+          New-Item -ItemType Directory -Force backend-dist/kirocrew-backend/bin | Out-Null
+          @('@echo off', 'exit /b 0') | Set-Content -Encoding ascii backend-dist/kirocrew-backend/bin/kirocrew.cmd
+
+      - name: Compile unsigned x64 NSIS installer
+        working-directory: website/electron
+        run: npx --no-install electron-builder --win nsis --x64 --publish never
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - name: Enforce native installer performance ceiling
+        shell: pwsh
+        working-directory: website/electron
+        run: '& "$env:GITHUB_WORKSPACE\.github\scripts\test-windows-installer.ps1" -SkipGatewayValidation'
+
+      - name: Upload installer timing
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-installer-performance
+          path: |
+            website/electron/runtime-evidence/install-timing.txt
+            website/electron/runtime-evidence/native-install-mode.png
+          if-no-files-found: warn
+
   # Resolve which desktop platforms a PR builds. Linux (both arches) ALWAYS
   # builds -- it is comparatively cheap and catches cross-platform bundle
   # breakage, and cannot be cross-compiled. The macos-15 leg bills at ~10x and
@@ -96,6 +148,8 @@ jobs:
       os: ${{ steps.compute.outputs.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         if: github.event_name == 'pull_request'
@@ -105,7 +159,13 @@ jobs:
               - 'website/electron/**'
               - 'website/package.json'
               - 'website/package-lock.json'
-              - 'build-desktop.sh'
+              # Path-qualified: the script lives in packaging/, and the bare name
+              # matched nothing, so every change to the one file that BUILDS the
+              # macOS app left the macos-15 leg uninstantiated on a PR. `ci.yml`'s
+              # own filter has the qualified form; this copy had drifted.
+              - 'packaging/build-desktop.sh'
+              # Also run by that script, so it is a packaging input too.
+              - 'scripts/stamp-distribution.sh'
               - 'Makefile'
               - 'pyproject.toml'
               - 'setup.cfg'
@@ -141,6 +201,8 @@ jobs:
         os: ${{ fromJSON(needs.desktop-matrix.outputs.os) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:

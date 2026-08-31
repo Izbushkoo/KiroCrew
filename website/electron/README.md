@@ -19,7 +19,9 @@ The app will:
    `/api/status`, so it is never adopted; the app waits for the port to clear
    and spawns fresh instead
 2. Launch `kirocrew gateway` when needed
-3. Show a loading screen while the backend boots
+3. Show a loading screen while the backend boots. A live bundled backend gets an
+   extended Windows cold-start window; a child that actually exits still fails
+   immediately with its launch-log cause.
 4. Load the dashboard
 5. Point the user at Kiro CLI installation and sign-in on the gateway host when
    either prerequisite is missing
@@ -93,9 +95,20 @@ Notes:
 - The result is an assisted (non-one-click, per-user) NSIS installer,
   `KiroCrew Setup <version>.exe` (nightly builds:
   `KiroCrew Nightly Setup <version>.exe`), in `website/electron/dist/`.
+- The pinned electron-builder NSIS template is patched during `npm install` to
+  expose Kiro Crew's staged-payload publish hook. On a normal same-volume
+  per-user install it renames the large `resources` / `locales` trees into place
+  and copies only the small root remainder; per-machine installs keep the
+  upstream copy path so files inherit the Program Files ACL. Cross-volume or
+  occupied destinations also retain the upstream copy-and-retry fallback. The
+  Windows backend ships checked-hash
+  bytecode for the measured gateway import closure, so first launch consumes
+  build-time caches rather than generating thousands of files under Defender.
 - The native welcome/finish sidebar and the header used on intermediate pages
   carry the Kiro Crew logo and ghost artwork. The standard NSIS controls and
-  localized instructions remain native; only their supporting artwork changes.
+  localized instructions remain native. Page boundaries use a short Win32
+  alpha-blended cross-fade that follows the system client-area animation setting;
+  extraction itself stays on the native progress page without timer-driven art.
 
 See `../../docs/guides/windows-install.md` for the CI-built installer and the
 current Windows support status.
@@ -184,6 +197,7 @@ each launch to get a fresh JWT — no manual paste required.
 
 | Location | Item | Action |
 |----------|------|--------|
+| Connection menu (macOS) | New Window (⌘⇧N) | Open another dashboard window with a new blank session on the existing local gateway |
 | Tab menu / tab bar right-click | Set Remote Host… | Configure hostname for the **focused tab's** port |
 | Tab menu / tab bar right-click | Refresh Token (⌘⇧T) | Fetch a fresh token for the **focused tab** |
 | Tab menu / tray | Open Config File | Open `config.json` in default editor |
@@ -229,6 +243,10 @@ Open via **Tab menu → Open Config File** or tray menu.
 
 ## Notes
 
+- On macOS, **Connection → New Window** (⌘⇧N) opens an independent
+  dashboard window and creates a blank session. It shares the running local
+  gateway and authentication origin, but does not copy the current session,
+  project, draft, or context.
 - Closing the window hides to tray — right-click the tray icon or Cmd+Q to quit
 - External links open in your default browser
 - Desktop leaves the child `PATH` unchanged; the gateway-side prerequisite

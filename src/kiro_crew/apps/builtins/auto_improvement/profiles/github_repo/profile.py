@@ -271,7 +271,7 @@ def _write_protected_targets() -> tuple[str, ...]:
       by ``os.path.isdir(target)`` — so a FILE path is silently skipped and the mask
       no-ops. (Files are masked through a separate ``SENSITIVE_FILES`` list the public helper
       does not expose.) Measured: passing the file paths left the child able to append to
-      ``~/.kiro/crew/.data-home-ready`` and exit 0; passing the parent blocked it.
+      ``~/.kiro/crew/config.json`` and exit 0; passing the parent blocked it.
     * Only EXISTING directories are returned — the launcher mounts over each target, and a
       mount over a missing path is a needless failure on a fresh install.
 
@@ -324,12 +324,12 @@ def _run(
     # Also MASK Kiro Crew's own write-protected files. `mode="strict"` hides 52 credential
     # paths so agent-authored code cannot READ secrets, but it does not make the rest of the
     # filesystem read-only — measured on this host: a strict-mode child appended to
-    # `~/.kiro/crew/.data-home-ready` and exited 0. Those paths are `security.
+    # `~/.kiro/crew/config.json` and exited 0. Those paths are `security.
     # write_protected_home_paths()`, enforced by the platform HOOK layer, which a sandboxed
     # subprocess never passes through — so the protection was inert for exactly the code that
     # most needs it. Bind-mounting an empty dir over each makes the write fail at the kernel
-    # instead. Scoped to Kiro Crew's OWN control files (config.json, config.local.json,
-    # .data-home-ready under both `.kiro/crew` and `.kirocrew`), i.e. the one-way doors that
+    # instead. Scoped to Kiro Crew's OWN control files (config.json, config.local.json
+    # under both `.kiro/crew` and `.kirocrew`), i.e. the one-way doors that
     # would corrupt the installation; broader hiding is not possible here because the
     # interpreter's own stdlib can live under `$HOME` (measured: hiding `~/.local/share`
     # broke `import platform` outright). Raised by the GPT review of this branch.
@@ -1384,23 +1384,9 @@ class RepoIsolation:
         `_ok` checks both, and this drifted from it. Raised by the GPT review of this branch.
         """
 
-        def _neutral(args: list[str]) -> bool:
-            try:
-                proc = _run(
-                    ["git", "-C", str(self.clone_path), *args],
-                    cwd=self.clone_path if self.clone_path.exists() else Path.cwd(),
-                    timeout=30,
-                )
-            except (OSError, subprocess.SubprocessError):
-                return False
-            if proc.returncode != 0:
-                return False
-            url = (proc.stdout or "").strip()
-            return (not url) or ("DISABLED" in url.upper()) or ("NO_PUSH" in url.upper())
+        from ...backend.clone_setup import _repository_is_isolated
 
-        return _neutral(["remote", "get-url", "--push", "origin"]) and _neutral(
-            ["remote", "get-url", "origin"]
-        )
+        return _repository_is_isolated(self.clone_path)
 
     def do_not_pollute_paths(self) -> list[Path]:
         """Host paths the spine snapshots around the (no-op) measurement boot.

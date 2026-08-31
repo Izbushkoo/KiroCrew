@@ -52,6 +52,7 @@ from kiro_crew.hooks import (
     _is_declared_builtin_mcp_server,
     _is_first_party_app,
     _script_hooks_capability_denied,
+    _should_carry_xattr,
     effective_denied_regexes_from_config,
     emit_internal_read_audit,
     fire_tool_hooks,
@@ -100,7 +101,10 @@ def _same(a: str, b: str) -> bool:
     returns the long one, so a raw string compare passes on POSIX and fails
     only on Windows.
     """
-    return os.path.realpath(a) == os.path.realpath(b)
+    def _normalized(path: str) -> str:
+        return os.path.normcase(os.path.normpath(os.path.realpath(path)))
+
+    return _normalized(a) == _normalized(b)
 
 
 def _identity(path: Path) -> tuple[int, int]:
@@ -400,6 +404,47 @@ class TestSafeReadFile:
         with pytest.raises(FileNotFoundError):
             safe_read_file(str(tmp_path / "nope.txt"))
 
+    def test_sensitive_refusal_message_escapes_the_path(self, monkeypatch):
+        """The refused path is caller/attacker influenced and the message reaches
+        log records via ``exc_info``; a raw newline in it would forge a second
+        record (refs #6371, the #6281/#6315 log-forgery class).
+        """
+        forged = "/tmp/pods/wt-evil\nWARNING forged: reclaim authorized"
+        # The message carries the RESOLVED path (drive-lettered and
+        # backslashed on Windows), so compute the expectation the same way
+        # production does.
+        resolved = os.path.realpath(os.path.expanduser(forged))
+        monkeypatch.setattr(hooks_mod, "is_sensitive_path", lambda p: True)
+        with pytest.raises(PermissionError, match="sensitive path") as excinfo:
+            safe_read_file(forged)
+        message = str(excinfo.value)
+        assert "\n" not in message
+        assert repr(resolved) in message
+
+    def test_symlink_refusal_message_escapes_the_path(self, tmp_path, monkeypatch):
+        """The ELOOP arm keeps the pre-race resolved path — including any
+        newline-bearing directory name — so its message must escape it too.
+        """
+        import errno as _errno
+
+        f = tmp_path / "map.json"
+        f.write_text("{}", encoding="utf-8")
+        resolved = os.path.realpath(str(f))
+
+        real_open = os.open
+
+        def _eloop(path, flags, *args, **kwargs):
+            if str(path) == resolved:
+                raise OSError(_errno.ELOOP, "symlink swapped in")
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", _eloop)
+        with pytest.raises(PermissionError, match="refusing to follow symlink") as excinfo:
+            safe_read_file(str(f))
+        message = str(excinfo.value)
+        assert "\n" not in message
+        assert repr(resolved) in message
+
 
 class TestSafeReadFileBytes:
     def test_reads_bytes(self, tmp_path):
@@ -484,9 +529,13 @@ class TestFdRealPath:
             got = _fd_real_path(fd)
         finally:
             os.close(fd)
-        # A platform with no supported mechanism fails closed (None); where one
-        # exists it must name the same file.
-        assert got is None or _same(got, str(f))
+        # Windows is a supported descriptor-containment platform. Other
+        # platforms without a supported mechanism still fail closed (None).
+        if os.name == "nt":
+            assert got is not None
+            assert _same(got, str(f))
+        else:
+            assert got is None or _same(got, str(f))
 
 
 class TestSafeReadPrefix:
@@ -506,13 +555,36 @@ class TestSafeReadPrefix:
 
 
 class TestIsAccessControlXattr:
-    @pytest.mark.parametrize("attr", ["security.selinux", "system.posix_acl_access"])
+    @pytest.mark.parametrize("attr", ["system.posix_acl_access", "system.posix_acl_default"])
     def test_access_control_attrs(self, attr):
         assert _is_access_control_xattr(attr) is True
 
     @pytest.mark.parametrize("attr", ["user.comment", "trusted.thing", ""])
     def test_informational_attrs(self, attr):
         assert _is_access_control_xattr(attr) is False
+
+    @pytest.mark.parametrize(
+        "attr",
+        ["security.capability", "security.ima", "security.evm", "security.selinux"],
+    )
+    def test_a_privileged_attr_is_neither_carried_nor_fail_closed(self, attr):
+        """These are outside the carry entirely, so also outside the refusal.
+
+        The carry replays attributes onto an inode holding CALLER-supplied
+        content, so a privilege- or integrity-bearing name must never be
+        reproduced (see ``atomic_write._CARRIED_ACCESS_CONTROL_XATTRS``). Since it
+        is never collected, no ``setxattr`` is attempted for it and it cannot
+        refuse a save either -- which also stops ``security.selinux`` from failing
+        every write on an enforcing host that denies ``relabelto``.
+        """
+        assert _should_carry_xattr(attr) is False
+        assert _is_access_control_xattr(attr) is False
+
+    @pytest.mark.parametrize(
+        "attr", ["system.posix_acl_access", "system.posix_acl_default", "user.comment"]
+    )
+    def test_the_carried_set(self, attr):
+        assert _should_carry_xattr(attr) is True
 
 
 class TestSafeReadFileBytesNolink:
@@ -1059,13 +1131,15 @@ class TestScriptHookStorePersistence:
         assert store.update(hook.id, {"timeout": 1}).timeout == 1
         assert store.update(hook.id, {"timeout": 300}).timeout == 300
 
-    def test_a_bool_timeout_is_accepted_as_its_int_value(self, tmp_path):
-        # Documents current behaviour, not an endorsement: bool is a subclass of
-        # int, so ``True`` satisfies the isinstance+range check and lands as a
-        # 1-second timeout. Recorded so a future tightening is a deliberate change.
+    def test_a_bool_timeout_is_rejected(self, tmp_path):
+        # The deliberate tightening the old test anticipated (issue #5444):
+        # ``bool`` is an ``int`` subclass, but ``True`` as a timeout is
+        # meaningless, so the shared validator now rejects it at the update
+        # boundary rather than silently landing a 1-second timeout.
         store = ScriptHookStore(tmp_path)
         hook = store.create({"name": "h1", "command": "true"})
-        assert store.update(hook.id, {"timeout": True}).timeout is True
+        with pytest.raises(ValueError, match="timeout must be an integer"):
+            store.update(hook.id, {"timeout": True})
 
     def test_update_applies_only_known_fields(self, tmp_path):
         store = ScriptHookStore(tmp_path)
@@ -1626,8 +1700,8 @@ class TestSafeWriteFileNolinkXattrs:
     def test_an_uncopyable_access_control_attr_refuses_the_write(self, tmp_path, monkeypatch):
         self._require_xattrs()
         f = _write(tmp_path / "a.txt", "old")
-        monkeypatch.setattr(os, "listxattr", lambda fd: ["security.selinux"])
-        monkeypatch.setattr(os, "getxattr", lambda fd, attr: b"label")
+        monkeypatch.setattr(os, "listxattr", lambda fd: ["system.posix_acl_access"])
+        monkeypatch.setattr(os, "getxattr", lambda fd, attr: b"acl")
 
         def _refuse(fd, attr, value):
             raise OSError(1, "cannot set")
@@ -1635,6 +1709,34 @@ class TestSafeWriteFileNolinkXattrs:
         monkeypatch.setattr(os, "setxattr", _refuse)
         assert safe_write_file_nolink(str(f), "new") is False
         assert f.read_text(encoding="utf-8") == "old"
+
+    def test_a_privileged_attr_is_not_carried_and_does_not_refuse(self, tmp_path, monkeypatch):
+        """File capabilities and integrity signatures must not reach the copy.
+
+        ``safe_write_file_nolink`` also installs a fresh inode holding
+        caller-supplied content, so it shares ``atomic_write``'s allowlist:
+        replaying ``security.capability`` there would attach the old file's
+        privileges to the new bytes, and ``security.ima``/``security.evm`` are
+        signatures over bytes that no longer exist. The ACL beside them is still
+        carried, so this is a filter and not a blanket stop.
+        """
+        self._require_xattrs()
+        f = _write(tmp_path / "a.txt", "old")
+        present = [
+            "security.capability",
+            "security.ima",
+            "security.evm",
+            "security.selinux",
+            "system.posix_acl_access",
+        ]
+        monkeypatch.setattr(os, "listxattr", lambda fd: list(present))
+        monkeypatch.setattr(os, "getxattr", lambda fd, attr: attr.encode())
+        written: list[str] = []
+        monkeypatch.setattr(os, "setxattr", lambda fd, attr, value: written.append(attr))
+
+        assert safe_write_file_nolink(str(f), "new") is True
+        assert f.read_text(encoding="utf-8") == "new"
+        assert written == ["system.posix_acl_access"]
 
     def test_an_uncopyable_informational_attr_is_best_effort(self, tmp_path, monkeypatch):
         self._require_xattrs()

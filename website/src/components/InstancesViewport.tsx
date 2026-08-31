@@ -36,12 +36,16 @@ import { AlertTriangle, Loader2, RefreshCw } from 'lucide-react'
 import { api } from '../api/client'
 import { useAppDispatch, useAppSelector } from '../store'
 import { removeWarm, setActiveId, setPaneReady, setUnread, setWarm } from '../store/instancesSlice'
-import InstanceTabBar, { visibleInstanceTabs, useCrewPins, toggleCrewPin } from './InstanceTabBar'
+import InstanceTabBar, { visibleInstanceTabs, useCrewPins, toggleCrewPin, useCrewSwitcherStableOrder, setStableOrder } from './InstanceTabBar'
 import { resolveTunnelOrigin } from '../lib/tunnelOrigin'
 import { LINUX_CAPTION_CONTROLS_WIDTH, TRAFFIC_LIGHT_INSET_PX, WIN_CAPTION_OVERLAY_WIDTH } from '../lib/electron'
 import { isEmbeddedPane } from '../lib/embedded'
+import AskAgentButton from './AskAgentButton'
+import { reportInstanceFailure } from '../utils/instanceFailureReport'
+import type { ErrorReport } from '../utils/errorReport'
 import { isElectron, isLinuxFramelessElectron, isWinElectron } from '../lib/electron'
 import type { DragGap } from '../lib/dragGaps'
+import { useFocusMode, useFocusChromeVisible, setFocusModeEnabled, setFocusChromeVisible } from '../hooks/useFocusMode'
 
 import { i18nT } from '../i18n/t'
 // Refresh the embedded token once elapsed reaches this fraction of its TTL
@@ -86,6 +90,16 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   // Stable array identity per pin change, so the model memo below does not
   // re-broadcast on every render.
   const pinnedCrews = useMemo(() => [...pinnedCrewSet], [pinnedCrewSet])
+  // The crew-switcher "keep tab order fixed" preference, relayed into every
+  // embedded pane so a remote pane's bar orders its chips the same way the local
+  // bar does. Reactive like the pins: a change re-broadcasts the model, and an
+  // embedded toggle routes back here via `mc-set-stable-order`.
+  const [stableOrder] = useCrewSwitcherStableOrder()
+  // Focus mode is a property of the WINDOW, not of one pane: a remote crew shown
+  // inside a focused window must hide its chrome too. Relayed down the host model
+  // below, and it also gates the host drag strips (see their render site).
+  const { enabled: focusMode } = useFocusMode()
+  const focusChromeVisible = useFocusChromeVisible()
 
   // Per-instance header drag gaps relayed up by each embedded pane
   // (mc-drag-gaps). Only the ACTIVE pane's gaps are rendered, but they are
@@ -110,6 +124,16 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   // postMessage listener) always sees the latest ports without re-subscribing.
   const warmRef = useRef(warm)
   warmRef.current = warm
+  // Read inside the message listener rather than closed over: the listener is
+  // registered once, and only the ACTIVE pane may speak for the window's chrome.
+  const activeIdRef = useRef(activeId)
+  activeIdRef.current = activeId
+  // Each pane's last-reported chrome visibility (mc-focus-chrome), so a pane
+  // SWITCH can apply the incoming pane's state immediately. Without this the
+  // window keeps the OUTGOING pane's value — switching necessarily happens from
+  // a peeked header (the tab bar lives on it), so the traffic lights stayed
+  // visible over the new pane until its own next hover cycle re-posted.
+  const paneChromeRef = useRef<Record<string, boolean>>({})
   const refreshingRef = useRef<Set<string>>(new Set())
   const lastRefreshRef = useRef<Map<string, number>>(new Map())
   // Live iframe elements by id, so the parent can postMessage the switcher model
@@ -223,6 +247,38 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
         // panes) via the module store, keeping the set one shared value.
         const id = (data as { id?: unknown }).id
         if (typeof id === 'string' && id) toggleCrewPin(id)
+      } else if (data.type === 'mc-set-stable-order') {
+        // The "keep tab order fixed" toggle was flipped inside an embedded pane.
+        // Like the pin, it has no access to the parent's preference store from
+        // its own iframe realm, so it relays the desired value here; applying it
+        // broadcasts to every bar (local header + all panes) via the module
+        // store, keeping the preference one shared value. Idempotent, so the
+        // model re-broadcast's return trip to the sending pane is a no-op.
+        const on = (data as { on?: unknown }).on
+        if (typeof on === 'boolean') setStableOrder(on)
+      } else if (data.type === 'mc-set-focus-mode') {
+        // Focus mode was toggled inside an embedded pane. It belongs to the WINDOW,
+        // not to one pane, so applying it here is what makes the state one shared
+        // value: the module store re-renders the local header's own toggle, and the
+        // model re-broadcast below carries it to every OTHER pane. The pane that
+        // sent it already adopted it locally, and the setter is idempotent, so the
+        // return trip is a no-op rather than a loop.
+        const on = (data as { on?: unknown }).on
+        if (typeof on === 'boolean') setFocusModeEnabled(on)
+      } else if (data.type === 'mc-focus-chrome') {
+        // The pane reports whether ITS chrome is on screen. Only the pane the user
+        // is actually looking at may speak for the window: a background pane's peek
+        // must not summon the host's traffic lights over a different pane. The host
+        // is the only side that can act on this at all — the lights are AppKit
+        // views on this window and the drag bar lives in this document.
+        // Every pane's report is REMEMBERED (not just the active one's): the
+        // switch-time effect below needs the incoming pane's last-known state,
+        // because a pane whose chrome state did not change re-posts nothing.
+        const on = (data as { on?: unknown }).on
+        if (typeof on === 'boolean') {
+          paneChromeRef.current[id] = on
+          if (id === activeIdRef.current) setFocusChromeVisible(on)
+        }
       } else if (data.type === 'mc-embedded-ready') {
         // The pane just (re)mounted and asked for the current model — send it now
         // rather than waiting for the next input-driven broadcast. Also record
@@ -296,6 +352,25 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   const [timedOut, setTimedOut] = useState<Record<string, boolean>>({})
   const [reloadSeq, setReloadSeq] = useState<Record<string, number>>({})
   const activeWarmConn = activeId ? warm[activeId] : undefined
+  // Apply the INCOMING pane's chrome state at switch time. The store otherwise
+  // keeps whatever the outgoing surface last reported — and a switch necessarily
+  // happens from a peeked header (the tab bar lives on it), so it is `true` —
+  // while the incoming pane, whose own state did not change, re-posts nothing.
+  // Symptom fixed: traffic lights stranded visible over the new pane until its
+  // next hover cycle. A pane with NO recorded report defaults to VISIBLE: remote
+  // crews are independently versioned installs, so a pane that has never posted
+  // mc-focus-chrome is most likely a pre-focus-mode version that renders its full
+  // header unconditionally — defaulting it to hidden would strip the traffic
+  // lights and drag strips out from under a header the user can see. A
+  // focus-mode-aware pane's first report corrects the brief lights-flash; a
+  // non-conforming pane keeps working chrome forever. Switching to LOCAL is
+  // covered by App.tsx's own writer (gated on activeInstanceId === null).
+  useEffect(() => {
+    // Only while focus mode is ON: off, chrome is unconditionally visible and
+    // owned by the surfaces themselves (and the local writer in App.tsx).
+    if (activeId === null || !focusMode) return
+    setFocusChromeVisible(paneChromeRef.current[activeId] ?? true)
+  }, [activeId, focusMode])
   // Primitive deps for the watchdog effect (a fresh conn object identity on
   // every setWarm would defeat the dep comparison; the src only depends on these).
   const activeWarmPort = activeWarmConn?.port
@@ -391,14 +466,15 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
           }
         : null
       return {
-        type: 'mc-host-model', v: 1, tabs, activeId, self, macInset,
+        type: 'mc-host-model', v: 1, tabs, activeId, self, macInset, focusMode,
         electron: isElectron,
         // Array, not the Set itself: structured clone rejects a Set across this
         // boundary in some engines and the receiver validates element-wise anyway.
         pinnedCrews,
+        stableOrder,
       }
     },
-    [instancesQuery.data, warm, unread, activeId, macInset, pinnedCrews],
+    [instancesQuery.data, warm, unread, activeId, macInset, focusMode, pinnedCrews, stableOrder],
   )
 
   // Post the model into one embedded pane, addressed to its exact loopback
@@ -425,7 +501,7 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   // to a loopback frame.
   useEffect(() => {
     for (const id of Object.keys(warm)) postModelTo(id)
-  }, [warm, activeId, unread, macInset, instancesQuery.data, postModelTo, pinnedCrews])
+  }, [warm, activeId, unread, macInset, instancesQuery.data, postModelTo, pinnedCrews, stableOrder])
 
   // Keep warm iframes mounted across Local<->remote switches (hide-not-unmount).
   // Also render when the active tab is a remote instance with no warm iframe
@@ -450,6 +526,41 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   // embedded switcher is a black pane with NO tabs — the local header is
   // display:none while a remote tab is active, so the user would be stranded.
   const showLoading = !showPanel && activeId !== null && !!warm[activeId] && !activeReady
+  // Journal the failure this panel is about to show, so its hand-off carries the
+  // diagnosis ladder instead of the one sentence on screen. Recorded here rather
+  // than by the API client because the panel's evidence arrives on a SUCCESSFUL
+  // poll: `status.error` and the ladder verdict ride a 200, and the auto-warm
+  // connect that failed earlier swallowed its own rejection. Placed above the
+  // early return below so the hook order cannot depend on what is warm.
+  // The report the panel's hand-off carries. Held in state because producing it
+  // journals, and passed as an object so the prompt is bound to THIS crew rather
+  // than to whichever crew last journaled the same sentence.
+  const [panelReport, setPanelReport] = useState<ErrorReport | null>(null)
+  useEffect(() => {
+    if (!activeId) return
+    const inst = instancesQuery.data?.instances.find(i => i.id === activeId)
+    // A connect in flight is not a failure. Without this the transient
+    // `connecting` state would journal as its own distinct signature, so every
+    // Retry would leave a phantom entry between the real ones.
+    if (inst?.status?.state === 'connecting') return
+    setPanelReport(reportInstanceFailure({
+      id: activeId,
+      name: inst?.name || activeId,
+      transport: inst?.connection_method === 'ssm' ? 'ssm' : 'ssh',
+      // With the panel down the pane is healthy, so pass no status: the recorder's
+      // no-failure path is what clears its de-dup signature, and gating this call
+      // on `showPanel` would make that branch unreachable — leaving the signature
+      // standing after recovery so a later identical failure is suppressed.
+      status: showPanel ? inst?.status : undefined,
+      stage: activeTimedOut ? 'pane_load' : 'connect',
+      // The watchdog case has no backend error string at all — the tunnel claims
+      // connected while the pane never loaded — so name that state explicitly
+      // rather than journaling nothing for the one failure with no visible cause.
+      fallbackMessage: showPanel && activeTimedOut
+        ? i18nT('components.instancesViewport.pane_failed_to_load')
+        : '',
+    }))
+  }, [showPanel, activeId, activeTimedOut, instancesQuery.data])
   if (embedded || (warmIds.length === 0 && !showPanel)) return null
 
   const nameFor = (id: string) =>
@@ -479,13 +590,18 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
           src={srcFor(id)}
           // The embedded pane is the SAME SPA on the tunnel's loopback port, so
           // it is a CROSS-ORIGIN iframe (same host, different port). Browsers
-          // disable the microphone in cross-origin frames unless the parent
-          // delegates it via Permissions-Policy, so getUserMedia in the remote
-          // dashboard rejects with NotAllowedError ("permission denied") without
-          // this. Local (top-level) use is unaffected. Loopback-only, and the
-          // pane already runs our own token-authed SPA, so delegating the mic
-          // here grants nothing a same-origin top-level load wouldn't already.
-          allow="microphone"
+          // deny microphone and fullscreen in cross-origin frames unless the
+          // parent delegates them via Permissions-Policy: without "microphone",
+          // getUserMedia in the remote dashboard rejects with NotAllowedError;
+          // without "fullscreen", document.fullscreenEnabled is false in the
+          // pane and the native <video> controls render a disabled fullscreen
+          // button. Local (top-level) use is unaffected. Loopback-only, and the
+          // pane already runs our own token-authed SPA, so delegating these
+          // grants nothing a same-origin top-level load wouldn't already.
+          // allowFullScreen mirrors the legacy attribute some engines still
+          // require alongside the Permissions-Policy delegation.
+          allow="microphone; fullscreen"
+          allowFullScreen
           onLoad={() => postModelTo(id)}
           className="absolute inset-0 w-full h-full border-0"
           style={{ display: id === activeId ? 'block' : 'none' }}
@@ -499,7 +615,17 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
           loading/error overlays, which carry their own interactive tab strip).
           Each strip sits in a control-free gap the pane measured, so it never
           swallows a header button's clicks. */}
-      {isElectron && activeId && !showPanel && !showLoading && !!warm[activeId] && activeReady &&
+      {/* Host-rendered drag strips over the pane's own header gaps. In focus
+          mode they follow the PANE's chrome: while its header is hidden they are
+          suppressed — the strips are `-webkit-app-region: drag`, which the
+          compositor resolves BEFORE hit-testing, so leaving them up would make
+          the pane's top band answer neither hover nor clicks and its own chrome
+          could never be peeked back. While the pane's header IS peeked they must
+          render: the pane's own app-region CSS is inert (draggable regions are
+          only collected from the host document, never from a cross-origin
+          iframe), so these strips are the ONLY thing that makes the peeked
+          header move the window. */}
+      {isElectron && (!focusMode || focusChromeVisible) && activeId && !showPanel && !showLoading && !!warm[activeId] && activeReady &&
         (dragGaps[activeId] ?? []).map((g, i) => {
           // Stay clear of the caption controls at the right edge: Windows'
           // native titleBarOverlay buttons, or frameless Linux's injected
@@ -582,6 +708,29 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
               >
                 <RefreshCw size={13} className={panelConnecting ? 'animate-spin' : ''} /> {i18nT('components.instancesViewport.retry')}
               </button>
+              {/* Retry stays primary — a momentary drop is worth one press. This is
+                  the other half: a first connect fails on SSH config, a remote
+                  gateway that is not running, a wrong port or an SSM instance
+                  profile, and none of those change between two presses. Nothing to
+                  stash: the panel holds no input.
+
+                  `onHandoff` returns to Local, and without it the hand-off is
+                  INVISIBLE: this panel renders inside the viewport's root overlay
+                  (`absolute inset-0 bg-bg`, opaque, over the local pane whenever a
+                  remote tab is active), and the hand-off only soft-navigates the
+                  local SPA to /chat — underneath. The user would keep staring at
+                  the same error panel and read the button as dead, while each
+                  further click stacked another copy of the prompt onto the
+                  hand-off QUEUE. The only other `setActiveId(null)` comes from the
+                  embedded pane's own switcher, and that iframe is exactly what
+                  failed here. Timed AFTER on purpose: leaving the panel on a
+                  FAILED staging would clear the error with no chat to show for it. */}
+              {!panelConnecting && panelReport && (
+                <AskAgentButton
+                  report={panelReport}
+                  onHandoff={() => dispatch(setActiveId(null))}
+                />
+              )}
               <div className="text-[11px] text-muted">
                 {i18nT('components.instancesViewport.this_tab_stays_until_you_disconnect_the_instance')}
               </div>

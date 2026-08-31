@@ -12,6 +12,7 @@ about both isolation layers being inactive (Fix #3 of the insecure-defaults audi
 from __future__ import annotations
 
 import logging
+import sys
 
 import kiro_crew.sandbox as sb
 
@@ -103,6 +104,28 @@ def test_mode_off_emits_security_warning(monkeypatch, caplog):
     assert "sandbox='off'" in msg or "both" in msg.lower() or "no OS-level" in msg.lower()
 
 
+def test_mode_off_diagnostic_never_logs_argv_values(monkeypatch, caplog):
+    """The generic sandbox logger emits only a fixed command class.
+
+    CodeQL models list elements as interchangeable, and the runtime contract is
+    stronger anyway: neither an executable path nor any later argument belongs
+    in a security-degradation log.
+    """
+    _reset_warned()
+    _neutralize_passthrough(monkeypatch)
+    monkeypatch.setattr(sys, "platform", "win32")
+    secret_marker = "SandboxCommandSecret"
+
+    with caplog.at_level(logging.WARNING, logger=sb.logger.name):
+        sb.wrap_argv(
+            [f"C:/private/{secret_marker}/git.exe", f"--token={secret_marker}"],
+            mode="off",
+        )
+
+    assert secret_marker not in caplog.text
+    assert "Command: git" in caplog.text
+
+
 def test_scrub_env_drops_credential_keys():
     """scrub_env removes AWS/SSH/Slack-token keys, keeps benign ones."""
     env = {
@@ -123,6 +146,23 @@ def test_scrub_env_extra_prefixes_strips_python_env():
     env = {"PATH": "/usr/bin", "PYTHONPATH": "/site", "PYTHONHOME": "/py"}
     out = sb.scrub_env(env, extra_prefixes=sb._PYTHON_ENV_PREFIXES)
     assert out == {"PATH": "/usr/bin"}
+
+
+def test_strip_python_env_covers_pycache_prefix(monkeypatch):
+    """PYTHONPYCACHEPREFIX is scrubbed on the agent spawn path (strip_python_env)
+    and kept otherwise.
+
+    The packaged app exports it for the gateway's own interpreter tree, but a
+    foreign interpreter in the agent subtree inheriting it mirrors its whole
+    stdlib/site-packages into <data home>/cache/pycache — the unbounded cache
+    growth bug. The keep-side matters equally: the gateway's own sandboxed
+    Python children must keep writing bytecode outside the signed bundle.
+    """
+    monkeypatch.setenv("PYTHONPYCACHEPREFIX", "/home/x/.kiro/crew/cache/pycache")
+    stripped = sb._sandbox_env_scrub_keys("standard", True)
+    kept = sb._sandbox_env_scrub_keys("standard", False)
+    assert "PYTHONPYCACHEPREFIX" in stripped
+    assert "PYTHONPYCACHEPREFIX" not in kept
 
 
 def test_strip_python_env_holds_on_fail_open_path(monkeypatch):

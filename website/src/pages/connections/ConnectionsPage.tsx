@@ -14,7 +14,7 @@ import {
   Unplug,
   X,
 } from 'lucide-react'
-import { api, type ConnectionMintState } from '../../api/client'
+import { api, type ConnectionMintState, type ConnectionStatus } from '../../api/client'
 import { useAppSelector } from '../../store'
 import type { ChatMessage, McpApplyChange, McpServer } from '../../types'
 import { fmtDate } from '../../i18n/format'
@@ -31,6 +31,11 @@ import {
  *  URL promptly without spinning on a request that mostly answers `minting`. */
 const MINT_POLL_MS = 2_000
 
+/** Authorization-status poll cadence. A grant changes rarely and the read is a
+ *  local stat, so this is slow relative to the mint poll — it only has to notice
+ *  a grant completed outside the dashboard and keep connected-since fresh. */
+const CONNECTION_STATUS_POLL_MS = 30_000
+
 export type ConnectionCardState =
   | 'not-connected'
   | 'waiting-for-approval'
@@ -40,7 +45,11 @@ export type ConnectionCardState =
 
 type ConnectionAction = 'connect' | 'disconnect' | 'relay' | 'test'
 export type Feedback = {
-  kind: 'success' | 'error'
+  // THREE kinds, because "the click did not do what you asked" splits in two. An
+  // `error` is a failure; a `warning` is a deliberate refusal that leaves the user
+  // a repair to make. Both must ANNOUNCE (role=alert) -- only `success` is a
+  // passing status update.
+  kind: 'success' | 'warning' | 'error'
   text: string
   revoke?: { href: string; provider: string }
 }
@@ -72,24 +81,10 @@ function safeApprovalUrl(value: string): string {
   }
 }
 
-/** Accept only the loopback redirect shape produced by the runtime callback. */
-export function isValidLoopbackReturnAddress(value: string): boolean {
-  try {
-    const url = new URL(value.trim())
-    const loopback = url.hostname === '127.0.0.1' || url.hostname === '[::1]' || url.hostname === '::1'
-    const codes = url.searchParams.getAll('code')
-    return url.protocol === 'http:'
-      && loopback
-      && url.port !== ''
-      && url.username === ''
-      && url.password === ''
-      && url.hash === ''
-      && codes.length === 1
-      && codes[0] !== ''
-  } catch {
-    return false
-  }
-}
+// The loopback pre-check lives in `utils/loopbackReturnAddress` (shared with
+// the chat banner's relay affordance).
+import { isValidLoopbackReturnAddress } from '../../utils/loopbackReturnAddress'
+import { useImeGuard } from '../../hooks/useImeGuard'
 
 export interface PendingConnect {
   kind: 'new' | 'reconnect'
@@ -230,9 +225,10 @@ export function uninstallOnCancel(pending: PendingConnect | undefined): boolean 
 export function disconnectFeedback(
   provider: Pick<ConnectionProvider, 'name' | 'revoke_page_url'>,
   text: string,
+  kind: Feedback['kind'] = 'success',
 ): Feedback {
   return {
-    kind: 'success',
+    kind,
     text,
     revoke: { href: provider.revoke_page_url, provider: provider.name },
   }
@@ -242,23 +238,43 @@ export function connectionStateFor(
   server: McpServer | undefined,
   oauth: OAuthState | undefined,
   locallyWaiting = false,
+  grantPresent?: boolean,
+  awaitingConsent = false,
 ): ConnectionCardState {
-  if (!server) return locallyWaiting ? 'waiting-for-approval' : 'not-connected'
+  if (!server) {
+    // `awaitingConsent` is the backend's mint table saying a flow for this
+    // provider is in flight RIGHT NOW. It is what survives a refresh: the
+    // locally-pending map and the chat's oauth message are both per-tab state,
+    // so without it a reload mid-consent silently drops back to Connect while
+    // the approval URL is still live.
+    return locallyWaiting || awaitingConsent ? 'waiting-for-approval' : 'not-connected'
+  }
   if (oauth?.failed) return 'needs-attention'
-  if (oauth?.completed || server.status === 'ok') return 'connected'
-  if (locallyWaiting || oauth?.oauthUrl) return 'waiting-for-approval'
+  // A completed OAuth flow in THIS session outranks a possibly-lagging status
+  // poll: the grant was just written, the feed may not have re-read yet.
+  if (oauth?.completed) return 'connected'
+  if (server.status === 'ok') {
+    // The reachability probe is cached, so `ok` outlives a revoked grant. A
+    // CONFIRMED absent grant (grantPresent === false, never the indeterminate
+    // or not-yet-loaded undefined) is the fresher authorization fact and wins:
+    // render the honest not-verified card instead of a Connected badge for an
+    // authorization that no longer exists.
+    return grantPresent === false ? 'not-verified' : 'connected'
+  }
+  if (locallyWaiting || awaitingConsent || oauth?.oauthUrl) return 'waiting-for-approval'
   // The status probe carries no OAuth token — kiro-cli owns token custody and
   // Kiro Crew stores no credential — so a remote OAuth server answers it with 401
   // and the gateway reports `needs_auth`. Two very different situations produce
   // that identical answer: a server nobody has authorized, and a server
   // authorized OUTSIDE the dashboard, which the runtime calls fine and which
-  // raised no `mcp_oauth` banner here. `needs_auth` is therefore honest about
-  // the PROBE (it needs authorization to see this server) and would be a claim
-  // we cannot support if restated as a fact about the server — which is why the
-  // state is named for what we know rather than for what the user must do. It
-  // must reach neither the error card (#1853) nor the spinner below, which would
-  // imply a grant is in flight.
-  if (server.status === 'needs_auth') return 'not-verified'
+  // raised no `mcp_oauth` banner here. The authorization axis from
+  // /api/connections/status (`grantPresent`) is what tells them apart: a grant on
+  // disk means the runtime IS authorized and the card is connected; no grant
+  // leaves the honest `not-verified` (needs authorization to see this server).
+  // Absent `grantPresent` (status feed not yet loaded) keeps the prior behaviour.
+  // It must reach neither the error card (#1853) nor the spinner below, which
+  // would imply a grant is in flight.
+  if (server.status === 'needs_auth') return grantPresent ? 'connected' : 'not-verified'
   if (server.status === 'error' || server.status === 'disabled') return 'needs-attention'
   return 'waiting-for-approval'
 }
@@ -301,6 +317,15 @@ interface ConnectionCardProps {
   server?: McpServer
   state: ConnectionCardState
   oauth?: OAuthState
+  /** First-authorization timestamp from /api/connections/status. Preferred over
+   *  server.connectedSince, which no current runtime populates. */
+  connectedSince?: string
+  /** Tri-state authorization verdict from /api/connections/status: true = a
+   *  grant is on disk, false = CONFIRMED absent, undefined = indeterminate or
+   *  not yet loaded. The card needs the raw verdict, not just the folded
+   *  `state`, because two substates share `not-verified`: a confirmed absence
+   *  can name itself, while an unknowable one must keep the honest hedge. */
+  grantPresent?: boolean
   busy?: ConnectionAction
   feedback?: Feedback
   highlighted: boolean
@@ -312,11 +337,28 @@ interface ConnectionCardProps {
   onRelay: (returnAddress: string) => Promise<boolean>
 }
 
+/** v1's approved copy: each provider's description leads with what the agent
+ *  can DO. The keys are literal (not built at runtime) because a key built at
+ *  runtime is invisible to every static tool: the extractor does not find it
+ *  and the dead-key scan reports it as referenced nowhere. A provider absent
+ *  here falls back to the generic blurb. */
+const VALUE_PROP_KEYS = {
+  notion: 'pages.connectionsPage.value_prop_notion',
+  github: 'pages.connectionsPage.value_prop_github',
+  linear: 'pages.connectionsPage.value_prop_linear',
+  atlassian: 'pages.connectionsPage.value_prop_atlassian',
+  stripe: 'pages.connectionsPage.value_prop_stripe',
+  vercel: 'pages.connectionsPage.value_prop_vercel',
+  gitlab: 'pages.connectionsPage.value_prop_gitlab',
+} as const
+
 function ConnectionCard({
   provider,
   server,
   state,
   oauth,
+  connectedSince,
+  grantPresent,
   busy,
   feedback,
   highlighted,
@@ -327,17 +369,19 @@ function ConnectionCard({
   onTest,
   onRelay,
 }: ConnectionCardProps) {
+  const ime = useImeGuard()
   const { t } = useTranslation()
   const [returnAddress, setReturnAddress] = useState('')
   const [invalidReturnAddress, setInvalidReturnAddress] = useState(false)
   const approvalUrl = safeApprovalUrl(oauth?.oauthUrl || '')
-  const accountLabel = server?.accountLabel || t('pages.connectionsPage.authorized_account')
   const logo = <ProviderLogo slug={provider.slug} />
   // `official_mcp_server` used to be a subtitle line under the name; the brand
   // mark now carries provenance visually, so keep the assurance as the card's
   // accessible/hover description instead of a third row of chrome.
   const provenance = t('pages.connectionsPage.official_mcp_server')
-  const scopes = provider.recommended_scopes
+  const valueProp = provider.slug in VALUE_PROP_KEYS
+    ? t(VALUE_PROP_KEYS[provider.slug as keyof typeof VALUE_PROP_KEYS])
+    : t('pages.connectionsPage.service_value_prop', { provider: provider.name })
   const stateMeta: Record<ConnectionCardState, { label: string; icon: ReactNode; tone: string }> = {
     'not-connected': {
       label: t('pages.connectionsPage.not_connected'),
@@ -405,11 +449,8 @@ function ConnectionCard({
         </span>
       </header>
 
-      <p
-        className="mb-2.5 mt-1.5 min-w-0 truncate text-[12.5px] text-muted"
-        title={t('pages.connectionsPage.service_value_prop', { provider: provider.name })}
-      >
-        {t('pages.connectionsPage.service_value_prop', { provider: provider.name })}
+      <p className="mb-2.5 mt-1.5 min-w-0 text-[12.5px] text-muted" title={valueProp}>
+        {valueProp}
       </p>
 
       <div className="mt-auto">
@@ -468,12 +509,7 @@ function ConnectionCard({
                     setReturnAddress(event.target.value)
                     if (invalidReturnAddress) setInvalidReturnAddress(false)
                   }}
-                  onKeyDown={event => {
-                    if (event.key === 'Enter') {
-                      event.preventDefault()
-                      void runRelay()
-                    }
-                  }}
+                  {...ime.bindEnter({ onEnter: () => void runRelay() })}
                   placeholder={t('pages.connectionsPage.return_address_placeholder')}
                   autoComplete="off"
                   spellCheck={false}
@@ -500,7 +536,16 @@ function ConnectionCard({
           <div className="space-y-3">
             <div className="flex items-start gap-2 rounded-md border border-warn/30 bg-warn-subtle p-2.5 text-[12px] text-text">
               <KeyRound className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warn" aria-hidden="true" />
-              <span>{t('pages.connectionsPage.not_verified_help', { provider: provider.name })}</span>
+              {/* Two substates share this card. `grantPresent === false` is a
+                  CONFIRMED verdict (the status feed stat'd kiro-cli's grant
+                  artifacts and found none), so the copy names the held fact
+                  instead of hedging "cannot see the authorization" — the hedge
+                  is only honest while the verdict is indeterminate. */}
+              <span>
+                {grantPresent === false
+                  ? t('pages.connectionsPage.not_authorized_help', { provider: provider.name })
+                  : t('pages.connectionsPage.not_verified_help', { provider: provider.name })}
+              </span>
             </div>
             <div className="flex justify-end">
               <Btn primary onClick={() => void onReconnect()} disabled={!!busy}>
@@ -513,26 +558,12 @@ function ConnectionCard({
 
         {state === 'connected' && (
           <div className="space-y-3">
-            <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-[12px]">
-              <dt className="text-muted">{t('pages.connectionsPage.account')}</dt>
-              <dd className="m-0 truncate font-medium text-text" title={accountLabel}>{accountLabel}</dd>
-              <dt className="text-muted">{t('pages.connectionsPage.access')}</dt>
-              <dd className="m-0 break-words text-text">
-                {scopes.length > 0 ? t('pages.connectionsPage.recommended_access', { scopes: scopes.join(', ') }) : t('pages.connectionsPage.tool_controlled_access')}
-              </dd>
-              {server?.connectedSince && (
-                <>
-                  <dt className="text-muted">{t('pages.connectionsPage.connected_since')}</dt>
-                  <dd className="m-0 text-text">{fmtDate(server.connectedSince)}</dd>
-                </>
-              )}
-            </dl>
-            <p className="m-0 text-[11px] leading-relaxed text-muted">
-              {t('pages.connectionsPage.disconnect_help')}{' '}
-              <a href={provider.revoke_page_url} target="_blank" rel="noopener noreferrer" className="text-accent hover:text-accent-hover">
-                {t('pages.connectionsPage.revoke_at_provider', { provider: provider.name })} <ExternalLink className="lucide-inline" aria-hidden="true" />
-              </a>
-            </p>
+            {(connectedSince || server?.connectedSince) && (
+              <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-[12px]">
+                <dt className="text-muted">{t('pages.connectionsPage.connected_since')}</dt>
+                <dd className="m-0 text-text">{fmtDate((connectedSince || server?.connectedSince) as string)}</dd>
+              </dl>
+            )}
             <div className="flex justify-end gap-2">
               <Btn onClick={() => void onTest()} disabled={!!busy}>
                 {busy === 'test' ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" /> : <RotateCw className="w-3.5 h-3.5" aria-hidden="true" />}
@@ -565,7 +596,7 @@ function ConnectionCard({
       </div>
 
       {feedback && (
-        <div role={feedback.kind === 'error' ? 'alert' : 'status'} className={`mt-3 text-[11px] ${feedback.kind === 'error' ? 'text-danger' : 'text-ok'}`}>
+        <div role={feedback.kind === 'success' ? 'status' : 'alert'} className={`mt-3 text-[11px] ${feedback.kind === 'error' ? 'text-danger' : feedback.kind === 'warning' ? 'text-warn' : 'text-ok'}`}>
           {feedback.text}
           {feedback.revoke && (
             <>
@@ -620,12 +651,41 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
     refetchInterval: activeTab === 'services' && Object.values(locallyWaiting).some(Boolean) ? 5_000 : false,
   })
 
+  // Authorization verdict + first-connect time per visible provider. Polled while
+  // the gallery is mounted so a grant completed outside the dashboard, and the
+  // connected-since clock, surface without a manual refresh. Additive to the mint
+  // feed below; this never mints and never owns reachability (that stays with
+  // /api/mcp). Declared before the mint feed because `waitingSlugs` reads the
+  // awaiting_consent verdicts.
+  const { data: statusBySlug = {} } = useQuery<Record<string, ConnectionStatus>>({
+    queryKey: ['connections-status'],
+    queryFn: async () => {
+      const { connections } = await api.connectionsStatus()
+      const next: Record<string, ConnectionStatus> = {}
+      for (const entry of connections) next[entry.slug] = entry
+      return next
+    },
+    enabled: servicesEnabled,
+    // Only while the gallery is the visible surface. On the MCP Servers tab no
+    // card is rendered, so a background poll would stat every provider's grant
+    // artifacts every 30s for a surface nobody is looking at.
+    refetchInterval: activeTab === 'services' ? CONNECTION_STATUS_POLL_MS : false,
+  })
+
   // Minted approval URLs, keyed by slug. Fetched only while a connect is pending:
   // outside that window nothing is minting and the endpoint would answer `idle`.
-  const waitingSlugs = useMemo(
-    () => Object.keys(locallyWaiting).sort(),
-    [locallyWaiting],
-  )
+  // "Pending" has two sources of truth, and both must feed the poll: this tab's
+  // own clicks (locallyWaiting) AND the backend's awaiting_consent verdict --
+  // per-tab state dies on a reload, so without the status-fed half the
+  // refresh-survival waiting card would render with no approval URL and copy
+  // telling the user to start a flow that is already running.
+  const waitingSlugs = useMemo(() => {
+    const slugs = new Set(Object.keys(locallyWaiting))
+    for (const [slug, entry] of Object.entries(statusBySlug)) {
+      if (entry.status === 'awaiting_consent') slugs.add(slug)
+    }
+    return [...slugs].sort()
+  }, [locallyWaiting, statusBySlug])
   const { data: mintByServer = {} } = useQuery<Record<string, ConnectionMintState>>({
     queryKey: ['connections-mint', waitingSlugs],
     queryFn: async () => {
@@ -676,6 +736,12 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
       void api.mcpProbe().then(probed => {
         queryClient.setQueryData<McpServer[]>(['mcp-servers'], probed as McpServer[])
       }).catch(() => undefined)
+      // Same staleness on the authorization axis: the status feed polls every
+      // 30s, so its cached pre-consent verdict (grantPresent=false /
+      // awaiting_consent) would outrank the grant that just landed and downgrade
+      // the card for up to a full poll interval. Invalidate rather than
+      // setQueryData: the fresh verdict is the backend's to compute.
+      void queryClient.invalidateQueries({ queryKey: ['connections-status'] })
     }
     if (failedMints.length) {
       setFeedback(current => {
@@ -794,33 +860,157 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
   })
 
   const disconnect = async (provider: ConnectionProvider, server: McpServer, cancelled = false) => run(provider, 'disconnect', async () => {
-    await api.mcpApply([{ name: server.name, uninstall: true }])
+    // Cancel must NOT revoke, and this branch is load-bearing. A grant is keyed by
+    // ENDPOINT, not by entry, so a cancelled *new* connect routed through the
+    // revoking endpoint would delete a grant that a user's own separately-named
+    // server at the same URL is still using — silently, because `cancelled`
+    // suppresses the note below. Cancel therefore keeps the entry-only removal it
+    // always had; only a deliberate Disconnect revokes.
+    if (cancelled) {
+      await api.mcpApply([{ name: server.name, uninstall: true }])
+    }
+    // One call does all three local things: dispose any in-flight mint, delete the
+    // stored grant artifacts when they are ours alone, and remove the MCP entry.
+    // This was an mcpApply uninstall, which took the entry out and left a usable
+    // refresh token on disk — so a later reconnect silently resumed a grant this
+    // card had already told the user was gone.
+    const result = cancelled ? undefined : await api.connectionsDisconnect(provider.slug)
     setLocallyWaiting(current => {
       const next = { ...current }
       delete next[provider.slug]
       return next
     })
     await queryClient.invalidateQueries({ queryKey: ['mcp-servers'] })
-    if (!cancelled) {
+    // The grant feed too, mirroring the connect-completed path: a Disconnect that
+    // deletes the grant but keeps the entry would otherwise leave the cached
+    // grantPresent=true rendering "Connected" beside a note saying the grant is
+    // gone, until the next poll.
+    void queryClient.invalidateQueries({ queryKey: ['connections-status'] })
+    if (result) {
+      // Facts are reported INDEPENDENTLY, never as an exclusive chain — two review
+      // rounds landed findings in this span because each single message asserted a
+      // second fact it never tested ("Entry removed." while the entry stayed;
+      // "Disconnected, but…" while the backend declined). The GRANT clause states
+      // only what happened to the grant; the ENTRY clause is appended whenever the
+      // backend left the entry alone. Outcomes that announce: a survivor is an
+      // `error` (a grant outliving the click is the state this endpoint exists to
+      // prevent), a census gap is a `warning` (nothing failed, but the grant is
+      // still there and the configuration needs checking), and a not-ours entry is
+      // a `warning` too (the card still shows Connected with a live Disconnect
+      // button, so a green success would misreport a click that changed nothing).
+      // A grant deliberately kept for a NAMED sharer needs nothing from the user,
+      // so it stays a success status.
+      // `grantSurviving` now reports FAILED unlinks only: the backend re-stats
+      // just the pairs it actually tried to remove, so a deliberate keep (a
+      // sharer, or a census gap) never appears here. That is what collapses the
+      // precedence ladder these branches used to need — a survivor no longer has
+      // to be disambiguated against `shared`/`censusGap` before it can alert.
+      const survived = result.grantSurviving.length > 0
+      const shared = result.grantSharedWith.length > 0
+      const censusGap = !shared && result.grantCensusIncomplete
+      const entryKept = !result.entryRemoved
+      // The not-ours outcome: nothing here was this provider's to remove — no
+      // grant artifacts existed and no purge-eligible entry matched, so the
+      // click changed nothing. The entry clause is the whole message there, and
+      // it must hand the user a next move: without the recourse their only
+      // move is to click Disconnect again. The message states only what the
+      // response proves (nothing changed) — `entryRemoved=false` cannot say WHY
+      // the entry was kept, so the copy never asserts a cause.
+      const entryNotOurs = entryKept && !survived && !shared && !censusGap && !result.grantRemoved
+      // The census knows which source it could not read, so the repair instruction
+      // names it. Empty is the honest case, not a missing field: `censusIncomplete`
+      // is also set by an entry whose URL could not be compared, which names no
+      // file -- so that outcome keeps the source-less wording instead of
+      // interpolating a blank into "fix that file".
+      const unreadable = result.grantCensusUnreadable ?? []
+      const grantClause = survived
+        ? t('pages.connectionsPage.disconnect_grant_survived')
+        : shared
+          ? t('pages.connectionsPage.disconnect_grant_shared', {
+              names: result.grantSharedWith.join(', '),
+            })
+          : censusGap
+            ? unreadable.length > 0
+              ? t('pages.connectionsPage.disconnect_census_incomplete_source', {
+                  source: unreadable[0],
+                })
+              : t('pages.connectionsPage.disconnect_census_incomplete')
+            : result.grantRemoved && entryKept
+            ? t('pages.connectionsPage.disconnect_entry_not_ours')
+            : entryKept
+              ? '' // no grant existed and the entry stayed: the entry clause is the whole story
+              : t('pages.connectionsPage.disconnected_locally')
+      const entryClause =
+        entryKept && (survived || shared || !result.grantRemoved)
+          ? t('pages.connectionsPage.disconnect_entry_left_alone')
+          : ''
       setFeedback(current => ({
         ...current,
-        [provider.slug]: disconnectFeedback(provider, t('pages.connectionsPage.disconnected_locally')),
+        [provider.slug]: disconnectFeedback(
+          provider,
+          [grantClause, entryClause].filter(Boolean).join(' '),
+          // A census gap tells the user their access was NOT withdrawn and hands
+          // them a repair to make; a not-ours entry leaves the card showing
+          // Connected with a live Disconnect button, so a green success would
+          // misreport a click that changed nothing. Neither is an `error`,
+          // because nothing failed — a safety rule declined to act, or there was
+          // nothing here to act on.
+          survived ? 'error' : censusGap || entryNotOurs ? 'warning' : 'success',
+        ),
       }))
     }
   })
 
   const cancelConnection = async (provider: ConnectionProvider, server?: McpServer): Promise<boolean> => {
-    if (uninstallOnCancel(locallyWaiting[provider.slug])) {
-      // The entry may not be in the cached list yet (probe still pending) —
-      // fall back to the slug the connect just wrote so Cancel always undoes it.
-      const target = server ?? ({ name: provider.slug } as McpServer)
-      return disconnect(provider, target, true)
-    }
+    const pending = locallyWaiting[provider.slug]
+    // Dispose the in-flight backend mint (its kiro-cli process, loopback listener
+    // and ephemeral spec) whether or not we also uninstall the config below. This
+    // is what main lacked: a cancelled reconnect or stateless wait dropped only
+    // the local wait and left the mint held to its TTL.
+    //
+    // Deliberately NOT awaited. Disposal waits on a child process shutdown, which
+    // is bounded only by the gateway's shutdown timeout (~10s), and awaiting it
+    // would leave Cancel un-actioned and re-clickable for that whole window. The
+    // withdrawal the user asked for is local; the dispose is bookkeeping that
+    // follows. Token-fenced so a stale tab cannot dispose a sibling's row, and
+    // the rejection is swallowed so a gateway failure never surfaces as a Cancel
+    // that did not work.
+    void api.connectionsCancel(provider.slug, pending?.token).catch(() => undefined).finally(() => {
+      // The dispose just changed the backend verdict, so re-fetch it rather
+      // than waiting out the 30s poll.
+      void queryClient.invalidateQueries({ queryKey: ['connections-status'] })
+    })
+    // Standard optimistic-update fence: a 30s poll already in flight was
+    // fetched BEFORE the cancel, so letting it resolve after the drop below
+    // would repopulate the stale awaiting_consent verdict until the
+    // settlement invalidation lands. Cancel the in-flight fetch first.
+    await queryClient.cancelQueries({ queryKey: ['connections-status'] })
+    // Drop this provider's cached verdict NOW: the poll cached `awaiting_consent`
+    // for up to 30s, and with the flow just disposed that stale entry would put
+    // the card straight back into waiting-for-approval -- a Cancel that appears
+    // to not work. Dropping (not fabricating a verdict) returns the card to the
+    // status-not-yet-loaded behaviour until the invalidated query answers.
+    queryClient.setQueryData<Record<string, ConnectionStatus>>(['connections-status'], current => {
+      if (!current || !(provider.slug in current)) return current
+      const next = { ...current }
+      delete next[provider.slug]
+      return next
+    })
+    // The wait dies with the click, unconditionally and BEFORE the uninstall:
+    // the mint was just disposed, so if the uninstall below fails there is no
+    // outcome left that could ever clear this flag -- leaving it set would
+    // strand the card on a waiting state with no live flow behind it.
     setLocallyWaiting(current => {
       const next = { ...current }
       delete next[provider.slug]
       return next
     })
+    if (uninstallOnCancel(pending)) {
+      // The entry may not be in the cached list yet (probe still pending) —
+      // fall back to the slug the connect just wrote so Cancel always undoes it.
+      const target = server ?? ({ name: provider.slug } as McpServer)
+      return disconnect(provider, target, true)
+    }
     return true
   }
 
@@ -913,7 +1103,7 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
               {t('pages.connectionsPage.no_matching_services')}
             </div>
           ) : (
-            <div className="grid grid-cols-1 gap-3 xl:grid-cols-2 2xl:grid-cols-3">
+            <div className="grid grid-cols-1 items-start gap-3 xl:grid-cols-2 2xl:grid-cols-3">
               {filteredProviders.map(provider => {
                 const server = serverForConnection(provider, servers)
                 const pending = locallyWaiting[provider.slug]
@@ -921,7 +1111,18 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
                   effectiveOAuth(oauthByServer[provider.slug], pending),
                   mintByServer[provider.slug],
                 )
-                const state = connectionStateFor(server, oauth, !!pending)
+                const status = statusBySlug[provider.slug]
+                const state = connectionStateFor(
+                  server,
+                  oauth,
+                  !!pending,
+                  // Only a CONFIRMED verdict may steer the card: an indeterminate
+                  // lookup reports grantPresent=false without knowing anything.
+                  status && !status.grantIndeterminate ? status.grantPresent : undefined,
+                  // The backend's mint table outlives this tab's local state, so
+                  // a refresh mid-consent still renders the waiting card.
+                  status?.status === 'awaiting_consent',
+                )
                 const cardBusy = busy?.slug === provider.slug ? busy.action : undefined
                 return (
                   <ConnectionCard
@@ -930,6 +1131,10 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
                     server={server}
                     state={state}
                     oauth={oauth}
+                    connectedSince={status?.connectedSince}
+                    // The same confirmed-only verdict the state fold received:
+                    // indeterminate stays undefined so the card keeps the hedge.
+                    grantPresent={status && !status.grantIndeterminate ? status.grantPresent : undefined}
                     busy={cardBusy}
                     feedback={feedback[provider.slug]}
                     highlighted={highlightedSlug === provider.slug}

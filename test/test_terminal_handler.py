@@ -71,6 +71,9 @@ def _make_session(session_id="s1", alive=True, ws=None, disconnect=None):
         proc=proc,
         ws=ws,
     )
+    # Most unit tests exercise an established terminal. Tests for the startup
+    # barrier opt back into the fresh-session state explicitly.
+    sess.shell_ready = True
     sess.last_ws_disconnect = disconnect
     sess.reader_task = None
     return sess
@@ -1860,6 +1863,47 @@ class TestApiTerminalWs:
         assert spawn.call_args.kwargs["env"]["SHELL"] == "/bin/zsh"
 
     @pytest.mark.asyncio
+    async def test_bash_spawn_uses_the_post_profile_init_stream(self, monkeypatch):
+        registry: dict = {}
+        req = _make_request(registry=registry, session_id="bash-ready")
+        req.query = MagicMock()
+        req.query.get = lambda *a, **k: None
+
+        ws = AsyncMock()
+        ws.closed = False
+        monkeypatch.setenv("SHELL", "/bin/bash")
+        monkeypatch.setattr(
+            terminal.shutil, "which", lambda c: c if c == "/bin/bash" else None
+        )
+
+        pty_fds = os.pipe()
+        spawn = AsyncMock(side_effect=RuntimeError("stop before read loop"))
+        fake_pty = MagicMock()
+        fake_pty.openpty.return_value = pty_fds
+        fake_fcntl = MagicMock()
+        fake_termios = MagicMock(TIOCSWINSZ=1, TIOCSCTTY=2)
+        with patch.object(terminal.platform_compat, "IS_POSIX", True), \
+             patch.object(terminal.platform_compat, "IS_WINDOWS", False), \
+             patch.object(terminal, "_pty", fake_pty), \
+             patch.object(terminal, "fcntl", fake_fcntl), \
+             patch.object(terminal, "termios", fake_termios), \
+             patch.object(terminal.asyncio, "create_subprocess_exec", spawn), \
+             patch.object(terminal, "_get_config", return_value={"enabled": True}), \
+             patch.object(terminal.web, "WebSocketResponse", return_value=ws), \
+             patch.object(terminal, "_sel") as mock_sel:
+            mock_sel.return_value.log_api_access = MagicMock()
+            resp = await terminal.api_terminal_ws(req)
+
+        assert resp is ws
+        args = spawn.call_args.args
+        assert args[0].replace("\\", "/").endswith("/bin/bash")
+        assert args[1] == "--init-file"
+        assert args[2].startswith("/dev/fd/")
+        assert args[3] == "-i"
+        inherited = spawn.call_args.kwargs["pass_fds"]
+        assert inherited == (int(args[2].rsplit("/", 1)[-1]),)
+
+    @pytest.mark.asyncio
     async def test_windows_conpty_spawn_failure_sends_error(self, monkeypatch):
         """On Windows a new WS session spawns a ConPTY shell (kiro_crew.conpty);
         the old 'not supported on Windows' refusal no longer exists. If the
@@ -2096,6 +2140,60 @@ def _make_app(registry=None, cfg=None, user="testuser"):
     return app
 
 
+async def _recv_matching(ws, predicate, what: str, *, frames: int = 40, timeout: float = 3):
+    """Return the first frame satisfying *predicate*, skipping the ones it does not.
+
+    The socket carries three interleaved things, and only one of them is what any given
+    test is about: the reply to what the test just sent, raw binary PTY output the shell
+    produced on its own, and a ``ready`` control frame.
+
+    ``ready``'s arrival is NOT ordered against the test's own send. When the resolved
+    shell has no ready-marker to inject, ``api_terminal_ws`` sets ``shell_ready`` and
+    emits ``ready`` while still setting the connection up, so it precedes any reply;
+    when the marker IS injected (Bash), ``ready`` waits for the marker to appear in PTY
+    output and so usually arrives after. Taking the first TEXT frame, or assuming the
+    first frame is BINARY, therefore asserts on which shell the host resolved rather
+    than on the behaviour under test -- and fails on a host whose shell is not Bash.
+
+    Bounded by a frame COUNT, not a sleep: every iteration consumes a real frame, so
+    this cannot pass by waiting.
+    """
+    for _ in range(frames):
+        msg = await ws.receive(timeout=timeout)
+        if msg.type in (
+            web.WSMsgType.CLOSE,
+            web.WSMsgType.CLOSING,
+            web.WSMsgType.CLOSED,
+            web.WSMsgType.ERROR,
+        ):
+            raise AssertionError(f"socket closed ({msg.type!r}) before {what} arrived")
+        if predicate(msg):
+            return msg
+    raise AssertionError(f"{what} did not arrive within {frames} frames")
+
+
+async def _recv_control(ws, wanted: str, **kw):
+    """The JSON control frame whose ``type`` is *wanted*. See :func:`_recv_matching`."""
+
+    def _is_wanted(msg) -> bool:
+        if msg.type is not web.WSMsgType.TEXT:
+            return False
+        try:
+            return json.loads(msg.data).get("type") == wanted
+        except (ValueError, AttributeError):
+            return False
+
+    return json.loads((await _recv_matching(ws, _is_wanted, f"a {wanted!r} frame", **kw)).data)
+
+
+async def _recv_pty_output(ws, **kw) -> bytes:
+    """The first BINARY frame — bytes the PTY itself produced. See :func:`_recv_matching`."""
+    msg = await _recv_matching(
+        ws, lambda m: m.type is web.WSMsgType.BINARY, "binary PTY output", **kw
+    )
+    return msg.data
+
+
 @pytest.mark.xdist_group("pty_integration")
 class TestTerminalWsIntegration:
     """Integration tests that exercise the full WebSocket PTY lifecycle.
@@ -2154,13 +2252,7 @@ class TestTerminalWsIntegration:
         async with TestClient(TestServer(app)) as client:
             async with client.ws_connect("/api/ws/terminal/ping-sess") as ws:
                 await ws.send_str(json.dumps({"type": "ping"}))
-                # Drain binary PTY frames until we get the text pong
-                for _ in range(20):
-                    msg = await ws.receive(timeout=2)
-                    if msg.type == web.WSMsgType.TEXT:
-                        break
-                data = json.loads(msg.data)
-                assert data == {"type": "pong"}
+                assert await _recv_control(ws, "pong") == {"type": "pong"}
                 await ws.close()
 
             await terminal._kill_session(registry["ping-sess"])
@@ -2215,10 +2307,7 @@ class TestTerminalWsIntegration:
             async with client.ws_connect("/api/ws/terminal/io-sess") as ws:
                 # Send a command — the PTY should echo something back
                 await ws.send_bytes(b"echo hello\n")
-                # Read at least one binary frame back (PTY output)
-                msg = await ws.receive(timeout=3)
-                assert msg.type == web.WSMsgType.BINARY
-                assert len(msg.data) > 0
+                assert len(await _recv_pty_output(ws)) > 0
                 await ws.close()
 
             await terminal._kill_session(registry["io-sess"])
@@ -2402,6 +2491,9 @@ class TestTerminalWsIntegration:
             sess = registry["recon-sess"]
             original_pid = terminal._sess_pid(sess)
             assert sess.ws is None  # disconnected
+            # The startup barrier has already completed for this PTY. A new
+            # browser must receive the same readiness state after replay.
+            sess.shell_ready = True
 
             # Reconnect
             async with client.ws_connect("/api/ws/terminal/recon-sess") as ws:
@@ -2409,6 +2501,13 @@ class TestTerminalWsIntegration:
                 assert terminal._sess_pid(sess) == original_pid  # same PTY
                 assert sess.ws is not None  # reconnected
                 assert sess.last_ws_disconnect is None
+                for _ in range(40):
+                    msg = await ws.receive(timeout=3)
+                    if msg.type == web.WSMsgType.TEXT:
+                        if json.loads(msg.data).get("type") == "ready":
+                            break
+                else:
+                    raise AssertionError("reconnected initialized shell did not send ready")
                 await ws.close()
 
             await terminal._kill_session(registry["recon-sess"])
@@ -2490,13 +2589,7 @@ class TestTerminalWsIntegration:
                 await ws.send_str("not valid json")
                 # Should not crash — send a ping to verify connection alive
                 await ws.send_str(json.dumps({"type": "ping"}))
-                # Drain binary PTY frames until we get the text pong
-                for _ in range(20):
-                    msg = await ws.receive(timeout=2)
-                    if msg.type == web.WSMsgType.TEXT:
-                        break
-                data = json.loads(msg.data)
-                assert data == {"type": "pong"}
+                assert await _recv_control(ws, "pong") == {"type": "pong"}
                 await ws.close()
 
             await terminal._kill_session(registry["json-sess"])
@@ -2519,9 +2612,10 @@ class TestTerminalWsIntegration:
             def __init__(self, argv, cwd=None, env=None, cols=80, rows=24):
                 self.pid = 4321
                 self._alive = True
+                self._reads = iter((b"PS> ", b""))
 
             def read(self, size=4096):
-                return b""  # EOF: the reader loop exits cleanly
+                return next(self._reads)  # prompt, then EOF
 
             def write(self, data):
                 return len(data)
@@ -2549,6 +2643,12 @@ class TestTerminalWsIntegration:
                 sess = registry["winok-sess"]
                 assert sess.winpty is not None
                 assert sess.proc is None  # Windows backend has no asyncio proc
+                prompt = await ws.receive(timeout=3)
+                ready = await ws.receive(timeout=3)
+                assert prompt.type == web.WSMsgType.BINARY
+                assert prompt.data == b"PS> "
+                assert ready.type == web.WSMsgType.TEXT
+                assert json.loads(ready.data) == {"type": "ready"}
                 await ws.close()
 
         if "winok-sess" in registry:
@@ -2605,15 +2705,27 @@ class TestTerminalWsIntegration:
 
         async with TestClient(TestServer(app)) as client:
             async with client.ws_connect("/api/ws/terminal/sigint-sess") as ws:
-                # Readiness gate: drive it off INPUT ECHO, not an unsolicited
-                # prompt. A login shell on a minimal build host (no MOTD, empty
-                # PS1, non-interactive-looking PTY) may emit nothing until it
-                # receives input, so waiting for a spontaneous ``$ ``/``# ``
-                # prompt is brittle and fired "shell never produced any PTY
-                # output" on the fleet. Instead send a probe and wait for the
-                # PTY line discipline to echo it back — the same proven pattern
-                # as test_ws_binary_io. This confirms the shell is interactive
-                # and consuming stdin without depending on prompt rendering.
+                # The backend's Bash init stream emits readiness only after the
+                # login profile chain returns. Wait for that control frame
+                # before writing the first probe, exactly as Run in terminal
+                # does; prompt text and timing are deliberately irrelevant.
+                loop = asyncio.get_event_loop()
+                ready_deadline = loop.time() + 15
+                ready_seen = False
+                while loop.time() < ready_deadline:
+                    msg = await ws.receive(timeout=ready_deadline - loop.time())
+                    if msg.type == web.WSMsgType.TEXT:
+                        if json.loads(msg.data).get("type") == "ready":
+                            ready_seen = True
+                            break
+                    elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+                        break
+                assert ready_seen, "shell never emitted the post-profile ready frame"
+
+                # Drive the PTY off INPUT ECHO, not an unsolicited prompt. A
+                # login shell on a minimal build host (no MOTD, empty PS1) may
+                # render no recognizable prompt. The probe confirms the shell
+                # is interactive and consuming stdin without depending on one.
                 await ws.send_bytes(b"echo __PTY_READY__\n")
                 ready = await _drain_until(
                     ws,
@@ -2896,6 +3008,48 @@ class TestSessionTitle:
             assert terminal._session_title(self._sess()) is None
 
 
+# ── shell input readiness ──
+
+
+class TestBashShellReadiness:
+    """Bash readiness is an explicit post-profile signal, never a PTY timing
+    or foreground-process-group inference."""
+
+    def test_recognizes_only_bash_executables(self):
+        assert terminal._is_bash_shell("/bin/bash") is True
+        assert terminal._is_bash_shell("C:\\tools\\bash.exe") is True
+        assert terminal._is_bash_shell("/bin/zsh") is False
+
+    def test_init_script_marks_ready_after_the_login_profile_chain(self):
+        script = terminal._bash_init_script("abc123")
+        marker = b"builtin printf '\\033]697;KiroCrewReady;abc123\\007'"
+        assert script.index(b". /etc/profile") < script.index(b'. "$HOME/.bash_profile"')
+        assert script.index(b'. "$HOME/.bash_profile"') < script.index(marker)
+        assert script.index(b'. "$HOME/.bash_login"') < script.index(marker)
+        assert script.index(b'. "$HOME/.profile"') < script.index(marker)
+
+    def test_marker_match_is_split_safe_and_one_shot(self):
+        sess = _make_session()
+        sess.shell_ready = False
+        sess.ready_marker = b"<random-ready-marker>"
+
+        assert terminal._consume_ready_marker(sess, b"output<random-") is False
+        assert sess.shell_ready is False
+        assert terminal._consume_ready_marker(sess, b"ready-marker>prompt") is True
+        assert sess.shell_ready is True
+        assert sess.ready_marker is None
+        assert sess.ready_probe == bytearray()
+        assert terminal._consume_ready_marker(sess, b"<random-ready-marker>") is False
+
+    def test_unrelated_output_never_releases_the_barrier(self):
+        sess = _make_session()
+        sess.shell_ready = False
+        sess.ready_marker = b"<random-ready-marker>"
+
+        assert terminal._consume_ready_marker(sess, b"profile is still waiting") is False
+        assert sess.shell_ready is False
+
+
 # ── one cwd probe per poll tick ──
 
 
@@ -3126,3 +3280,289 @@ class TestPollTerminalTitles:
              patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
             await terminal.poll_terminal_titles(self._app(sess))  # must not raise
         ws.send_str.assert_not_awaited()
+
+
+class TestTerminalRefusalCodes:
+    """Every JSON refusal from the terminal routes carries a machine-readable
+    ``code`` (contract gate: ``test/test_error_code_contract.py``).
+
+    Only the JSON routes are in scope. ``api_terminal_ws``, create's auth/enable
+    guards, and delete answer ``web.Response(text=...)`` — a plain-text contract
+    that carries no envelope to put a code in, and giving them one would change
+    their content type rather than complete this one.
+    """
+
+    @staticmethod
+    def _body(resp):
+        return json.loads(resp.body)
+
+    @pytest.mark.asyncio
+    async def test_create_refuses_over_the_session_cap_with_a_code(self):
+        registry = {"s1": _make_session(), "s2": _make_session()}
+        req = _make_request(registry=registry)
+        with patch.object(
+            terminal, "_get_config", return_value={"enabled": True, "max_sessions": 2}
+        ), patch.object(terminal, "_sel") as mock_sel:
+            mock_sel.return_value.log_api_access = MagicMock()
+            resp = await terminal.api_terminal_create(req)
+        assert resp.status == 429
+        assert self._body(resp)["code"] == "terminal_max_sessions"
+
+    @pytest.mark.asyncio
+    async def test_redact_refusals_are_coded(self):
+        cases = [
+            ({"text": 42}, 400, "terminal_invalid_body"),
+            ({"text": "x" * (terminal._REDACT_MAX_BYTES + 1)}, 413,
+             "terminal_selection_too_large"),
+        ]
+        for body, status, code in cases:
+            req = _make_request()
+            req.json = AsyncMock(return_value=body)
+            with patch.object(terminal, "_is_enabled", return_value=True):
+                resp = await terminal.api_terminal_redact(req)
+            assert resp.status == status, body
+            assert self._body(resp)["code"] == code, body
+
+    @pytest.mark.asyncio
+    async def test_a_failed_redaction_is_coded_and_still_fails_closed(self):
+        """The 500 must name the operation without carrying the selection: this
+        route exists to keep a credential out of the model's input, so its own
+        failure must not put the text back in the response."""
+        secret = "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        req = _make_request()
+        req.json = AsyncMock(return_value={"text": secret})
+        with patch.object(terminal, "_is_enabled", return_value=True), \
+             patch.object(terminal, "redact_exfiltration_urls", side_effect=RuntimeError):
+            resp = await terminal.api_terminal_redact(req)
+        assert resp.status == 500
+        assert self._body(resp)["code"] == "terminal_redaction_failed"
+        assert "wJalrXUtnFEMI" not in resp.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("body", "status", "reason"),
+        [
+            ({"session_id": 42}, 400, "invalid_body"),
+            ({"session_id": "s1", "token": "x" * (4096 + 1)}, 413, "token_too_long"),
+            ({"session_id": "missing"}, 404, "unknown_session"),
+        ],
+    )
+    async def test_complete_refusal_code_is_the_audited_reason(
+        self, body: dict, status: int, reason: str
+    ) -> None:
+        """`_log_complete` already records a fixed reason word for every refusal
+        and the response then dropped it. The code is that word, so the audit
+        trail and the API cannot drift apart."""
+        req = _make_request(registry={})
+        req.json = AsyncMock(return_value=body)
+        with patch.object(terminal, "_is_enabled", return_value=True), \
+             patch.object(terminal, "_sel") as mock_sel:
+            log = MagicMock()
+            mock_sel.return_value.log_api_access = log
+            resp = await terminal.api_terminal_complete(req)
+
+        assert resp.status == status
+        assert self._body(resp)["code"] == f"terminal_{reason}"
+        assert log.call_args.kwargs["resources"] == reason
+
+    @pytest.mark.asyncio
+    async def test_every_json_refusal_carries_a_code_and_its_prose(self):
+        """Per-file ratchet: no JSON refusal may regress to prose-only."""
+        collected = []
+
+        req = _make_request()
+        req.json = AsyncMock(return_value={"text": 42})
+        with patch.object(terminal, "_is_enabled", return_value=True):
+            collected.append(await terminal.api_terminal_redact(req))
+
+        req = _make_request(registry={})
+        req.json = AsyncMock(return_value={"session_id": "missing"})
+        with patch.object(terminal, "_is_enabled", return_value=True), \
+             patch.object(terminal, "_sel") as mock_sel:
+            mock_sel.return_value.log_api_access = MagicMock()
+            collected.append(await terminal.api_terminal_complete(req))
+
+        for resp in collected:
+            body = self._body(resp)
+            assert resp.status >= 400, body
+            assert isinstance(body.get("code"), str) and body["code"], body
+            assert isinstance(body.get("error"), str) and body["error"], body
+
+
+class TestWriteAll:
+    """The POSIX PTY write path must deliver every byte despite short writes.
+
+    ``os.write`` on a blocking PTY controller fd can accept fewer bytes than requested
+    when the tty input buffer is full. ``terminal._write_all`` loops over the
+    remaining bytes until the buffer is consumed; the previous single-write shape
+    (one ``os.write`` whose return was discarded) truncated the tail. The loop
+    writes through a private ``os.dup`` so a concurrent teardown closing (and the
+    kernel reusing) the original descriptor number cannot redirect the tail.
+    """
+
+    DUP_OFFSET = 1000
+
+    def _stub_dup(self, monkeypatch):
+        """Stub ``os.dup``/``os.close`` inside the handler module: dup returns
+        fd+DUP_OFFSET and both calls are recorded, so tests can assert writes
+        target the private dup and that it is always closed."""
+        dups: list[int] = []
+        closes: list[int] = []
+        monkeypatch.setattr(terminal.os, "dup", lambda fd: dups.append(fd) or fd + self.DUP_OFFSET)
+        monkeypatch.setattr(terminal.os, "close", lambda fd: closes.append(fd))
+        return dups, closes
+
+    def _short_write_stub(self, chunk):
+        """A fake ``os.write`` that accepts at most ``chunk`` bytes per call and
+        records everything it received (and the fd each write targeted).
+        Returns the short count, mirroring a backpressured PTY."""
+        received = bytearray()
+        fds: list[int] = []
+
+        def _write(fd, data):
+            fds.append(fd)
+            n = min(len(data), chunk)
+            received.extend(bytes(data[:n]))
+            return n
+
+        return _write, received, fds
+
+    def test_write_all_delivers_full_payload_despite_short_writes(self, monkeypatch):
+        payload = bytes(range(256)) * 40  # 10 KB, larger than the 64-byte chunk
+        fake_write, received, _fds = self._short_write_stub(64)
+        monkeypatch.setattr(terminal.os, "write", fake_write)
+        self._stub_dup(monkeypatch)
+
+        terminal._write_all(7, payload)
+
+        assert bytes(received) == payload
+
+    def test_old_single_write_shape_truncates(self, monkeypatch):
+        """Red proof: the pattern this fix replaces — a single ``os.write`` whose
+        return is discarded — loses every byte past the first short count."""
+        payload = bytes(range(256)) * 40
+        fake_write, received, _fds = self._short_write_stub(64)
+        monkeypatch.setattr(terminal.os, "write", fake_write)
+
+        # Exactly the old code shape: one write, return value ignored.
+        terminal.os.write(7, payload)
+
+        assert bytes(received) == payload[:64]
+        assert bytes(received) != payload  # truncated — the bug _write_all fixes
+
+    def test_write_all_targets_private_dup_and_always_closes_it(self, monkeypatch):
+        """The loop must never write to the raw session fd: a concurrent kill can
+        close it and the kernel can hand that NUMBER to an unrelated open(), so
+        every chunk targets the private dup, which is closed even on error."""
+        payload = bytes(range(256)) * 40
+        fake_write, _received, fds = self._short_write_stub(64)
+        monkeypatch.setattr(terminal.os, "write", fake_write)
+        dups, closes = self._stub_dup(monkeypatch)
+
+        terminal._write_all(7, payload)
+
+        assert dups == [7]
+        assert set(fds) == {7 + self.DUP_OFFSET}  # every chunk hit the dup
+        assert closes == [7 + self.DUP_OFFSET]  # and the dup was released
+
+    def test_write_all_closes_dup_when_write_raises(self, monkeypatch):
+        def _write(fd, data):
+            raise OSError(5, "Input/output error")
+
+        monkeypatch.setattr(terminal.os, "write", _write)
+        dups, closes = self._stub_dup(monkeypatch)
+
+        with pytest.raises(OSError):
+            terminal._write_all(7, b"payload")
+        assert closes == [7 + self.DUP_OFFSET]
+
+    def test_write_all_full_write_single_call(self, monkeypatch):
+        """A backend that accepts everything at once needs exactly one write."""
+        payload = b"echo hello\n"
+        calls = []
+
+        def _write(fd, data):
+            calls.append(bytes(data))
+            return len(data)
+
+        monkeypatch.setattr(terminal.os, "write", _write)
+        self._stub_dup(monkeypatch)
+        terminal._write_all(7, payload)
+
+        assert calls == [payload]
+
+    def test_write_all_propagates_oserror(self, monkeypatch):
+        """A concurrent kill sets the session fd to -1 before close; ``os.dup``
+        on the dead fd raises and the ``OSError`` must propagate so the write
+        loop's ``except OSError: break`` still terminates the session cleanly."""
+
+        def _dup(fd):
+            raise OSError(9, "Bad file descriptor")
+
+        monkeypatch.setattr(terminal.os, "dup", _dup)
+        with pytest.raises(OSError):
+            terminal._write_all(-1, b"data after kill")
+
+    def test_write_all_empty_payload_is_noop(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(terminal.os, "write", lambda fd, data: calls.append(bytes(data)) or len(data))
+        terminal._write_all(7, b"")
+        assert calls == []
+
+
+class TestWriteSerialization:
+    """Concurrent handlers must not interleave one frame's retry chunks.
+
+    A reconnect attaches a new WS handler by assignment without waiting for the
+    old handler's write loop to exit, so two handlers can dispatch PTY writes
+    for one session at once. Each frame is written under ``sess.write_lock`` so
+    its bytes land contiguously even when ``_write_all`` needs several
+    ``os.write`` calls.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_frames_stay_contiguous_under_write_lock(self, monkeypatch):
+        import threading
+
+        recorded: list[tuple[bytes, ...]] = []
+        chunks: list[bytes] = []
+        first_chunk_written = threading.Event()
+        peer_wrote = threading.Event()
+
+        def short_write(fd, data):
+            chunk = bytes(data[:4])
+            chunks.append(chunk)
+            if not first_chunk_written.is_set():
+                first_chunk_written.set()
+                # Give a concurrent (unserialized) writer every opportunity to
+                # slip a chunk in mid-frame. Under the lock this always times
+                # out because the peer cannot start until we finish.
+                peer_wrote.wait(timeout=0.3)
+            elif chunks and chunks[-1][:1] != chunks[0][:1]:
+                peer_wrote.set()
+            return len(chunk)
+
+        monkeypatch.setattr(terminal.os, "write", short_write)
+        monkeypatch.setattr(terminal.os, "dup", lambda fd: fd)
+        monkeypatch.setattr(terminal.os, "close", lambda fd: None)
+
+        lock = asyncio.Lock()
+        loop = asyncio.get_running_loop()
+
+        async def frame(payload: bytes):
+            async with lock:
+                await loop.run_in_executor(None, terminal._write_all, 7, payload)
+
+        await asyncio.gather(frame(b"A" * 12), frame(b"B" * 12))
+        recorded.append(tuple(chunks))
+
+        stream = b"".join(chunks)
+        # Each frame's 12 bytes must be contiguous: the stream is one frame
+        # then the other, never A-chunks interleaved with B-chunks.
+        assert stream in (b"A" * 12 + b"B" * 12, b"B" * 12 + b"A" * 12), recorded
+
+    def test_session_dataclass_has_write_lock(self):
+        import dataclasses
+
+        names = {f.name for f in dataclasses.fields(terminal._TerminalSession)}
+        assert "write_lock" in names

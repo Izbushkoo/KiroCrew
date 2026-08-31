@@ -98,7 +98,7 @@ class TestCarveOutAllowedPath:
             wrapped, _ = wrap_argv(_ARGV, mode="standard", first_party_fixed_argv=True)
         assert wrapped[0] == sys.executable
         assert "AWS_SECRET_ACCESS_KEY" in wrapped[: -len(_ARGV)]
-        assert wrapped[-len(_ARGV):] == _ARGV
+        assert wrapped[-len(_ARGV) :] == _ARGV
 
     def test_no_trusted_env_binary_returns_plain_argv(self, no_backend, monkeypatch):
         """Windows shape: no ``env`` binary — the argv-level scrub is skipped.
@@ -129,7 +129,7 @@ class TestCarveOutAllowedPath:
         # synchronously on the gateway event loop.
         assert not kwargs.get("critical")
         assert "first-party fixed argv" in kwargs["resources"]
-        assert kwargs["tool_name"] == _ARGV[0]
+        assert kwargs["tool_name"] == "kiro"
 
     def test_sel_failure_is_log_and_proceed(self, no_backend):
         """Matches the mode="off" delegation precedent: audit hiccups must not
@@ -138,7 +138,7 @@ class TestCarveOutAllowedPath:
         sel_instance.log_tool_invocation.side_effect = OSError("disk full")
         with patch("kiro_crew.sel.sel", return_value=sel_instance):
             wrapped, cleanup = wrap_argv(_ARGV, mode="standard", first_party_fixed_argv=True)
-        assert wrapped[-len(_ARGV):] == _ARGV
+        assert wrapped[-len(_ARGV) :] == _ARGV
         assert cleanup is None
 
     def test_security_warning_fires_exactly_once_per_process(self, no_backend, caplog):
@@ -337,7 +337,9 @@ class TestFlagIsOtherwiseInert:
         assert with_flag == without_flag == (_ARGV, None)
 
     def test_backend_available_flag_is_inert(self, monkeypatch):
-        stub = ["launcher", "/tmp/launcher.py", *_ARGV]
+        # Real namespace_argv shape: [python, *interpreter_flags, script, *argv].
+        script = "/tmp/launcher.py"
+        stub = ["launcher", *sandbox_mod._LAUNCHER_INTERPRETER_FLAGS, script, *_ARGV]
         monkeypatch.setattr(
             sandbox_mod, "detect_backend", lambda config_mode="auto": "namespace"
         )
@@ -346,7 +348,7 @@ class TestFlagIsOtherwiseInert:
         )
         with_flag = wrap_argv(_ARGV, mode="standard", first_party_fixed_argv=True)
         without_flag = wrap_argv(_ARGV, mode="standard")
-        assert with_flag == without_flag == (stub, stub[1])
+        assert with_flag == without_flag == (stub, script)
 
 
 class TestChokepointThreading:

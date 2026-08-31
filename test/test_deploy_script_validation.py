@@ -1,6 +1,7 @@
 """Unit tests for argument validation in attach_backend.py and detach_backend.py."""
 
 import importlib.util
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,6 +38,10 @@ class TestAttachBackendValidation:
     def test_valid_args_pass(self):
         """Known-good inputs should not raise."""
         self.mod._validate_args("my-profile", "us-west-2", "E1A2B3C4D5E6F7", "my-app")
+
+    def test_sso_plus_profile_passes(self):
+        """IAM Identity Center derived names contain '+' (#6055)."""
+        self.mod._validate_args("AdminAccess+dev", "us-west-2", "E1A2B3C4D5E6F7", "my-app")
 
     def test_empty_profile_allowed(self):
         """Empty profile (default) should pass."""
@@ -80,6 +85,10 @@ class TestDetachBackendValidation:
 
     def test_valid_args_pass(self):
         self.mod._validate_args("my-profile", "us-west-2", "E1A2B3C4D5E6F7", "my-app")
+
+    def test_sso_plus_profile_passes(self):
+        """IAM Identity Center derived names contain '+' (#6055)."""
+        self.mod._validate_args("AdminAccess+dev", "us-west-2", "E1A2B3C4D5E6F7", "my-app")
 
     def test_empty_profile_allowed(self):
         self.mod._validate_args("", "ap-southeast-2", "ABCDEFGHIJKLM", "demo")
@@ -167,3 +176,56 @@ class TestAwsSpawnFlow:
         assert exc.value.code == 7
         assert "AccessDenied" in capsys.readouterr().err
         assert not profile_file.exists(), "temp sandbox profile must be unlinked on CLI failure"
+
+
+class TestAwsHelperResolvesAbsolutely:
+    """The scripts' aws() spawn helper must resolve the CLI absolutely under a
+    GUI-launched gateway's minimal PATH via the deploy engine's shared
+    well-known-dirs resolver (#4770)."""
+
+    @pytest.fixture(params=["attach_backend.py", "detach_backend.py"])
+    def mod(self, request):
+        return _load_script(request.param)
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="fallback install dirs are POSIX literals; dead on Windows by design",
+    )
+    def test_cmd_head_absolute_under_minimal_path(self, mod, monkeypatch, tmp_path):
+        from kiro_crew import github_runner, sandbox
+        from kiro_crew.deploy import engine
+
+        fake_aws = tmp_path / "aws"
+        fake_aws.write_text("#!/bin/sh\n")
+        fake_aws.chmod(0o755)
+        empty_bin = tmp_path / "emptybin"
+        empty_bin.mkdir()
+        monkeypatch.setenv("PATH", str(empty_bin))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(tmp_path),))
+        monkeypatch.setattr(github_runner, "validate_provider_executable", lambda c: c)
+
+        seen: dict = {}
+
+        def fake_spawn_argv(cmd):
+            seen["cmd"] = list(cmd)
+            return list(cmd), {}, None
+
+        def fake_run_limited(argv, **kwargs):
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+        # The helper imports these lazily from kiro_crew.sandbox at call time,
+        # so patching the sandbox module attributes intercepts the spawn.
+        monkeypatch.setattr(sandbox, "sandboxed_spawn_argv", fake_spawn_argv)
+        monkeypatch.setattr(sandbox, "run_limited", fake_run_limited)
+
+        out = mod.aws("dev", "us-west-2", "sts", "get-caller-identity")
+        assert out == "{}"
+        assert seen["cmd"][0] == str(fake_aws)  # absolute, not a bare "aws"
+        assert seen["cmd"][1:] == [
+            "--profile",
+            "dev",
+            "--region",
+            "us-west-2",
+            "sts",
+            "get-caller-identity",
+        ]

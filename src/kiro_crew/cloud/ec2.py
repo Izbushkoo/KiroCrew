@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from kiro_crew.cloud import aws, sizes
+from kiro_crew.deploy import profiles as profiles_mod
 from kiro_crew.validation import FieldSpec, ValidationError, validate_field
 
 logger = logging.getLogger(__name__)
@@ -75,8 +76,12 @@ _TAG_RE = re.compile(r"^[a-zA-Z0-9-]{1,51}$")
 _TAG_SPEC = FieldSpec(name="tag", type=str, max_len=51, pattern=_TAG_RE)
 _REGION_RE = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
 _REGION_SPEC = FieldSpec(name="region", type=str, max_len=32, pattern=_REGION_RE)
-_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-_PROFILE_SPEC = FieldSpec(name="profile", type=str, max_len=128, pattern=_PROFILE_RE)
+# The profile charset ('+' admitted for IAM Identity Center derived names,
+# leading '-' excluded so a value is never option-shaped, \Z anchor — #6055)
+# is deploy/profiles.py's PROFILE_SPEC, aliased rather than re-spelled here
+# (same idiom as deploy/handlers.py; cloud/ already depends on deploy via the
+# shared aws-bin resolver in cloud/aws.py).
+_PROFILE_SPEC = profiles_mod.PROFILE_SPEC
 _CIDR_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$")
 _CIDR_SPEC = FieldSpec(name="allow_ssh_cidr", type=str, max_len=18, pattern=_CIDR_RE)
 # repo/ref reach a `git clone --branch '<ref>' '<repo>'` in the instance
@@ -432,7 +437,6 @@ def build_deploy_argv(
     allow_ssh_cidr: str = "",
     source_bucket: str = "",
     source_key: str = "",
-    dashboard_port: int = 0,
 ) -> list[str]:
     """Assemble the exact ``aws cloudformation deploy`` argv (also the dry-run output).
 
@@ -451,10 +455,6 @@ def build_deploy_argv(
         f"StackTag={tag}",
         f"PermissionsBoundaryArn={permissions_boundary_arn}",
     ]
-    # Only sent when the caller allocated one, so a direct deploy keeps the
-    # template default rather than being pinned by an implicit 0.
-    if dashboard_port:
-        overrides.append(f"DashboardPort={dashboard_port}")
     # Prefer the S3 source (private-repo safe); else pass git repo/ref fallback.
     if source_bucket:
         overrides.append(f"SourceBucket={source_bucket}")
@@ -493,7 +493,6 @@ def deploy(
     ref: str = "",
     allow_ssh_cidr: str = "",
     ship_source: Optional[bool] = None,
-    dashboard_port: int = 0,
     disable_rollback: bool = False,
     dry_run: bool = False,
     proc_sink: Optional[Any] = None,
@@ -546,7 +545,6 @@ def deploy(
             allow_ssh_cidr=allow_ssh_cidr,
             source_bucket="<auto>" if ship_source else "",
             source_key=f"{tag}/kirocrew-src.tar.gz" if ship_source else "",
-            dashboard_port=dashboard_port,
         )
         return DeployResult(
             tag=tag,
@@ -614,7 +612,6 @@ def deploy(
         allow_ssh_cidr=allow_ssh_cidr,
         source_bucket=source_bucket,
         source_key=source_key,
-        dashboard_port=dashboard_port,
     )
     # `cloudformation deploy` blocks until the stack settles (WaitCondition gates
     # on the gateway being healthy). "No changes" exits 0 with a message on reuse.

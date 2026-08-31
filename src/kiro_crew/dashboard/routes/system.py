@@ -40,6 +40,13 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/update/auto", handlers.api_update_auto)
     app.router.add_post("/api/update/channel", handlers.api_update_channel)
     app.router.add_post("/api/update/cancel", handlers.api_update_cancel)
+    # In-app wheel update step-up (RFC OQ7): the SPA arms, only the host
+    # approves. Arm/status are ordinary authenticated routes; approve
+    # additionally requires the nonce written to the data home, which a
+    # remote dashboard bearer cannot read.
+    app.router.add_post("/api/update/arm", handlers.api_update_arm)
+    app.router.add_get("/api/update/arm", handlers.api_update_arm_status)
+    app.router.add_post("/api/update/approve", handlers.api_update_approve)
     # Restart with no update. Sibling of /api/update rather than a mode of it:
     # /api/update refuses every layout that is not a git checkout, while a
     # restart is valid everywhere and is how a wheel install picks up code a
@@ -59,9 +66,19 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/usage", handlers.api_usage)
     app.router.add_get("/api/telemetry/startup", handlers.api_telemetry_startup)
     app.router.add_get("/api/telemetry/context-trace", handlers.api_context_trace)
+    app.router.add_get("/api/usage/turns", handlers.api_usage_turns)
     app.router.add_get("/api/telemetry/beacon", handlers.api_beacon_status)
     app.router.add_get("/api/telemetry/collection", handlers.api_collection_status)
     app.router.add_get("/api/tailnet/status", handlers.api_tailnet_status)
+    # Mobile access: a LIVE probe (the status route above reports the startup
+    # value) plus setup/publish/withdraw mutations and the QR mint. Registered
+    # here rather than in a tailnet-specific module because these share the
+    # system routes' owner.
+    app.router.add_get("/api/tailnet/mobile", handlers.api_tailnet_mobile_status)
+    app.router.add_post("/api/tailnet/mobile/configure", handlers.api_tailnet_mobile_configure)
+    app.router.add_post("/api/tailnet/mobile/publish", handlers.api_tailnet_mobile_publish)
+    app.router.add_post("/api/tailnet/mobile/unpublish", handlers.api_tailnet_mobile_unpublish)
+    app.router.add_post("/api/tailnet/mobile/qr", handlers.api_tailnet_mobile_qr)
     app.router.add_post("/api/sessions/restart", handlers.api_sessions_restart)
     # NOTE: /search must be registered before /{key} to avoid the path param catching "search"
     app.router.add_get("/api/sessions/search", handlers.api_sessions_search)
@@ -106,6 +123,14 @@ def register(app: web.Application) -> None:
     # set and is registered in ``_register_mcp_routes``.
     app.router.add_get("/api/computer-use/config", handlers.api_computer_use_config_get)
     app.router.add_put("/api/computer-use/config", handlers.api_computer_use_config_save)
+
+    # Paid-AWS-service consent (Settings > Voice). Browser-called and
+    # cookie-authed like the computer-use pair above, and for the same reason:
+    # this is the operator's out-of-band surface for an authorization the agent
+    # must not be able to grant itself.
+    app.router.add_get("/api/aws/consent", handlers.api_aws_consent_get)
+    app.router.add_post("/api/aws/consent", handlers.api_aws_consent_post)
+    app.router.add_delete("/api/aws/consent", handlers.api_aws_consent_delete)
     app.router.add_get("/api/approvals", handlers.api_approvals)
     app.router.add_post("/api/approvals/{id}/{action}", handlers.api_approval_resolve)
 

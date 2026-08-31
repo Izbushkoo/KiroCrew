@@ -1,5 +1,6 @@
 import { afterAll, describe, it, expect, vi } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
+import { MOBILE_BREAKPOINT } from '../hooks/useIsMobile'
 import { join } from 'node:path'
 import { render, screen, act, fireEvent, waitFor, within } from '@testing-library/react'
 import { renderWithProviders, createTestStore } from './helpers'
@@ -142,6 +143,25 @@ describe('App routing', () => {
       color: '',
       onboarded: false,
       import_onboarded: false,
+    } as never)
+    // Keep the import chapter open after its scan. An empty scan deliberately
+    // auto-completes the chapter, so asserting on the transient dialog races
+    // that completion under a loaded test shard.
+    vi.mocked(api.onboardingImportScan).mockResolvedValueOnce({
+      sources: [{
+        id: 'codex',
+        name: 'Codex',
+        detected: true,
+        detail: '~/.codex',
+        categories: [{
+          id: 'instructions',
+          label: 'Instructions',
+          count: 1,
+          description: 'Agent instructions',
+        }],
+      }],
+      skipped: [],
+      merge_only: true,
     } as never)
 
     renderWithProviders(<App />, { route: '/chat' })
@@ -423,8 +443,11 @@ describe('App routing', () => {
     expect(screen.getByText('Sessions')).toBeInTheDocument()
     expect(screen.getByText('Agent Capabilities')).toBeInTheDocument()
     expect(screen.getByText('Settings')).toBeInTheDocument()
-    // The App Store now rides the Apps section header as an accent link.
-    expect(screen.getByText('Explore')).toBeInTheDocument()
+    // PR1 App Store split: the single 'Explore' entry is gone — the sidebar
+    // now carries TWO App Store rows, Discover (/apps) and Library
+    // (/apps/library).
+    expect(screen.getByText('Discover')).toBeInTheDocument()
+    expect(screen.getByText('Library')).toBeInTheDocument()
     // The bottom-pinned community row: the GitHub mark fronts a "Star us" link
     // plus a "Report issue" BUTTON (it opens the diagnostics flow rather than
     // navigating to the issue list), and the icon-only Discord link. The
@@ -460,16 +483,17 @@ describe('App routing', () => {
     expect(screen.getByRole('button', { name: /create report/i })).toBeInTheDocument()
   })
 
-  it('renders the registry-derived Artifacts and Knowledge nav items', () => {
+  it('renders the registry-derived Artifacts nav item, without a Knowledge rail item', () => {
     // Regression guard for the aaf7cfe stale-branch merge, which reverted the
     // registry-driven rail (`NAV_ITEMS = getBuiltinSurfaces().map(...)`) back
-    // to a hardcoded array that omitted Artifacts and Knowledge. Both are
-    // registered unconditionally in `surfaces/builtins.tsx`, so they must
-    // always appear in the rail. Asserting them by label catches a future
-    // hardcoded-array regression that the isolated surfaces.test.tsx cannot.
+    // to a hardcoded array that omitted Artifacts. Artifacts is registered
+    // unconditionally in `surfaces/builtins.tsx`, so it must always appear in
+    // the rail. Knowledge is the opposite pin: it deliberately has NO rail
+    // item — it lives as a tab inside Agent Capabilities and /knowledge
+    // redirects there — so a rail entry reappearing is itself a regression.
     renderWithProviders(<App />, { route: '/chat' })
     expect(screen.getByText('Artifacts')).toBeInTheDocument()
-    expect(screen.getByText('Knowledge')).toBeInTheDocument()
+    expect(screen.queryByText('Knowledge')).not.toBeInTheDocument()
   })
 
   it('does not double-render Secretary when the builtin Secretary app is enabled', async () => {
@@ -632,6 +656,45 @@ describe('App routing', () => {
     }
   })
 
+  it('invalidates the registry query on mc:apps-changed so install state refreshes', async () => {
+    // The Explore shelf renders Get vs Installed from the server-computed
+    // `installed` flag on the `['registry']` rows, cached with a multi-minute
+    // staleTime. Install/uninstall surfaces announce themselves via
+    // mc:apps-changed; the handler must drop that cache or a just-installed
+    // registry app keeps showing a "Get" button until the cache expires.
+    const { queryClient } = renderWithProviders(<App />, { route: '/chat' })
+    queryClient.setQueryData(['registry'], { apps: [] })
+    expect(queryClient.getQueryState(['registry'])?.isInvalidated).toBe(false)
+    act(() => { window.dispatchEvent(new Event('mc:apps-changed')) })
+    await waitFor(() => {
+      expect(queryClient.getQueryState(['registry'])?.isInvalidated).toBe(true)
+    })
+  })
+
+  it('marks the apps cache stale on mc:apps-changed even when the refetch fails', async () => {
+    // Dispatch sites do not invalidate ['apps'] themselves; this listener
+    // owns that cache. refreshAppNav publishes fresh data only on fetch
+    // SUCCESS, so the handler must invalidate the cache up front — otherwise
+    // a retry-exhausted refetch chain would leave stale ['apps'] rows marked
+    // fresh.
+    const { api } = await import('../api/client')
+    const listApps = api.listApps as ReturnType<typeof vi.fn>
+    listApps.mockReset()
+    listApps.mockRejectedValue(new Error('gateway down'))
+    try {
+      const { queryClient } = renderWithProviders(<App />, { route: '/chat' })
+      queryClient.setQueryData(['apps'], [])
+      expect(queryClient.getQueryState(['apps'])?.isInvalidated).toBe(false)
+      act(() => { window.dispatchEvent(new Event('mc:apps-changed')) })
+      await waitFor(() => {
+        expect(queryClient.getQueryState(['apps'])?.isInvalidated).toBe(true)
+      })
+    } finally {
+      listApps.mockReset()
+      listApps.mockResolvedValue([])
+    }
+  })
+
   it('shows a portaled hover label for a collapsed (icon-only) nav item', async () => {
     // Covers useNavTip: in collapsed mode nav rows hide their text label and
     // instead show it via a portal to <body> on hover (so the rail's vertical
@@ -766,22 +829,33 @@ describe('App routing', () => {
   it('renders the search trigger in the header centre track, not as a positioned overlay', () => {
     renderWithProviders(<App />, { route: '/chat' })
     const trigger = screen.getByRole('button', { name: 'Search sessions, files, and commands' })
-    // The trigger is a flow item now: it fills its grid track (`w-full`) and
-    // carries no positioning of its own. The previous implementation centred it
-    // on `50vw` with a JS-measured inline width, which is what forced it to
-    // reserve `max(left, right)` on BOTH sides and drop itself once that
-    // mirrored gutter fell under a floor.
-    expect(trigger).toHaveClass('w-full')
+    // The trigger is a flow item now: it fills its grid track and carries no
+    // positioning of its own. The previous implementation centred it on `50vw`
+    // with a JS-measured inline width, which is what forced it to reserve
+    // `max(left, right)` on BOTH sides and drop itself once that mirrored gutter
+    // fell under a floor.
+    //
+    // It shares the centre CELL with the focus-mode toggle, so it fills that
+    // cell (`flex-1`) rather than the track directly — the cell is what fills
+    // the track. Both halves of the original assertion still hold: nothing here
+    // is positioned, and the header keeps exactly three in-flow children.
+    expect(trigger).toHaveClass('flex-1')
     expect(trigger).not.toHaveClass('absolute')
     expect(trigger.style.left).toBe('')
     expect(trigger.style.width).toBe('')
-    // Header children, in order: left group · trigger · actions group. The
+    // Header children, in order: left group · centre cell · actions group. The
     // three-track grid depends on that being exactly three in-flow children.
-    const header = trigger.parentElement!
+    const centre = trigger.parentElement!
+    const header = centre.parentElement!
     const flow = [...header.children].filter(el => !el.className.includes('absolute'))
     expect(flow[0]).toHaveClass('tb-left')
-    expect(flow[1]).toBe(trigger)
+    expect(flow[1]).toBe(centre)
     expect(flow[2]).toHaveClass('tb-right')
+    // The centre cell holds the trigger and the focus-mode toggle, and nothing
+    // else: a third control there is what website/AUTOSDE.yaml's
+    // max-two-buttons-per-row rule forbids.
+    expect([...centre.children]).toHaveLength(2)
+    expect(centre.children[1]).toBe(screen.getByTestId('focus-mode-toggle'))
   })
 
   it('sizes the top-bar search from the window alone, with equal side tracks', () => {
@@ -858,6 +932,143 @@ describe('App routing', () => {
     for (const rung of ['tb-drop-metrics', 'tb-drop-usage', 'tb-drop-feedback', 'tb-narrow-only']) {
       expect(css).toMatch(new RegExp(`@container \\([^)]+\\)\\{\\s*\\.${rung}\\{`))
     }
+  })
+
+  it('shifts the collapse rungs by the pill footprint of the matching viewport base', () => {
+    // The update pill is a conditional sibling of the ladder: it never shrinks
+    // and only exists while an update does, so the rung budget has extra bases
+    // while it is mounted — and the pill's own label is viewport-gated
+    // (`hidden sm:inline`, 640px), so the footprint itself has TWO values:
+    // the widest shipped-locale label form at ≥640px, the bare icon below.
+    // A single unconditional shift measured at the labeled width would blank
+    // the whole capsule on phones for nothing. Constants are measured in
+    // capture/topbar-search-variants.tsx (?update=on&updatelabel=…); the
+    // dev-only en-XA pseudolocale is excluded (nowrap backstop covers it).
+    // Re-measure and update BOTH the constants here and the index.css rungs
+    // when the pill's chrome or any locale catalog changes its widest form —
+    // the catalog-drift test below fails when that happens.
+    const css = topbarCss().replace(/\/\*[\s\S]*?\*\//g, '')
+    // Brace-balanced extraction: the ≥640px rungs live inside
+    // `@media (min-width:640px)` blocks, which nest @container blocks, so a
+    // lazy regex to the first `}` cannot delimit them.
+    const mediaBlocks: string[] = []
+    let rest = ''
+    let cursor = 0
+    const opener = /@media \(min-width:640px\)\{/g
+    let m: RegExpExecArray | null
+    while ((m = opener.exec(css)) !== null) {
+      let depth = 1
+      let i = opener.lastIndex
+      while (i < css.length && depth > 0) {
+        if (css[i] === '{') depth++
+        else if (css[i] === '}') depth--
+        i++
+      }
+      mediaBlocks.push(css.slice(opener.lastIndex, i - 1))
+      rest += css.slice(cursor, m.index)
+      cursor = i
+      opener.lastIndex = i
+    }
+    rest += css.slice(cursor)
+    const desktopCss = mediaBlocks.join('\n')
+
+    const rung = (scope: string, selector: string, hasUpdate: boolean, label: string): number => {
+      const esc = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      // Anchored to line start: without it a same-suffix rule (e.g. a scoped
+      // `.tb-has-update .tb-capsule …` line) could satisfy the base lookup and
+      // pair the shift assertion against the wrong rung.
+      const re = new RegExp(
+        `^\\s*@container \\(max-width:(\\d+)px\\)\\{ ?${hasUpdate ? '\\.tb-has-update ' : ''}${esc}\\{display:none\\}`,
+        'm'
+      )
+      const match = scope.match(re)
+      expect(match, `expected ${label} rung for ${selector}`).not.toBeNull()
+      return Number(match![1])
+    }
+    const PILL_WIDEST_LABELED = 201.7 // de downloading_percent "Wird heruntergeladen 100 %"
+    const PILL_ICON_ONLY = 34
+    const GROUP_GAP = 6
+    const SHIFT_LABELED = Math.ceil(PILL_WIDEST_LABELED + GROUP_GAP)
+    const SHIFT_ICON = Math.ceil(PILL_ICON_ONLY + GROUP_GAP)
+    const TERMINAL = '.tb-capsule > *:not(:first-child)'
+    // ≥640px (label visible): every rung, terminal included, shifts by the
+    // labeled footprint, inside the media gate.
+    for (const sel of ['.tb-drop-metrics', '.tb-drop-usage', '.tb-drop-feedback', TERMINAL]) {
+      expect(
+        rung(desktopCss, sel, true, '≥640 shifted') - rung(rest, sel, false, 'base'),
+        `labeled shift for ${sel}`
+      ).toBe(SHIFT_LABELED)
+    }
+    // <640px (icon-only): only the terminal rung shifts, by the icon footprint,
+    // OUTSIDE the media gate. The named readout rungs render desktop-only
+    // elements, so they need no icon-base form.
+    expect(
+      rung(rest, TERMINAL, true, 'icon-base shifted') - rung(rest, TERMINAL, false, 'base'),
+      'icon-only terminal shift'
+    ).toBe(SHIFT_ICON)
+    // The metric readout's icon stand-in must stay visible through the shifted
+    // band, inside the same media gate: the base rule hides it from 531px up,
+    // so the counterpart re-shows it between the base metrics rung and the
+    // shifted one.
+    const iconBand = desktopCss.match(
+      /@container \(min-width:(\d+)px\) and \(max-width:(\d+)px\)\{\s*\.tb-has-update \.tb-narrow-only\{display:(?!none)/
+    )
+    expect(iconBand, 'expected the tb-has-update .tb-narrow-only counterpart band').not.toBeNull()
+    expect(Number(iconBand![1])).toBeLessThanOrEqual(rung(rest, '.tb-drop-metrics', false, 'base') + 1)
+    expect(Number(iconBand![2])).toBe(rung(desktopCss, '.tb-drop-metrics', true, '≥640 shifted'))
+  })
+
+  it('fails when a locale catalog outgrows the measured pill budget', () => {
+    // The 201.7px constant above is a hand-measured number, so a catalog change
+    // that makes some other label the widest would leave the budget silently
+    // stale (degraded to a clean clip by the nowrap backstop, but stale).
+    // jsdom cannot measure rendered text, so the sentinel compares WIDTH UNITS:
+    // East-Asian wide/fullwidth glyphs count 2, everything else 1 — a CJK glyph
+    // renders ~2x a Latin one at this font size, so a 15-char Japanese label
+    // that would out-render the 26-char German one trips the guard instead of
+    // hiding behind a smaller .length. The range list is a BMP approximation
+    // (supplementary-plane CJK and emoji count 1, combining marks count 1
+    // each); it is a drift tripwire, not a width oracle — the real number
+    // always comes from re-measuring in the harness. The anchor is the MEASURED string
+    // itself: it must still exist, and no shipped visible label may exceed its
+    // unit width. When this fails, re-measure with
+    // capture/topbar-search-variants.tsx and update the constants + rungs.
+    const wide = /[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]/
+    const unitWidth = (s: string): number =>
+      [...s].reduce((acc, ch) => acc + (wide.test(ch) ? 2 : 1), 0)
+    const localesDir = join(__dirname, '..', 'i18n', 'locales')
+    const MEASURED = 'Wird heruntergeladen 100 %'
+    const visibleKeys = ['update_available', 'update_ready', 'downloading', 'downloading_percent']
+    let measuredSeen = false
+    let localesWithPill = 0
+    for (const file of readdirSync(localesDir).filter(f => f.endsWith('.json'))) {
+      if (file === 'en-XA.json') continue // devOnly pseudolocale, excluded from the budget
+      const pill = JSON.parse(readFileSync(join(localesDir, file), 'utf8')).components?.updatePill
+      if (!pill) continue
+      localesWithPill++
+      for (const key of visibleKeys) {
+        const label = (pill[key] ?? '').replace('{{percent}}', '100')
+        if (label === MEASURED) measuredSeen = true
+        expect(
+          unitWidth(label),
+          `${file} ${key} "${label}" out-measures the widest pill label the budget was derived from — re-measure`
+        ).toBeLessThanOrEqual(unitWidth(MEASURED))
+      }
+    }
+    // Guards the sentinel itself: a renamed i18n namespace would otherwise make
+    // every lookup miss and the loop above pass vacuously.
+    expect(localesWithPill, 'expected the shipped catalogs to carry updatePill labels').toBeGreaterThanOrEqual(10)
+    expect(measuredSeen, 'the measured widest label no longer exists — re-measure the budget').toBe(true)
+  })
+
+  it('keeps the desktop form switch at or above the pill label gate', () => {
+    // The <640px rung base in index.css shifts ONLY the capsule's terminal
+    // rung, on the premise that the named readout rungs render desktop-only
+    // elements and the desktop layout never exists below the pill's own label
+    // gate (`hidden sm:inline`, 640px). That premise is this inequality; if
+    // the form switch ever drops below the gate, the 531-640px band would pair
+    // full desktop readouts with an unbudgeted icon-only pill.
+    expect(MOBILE_BREAKPOINT).toBeGreaterThanOrEqual(640)
   })
 
   it('resizes the sidebar and main body together with a quick shell transition', () => {
@@ -1127,13 +1338,19 @@ describe('mobile nav drawer insets', () => {
   })
 
   it('spans the viewport height so both margins resolve', () => {
-    // `top-0 bottom-0` with a margin on each end resolves the height to
+    // An anchor on BOTH ends plus a margin on each resolves the height to
     // viewport-16px. Dropping either anchor would make the margins inert (auto
     // height) and re-open the flush-top defect from the other direction.
+    //
+    // The safe-area variants satisfy this the same way the plain ones do: they
+    // set top/bottom to env(safe-area-inset-*), a definite length that is 0 on
+    // hardware without a notch. So accept either form per end, but keep
+    // requiring that BOTH ends are anchored -- that is the actual invariant,
+    // and the literal class name is not.
     const classes = mobileDrawerClasses()
     expect(classes).toContain('fixed')
-    expect(classes).toContain('top-0')
-    expect(classes).toContain('bottom-0')
+    expect(classes.some(c => c === 'top-0' || c === 'top-safe'), `expected a top anchor, got: ${classes.join(' ')}`).toBe(true)
+    expect(classes.some(c => c === 'bottom-0' || c === 'bottom-safe'), `expected a bottom anchor, got: ${classes.join(' ')}`).toBe(true)
   })
 })
 
@@ -1250,10 +1467,18 @@ describe('onCycleAgent keyboard shortcut', () => {
     store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'kirocrew' }] })
     store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
     renderWithProviders(<App />, { route: '/chat' })
-    act(() => {
+    // The switch now rides performSlotSwitch (#5120), so the API call lands a
+    // microtask after the keydown — flush with an async act.
+    await act(async () => {
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'A', code: 'KeyA', altKey: true, shiftKey: true, bubbles: true }))
     })
     expect(api.chatSlotAgent).toHaveBeenCalledWith('slot-1', 'reviewer')
+    // The pick must land in the store WITHOUT a slots round trip (#5120):
+    // no websocket exists in this harness, so only the optimistic write can
+    // move the row. The mock resolves {} — the requested-name fallback path.
+    await waitFor(() => expect(
+      store.getState().dashboard.slots.find((s: { key: string }) => s.key === 'slot-1')?.agent,
+    ).toBe('reviewer'))
   })
 
   it('does not call api.chatSlotAgent when no active slot', async () => {
@@ -1281,7 +1506,9 @@ describe('onCycleAgent keyboard shortcut', () => {
     store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
     renderWithProviders(<App />, { route: '/chat' })
 
-    act(() => {
+    // The switch now rides performSlotSwitch (#5120): flush the microtask
+    // chain so both the API call and the failure notice land.
+    await act(async () => {
       document.dispatchEvent(new KeyboardEvent('keydown', { key, code, altKey: true, shiftKey: true, bubbles: true }))
     })
 
@@ -1347,6 +1574,51 @@ describe('onCycleAgent edge cases', () => {
     })
     expect(api.chatSlotAgent).not.toHaveBeenCalled()
     useAgentsMock.mockReturnValue({ agents: [{ name: 'kirocrew' }, { name: 'reviewer' }, { name: 'oracle' }], defaultAgent: 'kirocrew' })
+  })
+})
+
+describe('onCycleReasoningEffort keyboard shortcut (#5120)', () => {
+  it('steps a burst from the in-flight target and writes the adjudicated level', async () => {
+    const { api } = await import('../api/client')
+    const { store } = await import('../store')
+    ;(api.chatSlotReasoningEffort as ReturnType<typeof vi.fn>).mockClear()
+    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'kirocrew', reasoning_effort: 'max' }] })
+    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
+    renderWithProviders(<App />, { route: '/chat' })
+    // Two presses in one synchronous batch: the first pick is still in
+    // flight when the second press computes its base. From 'max' the first
+    // press targets '' (clear the override — a REAL target), so the second
+    // press's base MUST come from pendingSlotSwitchTarget: reading the store
+    // (still 'max', nothing settled) would issue '' twice, and the ''-falsy
+    // accessor would misread the in-flight '' the same way.
+    await act(async () => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'D', code: 'KeyD', altKey: true, shiftKey: true, bubbles: true }))
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'D', code: 'KeyD', altKey: true, shiftKey: true, bubbles: true }))
+    })
+    expect(api.chatSlotReasoningEffort).toHaveBeenNthCalledWith(1, 'slot-1', '')
+    expect(api.chatSlotReasoningEffort).toHaveBeenNthCalledWith(2, 'slot-1', 'low')
+    // The adjudicated survivor (the newest pick) lands in the store without
+    // a slots round trip — no websocket exists in this harness.
+    await waitFor(() => expect(
+      store.getState().dashboard.slots.find((s: { key: string }) => s.key === 'slot-1')?.reasoning_effort,
+    ).toBe('low'))
+  })
+
+  it('cycles backward on Alt+Shift+C and writes the store', async () => {
+    const { api } = await import('../api/client')
+    const { store } = await import('../store')
+    ;(api.chatSlotReasoningEffort as ReturnType<typeof vi.fn>).mockClear()
+    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'kirocrew', reasoning_effort: 'low' }] })
+    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
+    renderWithProviders(<App />, { route: '/chat' })
+    await act(async () => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'C', code: 'KeyC', altKey: true, shiftKey: true, bubbles: true }))
+    })
+    // 'low' is index 1; backward reaches '' (provider default).
+    expect(api.chatSlotReasoningEffort).toHaveBeenCalledWith('slot-1', '')
+    await waitFor(() => expect(
+      store.getState().dashboard.slots.find((s: { key: string }) => s.key === 'slot-1')?.reasoning_effort,
+    ).toBe(''))
   })
 })
 
@@ -1453,7 +1725,9 @@ describe('onCycleApprovalMode and onCyclePrevAgent shortcuts', () => {
     store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'reviewer' }] })
     store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
     renderWithProviders(<App />, { route: '/chat' })
-    act(() => {
+    // Async act: the switch protocol (#5120) chains the wire call on a
+    // microtask, so the mock is invoked a tick after the keydown.
+    await act(async () => {
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Z', code: 'KeyZ', altKey: true, shiftKey: true, bubbles: true }))
     })
     expect(api.chatSlotAgent).toHaveBeenCalledWith('slot-1', 'kirocrew')

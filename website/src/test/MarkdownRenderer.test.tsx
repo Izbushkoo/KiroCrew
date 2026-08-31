@@ -201,6 +201,45 @@ describe('isPathCandidate — path chip pre-filter', () => {
     expect(isPathCandidate('website/src/components/MarkdownRenderer.tsx')).toBe(true)
   })
 
+  it('accepts Unicode segments in rooted, home-relative and explicitly relative paths', () => {
+    // Filenames are not ASCII-only. Each shape class from the ASCII cases
+    // above must also classify when its segments carry CJK, accented or
+    // Cyrillic letters (issue #6483: \w rejected these before the stat probe).
+    expect(isPathCandidate('/a/b/产品文档-v1.0.md')).toBe(true) // CJK, rooted
+    expect(isPathCandidate('/home/user/notes/café-menü')).toBe(true) // accented, rooted, no extension
+    expect(isPathCandidate('~/документы/отчёт.txt')).toBe(true) // Cyrillic, home-relative
+    expect(isPathCandidate('~/文档/说明')).toBe(true) // CJK terminal segment, no extension
+    expect(isPathCandidate('./docs/仕様書.md')).toBe(true) // CJK, explicitly relative
+    expect(isPathCandidate('../архив/старый-отчёт')).toBe(true) // Cyrillic, parent-relative
+  })
+
+  it('accepts combining marks — NFD-decomposed and mark-requiring scripts', () => {
+    // macOS returns NFD-decomposed filenames (é as e + U+0301), and Indic
+    // scripts need combining marks even under NFC — both are \p{M}, not
+    // \p{L}. Written as escapes so the source encoding cannot renormalize.
+    expect(isPathCandidate('/home/user/notes/cafe\u0301-menu\u0308')).toBe(true)
+    expect(isPathCandidate('~/दस्तावेज़/रिपोर्ट.md')).toBe(true) // Devanagari (virama/matra/nukta)
+  })
+
+  it('accepts a bare relative path whose Unicode basename has an ASCII extension', () => {
+    // The extension positive-signal must not require the whole basename to be
+    // ASCII — only the trailing `.ext` is the signal.
+    expect(isPathCandidate('src/产品文档-v1.0.md')).toBe(true)
+    expect(isPathCandidate('docs/résumé.pdf')).toBe(true)
+  })
+
+  it('still rejects slash-separated Unicode prose with no positive path signal', () => {
+    // Same rule as ASCII `and/or`: a bare two-segment identifier without a
+    // root, explicit-relative prefix, or extension is not a candidate.
+    expect(isPathCandidate('要么这样/要么那样')).toBe(false)
+    expect(isPathCandidate('и/или')).toBe(false)
+    expect(isPathCandidate('entweder/oder')).toBe(false)
+    // Shape-level pin: fullwidth colon U+FF1A is \p{Po}, outside the widened
+    // class, so this is rejected by PATH_SHAPE_RE itself — not by the
+    // extension gate — pinning that Unicode punctuation stays excluded.
+    expect(isPathCandidate('/文档：说明/文件.md')).toBe(false)
+  })
+
   it('rejects git refs — the regression that made this gate necessary', () => {
     // These rendered as clickable "files" and could only ever 404.
     expect(isPathCandidate('refs/heads/fix/investigation-record-403')).toBe(false)
@@ -330,6 +369,82 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     })
   })
 
+  it('opens a confirmed Markdown file link in the file viewer instead of navigating to the chat route', async () => {
+    globalThis.fetch = vi.fn((url: unknown) => {
+      const asked = decodeURIComponent(new URL(String(url), 'http://x').searchParams.get('path') || '')
+      const hit = asked === '/home/user/a.md'
+      return Promise.resolve({
+        ok: hit,
+        status: hit ? 200 : 404,
+        headers: new Headers(hit ? { 'X-Path-Kind': 'file' } : {}),
+      } as Response)
+    }) as unknown as typeof fetch
+    const onFileOpen = vi.fn()
+    const { container } = render(<MarkdownRenderer content={'[open file](/home/user/a.md:12)'} onFileOpen={onFileOpen} />)
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(2))
+
+    const anchor = container.querySelector('a[href="/home/user/a.md:12"]')
+    expect(anchor).not.toBeNull()
+    fireEvent.click(anchor!)
+    expect(onFileOpen).toHaveBeenCalledWith('/home/user/a.md', { line: 12 })
+  })
+
+  it('swallows a plain Markdown file-link click while its path probe is pending', async () => {
+    let resolveProbe: ((response: Response) => void) | undefined
+    globalThis.fetch = vi.fn(() => new Promise<Response>((resolve) => { resolveProbe = resolve })) as unknown as typeof fetch
+    const onFileOpen = vi.fn()
+    const { container } = render(<MarkdownRenderer content={'[open file](/home/user/a.md)'} onFileOpen={onFileOpen} />)
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(1))
+
+    const anchor = container.querySelector('a[href="/home/user/a.md"]')
+    expect(anchor).not.toBeNull()
+    expect(fireEvent.click(anchor!)).toBe(false)
+    expect(onFileOpen).not.toHaveBeenCalled()
+
+    resolveProbe?.({ ok: true, status: 200, headers: new Headers({ 'X-Path-Kind': 'file' }) } as Response)
+  })
+
+  it('does not probe a decoded root-relative UNC path', async () => {
+    globalThis.fetch = vi.fn() as unknown as typeof fetch
+    const onFileOpen = vi.fn()
+    render(<MarkdownRenderer content={'[open](/%2Fserver/share/report.md)'} onFileOpen={onFileOpen} />)
+    await Promise.resolve()
+    expect(globalThis.fetch).not.toHaveBeenCalled()
+    expect(onFileOpen).not.toHaveBeenCalled()
+  })
+
+  it('prefers a literal Markdown link filename over its line-reference sibling', async () => {
+    globalThis.fetch = vi.fn((url: unknown) => {
+      const asked = decodeURIComponent(new URL(String(url), 'http://x').searchParams.get('path') || '')
+      const hit = asked === '/tmp/report.md' || asked === '/tmp/report.md:12'
+      return Promise.resolve({
+        ok: hit,
+        status: hit ? 200 : 404,
+        headers: new Headers(hit ? { 'X-Path-Kind': 'file' } : {}),
+      } as Response)
+    }) as unknown as typeof fetch
+    const onFileOpen = vi.fn()
+    const { getByRole } = render(
+      <MarkdownRenderer content={'[open](/tmp/report.md%3A12)'} onFileOpen={onFileOpen} />,
+    )
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(2))
+
+    fireEvent.click(getByRole('link', { name: 'open' }))
+    expect(onFileOpen).toHaveBeenCalledWith('/tmp/report.md:12')
+  })
+
+  it('leaves an unconfirmed root-relative application link to navigate normally', async () => {
+    stubKind(null, false)
+    const onFileOpen = vi.fn()
+    const { container } = render(<MarkdownRenderer content={'[docs](/docs/page)'} onFileOpen={onFileOpen} />)
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
+
+    const anchor = container.querySelector('a[href="/docs/page"]')
+    expect(anchor).not.toBeNull()
+    expect(fireEvent.click(anchor!)).toBe(true)
+    expect(onFileOpen).not.toHaveBeenCalled()
+  })
+
   it('leaves an inert chip glyph-free, so the affordance stays meaningful', async () => {
     stubKind(null, false)
     const { container } = render(<MarkdownRenderer content={'`/home/user/ghost.md`'} />)
@@ -434,6 +549,13 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     // Mid-stream, '/Users' is itself a valid candidate en route to the real
     // path; probing every chunk would flash the wrong affordance.
     render(<MarkdownRenderer content={'`/Users/me/pro`'} streaming />)
+    await Promise.resolve()
+    expect(globalThis.fetch).not.toHaveBeenCalled()
+  })
+
+  it('does not probe a Markdown file link while the message is still streaming', async () => {
+    stubKind('file')
+    render(<MarkdownRenderer content={'[open](/Users/me/pro)'} streaming onFileOpen={vi.fn()} />)
     await Promise.resolve()
     expect(globalThis.fetch).not.toHaveBeenCalled()
   })

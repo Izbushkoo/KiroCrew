@@ -21,6 +21,11 @@ def register(app: web.Application) -> None:
     """Register the realtime routes on *app*."""
     app.router.add_get("/", handlers.index)
     app.router.add_get("/logo.png", handlers.logo)
+    # A long tail of clients (bookmark managers, in-app browsers, uptime
+    # monitors) never parse <link rel="icon"> and fetch /favicon.ico directly.
+    # Without this route the request falls through to the SPA fallback and
+    # returns 200 text/html, which fails image decoding downstream.
+    app.router.add_get("/favicon.ico", handlers.logo)
     app.router.add_get(
         "/{name:manifest\\.json|sw\\.js|icon-\\d+\\.png|pcm-worklet\\.js}", handlers.pwa_file
     )
@@ -42,6 +47,11 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/system/session-storage/cleanup", handlers.api_session_storage_cleanup)
     app.router.add_post("/api/system/session-storage/restore", handlers.api_session_storage_restore)
     app.router.add_post("/api/system/session-storage/empty", handlers.api_session_storage_empty)
+    # Progress for the empty above. A GET on the same path, because it reports on
+    # exactly the operation that POST starts.
+    app.router.add_get(
+        "/api/system/session-storage/empty", handlers.api_session_storage_empty_status
+    )
     app.router.add_get("/api/stream", handlers.api_stream)
     app.router.add_get("/api/sso-ttl", handlers.api_sso_ttl)
     app.router.add_get("/api/dashboard/branding", handlers.api_branding)
@@ -61,6 +71,25 @@ def register(app: web.Application) -> None:
         "/api/kiro-prerequisite/repair-specs",
         handlers.api_kiro_prerequisite_repair_specs,
     )
+
+    # KAS-mode interactive login (no kiro-cli): status is a read; the device-code
+    # begin/poll/logout mutations are POSTs so they stay origin-checked and audited.
+    # The kas_login module (and the auth subsystem behind it) is imported on the
+    # FIRST request, never at boot — route registration must add no gateway-boot
+    # work for a subsystem most launches never touch. Python caches the module
+    # after that first import, so the per-request cost is a dict lookup.
+    def _lazy_kas(handler_name: str):
+        async def _dispatch(request):
+            from kiro_crew.dashboard.handlers import kas_login
+
+            return await getattr(kas_login, handler_name)(request)
+
+        return _dispatch
+
+    app.router.add_get("/api/kas-login", _lazy_kas("api_kas_login_status"))
+    app.router.add_post("/api/kas-login/device", _lazy_kas("api_kas_login_begin_device"))
+    app.router.add_post("/api/kas-login/poll", _lazy_kas("api_kas_login_poll"))
+    app.router.add_post("/api/kas-login/logout", _lazy_kas("api_kas_login_logout"))
     app.router.add_get("/api/governance/channels", handlers.api_governance_channels)
     app.router.add_get("/api/system/mobile-sync", handle_mobile_sync)
 

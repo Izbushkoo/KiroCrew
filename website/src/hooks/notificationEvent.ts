@@ -1,9 +1,27 @@
-/** Shared contract between useSSE.ts (dispatcher) and useNotificationSound.ts (listener). */
+/** Shared contract between useWebSocket.ts (dispatcher) and useNotificationSound.ts (listener). */
 export const MC_NOTIFICATION_EVENT = 'mc-notification' as const
 export const MC_SOUND_SETTINGS_CHANGED_EVENT = 'mc-notification-sound-changed' as const
 
 export interface McNotificationDetail {
   kind?: string
+}
+
+/**
+ * Fire the `mc-notification` DOM event for a sound `kind`. Centralizes the
+ * dispatch + defensive try/catch that three websocket call sites (feed, approval,
+ * turn-done) previously duplicated inline, so the `CustomEvent` wiring and its
+ * error handling live in one place. Swallows listener errors (a broken listener
+ * must not break WS handling) and logs once here.
+ */
+export function dispatchMcNotification(kind: string): void {
+  try {
+    const detail: McNotificationDetail = { kind }
+    window.dispatchEvent(new CustomEvent(MC_NOTIFICATION_EVENT, { detail }))
+  } catch (err) {
+    // Last-resort surface for a broken notification listener; no app logger on this DOM-event path.
+    // eslint-disable-next-line no-console
+    console.warn('mc-notification listener error', err)
+  }
 }
 
 /**

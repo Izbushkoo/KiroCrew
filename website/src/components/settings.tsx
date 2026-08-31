@@ -1,6 +1,7 @@
 import React from 'react'
 import Clickable from './Clickable'
 import InfoTip from './InfoTip'
+import SearchableSelect, { type SearchableSelectOption } from './SearchableSelect'
 import SimpleSelect from './SimpleSelect'
 import { Input, Toggle } from './ui'
 
@@ -8,10 +9,11 @@ import { i18nT } from '../i18n/t'
 /* ── Settings-specific UI primitives ──
  *
  * These match the pencil design system components:
- *   - SettingsToggle  → flat row: label+description left, toggle right
- *   - SettingsSelect  → vertical: label, description, dropdown
- *   - SettingsInput   → vertical: label, description, text/number input
- *   - SettingsSection → standalone section header above cards
+ *   - SettingsToggle   → flat row: label+description left, toggle right
+ *   - SettingsSelect   → vertical: label, description, dropdown
+ *   - SettingsCombobox → vertical: label, description, searchable dropdown
+ *   - SettingsInput    → vertical: label, description, text/number input
+ *   - SettingsSection  → standalone section header above cards
  *
  * Layout rule: all settings within a card stack vertically (gap-3).
  * Section headers sit outside the card.
@@ -120,6 +122,52 @@ export function SettingsSelect({ label, description, hint, value, options, optio
   )
 }
 
+/* ── Combobox ── */
+
+interface SettingsComboboxProps {
+  label: string
+  description?: string
+  value: string
+  options: SearchableSelectOption[]
+  onChange: (value: string) => void
+  /** Trigger text when `value` matches no option — e.g. a typed-in value. */
+  triggerFallback?: string
+  searchPlaceholder?: string
+  /** Offer the typed text as a committable value, shaped here. See `SearchableSelect`. */
+  customValueOption?: (typed: string) => Omit<SearchableSelectOption, 'value'>
+  /** Action row inside the list, e.g. an opt-in permission prompt. */
+  action?: { label: string; onSelect: () => void }
+  /** One-line outcome of the last action run, rendered beside it in the popup. */
+  actionStatus?: string
+  /** Backend config key this combobox writes. */
+  configKey?: string
+}
+
+/**
+ * Searchable dropdown row — `SettingsSelect`'s sibling for a list too long to
+ * scan, or one that carries a per-option sublabel. Reach for `SettingsSelect` at
+ * a dozen-ish fixed options and this past that.
+ */
+export function SettingsCombobox({ label, description, value, options, onChange, triggerFallback, searchPlaceholder, customValueOption, action, actionStatus, configKey }: SettingsComboboxProps) {
+  const controlId = React.useId()
+  return (
+    <SettingsField label={label} description={description} configKey={configKey} controlId={controlId}>
+      <SearchableSelect
+        id={controlId}
+        options={options}
+        value={value}
+        onChange={onChange}
+        triggerFallback={triggerFallback}
+        searchPlaceholder={searchPlaceholder}
+        customValueOption={customValueOption}
+        action={action}
+        actionStatus={actionStatus}
+        aria-label={label}
+      />
+    </SettingsField>
+  )
+}
+
 /* ── Input ── */
 
 interface SettingsInputProps {
@@ -128,12 +176,17 @@ interface SettingsInputProps {
   hint?: string
   value: string
   onChange: (value: string) => void
-  onBlur?: () => void
+  onBlur?: React.FocusEventHandler<HTMLInputElement | HTMLTextAreaElement>
   /** Key handler on the control itself. Needed by panels that commit on blur and
    *  have no Save button (WeChat), where Enter must commit the value the way it
    *  would in a form — a `<div>` wrapper cannot carry that without becoming an
    *  interactive static element. */
   onKeyDown?: React.KeyboardEventHandler<HTMLInputElement | HTMLTextAreaElement>
+  /** Composition/focus pass-throughs so callers can spread `ime.bindComposition()`
+   *  from `useImeGuard` onto the control; see the WeChat folder-name field. */
+  onFocus?: React.FocusEventHandler<HTMLInputElement | HTMLTextAreaElement>
+  onCompositionStart?: React.CompositionEventHandler<HTMLInputElement | HTMLTextAreaElement>
+  onCompositionEnd?: React.CompositionEventHandler<HTMLInputElement | HTMLTextAreaElement>
   placeholder?: string
   type?: 'text' | 'number' | 'password'
   min?: number
@@ -146,7 +199,7 @@ interface SettingsInputProps {
   configKey?: string
 }
 
-export function SettingsInput({ label, description, hint, value, onChange, onBlur, onKeyDown, placeholder, type = 'text', min, max, step, disabled, multiline, 'aria-label': ariaLabel, configKey }: SettingsInputProps) {
+export function SettingsInput({ label, description, hint, value, onChange, onBlur, onKeyDown, onFocus, onCompositionStart, onCompositionEnd, placeholder, type = 'text', min, max, step, disabled, multiline, 'aria-label': ariaLabel, configKey }: SettingsInputProps) {
   // Per-instance id pairing the caption's htmlFor with the control. This is
   // what gives the single-line branch an accessible name by DEFAULT: it used
   // to render aria-label={ariaLabel} with ariaLabel undefined unless a caller
@@ -163,6 +216,9 @@ export function SettingsInput({ label, description, hint, value, onChange, onBlu
           onChange={e => onChange(e.target.value)}
           onBlur={onBlur}
           onKeyDown={onKeyDown}
+          onFocus={onFocus}
+          onCompositionStart={onCompositionStart}
+          onCompositionEnd={onCompositionEnd}
           placeholder={placeholder}
           disabled={disabled}
           rows={3}
@@ -177,6 +233,9 @@ export function SettingsInput({ label, description, hint, value, onChange, onBlu
           onChange={e => onChange(e.target.value)}
           onBlur={onBlur}
           onKeyDown={onKeyDown}
+          onFocus={onFocus}
+          onCompositionStart={onCompositionStart}
+          onCompositionEnd={onCompositionEnd}
           placeholder={placeholder}
           min={min}
           max={max}
@@ -324,7 +383,24 @@ interface SettingsButtonGroupProps {
   description?: string
   hint?: string
   value: string
-  options: { value: string; label: string; icon?: React.ReactNode }[]
+  /** `disabled` on an OPTION keeps the choice visible but unselectable — for a
+   *  value this build knows about but cannot serve. Renders the full vocabulary
+   *  rather than hiding it, so the control does not silently change shape
+   *  between builds and the reader can see what exists.
+   *
+   *  `describedById` is the id of the element stating WHY, wired through as
+   *  `aria-describedby`. Dimming carries "unavailable" visually and through the
+   *  native `disabled` state, but the REASON is usually rendered outside this
+   *  component, where proximity alone associates them — which is no association
+   *  at all for a screen reader. Optional, so a group whose options are all
+   *  selectable stays unchanged. */
+  options: {
+    value: string
+    label: string
+    icon?: React.ReactNode
+    disabled?: boolean
+    describedById?: string
+  }[]
   onChange: (value: string) => void
   disabled?: boolean
   /** Backend config key this button group writes. */
@@ -348,13 +424,14 @@ export function SettingsButtonGroup({ label, description, hint, value, options, 
           Selection is conveyed by elevation + weight, not by hue alone, so it
           survives a theme whose accent is low-contrast — and `aria-pressed`
           carries it to screen readers, which no amount of styling does. */}
-      <div role="group" aria-label={label} className="inline-flex items-center gap-0.5 p-[3px] rounded-lg border border-border bg-bg-accent w-fit">
+      <div role="group" aria-label={label} className="inline-flex flex-wrap items-center gap-0.5 p-[3px] rounded-lg border border-border bg-bg-accent w-fit max-w-full">
         {options.map(o => (
           <button
             key={o.value}
             type="button"
-            disabled={disabled}
+            disabled={disabled || o.disabled}
             aria-pressed={value === o.value}
+            aria-describedby={o.describedById}
             className={`flex items-center gap-1.5 px-3 py-[5px] rounded-md text-[13px] cursor-pointer border transition-colors ${
               value === o.value
                 ? 'bg-bg-elevated text-text-strong border-border-strong shadow-sm font-semibold'

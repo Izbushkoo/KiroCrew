@@ -4,7 +4,8 @@
  * `AppsPageDiscover.test.tsx` covers the editorial/browse rendering surface.
  * This file covers what it does not touch: the navigation helpers (Cmd-click,
  * `autoAction` router state), the enable path including the trust-denied
- * consent hand-off, the Library disable toast, Update All's failure report,
+ * consent hand-off, the Library disable toast and updates hint row, Update
+ * All's failure report (on Discover's Updates sub-tab, its PR2 home),
  * the whole uninstall confirmation dialog (every provenance notice, the
  * dependency preview, keep-data / keep-dependency wiring), the query-error
  * card, the empty states, and `pickFeatured`'s trust filter.
@@ -50,6 +51,11 @@ vi.mock('../api/client', () => ({
 }))
 
 vi.mock('../hooks/useTheme', () => ({ useTheme: () => ({ theme: 'dark' }) }))
+
+// The Library tiles' overflow menu is a Radix DropdownMenu, which happy-dom
+// cannot drive — swap in the repo's stateful mock (FileExplorerPageCoverage
+// pattern): Trigger click toggles, items render inline as role="menuitem".
+vi.mock('@radix-ui/react-dropdown-menu', async () => await import('./__mocks__/@radix-ui/react-dropdown-menu'))
 
 vi.mock('../components/AppIcon', () => ({
   default: ({ icon }: { icon?: string }) => <div data-testid="app-icon" data-icon={icon || ''} />,
@@ -99,7 +105,9 @@ vi.mock('../components/SimpleSelect', () => ({
   ),
 }))
 
-import AppsPage, { pickFeatured } from '../pages/AppsPage'
+import DiscoverPage from '../pages/apps/DiscoverPage'
+import LibraryPage from '../pages/apps/LibraryPage'
+import { pickFeatured } from '../pages/apps/useAppsData'
 import type { RegistryApp } from '../components/appstore/types'
 
 /** Detail-route probe: reports the app name and the `autoAction` router state. */
@@ -111,16 +119,22 @@ function DetailProbe() {
   )
 }
 
-function renderPage() {
+/** Mounts the split pages under their real routes. Library tests mount at
+ *  '/apps/library' directly — the in-page Library tab is gone (PR1 split). */
+function renderPage(initialRoute = '/apps') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
   return render(
     <QueryClientProvider client={qc}>
-      <MemoryRouter initialEntries={['/apps']}>
+      <MemoryRouter initialEntries={[initialRoute]}>
         <Routes>
-          <Route path="/apps" element={<AppsPage />} />
+          <Route path="/apps" element={<DiscoverPage />} />
+          {/* Static segments BEFORE the param routes, mirroring App.tsx's
+              route order. `/apps/-/updates` is Discover's Updates sub-tab
+              (PR2) — the pending-updates worklist and Update All live there. */}
+          <Route path="/apps/-/updates" element={<DiscoverPage />} />
+          <Route path="/apps/library" element={<LibraryPage />} />
           <Route path="/apps/detail/:name" element={<DetailProbe />} />
           <Route path="/apps/:name" element={<DetailProbe />} />
-          <Route path="/secretary-ui" element={<div data-testid="app-ui-route" />} />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -211,7 +225,19 @@ async function browseRow(name: string) {
   return rows[rows.length - 1]
 }
 
-const goLibrary = () => fireEvent.click(screen.getByText('Library'))
+/** Mount the Library route directly — the split removed the in-page tab. */
+const renderLibrary = () => renderPage('/apps/library')
+
+/** Open a Library tile's overflow menu (the MoreHorizontal trigger). The
+ *  mocked portal renders inline, so items land inside the tile scope. */
+async function openTileMenu(display: string) {
+  fireEvent.click(await screen.findByRole('button', { name: `More actions for ${display}` }))
+  return screen
+}
+
+/** Mount Discover's Updates sub-tab, where Update All lives since PR2 demoted
+ *  the Library banner to a hint row. */
+const renderUpdates = () => renderPage('/apps/-/updates')
 
 describe('AppsPage — Discover navigation', () => {
   it('Cmd-clicks a row into a new tab instead of routing in place', async () => {
@@ -284,7 +310,7 @@ describe('AppsPage — enable path', () => {
     await catalogReady()
     const row = await browseRow('Pets')
     fireEvent.click(within(row).getByRole('button', { name: /^Enable/ }))
-    expect(await screen.findByText('Trust Pets to run its own code?')).toBeInTheDocument()
+    expect(await screen.findByText('Trust “Pets” to run its own code?')).toBeInTheDocument()
     // A consent prompt is not an error — the error card must stay away.
     expect(screen.queryByText(/Failed to enable/)).toBeNull()
   })
@@ -296,7 +322,7 @@ describe('AppsPage — enable path', () => {
     const row = await browseRow('Pets')
     fireEvent.click(within(row).getByRole('button', { name: /^Enable/ }))
     expect(await screen.findByText('gateway is busy')).toBeInTheDocument()
-    expect(screen.queryByText('Trust Pets to run its own code?')).toBeNull()
+    expect(screen.queryByText('Trust “Pets” to run its own code?')).toBeNull()
   })
 
   it('falls back to the generic enable message when the failure carries no text', async () => {
@@ -329,7 +355,7 @@ describe('AppsPage — query failures and empty states', () => {
     listRegistry.mockResolvedValue({ apps: [] })
     renderPage()
     expect(await screen.findByText('No apps available')).toBeInTheDocument()
-    expect(screen.getByText('Add an app source (gear icon above) or install from a local path.')).toBeInTheDocument()
+    expect(screen.getByText('Add an app source (Sources, top right) or install from a local path.')).toBeInTheDocument()
   })
 
   it('shows the no-match state when the search excludes every row', async () => {
@@ -343,100 +369,136 @@ describe('AppsPage — query failures and empty states', () => {
   it('shows the empty Library state when no app is installed', async () => {
     listApps.mockResolvedValue([])
     listRegistry.mockResolvedValue({ apps: [] })
-    renderPage()
-    await screen.findByText('No apps available')
-    goLibrary()
+    renderLibrary()
     expect(await screen.findByText('No apps installed yet')).toBeInTheDocument()
   })
 
   it('shows the no-match Library state when the search excludes every installed app', async () => {
-    renderPage()
-    await catalogReady()
-    goLibrary()
-    await screen.findByText('Slack inbox manager.')
-    fireEvent.change(screen.getByLabelText('Search apps'), { target: { value: 'nothing-matches-this' } })
+    renderLibrary()
+    await screen.findByTestId('launchpad-tile-secretary')
+    fireEvent.change(screen.getByLabelText('Search library'), { target: { value: 'nothing-matches-this' } })
     expect(await screen.findByText('No matching apps')).toBeInTheDocument()
     expect(screen.getByText('Try a different search term')).toBeInTheDocument()
   })
 
   it('matches an installed app by its manifest tags', async () => {
-    renderPage()
-    await catalogReady()
-    goLibrary()
-    await screen.findByText('Slack inbox manager.')
-    fireEvent.change(screen.getByLabelText('Search apps'), { target: { value: 'inbox' } })
-    // The tag match keeps the row; nothing falls through to the empty state.
+    renderLibrary()
+    await screen.findByTestId('launchpad-tile-secretary')
+    fireEvent.change(screen.getByLabelText('Search library'), { target: { value: 'inbox' } })
+    // The tag match keeps the tile; nothing falls through to the empty state.
     await waitFor(() => expect(screen.queryByText('No matching apps')).toBeNull())
-    expect(screen.getByText('Slack inbox manager.')).toBeInTheDocument()
+    expect(screen.getByTestId('launchpad-tile-secretary')).toBeInTheDocument()
   })
 })
 
 describe('AppsPage — Library actions', () => {
-  it('opens the app UI page from the card and the detail page from its name', async () => {
-    renderPage()
-    await catalogReady()
-    goLibrary()
+  it('opens the app at its AppHost route from the card, and the detail page from its name', async () => {
+    renderLibrary()
+    // Open must resolve through the same appNavTarget derivation the sidebar and
+    // command palette use: a third-party (non-builtin) app is AppHost-routed at
+    // /apps/<name>, NOT its raw manifest page route (which only a native builtin
+    // serves, and which otherwise dead-ends at BuiltinAppRoute -> /chat).
     fireEvent.click(await screen.findByRole('button', { name: 'Open' }))
-    expect(await screen.findByTestId('app-ui-route')).toBeInTheDocument()
+    const probe = await screen.findByTestId('detail-route')
+    expect(probe).toHaveAttribute('data-path', '/apps/secretary')
   })
 
-  it('routes to the detail page when the card name is clicked', async () => {
-    renderPage()
-    await catalogReady()
-    goLibrary()
+  it('routes to the detail page when the tile face of a non-openable app is clicked', async () => {
+    // The tile face opens the app when it can open (previous test); an
+    // enabled app with no UI and no openCommand has nowhere to open, so its
+    // face falls back to the detail page — plain navigation, no autoAction.
+    listApps.mockResolvedValue([{
+      ...SECRETARY,
+      manifest: { ...SECRETARY.manifest, ui: undefined },
+    }])
+    renderLibrary()
     fireEvent.click(await screen.findByRole('button', { name: 'Secretary' }))
     const probe = await screen.findByTestId('detail-route')
     expect(probe).toHaveAttribute('data-path', '/apps/detail/secretary')
     expect(probe).toHaveAttribute('data-auto', '')
   })
 
-  it('toasts after disabling a builtin and clears the toast on dismiss', async () => {
+  it('keeps the builtin row listed after disabling it, with no toast', async () => {
+    // The toast used to say "re-enable it from the Discover tab" because the row
+    // vanished on disable. It stays now, so the Enable button is the recovery
+    // path and nothing narrates a disappearance that no longer happens -- and the
+    // old copy pointed at a dead end for a builtin with no catalog row.
     listApps.mockResolvedValue([{ ...BUILTIN_OFF, enabled: true }])
-    renderPage()
-    await catalogReady()
-    goLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Disable' }))
+    renderLibrary()
+    await openTileMenu('Pets')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Disable' }))
     await waitFor(() => expect(disableApp).toHaveBeenCalledWith('pets'))
-    expect(await screen.findByText('Disabled. You can re-enable it from the Discover tab.')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Dismiss message' }))
-    await waitFor(() =>
-      expect(screen.queryByText('Disabled. You can re-enable it from the Discover tab.')).toBeNull())
+    expect(screen.queryByText(/re-enable it from the Discover/)).toBeNull()
+  })
+
+  it('lists a builtin that is already disabled, with Enable in its overflow menu', async () => {
+    // The reachability property itself: a disabled builtin is in Library at
+    // all. Its Enable verb lives in the tile's overflow menu (the launchpad
+    // grid caps direct actions at two peers).
+    listApps.mockResolvedValue([{ ...BUILTIN_OFF, enabled: false }])
+    renderLibrary()
+    await openTileMenu('Pets')
+    expect(await screen.findByRole('menuitem', { name: 'Enable' })).toBeInTheDocument()
+  })
+
+  it('orders enabled rows above disabled ones', async () => {
+    // Listing disabled builtins adds ~20 rows on a fresh install and Library has
+    // only a search box, so ordering is what keeps the apps in use on top. The
+    // gateway returns them disabled-first here, so a pass-through would fail.
+    listApps.mockResolvedValue([
+      { ...BUILTIN_OFF, name: 'zeta-off', displayName: 'Zeta Off', enabled: false },
+      { ...BUILTIN_OFF, name: 'alpha-on', displayName: 'Alpha On', enabled: true },
+    ])
+    renderLibrary()
+    await screen.findByText('Alpha On')
+    const rendered = screen.getAllByText(/Alpha On|Zeta Off/).map(n => n.textContent)
+    expect(rendered.indexOf('Alpha On')).toBeLessThan(rendered.indexOf('Zeta Off'))
   })
 
   it('reports a failed disable with the action-failed message', async () => {
     disableApp.mockRejectedValue({})
-    renderPage()
-    await catalogReady()
-    goLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Disable' }))
+    renderLibrary()
+    await openTileMenu('Secretary')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Disable' }))
     expect(await screen.findByText('Failed to disable secretary')).toBeInTheDocument()
   })
 
   it('names the apps that failed during Update All', async () => {
     updateApp.mockRejectedValue(new Error('clone failed'))
-    renderPage()
-    await catalogReady()
-    goLibrary()
+    // Update All moved with the banner demotion (PR2): the batch runs from
+    // Discover's Updates sub-tab, whose page owns the error notice surface.
+    renderUpdates()
     fireEvent.click(await screen.findByRole('button', { name: 'Update All' }))
     expect(await screen.findByText('Failed to update: secretary')).toBeInTheDocument()
   })
 
   it('reports success after Update All and shows no error', async () => {
-    renderPage()
-    await catalogReady()
-    goLibrary()
+    renderUpdates()
     fireEvent.click(await screen.findByRole('button', { name: 'Update All' }))
     expect(await screen.findByText('Updated 1 app.')).toBeInTheDocument()
     expect(screen.queryByText(/Failed to update/)).toBeNull()
+  })
+
+  it('Library shows the muted updates hint row, not the old banner', async () => {
+    renderLibrary()
+    // PR2 demoted the banner: a one-line hint with the count and a hand-off
+    // link to the Updates sub-page — no Update All button on Library.
+    expect(await screen.findByText('1 update available')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'View updates' }))
+      .toHaveAttribute('href', '/apps/-/updates')
+    expect(screen.queryByRole('button', { name: 'Update All' })).toBeNull()
+    // The affected tile still offers per-app Update — in its overflow menu
+    // (the redesigned bar caps at Open + menu).
+    await openTileMenu('Secretary')
+    expect(screen.getByRole('menuitem', { name: 'Update' })).toBeInTheDocument()
   })
 })
 
 describe('AppsPage — uninstall dialog', () => {
   const openDialog = async () => {
-    renderPage()
-    await catalogReady()
-    goLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Uninstall' }))
+    renderLibrary()
+    await openTileMenu('Secretary')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Uninstall' }))
     return screen.findByRole('dialog', { name: 'Confirm uninstall' })
   }
 
@@ -541,7 +603,8 @@ describe('AppsPage — uninstall dialog', () => {
     fireEvent.keyDown(first, { key: 'Escape' })
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Confirm uninstall' })).toBeNull())
 
-    fireEvent.click(screen.getByRole('button', { name: 'Uninstall' }))
+    await openTileMenu('Secretary')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Uninstall' }))
     const second = await screen.findByRole('dialog', { name: 'Confirm uninstall' })
     fireEvent.click(second)
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Confirm uninstall' })).toBeNull())
@@ -578,14 +641,20 @@ describe('AppsPage — editorial layer wiring', () => {
     expect(await screen.findByTestId('detail-route')).toHaveAttribute('data-path', '/apps/detail/pets')
   })
 
-  it('enables from the spotlight and Gets from the feature card', async () => {
+  it('enables from the lead card and Gets from a row card', async () => {
     // Pets sorts ahead of Zeta App (both verified), so the switched-off builtin
-    // takes the spotlight and the uninstalled core app takes the feature card.
+    // takes the derived `full` lead; Zeta App and Zulu Utility fill the derived
+    // `row` (which needs TWO cards -- with one leftover pick the lead stands
+    // alone and Zeta would only render as a list row).
     listApps.mockResolvedValue([BUILTIN_OFF])
     listRegistry.mockResolvedValue({
       apps: [
         {
           name: 'zeta-app', displayName: 'Zeta App', author: 'kirocrew', description: 'Later in the alphabet.',
+          version: '1.0.0', tags: ['github'], installed: false, provenance: 'core',
+        },
+        {
+          name: 'zulu-utility', displayName: 'Zulu Utility', author: 'kirocrew', description: 'Fills the second row slot.',
           version: '1.0.0', tags: ['github'], installed: false, provenance: 'core',
         },
         // Explore renders server rows, so the installed built-in reaches the
@@ -609,10 +678,9 @@ describe('AppsPage — editorial layer wiring', () => {
 
 describe('AppsPage — Library enable and update', () => {
   it('Update on a Library card routes to the streaming detail page', async () => {
-    renderPage()
-    await catalogReady()
-    goLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Update' }))
+    renderLibrary()
+    await openTileMenu('Secretary')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Update' }))
     const probe = await screen.findByTestId('detail-route')
     expect(probe).toHaveAttribute('data-path', '/apps/detail/secretary')
     expect(probe).toHaveAttribute('data-auto', 'update')
@@ -621,36 +689,40 @@ describe('AppsPage — Library enable and update', () => {
   })
 
   it('syncs a PATH-installed app in place instead of routing at the registry', async () => {
-    // A directory install has no registry row, so the streaming registry install
-    // the detail page runs can only answer "not found in registry". Its refresh
-    // is POST /api/apps/{name}/update, which re-copies the recorded directory.
+    // The grid only offers Update while one is pending (a registry row later
+    // published for this name), but ROUTING stays keyed on the RECORDED
+    // source: a directory install refreshes via POST /api/apps/{name}/update
+    // (re-copying the recorded directory), never the streaming registry
+    // install the detail page runs.
     listApps.mockResolvedValue([{
       ...SECRETARY, name: 'orchestrator-switch', displayName: 'Orchestrator Switch',
       source: '/home/u/apps/orchestrator-switch', origin: 'local',
     }])
-    listRegistry.mockResolvedValue({ apps: [] })
-    renderPage()
-    await screen.findByText('No apps available')
-    goLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
+    listRegistry.mockResolvedValue({
+      apps: [{ ...REGISTRY_APPS[1], name: 'orchestrator-switch', displayName: 'Orchestrator Switch' }],
+    })
+    renderLibrary()
+    await openTileMenu('Orchestrator Switch')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Update' }))
     await waitFor(() => expect(updateApp).toHaveBeenCalledWith('orchestrator-switch'))
     expect(screen.queryByTestId('detail-route')).toBeNull()
   })
 
   it('reflects a completed in-place sync, which is otherwise invisible', async () => {
     // Re-copying a source directory usually carries the SAME version, so the
-    // card re-renders identically and silence is indistinguishable from a
+    // tile re-renders identically and silence is indistinguishable from a
     // no-op. Without this the primary action the fix creates has no success
     // signal at all.
     listApps.mockResolvedValue([{
       ...SECRETARY, name: 'orchestrator-switch', displayName: 'Orchestrator Switch',
       source: '/home/u/apps/orchestrator-switch', origin: 'local',
     }])
-    listRegistry.mockResolvedValue({ apps: [] })
-    renderPage()
-    await screen.findByText('No apps available')
-    goLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
+    listRegistry.mockResolvedValue({
+      apps: [{ ...REGISTRY_APPS[1], name: 'orchestrator-switch', displayName: 'Orchestrator Switch' }],
+    })
+    renderLibrary()
+    await openTileMenu('Orchestrator Switch')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Update' }))
     expect(await screen.findByText(/Synced Orchestrator Switch from its source directory/)).toBeInTheDocument()
   })
 
@@ -659,33 +731,35 @@ describe('AppsPage — Library enable and update', () => {
       ...SECRETARY, name: 'orchestrator-switch', displayName: 'Orchestrator Switch',
       source: '/home/u/apps/orchestrator-switch', origin: 'local',
     }])
-    listRegistry.mockResolvedValue({ apps: [] })
+    listRegistry.mockResolvedValue({
+      apps: [{ ...REGISTRY_APPS[1], name: 'orchestrator-switch', displayName: 'Orchestrator Switch' }],
+    })
     updateApp.mockRejectedValue(new Error('source path no longer exists'))
-    renderPage()
-    await screen.findByText('No apps available')
-    goLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
+    renderLibrary()
+    await openTileMenu('Orchestrator Switch')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Update' }))
     expect(await screen.findByText('source path no longer exists')).toBeInTheDocument()
   })
 
-  it('still routes a registry-sourced app at the registry when it has no update', async () => {
+  it('offers no update affordance on a tile when nothing is pending', async () => {
+    // Grid contract: Update appears in the overflow menu only WHEN an update
+    // is pending. With no registry row flagging one, the menu carries no
+    // Update item at all — the recorded-source routing for that case is the
+    // shared hook's contract (useAppUpdates.test.tsx).
     listApps.mockResolvedValue([{ ...SECRETARY, source: 'registry:secretary' }])
     listRegistry.mockResolvedValue({ apps: [] })
-    renderPage()
-    await screen.findByText('No apps available')
-    goLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
-    const probe = await screen.findByTestId('detail-route')
-    expect(probe).toHaveAttribute('data-auto', 'update')
+    renderLibrary()
+    await screen.findByTestId('launchpad-tile-secretary')
+    await openTileMenu('Secretary')
+    expect(screen.queryByRole('menuitem', { name: 'Update' })).toBeNull()
     expect(updateApp).not.toHaveBeenCalled()
   })
 
   it('enables a switched-off installed app from the Library', async () => {
     listApps.mockResolvedValue([{ ...SECRETARY, enabled: false }])
-    renderPage()
-    await catalogReady()
-    goLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Enable' }))
+    renderLibrary()
+    await openTileMenu('Secretary')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Enable' }))
     await waitFor(() => expect(enableApp).toHaveBeenCalledWith('secretary'))
   })
 
@@ -697,31 +771,23 @@ describe('AppsPage — Library enable and update', () => {
     }])
     listRegistry.mockResolvedValue({ apps: [] })
     enableApp.mockRejectedValue({ code: 'app_execution_denied' })
-    renderPage()
-    await screen.findByText('No apps available')
-    goLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Enable' }))
-    expect(await screen.findByText('Trust Local App to run its own code?')).toBeInTheDocument()
-    expect(screen.getByText('https://github.com/z/secretary')).toBeInTheDocument()
+    renderLibrary()
+    await openTileMenu('Local App')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Enable' }))
+    expect(await screen.findByText('Trust “Local App” to run its own code?')).toBeInTheDocument()
+    expect(screen.queryByText('https://github.com/z/secretary')).toBeNull()
   })
 })
 
 describe('AppsPage — toast expiry', () => {
-  it('the disable toast clears itself after four seconds', async () => {
-    listApps.mockResolvedValue([{ ...BUILTIN_OFF, enabled: true }])
-    renderPage()
-    await catalogReady()
-    goLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Disable' }))
-    await screen.findByText('Disabled. You can re-enable it from the Discover tab.')
-    await act(async () => { vi.advanceTimersByTime(4000) })
-    expect(screen.queryByText('Disabled. You can re-enable it from the Discover tab.')).toBeNull()
-  })
+  // The disable-a-builtin toast is gone (the row stays listed, so nothing needs
+  // narrating), and with it the case that used to pin the four-second self-clear
+  // here. The Update All toast below pins the same timer on a toast that remains.
 
   it('the Update All toast clears itself after four seconds', async () => {
-    renderPage()
-    await catalogReady()
-    goLibrary()
+    // Update All lives on Discover's Updates sub-tab since PR2; its success
+    // toast is DiscoverPage's notice surface with the same 4s dismissal.
+    renderUpdates()
     fireEvent.click(await screen.findByRole('button', { name: 'Update All' }))
     await screen.findByText('Updated 1 app.')
     await act(async () => { vi.advanceTimersByTime(4000) })

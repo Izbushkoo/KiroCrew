@@ -39,8 +39,9 @@
  * leading unicode-ranged alias is deterministic regardless of what follows it.
  */
 
-import { readFileSync, readdirSync, statSync } from 'node:fs'
-import { join, relative } from 'node:path'
+import { readFileSync } from 'node:fs'
+import { readFile, readdir } from 'node:fs/promises'
+import { basename, join, relative } from 'node:path'
 
 import { describe, it, expect } from 'vitest'
 
@@ -56,12 +57,13 @@ const SC_ALIASES = [
 /**
  * Locale-specific aliases, keyed by the `html:lang()` rule that activates them.
  *
- * `KC Han Fallback` draws Simplified glyph forms and no Hangul at all, so leaving
- * it in front for `lang=ja` or `lang=ko` puts an alias that cannot serve the locale
- * ahead of one that can — which is why each entry REPLACES the default pair rather
- * than prepending to it.
+ * These are NOT the untagged default. A leading Simplified Chinese face would
+ * draw Japanese and Korean content (and untagged CJK in an English UI) with
+ * the wrong regional glyph forms. Each entry REPLACES every other Han pair
+ * rather than prepending to it.
  */
 const REGIONAL = [
+  { lang: 'zh-CN', body: 'KC Han Fallback', mono: 'KC Han Mono Fallback' },
   { lang: 'ja', body: 'KC Japanese Fallback', mono: 'KC Japanese Mono Fallback' },
   { lang: 'ko', body: 'KC Korean Fallback', mono: 'KC Korean Mono Fallback' },
 ] as const
@@ -74,6 +76,7 @@ const REGIONAL_ALIASES = REGIONAL.flatMap(r => [r.body, r.mono])
  * or merged token fails here rather than rendering from the OS cascade.
  */
 const SCRIPT_PROBES: Record<string, ReadonlyArray<readonly [string, number]>> = {
+  'zh-CN': [['CJK Unified Ideographs', 0x4e00], ['CJK punctuation', 0x3001]],
   ja: [['hiragana', 0x3042], ['katakana', 0x30a2]],
   ko: [['Hangul syllables', 0xac00], ['Hangul compatibility jamo', 0x3131]],
 }
@@ -152,6 +155,11 @@ function ruleBody(pattern: RegExp): string {
   return INDEX_CSS.match(pattern)?.[1] ?? ''
 }
 
+/** An `html:lang(tag)` rule. Document-level only — no descendant content scope. */
+function htmlLangRuleBody(lang: string): string {
+  return ruleBody(new RegExp(`html:lang\\(${lang}\\)\\s*\\{([^}]*)\\}`))
+}
+
 /** A token is unusable unless it is present and carries the shared script aliases. */
 function expectCommon(label: string, value: string): void {
   expect(value, `no script fallback token for ${label}`).not.toBe('')
@@ -189,23 +197,32 @@ function scriptToken(block: string, mono = false): string {
 }
 
 /** Every file that DECLARES --font-body or --mono, found by walking the tree. */
-function declarationSites(): Array<{ file: string; line: number; text: string }> {
+async function declarationSites(): Promise<Array<{ file: string; line: number; text: string }>> {
   const out: Array<{ file: string; line: number; text: string }> = []
-  const walk = (dir: string) => {
-    for (const entry of readdirSync(dir)) {
-      if (entry === 'node_modules' || entry.startsWith('.')) continue
-      const full = join(dir, entry)
-      if (statSync(full).isDirectory()) {
-        walk(full)
-        continue
-      }
-      if (!/\.(css|ts|tsx)$/.test(entry)) continue
+  const sourceFiles = async (dir: string): Promise<string[]> => {
+    const entries = await readdir(dir, { withFileTypes: true })
+    const nested = await Promise.all(entries.map(async (entry) => {
+      if (entry.name === 'node_modules' || entry.name.startsWith('.')) return []
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) return sourceFiles(full)
+      return /\.(css|ts|tsx)$/.test(entry.name) ? [full] : []
+    }))
+    return nested.flat()
+  }
+
+  const files = await sourceFiles(SRC)
+  let next = 0
+  const scan = async () => {
+    while (next < files.length) {
+      const full = files[next++]
+      const entry = basename(full)
       // Tests never declare a font stack, and this file necessarily contains the
       // detection pattern as a literal — without the exclusion it matches itself.
       // The only false-negative this creates is a stack declared inside a test,
       // which would not reach the app.
       if (/\.test\.(ts|tsx)$/.test(entry)) continue
-      readFileSync(full, 'utf8')
+      const content = await readFile(full, 'utf8')
+      content
         .split('\n')
         .forEach((text, i) => {
           // A declaration, not a read: `--font-body:` / `--mono:` / a role token
@@ -219,9 +236,17 @@ function declarationSites(): Array<{ file: string; line: number; text: string }>
         })
     }
   }
-  walk(SRC)
-  return out
+  // Files are independent. A bounded worker set avoids both the serial OneDrive
+  // walk that exceeded Vitest's test budget under full-suite load and an
+  // unbounded Promise.all that could exhaust file descriptors on a larger tree.
+  await Promise.all(Array.from({ length: Math.min(16, files.length) }, scan))
+  return out.sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line)
 }
+
+// The three assertions inspect the same immutable source snapshot. Scan once so
+// later assertions cannot pay another full-tree I/O pass or observe a different
+// tree halfway through the file.
+const allDeclarationSites = declarationSites()
 
 describe('script fallback faces', () => {
   it.each(ALIASES)('defines %s with a unicode-range and local()-only sources', (family) => {
@@ -282,7 +307,7 @@ describe('script fallback faces', () => {
     expect(root).toMatch(/--script-fallbacks-mono:/)
   })
 
-  it('keeps the Simplified Chinese aliases as the default token', () => {
+  it('keeps regional Han aliases out of the untagged default token', () => {
     const rootBlock = ruleBody(/:root\s*\{([^}]*)\}/)
     expect(rootBlock, 'no :root block found in index.css').not.toBe('')
 
@@ -290,7 +315,9 @@ describe('script fallback faces', () => {
     const rootMono = scriptToken(rootBlock, true)
     expectCommon('root body', root)
     expectCommon('root mono', rootMono)
-    expectAliasPair('root', root, rootMono, ...SC_ALIASES)
+    // Untagged CJK (English UI, Japanese chat, mixed messages) must reach the
+    // browser/OS locale-aware cascade. A leading regional Han alias would force
+    // every shared ideograph through one region's glyph forms.
     for (const family of REGIONAL_ALIASES) {
       expect(root, `${family} leaked into the default body token`).not.toContain(family)
       expect(rootMono, `${family} leaked into the default mono token`).not.toContain(family)
@@ -298,7 +325,7 @@ describe('script fallback faces', () => {
   })
 
   it.each(REGIONAL)('swaps to isolated aliases for html:lang($lang)', ({ lang, body, mono }) => {
-    const block = ruleBody(new RegExp(`html:lang\\(${lang}\\)\\s*\\{([^}]*)\\}`))
+    const block = htmlLangRuleBody(lang)
     expect(block, `no html:lang(${lang}) block found in index.css`).not.toBe('')
 
     const bodyToken = scriptToken(block)
@@ -316,17 +343,27 @@ describe('script fallback faces', () => {
       expect(monoToken, `${family} leaked into the ${lang} mono token`).not.toContain(family)
     }
   })
+
+  it('scopes Simplified aliases to html:lang(zh-CN), not a bare :lang(zh)', () => {
+    // `:lang(zh)` also matches zh-TW / zh-HK / zh-Hant and would force
+    // Traditional content through Simplified faces — the same class of bug
+    // this change removes for Japanese. The dashboard's Chinese UI is zh-CN.
+    const bareZh = INDEX_CSS.match(/(?<![\w-]):lang\(zh\)(?=\s*[,{])/)
+    expect(bareZh, 'bare :lang(zh) matches Traditional Chinese tags').toBeNull()
+    expect(INDEX_CSS).toMatch(/html:lang\(zh-CN\)/)
+    expect(INDEX_CSS).not.toMatch(/:lang\(zh-Hans\)/)
+  })
 })
 
 describe('font stack declarations', () => {
-  it('finds every declaration site the tree actually contains', () => {
+  it('finds every declaration site the tree actually contains', async () => {
     // Guards the walker itself: if this drops to a handful, the glob broke and the
     // next assertion would pass vacuously.
-    expect(declarationSites().length).toBeGreaterThanOrEqual(12)
+    expect((await allDeclarationSites).length).toBeGreaterThanOrEqual(12)
   })
 
-  it('references the alias token at every declaration site', () => {
-    const offenders = declarationSites()
+  it('references the alias token at every declaration site', async () => {
+    const offenders = (await allDeclarationSites)
       .filter((s) => !/var\(--script-fallbacks(-mono)?\)/.test(s.text))
       .map((s) => `${s.file}:${s.line}: ${s.text.trim().slice(0, 96)}`)
     expect(
@@ -335,9 +372,9 @@ describe('font stack declarations', () => {
     ).toEqual([])
   })
 
-  it('puts the aliases ahead of every Latin base family', () => {
+  it('puts the aliases ahead of every Latin base family', async () => {
     const offenders: string[] = []
-    for (const site of declarationSites()) {
+    for (const site of await allDeclarationSites) {
       const aliasAt = site.text.search(/var\(--script-fallbacks(-mono)?\)/)
       if (aliasAt < 0) continue
       for (const base of BASE_FAMILIES) {

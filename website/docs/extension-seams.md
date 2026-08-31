@@ -9,11 +9,12 @@ The backend has the sibling mechanism, Composed Platform Providers: see
 [`docs/system-specs/modules/platform-context.md`](../../docs/system-specs/modules/platform-context.md).
 The two are independent. Nothing here reads `CONTRACT_VERSION`.
 
-## The nine registry seams
+## The thirteen registry seams
 
 Each entry is one registrar the edition may call, paired with the reader the core
-already calls. `src/extensions.ts` names exactly these nine in its header, and
-`src/test/extensionSeams.test.tsx` exercises each one.
+already calls. `src/extensions.ts` names exactly these thirteen in its header.
+`src/test/extensionSeams.test.tsx` exercises each one except the source-provider
+seam, which has its own suite in `src/test/sourceProviderSeam.test.ts`.
 
 | Seam | Module | Registrar to reader |
 |------|--------|---------------------|
@@ -24,16 +25,26 @@ already calls. `src/extensions.ts` names exactly these nine in its header, and
 | Top-bar widgets | `apps/topBarWidgets.tsx` | `registerTopBarWidgets()` to `getTopBarWidgets()` |
 | Readout-capsule segments | `apps/capsuleSegments.tsx` | `registerCapsuleSegment()` to `getCapsuleSegments()` |
 | Overview status cards | `pages/overviewStatCards.tsx` | `registerOverviewStatCards()` to `getOverviewStatCards()` |
+| Overview lower panel (single owner) | `pages/overviewPanel.tsx` | `registerOverviewPanel()` to `getOverviewPanel()` |
+| Overview built-in suppression (subtractive) | `pages/overviewBuiltins.ts` | `suppressOverviewBuiltin()` to `isOverviewBuiltinSuppressed()` |
 | Panel-navigation chords | `hooks/useKeyboardShortcuts.ts` | `registerPanelShortcut()`, read by the shortcut handler and `DEFAULT_SHORTCUTS` |
 | Non-app route prefixes | `components/MigrationCheck.tsx` | `registerNonAppPrefix()`, read by `MigrationCheck` |
+| Source providers (Changes panel + sidebar chips) | `utils/pullRequestLinks.ts` | `registerSourceProvider()` to `sourceProviderDescriptor()` |
+| Phone-connection method renderers | `components/mobileConnectRenderers.tsx` | `registerMobileConnectRenderer()` to `getMobileConnectRenderers()` / `canRenderMobileConnectKind()` |
 
 Plus one **exported-transport** seam for edition-owned API methods. It is not a
 registry; see "API methods" below.
 
 Other `register*()` functions in `src/` (built-in surfaces, command-palette
 providers, tool pills, terminal sockets, highlight.js languages) are core-internal
-wiring, not edition seams. Only the nine above are called from the composition
+wiring, not edition seams. Only the thirteen above are called from the composition
 root.
+
+Twelve of the thirteen are **additive** — the edition contributes a surface. The
+remaining one is **subtractive**: `suppressOverviewBuiltin()` removes a built-in
+Overview surface for a distribution whose environment makes it permanently
+inapplicable, which no additive seam can express. It is named `suppress*` rather
+than `register*` precisely so a call site cannot be misread as a contribution.
 
 ## Composition root
 
@@ -256,8 +267,8 @@ unaffected because the applied value persists in `localStorage`.
 
 ## Collision policy
 
-`apps/seamCollision.ts` is the one policy every registrar routes rejections
-through. A registration whose key collides with a core entry (or an
+`apps/seamCollision.ts` is the one policy every **additive** registrar routes
+rejections through. A registration whose key collides with a core entry (or an
 already-registered one) is resolved core-wins, and `reportSeamCollision`:
 
 - **fails loud in dev and test** (it throws under `import.meta.env.DEV`, which is
@@ -265,6 +276,13 @@ already-registered one) is resolved core-wins, and `reportSeamCollision`:
   build/test time rather than by an end user;
 - **degrades safe in production** (warn and ignore), so a shipped app never
   white-screens over a duplicate.
+
+The subtractive seam is deliberately **exempt**. `suppressOverviewBuiltin()` is a
+set, and a repeat is not a conflict: two owners cannot share one render slot, but
+two parties that both want a surface gone agree. So re-entrant registration (HMR,
+a module imported twice) is silently idempotent rather than a
+`reportSeamCollision` — which is why it is the one seam whose second call is not
+an error.
 
 ## Per-seam validation
 
@@ -334,12 +352,13 @@ through `registerTopBarWidgets` instead.
 
 **Rung thresholds are locale-measured.** The container-query breakpoints in
 `.topbar`'s ladder (`src/index.css`) are the measured content width of each
-readout tier plus a margin, taken in one locale through
-`website/capture/topbar-search-variants.tsx`. A wider locale can push a tier past
-its own threshold, in which case the group squeezes or truncates its text before
-the rung fires — graceful, but it means the constants are an approximation, not a
-guarantee. Re-measure with that harness when readout content or the catalogs
-change materially.
+readout tier plus a margin, taken through
+`website/capture/topbar-search-variants.tsx`. The base rungs are measured in one
+locale; the update-pill shift (below) is measured across every shipped locale. A
+wider-than-measured tier squeezes or truncates its text before the rung fires —
+graceful, but it means the constants are an approximation, not a guarantee.
+Re-measure with that harness when readout content or the catalogs change
+materially.
 
 
 **Width budget for both top-bar seams.** The header is a three-track grid whose
@@ -357,14 +376,116 @@ clips deliberately rather than pushing the notifications bell out of the
 header), and at the terminal rung the capsule is reduced to its connection dot,
 which hides registered segments along with the core readouts.
 
+**The budget has TWO bases.** While an update is pending, the top bar mounts the
+update pill — a non-shrinking sibling of the ladder — and the actions group
+carries `tb-has-update`, which shifts the rungs by the pill's footprint (see the
+rung comments in `src/index.css`). The footprint follows the pill's own label
+gate (`hidden sm:inline`, 640px viewport): at ≥640px it is the widest
+shipped-locale label form plus the group gap (201.7px + 6px = 208) and every
+rung shifts, terminal included (408px instead of 200px); below 640px the pill
+is icon-only (34px + 6px gap = 40) and only the terminal rung shifts (240px).
+The ≥640 shift is a deliberate over-reservation for every narrower-label
+locale — static CSS cannot key a rung on the active language, so an English
+pill (~134px) gives up readouts ~68px earlier than its own width requires, in
+exchange for no locale ever re-entering the squeeze band. For a registered
+segment that means the ~40px collapsed-form budget above holds only in the
+no-update state; with an update pending the same window width leaves up to
+208px less, and at the narrowest desktop widths the remainder for registered
+content is zero. Treat the update-pending state as one of the widths your own
+`@container` rule must survive.
+
 **Overview status cards.** `registerOverviewStatCards([{ id, order?, component }])`
 adds a self-contained `StatCard` (owning its own query and state, like the core
 `TunnelStatus`) to the Settings Overview grid, after the core cards, in ascending
 `order`. Each receives a `delay` prop for the grid's stagger animation.
 
+**Overview lower panel.** `registerOverviewPanel({ id, component })` claims the
+region below the Usage/Memory summary grid, which the stock build leaves empty.
+Unlike every other registry here this slot holds **at most one** entry: the first
+registration owns the region, and a second is a collision (throws in dev/test,
+warns and is ignored in production) rather than appending or replacing. That is
+the point — the region has one owner who renders whatever internal layout it
+wants and owns all of it, so there is no layout negotiation between parties who
+cannot see each other. Reach for `registerOverviewStatCards` instead when the
+contribution really is one more tile in the status grid; use this slot when the
+content does not fit a 150px tile. The component receives no props and is wrapped
+in an `ErrorBoundary`, so a throwing panel disables only itself.
+
+**Overview built-in suppression.** `suppressOverviewBuiltin(id)` takes an id from
+a **typed union**, not a free string. That is the validation: a misspelled
+free-form id would suppress nothing and say nothing, and that symptom is
+indistinguishable from the seam not working at all, so the union turns it into a
+compile error at the call site. Keep the union minimal and add a member only
+alongside a real consumer — an id with no caller is API surface that has never
+been exercised. The seam is **one-way** (there is no `unsuppress`) and, like every
+registry here, is read at render and not reactive, so suppression must be
+registered during composition.
+
+It is **not a security control**. Suppression removes a piece of guidance from one
+page and relaxes nothing: whatever policy made the surface inapplicable is still
+enforced server-side (for `tailnet-mobile` the status endpoint still derives its
+step and the QR mint still refuses a pinned install with `governance_pinned`), so
+hiding a card cannot grant access the backend would otherwise deny. At the render
+site the gate sits outside both the `ErrorBoundary` and the spacing wrapper, so a
+suppressed build emits no element at all rather than an empty, still-spaced one.
+
 **Non-app route prefixes.** `registerNonAppPrefix(prefix)` tells `MigrationCheck`
 that a route can never host a migratable app, so the migration banner does not
 probe it. A duplicate prefix is a no-op.
+
+**Source providers.** `registerSourceProvider(descriptor)` adds a code-review
+forge to link extraction, sidebar chips, and the Changes panel. It is the one
+seam whose registration is HALF a provider: the descriptor covers parsing and
+rendering (`parse`, `chipLabel`, `refLabel`, an optional `icon` glyph, and the
+`capabilities` flags gating each write affordance), while fetching and every
+mutation are served by a backend plugin the edition registers with
+`register_source_provider()` in
+`src/kiro_crew/dashboard/handlers/source_providers.py`, under the same id. The
+two registries validate the same id grammar (`/^[a-z][a-z0-9_-]{0,31}$/`) and
+both refuse the built-in ids (`github`, `gitlab`, `jira`), so a descriptor can
+never restyle a core provider and a payload provider id round-trips through both
+layers. A descriptor missing `parse`/`chipLabel`/`refLabel`/`capabilities`
+routes through `reportSeamCollision`.
+
+Every capability flag names the backend hooks it commits the plugin to (see
+`SourceProviderCapabilities` in `utils/pullRequestLinks.ts`): a flag set without
+its hooks renders a button whose call can only fail, which is exactly what the
+flags exist to prevent. Descriptor-returned links are re-validated
+(`validRegisteredLink`): the link must carry the descriptor's own id, an
+`https://` canonical URL that survives persist-and-reparse, and `kind: 'change'`
+— issue refs are refused at admission because the issue pipeline is
+built-in-only. A provider id the frontend has no descriptor for renders through
+fail-closed fallback meta (`utils/sourceProviderMeta.ts`): neutral labels, no
+logo, no write affordances. The backend plugin contract — payload schema
+(`SourceChangePayload`), shared caches, redaction, byte caps, and the optional
+mutation hooks — is documented on `SourceProviderPlugin` in
+`source_providers.py`; this seam's suite is `src/test/sourceProviderSeam.test.ts`
+plus `test/test_source_provider_plugin.py` on the backend.
+
+**Phone-connection method renderers.**
+`registerMobileConnectRenderer({ kind, component })` supplies the "Connect your
+phone" dialog section that draws one `MobileConnectMethod.kind` contributed by the
+backend `mobile_connect` CPP seam. It keys on `kind`, not `id`, because that is
+the descriptor's own split: `id` is the governed identifier the
+`capabilities.mobile_connect` `methods` ruleset narrows on, while `kind` exists to
+name the renderer — so two methods may share one kind and a component that needs
+the ids reads `/api/mobile-connect/methods` itself. A blank kind, a duplicate, or
+a **built-in** kind (`tailnet_qr`, `login_link`) routes through
+`reportSeamCollision`: those two are drawn by core sections whose mint endpoints
+the core audits, so registering over one would be an override that silently
+redirects a credential mint, not a contribution.
+
+The registry is also the **single** definition of the renderable set, read by two
+consumers that used to carry it as matching literals: `canRenderMobileConnectKind()`
+gates the nav rail's row and `getMobileConnectRenderers()` supplies the dialog's
+sections. A kind neither drawn nor registered is still filtered out at the rail, so
+the row stays hidden rather than opening a dialog with an empty body — the seam adds
+a way to draw a method, it does not remove that guard. Registered sections render
+above the built-ins, each in its own `ErrorBoundary`, so a throwing renderer
+disables only itself. It **cannot widen governance**: the endpoint filters every id
+through `capabilities.mobile_connect` before the dialog sees a kind, and each mint
+endpoint re-runs that decision (`mint_denied_reason`), so a renderer for a denied or
+unoffered method draws nothing.
 
 ## Reactivity
 

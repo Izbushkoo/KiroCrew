@@ -30,6 +30,29 @@ superseded-by: []
 
 ## Implementation status (as of `8861f89e`)
 
+**Phase 2, CLI half — implemented** (`platform/wheel_engine.py`): the
+managed-venv shape (`cli.sh`'s non-pipx branch) now updates via versioned
+sibling trees behind a `crew-venv-current` stable symlink, per §3's invariants
+and first-migration protocol. `kirocrew update` builds
+`crew-venv-<version>` fresh (manifest signature verified against the
+cli.sh-pinned trust root, wheel SHA-256 against the signed digest), verifies
+the tree imports the promised version, promotes the stable link via sibling
+symlink + `os.replace`, repoints `~/.local/bin/kirocrew`, and deliberately does NOT
+prune old trees — deletion needs an ownership/liveness proof this engine
+cannot make yet, so superseded trees stay as manual recovery targets.
+`cli.sh` repoints the stable link at the legacy tree after its own installs,
+so the link always names the last-installed version whichever writer ran.
+Gateway restarts resolve their interpreter through the stable link
+(`respawn_executable`), which is the `updates.py` launch path from §3's list;
+the service-unit and macOS-launcher rewrites, the in-app Apply now ships WITH its OQ7 step-up: the SPA's
+Update button arms a pending request (`POST /api/update/arm`; single-use
+nonce, TTL 10 min, written owner-only to the data home and never returned to
+the SPA), and `kirocrew update approve` on the gateway host presents the
+nonce back (`POST /api/update/approve`, loopback + unix-socket preferred),
+upon which the gateway runs the shadow apply itself and restarts. The full
+drain lease (§5) and hash-pinned dependency constraints remain open. pipx
+installs keep the installer re-run.
+
 **Landed in PR #1734** — the tactical half of Phase 1, driven by a user-visible
 defect rather than the architecture: the dashboard told wheel installs "you're on
 the latest version" while they were two releases behind, because the check was
@@ -120,7 +143,7 @@ Three mechanisms:
 | Mechanism | Where | Covers |
 |---|---|---|
 | git self-update | `slack/gateway.py:4959` (`_check_for_updates`, called once from startup at `:5426`) → `_auto_apply_update` (`:5004`) | `source` only |
-| Electron OTA | `website/electron/auto-update.js` (electron-updater, `autoDownload=false`, `autoInstallOnAppQuit=false`) | `dmg`, `appimage` |
+| Electron OTA | `website/electron/auto-update.js` (electron-updater, `autoDownload=false` at the library level with an auto-download preference above it, `autoInstallOnAppQuit=false`) | `dmg`, `appimage` |
 | — none — | | `wheel`, `docker` |
 
 All three backend entry points to the git path guard on roughly the same two
@@ -244,8 +267,10 @@ re-asked which shapes it still governs.
   a button.
 - One shared drain-and-restart sequence, with success defined by a health +
   version handshake rather than a clean exit code.
-- No regression to the desktop OTA engine, whose consent-first posture is load
-  bearing for signing and notarization.
+- No regression to the desktop OTA engine, whose install-ordering posture is load
+  bearing for signing and notarization. (Its *consent* posture has since become a
+  default-on preference — see the amended §4 — but the ordering invariant it was
+  protecting, gateway-stopped-before-swap, is unchanged.)
 
 ## Non-goals
 
@@ -528,9 +553,31 @@ post-restart verification.
 
 | | nightly | insider | stable |
 |---|---|---|---|
-| desktop | opt-in background staging, apply on idle/quit | consent-first | consent-first |
+| desktop | background download by default, install on next quit (opt out in About) | same | same |
 | wheel | notify + explicit apply (in-app button or `kirocrew update`) | same | same |
 | source | notify only | same | same |
+
+**Amended (desktop row).** This row originally read "opt-in background staging"
+for nightly and "consent-first" for insider and stable. Desktop now downloads by
+default on every channel, with an opt-out in Settings → About
+(`autoDownloadUpdates`, default true). Two things did NOT change with it, and
+they are what keep the row honest:
+
+- **The install is still not automatic in-session.** A downloaded update is
+  armed on `before-quit` and installs on the user's own next quit, after an
+  awaited gateway stop. Nothing swaps the bundle under a running session, which
+  is the property §5's drain sequence exists to protect and the reason
+  "apply on idle/quit" survives as "install on next quit".
+- **`autoInstallOnAppQuit` stays false on every platform.** Auto-download does
+  not imply it and must never be conflated with it: on macOS that flag stages
+  eagerly, and staging is what ARMS ShipIt to swap the bundle on any exit,
+  including exits that skip the gateway teardown. It cannot be un-armed, so it
+  also defeats the retraction that `allowDowngrade=true` provides.
+
+The consent-first path is therefore preserved as the opt-out rather than
+deleted, and the distinction the original row was drawing — between fetching
+bytes and committing them — is now carried by the download/install split
+instead of by the channel.
 
 **"Explicit" means a deliberate user action, not necessarily a terminal.** An
 in-app Apply button and `kirocrew update` in a terminal both qualify, and since
@@ -701,9 +748,19 @@ contract tells it not to.
   nothing short of a system-installed, root-owned helper would. Whether that is
   worth building is Open Question 1; until it is answered, the local-execution
   case is an accepted, stated gap rather than a covered one.
-- Desktop consent-first behavior is unchanged. Nothing in this RFC introduces a
-  path that installs a signed bundle without an explicit user action, outside
-  the existing policy-mandated case.
+- **Desktop now DOWNLOADS without an explicit user action, and still does not
+  INSTALL without one.** This supersedes the original claim that nothing here
+  installs a signed bundle without explicit action. The distinction is the whole
+  security argument: a download is a fetch of sha512-verified bytes into a cache
+  that changes nothing until it is committed, whereas the commit remains gated on
+  the user's own quit plus an awaited gateway stop. `autoInstallOnAppQuit` stays
+  false on every platform, so no code path hands the platform installer the bytes
+  outside `quitAndInstall()`, and release retraction keeps working because
+  nothing is staged early. The opt-out is `autoDownloadUpdates` (default true).
+- The in-app Apply step-up resolved in Open Question 7 is unaffected: it governs
+  a *dashboard-session-triggered* install of the WHEEL shape, where the authority
+  is a network-reachable bearer. The desktop path here is triggered by the user's
+  own quit on the host, which is not that actor.
 
 ## Alternatives considered
 

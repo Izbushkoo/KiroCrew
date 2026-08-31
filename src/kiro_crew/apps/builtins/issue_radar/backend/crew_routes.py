@@ -390,10 +390,18 @@ async def _json_object(request: web.Request) -> tuple[dict, web.Response | None]
     Split out of :func:`_body_preamble` so the agent write path can read a body
     without the owner/repo gate it does not use — one implementation, so the two
     paths cannot drift on which malformed payload gets which refusal.
+
+    Follows the ``dashboard/handlers/_shared.read_bounded_json`` contract on
+    Q1/Q2 (400 for a non-object; catch spanning the client-input failure set of
+    ``LookupError``/``RecursionError``/``ValueError`` so an unknown ``charset=``
+    codec is a 400 and a mid-read transport error still propagates). The
+    deliberate divergence is the extra ``_holds_non_finite_number`` gate below:
+    ``NaN``/``Infinity`` decode fine here but are not valid JSON on the wire, so
+    they are refused rather than persisted.
     """
     try:
         raw = await request.json()
-    except Exception:
+    except (LookupError, RecursionError, ValueError):
         return {}, web.json_response(
             {"error": "request body must be JSON", "code": "invalid_json"}, status=400
         )
@@ -987,6 +995,53 @@ async def _handle_crew_pause(request: web.Request) -> web.Response:
     return web.json_response({"crew": crew})
 
 
+# ── the crew fabric (pipeline view) ─────────────────────────────────────────
+
+
+def _fabric_page(owner: str, repo: str, root: Any) -> dict[str, Any]:
+    """The ``items`` half of ``GET /crew/fabric``, computed in ONE off-loop call.
+
+    The provider gate is NOT here — it is the route's, because a non-GitHub repo
+    still answers 200 with an empty list and this helper is only reached once the
+    repo is known to be crew-bearing. Kept parallel to ``_crews_page`` /
+    ``_crew_page``: one off-loop hop that reads every crew's items and the ledger,
+    rather than a hop per crew.
+    """
+    return {
+        "schema": crew_store.FABRIC_SCHEMA,
+        "phases": list(crew_store.SPINE_PHASES),
+        "items": crew_store.fold_fabric(owner, repo, root),
+    }
+
+
+async def _handle_crew_fabric(request: web.Request) -> web.Response:
+    """GET /crew/fabric?owner&repo -> {schema, owner, repo, provider, host,
+    generated_at, phases[], items[]} — the pipeline view's whole payload.
+
+    Cookie-authenticated browser only, gated on the repo being CONNECTED, exactly
+    like ``GET /crews``: no write gate (it is a read) and no agent reachability (it
+    is not in ``_AGENT_REACHABLE``, so ``_agent_gate`` refuses an internal-secret
+    caller).
+
+    Non-GitHub providers answer ``items: []`` at HTTP 200, not an error: crews are a
+    GitHub-only feature today, so a GitLab repo simply has no crews to fold, and the
+    frontend renders the same designed empty state it renders for a GitHub repo that
+    never ran one. A repo with no crews answers the same way, from the fold itself.
+    """
+    key, early = await _query_preamble(request)
+    if early is not None:
+        return early
+    if key.is_github:
+        page = await asyncio.to_thread(
+            partial(_fabric_page, key.owner, key.repo, routes._scope(key))
+        )
+    else:
+        page = {"schema": crew_store.FABRIC_SCHEMA, "phases": list(crew_store.SPINE_PHASES), "items": []}
+    return web.json_response(
+        {**routes._identity(key), "generated_at": store._now_iso(), **page}
+    )
+
+
 # ── repo-wide protocol settings ─────────────────────────────────────────────
 
 
@@ -1114,6 +1169,7 @@ def register_crew_routes(app: web.Application) -> None:
     _add("GET", "/crews/settings", _handle_crews_settings_get)
     _add("PUT", "/crews/settings", _handle_crews_settings_put)
     _add("GET", "/crew", _handle_crew_read)
+    _add("GET", "/crew/fabric", _handle_crew_fabric)
     _add("PUT", "/crew", _handle_crew_update)
     _add("DELETE", "/crew", _handle_crew_retire)
     _add("PUT", "/crew/work", _handle_crew_work)

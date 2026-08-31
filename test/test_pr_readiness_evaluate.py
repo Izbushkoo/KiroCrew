@@ -148,9 +148,40 @@ def _run_json(name: str, *, status: str, conclusion: str) -> str:
     )
 
 
+def _runs_json(name: str, runs: list[dict]) -> str:
+    """Multi-run fixture, in the order given (the Actions API returns
+    newest-first). Each entry supplies id/status/conclusion; created_at
+    defaults to one shared second, the tie the collapse must break on id."""
+    return json.dumps(
+        {
+            "workflow_runs": [
+                {
+                    "head_repository": {"full_name": "kirodotdev/KiroCrew"},
+                    "head_branch": "feat/x",
+                    "path": (
+                        "dynamic/github-code-scanning/codeql"
+                        if name == "codeql"
+                        else f".github/workflows/{name}"
+                    ),
+                    "created_at": "2026-08-11T00:00:00Z",
+                    **run,
+                }
+                for run in runs
+            ]
+        }
+    )
+
+
+def _lane_log(proc: subprocess.CompletedProcess[str]) -> str:
+    """The step's own diagnostic lane-state line (the only place the arrays are
+    readable from a `gh run view --log`, per #3550)."""
+    return next(
+        line for line in proc.stdout.splitlines() if line.startswith("pr-readiness: lane state")
+    )
+
+
 class Runner:
     """Executes the evaluate step against one stubbed repository state."""
-
     def __init__(self, root: Path) -> None:
         self.fixtures = root / "fixtures"
         bindir = root / "bin"
@@ -182,11 +213,15 @@ class Runner:
             "TRIGGER_ACTION": "completed",
         }
         # Materialize the helper exactly as CI does: run the install step.
+        # cwd pins the children under this runner's own temp dir so a
+        # relative write in a future script revision cannot land in the
+        # repository root (pytest's CWD).
         subprocess.run(
             ["bash", "-c", _helper_script()],
             env=self.env,
             check=True,
             capture_output=True,
+            cwd=self.temp,
         )
         # Default fixtures: everything green and completed.
         green = _run_json("green.yml", status="completed", conclusion="success")
@@ -215,8 +250,14 @@ class Runner:
         fork: bool = False,
         http_error: str = "",
         existing_status_state: str = "",
+        disposition_ok: str = "",
+        disposition_violations: str = "",
     ):
         env = dict(self.env)
+        if disposition_ok:
+            env["DISPOSITION_OK"] = disposition_ok
+        if disposition_violations:
+            env["DISPOSITION_VIOLATIONS"] = disposition_violations
         if fork:
             env["FORK"] = "true"
         if http_error:
@@ -233,6 +274,7 @@ class Runner:
             env=env,
             capture_output=True,
             text=True,
+            cwd=self.temp,
         )
         outputs = {}
         for line in self.output.read_text().splitlines():
@@ -501,3 +543,367 @@ class TestGenuineFailureStaysRed:
         # say so instead of presenting itself as a complete evaluation.
         summary = (runner.temp / "pr-readiness-summary.md").read_text()
         assert "truncated" in summary
+
+
+class TestLaneStateIsLoggedNotOnlySummarized:
+    """#3550: a run that publishes a wrong verdict (e.g. a lane invisible
+    under GITHUB_TOKEN but visible under a user token) could previously only
+    be diagnosed by opening the $GITHUB_STEP_SUMMARY UI by hand --
+    `gh run view --log` cannot query it. The evaluate step must also echo the
+    lane arrays to the job's own stdout log."""
+
+    def test_all_green_run_logs_every_lane_as_passed(self, runner: Runner):
+        proc, outputs = runner.evaluate()
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "success"
+        log_line = next(
+            line for line in proc.stdout.splitlines() if line.startswith("pr-readiness: lane state")
+        )
+        assert "pending=[]" in log_line
+        assert "failed=[]" in log_line
+        # Real lane labels, not just a non-empty bucket -- proves the log line
+        # carries the SAME names the summary does, not a placeholder.
+        assert "CI" in log_line
+        assert "Opus 4.8 Review" in log_line
+
+    def test_a_stuck_lane_is_named_in_the_log_line(self, runner: Runner):
+        # The exact #3550 shape: one lane never completes (still queued),
+        # everything else green. The diagnostic line must name it so a
+        # stuck-pending PR is diagnosable from `gh run view --log` alone,
+        # without opening the step-summary UI.
+        (runner.fixtures / "codeql_runs.json").write_text(
+            _run_json("codeql", status="queued", conclusion="")
+        )
+        proc, outputs = runner.evaluate()
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "pending"
+        log_line = next(
+            line for line in proc.stdout.splitlines() if line.startswith("pr-readiness: lane state")
+        )
+        assert "CodeQL" in log_line
+        assert "pending=[CodeQL" in log_line
+
+
+class TestSameSecondRunCollapse:
+    """The per-workflow collapse must be deterministic on the monotonic run
+    id, not on second-granularity created_at: two runs of one workflow on one
+    head routinely share a created_at second (synchronize + edited both fire),
+    the API returns runs newest-first, and jq's sort_by is stable -- so a
+    created_at sort picked the OLDEST run of a tied group. When that run was
+    concurrency-cancelled, a lane whose newest run succeeded published
+    "failure: N blocking readiness item(s)" on a fully-green PR."""
+
+    def test_same_second_cancelled_twin_does_not_mask_a_success(
+        self, runner: Runner
+    ):
+        # The observed shape: newest-first API order, the newer (higher-id)
+        # run succeeded, its same-second concurrency-cancelled twin sits
+        # after it. A created_at collapse selects the cancelled twin and
+        # reddens the lane; the id collapse must reach the success.
+        (runner.fixtures / "ci_runs.json").write_text(
+            _runs_json(
+                "ci.yml",
+                [
+                    {
+                        "id": 33096637341,
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                    {
+                        "id": 33096636697,
+                        "status": "completed",
+                        "conclusion": "cancelled",
+                    },
+                ],
+            )
+        )
+        proc, outputs = runner.evaluate()
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "success"
+        assert outputs["label"] == "readiness: passed"
+
+    def test_a_cancelled_newest_run_stays_red(self, runner: Runner):
+        # There is deliberately no cancelled-run filter: when the run with
+        # the highest id was cancelled (e.g. a maintainer cancelled a rerun),
+        # it IS the verdict and the lane must stay failure-class. Dropping it
+        # would resurface the older success -- a stale green on a revision
+        # whose latest validation never completed.
+        (runner.fixtures / "ci_runs.json").write_text(
+            _runs_json(
+                "ci.yml",
+                [
+                    {
+                        "id": 500,
+                        "status": "completed",
+                        "conclusion": "cancelled",
+                    },
+                    {
+                        "id": 400,
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                ],
+            )
+        )
+        proc, outputs = runner.evaluate()
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "failure"
+        assert outputs["label"] == "readiness: action required"
+
+    def test_all_runs_cancelled_still_reads_failure_class(
+        self, runner: Runner
+    ):
+        # When every run of the workflow was cancelled there is no verdict,
+        # and the lane must stay a blocking red -- not report "(not started)"
+        # and pend forever, and never read as green.
+        (runner.fixtures / "ci_runs.json").write_text(
+            _runs_json(
+                "ci.yml",
+                [
+                    {
+                        "id": 200,
+                        "status": "completed",
+                        "conclusion": "cancelled",
+                    },
+                    {
+                        "id": 100,
+                        "status": "completed",
+                        "conclusion": "cancelled",
+                    },
+                ],
+            )
+        )
+        proc, outputs = runner.evaluate()
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "failure"
+        assert outputs["label"] == "readiness: action required"
+
+    def test_a_real_failure_with_a_cancelled_twin_stays_red(
+        self, runner: Runner
+    ):
+        # The cancelled-twin drop must never launder a genuine red: a
+        # completed/failure run is a verdict, and it wins the collapse over
+        # its cancelled sibling exactly like a success would.
+        (runner.fixtures / "ci_runs.json").write_text(
+            _runs_json(
+                "ci.yml",
+                [
+                    {
+                        "id": 700,
+                        "status": "completed",
+                        "conclusion": "failure",
+                    },
+                    {
+                        "id": 600,
+                        "status": "completed",
+                        "conclusion": "cancelled",
+                    },
+                ],
+            )
+        )
+        proc, outputs = runner.evaluate()
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "failure"
+        assert outputs["label"] == "readiness: action required"
+
+    def test_codeql_collapse_breaks_the_same_tie_the_same_way(
+        self, runner: Runner
+    ):
+        # The dynamic CodeQL resolution is a second, separately-written
+        # collapse over the same API shape; it must break the same-second
+        # tie identically or the defect just moves lanes.
+        (runner.fixtures / "codeql_runs.json").write_text(
+            _runs_json(
+                "codeql",
+                [
+                    {
+                        "id": 900,
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                    {
+                        "id": 800,
+                        "status": "completed",
+                        "conclusion": "cancelled",
+                    },
+                ],
+            )
+        )
+        proc, outputs = runner.evaluate()
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "success"
+        assert outputs["label"] == "readiness: passed"
+
+    def test_the_two_collapse_sites_carry_identical_logic(self):
+        # The workflow resolves runs at two separately-written sites (the
+        # monitored-workflow loop and the dynamic CodeQL read). Behavioral
+        # tests exercise one shape each; this pins the collapse FRAGMENT
+        # itself so an edit to one site cannot drift from the other for
+        # shapes no fixture covers. The fragment starts after the
+        # site-specific select() line and runs to the terminal collapse.
+        script = _evaluate_script()
+        fragment = "| max_by(.id) // empty"
+        lines = [ln.strip() for ln in script.splitlines()]
+        count = lines.count(fragment)
+        assert count == 2, (
+            "expected exactly the two run-collapse sites (monitored"
+            f" workflows + dynamic CodeQL), found {count}"
+        )
+        # No site may re-grow a filter stage between the select() and the
+        # collapse: the line preceding each collapse must be the end of the
+        # site-specific select bracket.
+        for i, line in enumerate(lines):
+            if line == fragment:
+                assert lines[i - 1].endswith("]"), (
+                    "a collapse site carries an extra pipeline stage between"
+                    f" select() and the collapse: {lines[i - 1]!r}"
+                )
+
+
+class TestAwaitingApprovalIsAttributedToTheMaintainer:
+    @staticmethod
+    def _all_monitored_workflows_await_approval(runner: Runner) -> None:
+        awaiting = _run_json("x.yml", status="completed", conclusion="action_required")
+        (runner.fixtures / "ci_runs.json").write_text(awaiting)
+        (runner.fixtures / "green_runs.json").write_text(awaiting)
+        (runner.fixtures / "check_runs.json").write_text(json.dumps({"check_runs": []}))
+
+    @staticmethod
+    def _lane_state(proc: subprocess.CompletedProcess[str]) -> str:
+        return next(
+            line for line in proc.stdout.splitlines() if line.startswith("pr-readiness: lane state")
+        )
+
+    def test_unapproved_fork_runs_still_block_without_claiming_failure(self, runner: Runner):
+        self._all_monitored_workflows_await_approval(runner)
+
+        proc, outputs = runner.evaluate(fork=True)
+
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["state"] == "action_required"
+        assert outputs["status_state"] == "failure"
+        assert outputs["label"] == "readiness: action required"
+        assert outputs["description"] == (
+            "3 workflow(s) awaiting maintainer approval; none has run yet"
+        )
+        assert len(outputs["description"]) <= 140
+        summary = (runner.temp / "pr-readiness-summary.md").read_text()
+        assert "**Awaiting maintainer approval**" in summary
+        assert "**Blocking**" not in summary
+        assert "**Waiting**" in summary
+        log_line = self._lane_state(proc)
+        assert "failed=[]" in log_line
+        assert "awaiting_approval=[CI Build Code Review]" in log_line
+
+    def test_real_failure_and_approval_wait_are_reported_separately(self, runner: Runner):
+        (runner.fixtures / "ci_runs.json").write_text(
+            _run_json("ci.yml", status="completed", conclusion="failure")
+        )
+        (runner.fixtures / "green_runs.json").write_text(
+            _run_json("x.yml", status="completed", conclusion="action_required")
+        )
+
+        proc, outputs = runner.evaluate(fork=True)
+
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "failure"
+        assert outputs["description"] == (
+            "1 blocking readiness item(s); 2 awaiting maintainer approval"
+        )
+        summary = (runner.temp / "pr-readiness-summary.md").read_text()
+        assert "**Blocking**" in summary
+        assert "**Awaiting maintainer approval**" in summary
+
+    def test_same_repo_action_required_remains_failure_class(self, runner: Runner):
+        self._all_monitored_workflows_await_approval(runner)
+
+        proc, outputs = runner.evaluate()
+
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "failure"
+        assert "blocking readiness item" in outputs["description"]
+        assert "awaiting maintainer approval" not in outputs["description"]
+        log_line = self._lane_state(proc)
+        assert "awaiting_approval=[]" in log_line
+        assert "action_required" in log_line
+
+    def test_approval_wait_dominates_a_later_transport_failure(self, runner: Runner):
+        (runner.fixtures / "ci_runs.json").write_text(
+            _run_json("ci.yml", status="completed", conclusion="action_required")
+        )
+
+        proc, outputs = runner.evaluate(
+            fork=True,
+            flaky_substr="build.yml/runs",
+            flaky_fails=3,
+        )
+
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["state"] == "action_required"
+        assert outputs["status_state"] == "failure"
+        assert outputs["description"] == ("1 workflow(s) awaiting maintainer approval")
+        summary = (runner.temp / "pr-readiness-summary.md").read_text()
+        assert "**Awaiting maintainer approval**" in summary
+        assert "Evaluation was truncated" in summary
+
+
+class TestDispositionViolationsBlockTheVerdict:
+    """Issue #6658: the disposition rule was mechanical only for a writer
+    running the prepare-pr loop. Readiness publishes the repository's sole
+    required status, so folding the violation list in here is what binds every
+    writer -- including one who never runs that loop."""
+
+    def test_a_violation_turns_an_otherwise_green_revision_red(self, runner: Runner):
+        proc, outputs = runner.evaluate(
+            disposition_ok="true",
+            disposition_violations=(
+                "disposition record claims no span= finding identity "
+                "(comment 900 by alice; target=gpt) while that lane has findings"
+            ),
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "failure"
+        assert outputs["label"] == "readiness: action required"
+        assert outputs["description"] == "1 blocking readiness item(s)"
+        assert "disposition rule:" in _lane_log(proc)
+
+    def test_every_violation_is_counted_separately(self, runner: Runner):
+        proc, outputs = runner.evaluate(
+            disposition_ok="true",
+            disposition_violations="first violation\nsecond violation",
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "failure"
+        assert outputs["description"] == "2 blocking readiness item(s)"
+
+    def test_a_clean_evaluation_leaves_the_verdict_green(self, runner: Runner):
+        # The ordinary case: the gate ran, found nothing, and must contribute
+        # nothing -- not a pending, not a note.
+        proc, outputs = runner.evaluate(disposition_ok="true", disposition_violations="")
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "success"
+        assert outputs["label"] == "readiness: passed"
+
+    def test_an_unreadable_record_set_waits_instead_of_going_red(self, runner: Runner):
+        """A transient comments/permission API failure must never red the
+        required status -- that is issue #2753's class of bug. UNKNOWN is
+        pending, which a later event recomputes."""
+        proc, outputs = runner.evaluate(disposition_ok="false")
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "pending"
+        assert outputs["label"] == "readiness: checking"
+        assert "disposition records could not be read" in _lane_log(proc)
+
+    def test_a_violation_outranks_an_unrelated_pending_lane(self, runner: Runner):
+        """A violation is not something waiting can clear: only the author
+        editing or deleting the comment can, so it must be reported as blocking
+        even while other lanes are still running."""
+        (runner.fixtures / "ci_runs.json").write_text(
+            _run_json("ci.yml", status="in_progress", conclusion="")
+        )
+        proc, outputs = runner.evaluate(
+            disposition_ok="true", disposition_violations="one violation"
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "failure"
+        assert outputs["description"] == "1 blocking readiness item(s)"

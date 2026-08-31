@@ -4,8 +4,8 @@ import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import '@xterm/xterm/css/xterm.css'
 import { useMutation } from '@tanstack/react-query'
-import { MessageSquarePlus, Copy, Check } from 'lucide-react'
-import { ensureTerminalConnection, disposeTerminalConnection, getTerminalCwd } from '../utils/terminalRegistry'
+import { MessageSquarePlus, Copy, Check, PlugZap } from 'lucide-react'
+import { ensureTerminalConnection, disposeTerminalConnection, getTerminalCwd, useTerminalConnStatus, useTerminalManualRetry, retryTerminalConnection } from '../utils/terminalRegistry'
 import { getTerminalFont, resolveTerminalFontFamily, subscribeTerminalFont } from '../hooks/useTerminalFont'
 import { useIsTouchDevice } from '../hooks/useIsTouchDevice'
 import TerminalCompletion from './TerminalCompletion'
@@ -60,6 +60,26 @@ function scheduleTermThemeRefresh() {
   if (_themeRaf) cancelAnimationFrame(_themeRaf)
   _themeRaf = requestAnimationFrame(() => { _themeRaf = 0; refreshTermThemes() })
 }
+/** Whether a batch of mutation records is one of the two theme signals.
+ *
+ * Split out of the observer callback so the CLASSIFICATION can be asserted directly.
+ * Driving it through a live MutationObserver in a test means asserting on happy-dom's
+ * record DELIVERY, which is bistable in this suite -- the same file passes under
+ * `--coverage` and fails without it -- so a test written that way reports on the
+ * environment rather than on this rule.
+ */
+export function isThemeSignal(records: MutationRecord[]): boolean {
+  for (const r of records) {
+    // (1) a built-in theme / mode swap flips <html data-theme>.
+    if (r.type === 'attributes') return true
+    // (2) a CUSTOM theme's vars only resolve once useTheme injects its <style>.
+    for (const n of r.addedNodes) {
+      if (n instanceof HTMLStyleElement && n.id.startsWith('mc-custom-theme-')) return true
+    }
+  }
+  return false
+}
+
 function ensureThemeObserver() {
   if (_themeObserver || typeof document === 'undefined') return
   // A terminal's xterm colours are a construction-time snapshot (canvas, not
@@ -71,18 +91,18 @@ function ensureThemeObserver() {
   //      observer misses it and the terminal stays on the boot-default palette.
   // The attribute filter catches (1); watching <head> childList catches (2).
   _themeObserver = new MutationObserver((records) => {
-    for (const r of records) {
-      if (r.type === 'attributes') { scheduleTermThemeRefresh(); return }
-      for (const n of r.addedNodes) {
-        if (n instanceof HTMLStyleElement && n.id.startsWith('mc-custom-theme-')) {
-          scheduleTermThemeRefresh()
-          return
-        }
-      }
-    }
+    if (isThemeSignal(records)) scheduleTermThemeRefresh()
   })
   _themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] })
   _themeObserver.observe(document.head, { childList: true })
+}
+
+/** Test-only: release the document-scoped observer and any queued frame. */
+export function __resetTerminalThemeSyncForTests(): void {
+  if (_themeRaf) cancelAnimationFrame(_themeRaf)
+  _themeRaf = 0
+  _themeObserver?.disconnect()
+  _themeObserver = null
 }
 
 /* ── Terminal font sync ──
@@ -216,6 +236,21 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
   // The soft keys exist for one reason — no physical keyboard.
   const touchDevice = useIsTouchDevice()
 
+  // Live socket state, so the view can surface a disconnected banner. The
+  // banner shows in two cases: the terminal 'disconnected' state (backoff
+  // ceiling reached), and while a USER-initiated reconnect is in flight — the
+  // latter as a "Reconnecting…" presentation so a failing manual retry is not
+  // silent. Ordinary automatic 'reconnecting' blips (tab hide/show) stay quiet
+  // to avoid flicker; only a manual retry sets manualRetry.
+  const connStatus = useTerminalConnStatus(sessionId)
+  const manualRetry = useTerminalManualRetry(sessionId)
+  // The manual "Reconnecting…" state: the user clicked Reconnect and the dial
+  // has not yet resolved. On failure the status flips back to 'disconnected'
+  // (manualRetry clears with it), returning the banner to its disconnected
+  // presentation; on success it flips to 'connected' and the banner is gone.
+  const reconnecting = manualRetry && connStatus === 'reconnecting'
+  const showBanner = connStatus === 'disconnected' || reconnecting
+
   if (!entryRef.current) {
     entryRef.current = getOrCreateTerm(sessionId)
   }
@@ -278,7 +313,18 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
     fonts.ready.then(onReady)
     try {
       const px = term.options.fontSize ?? 13
-      fonts.load(`${px}px "JetBrains Mono"`).then(onReady, () => {})
+      // Preload the family the terminal is actually configured to render. The
+      // previous version hardcoded 'JetBrains Mono' — fine for the default
+      // stack but silently miss for anyone who picked a different Terminal
+      // Font Family (e.g. the bundled OpenDyslexicMono, or a custom Nerd Font):
+      // @font-face fonts fetch lazily on first DOM use, so xterm's canvas
+      // renderer would measure and draw against the generic monospace fallback
+      // until some other var(--mono) surface pulled the resolved family in.
+      // Using `term.options.fontFamily` (already the resolved stack from
+      // resolveTerminalFontFamily — comma-separated with a generic fallback)
+      // makes the load target follow the picker.
+      const configuredFontFamily = term.options.fontFamily ?? 'monospace'
+      fonts.load(`${px}px ${configuredFontFamily}`).then(onReady, () => {})
     } catch { /* invalid spec on some engines — `ready` handler covers it */ }
     return () => { cancelled = true }
   }, [term, doRefit]) // stable — term/doRefit come from the per-session cache
@@ -414,6 +460,28 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
             feature that attaches its own handler here would silently replace it —
             extend the handler inside TerminalCompletion instead. */}
         <TerminalCompletion term={term} sessionId={sessionId} active={visible} />
+        {showBanner && (
+          <div
+            className="absolute inset-x-0 top-0 z-30 flex items-center gap-2 border-b border-border bg-bg-elevated/95 px-3 py-1.5 text-[12px] text-text shadow-sm backdrop-blur"
+            role="status"
+            aria-live="polite"
+          >
+            <PlugZap className={`h-3.5 w-3.5 shrink-0 ${reconnecting ? 'text-text-muted' : 'text-danger'}`} aria-hidden="true" />
+            <span className="min-w-0 flex-1 truncate">
+              {reconnecting
+                ? i18nT('components.cliPanel.reconnecting')
+                : i18nT('components.cliPanel.disconnected_message')}
+            </span>
+            <button
+              type="button"
+              onClick={() => retryTerminalConnection(sessionId)}
+              disabled={reconnecting}
+              className="shrink-0 rounded-md border border-border px-2 py-0.5 text-[12px] text-text hover:bg-bg-hover transition-colors disabled:cursor-default disabled:opacity-60 disabled:hover:bg-transparent"
+            >
+              {i18nT('components.cliPanel.reconnect')}
+            </button>
+          </div>
+        )}
       </div>
       {/* Below the terminal in flow, never over it: the shell prompt occupies the
           bottom row, so an overlay would hide the line being typed. The terminal

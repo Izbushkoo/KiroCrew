@@ -35,12 +35,10 @@ from kiro_crew.security import (
 if platform_compat.IS_POSIX:
     import fcntl
     import pty as _pty
-    import signal
     import termios
 else:  # pragma: no cover — Windows fallback
     fcntl = None  # type: ignore[assignment]
     _pty = None  # type: ignore[assignment]
-    signal = None  # type: ignore[assignment]
     termios = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
@@ -60,6 +58,43 @@ def _sel():
     import kiro_crew.dashboard.handlers as _pkg  # circular import: __init__ imports terminal
 
     return _pkg.sel()
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte of ``data`` to ``fd``, tolerating short writes.
+
+    ``os.write`` on a blocking PTY controller fd may accept fewer bytes than requested
+    when the tty input buffer is full: it blocks until *some* space frees, writes
+    what fits, and returns a short count. A single ``os.write`` that discards its
+    return therefore silently truncates a large paste under a backpressured
+    reader. Loop over a ``memoryview`` so partial writes advance without
+    reslicing, until the buffer is fully consumed.
+
+    The loop writes through a private ``os.dup`` of ``fd``, taken before the
+    first write. A concurrent ``_kill_session`` closes the session's descriptor
+    without waiting for in-flight writes, and the kernel may hand that NUMBER
+    to an unrelated ``open()`` — a loop still holding the raw number would then
+    write the paste's remaining bytes into whatever reused it. The dup pins the
+    PTY's file description for the loop's lifetime, so the original can close
+    and be reused freely; once the shell side is gone, writes to the dup raise
+    (``EIO``) instead of landing elsewhere. The race window shrinks back to the
+    single ``dup`` call, no wider than the single-``os.write`` shape this
+    replaced. Teardown still never waits on writers — semantics unchanged.
+
+    Runs inside a single executor call so a multi-KB write does not bounce
+    per-chunk through the event loop. ``OSError`` (a closed fd at the ``dup``,
+    or the PTY torn down mid-loop) propagates to the caller unchanged.
+    """
+    if not data:
+        return
+    dup_fd = os.dup(fd)
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(dup_fd, view)
+            view = view[written:]
+    finally:
+        os.close(dup_fd)
 
 
 class _ConptyBackend(Protocol):
@@ -119,9 +154,27 @@ class _TerminalSession:
     # and on (re)connect, where the dedup markers are cleared and both frames
     # must be pushed again.
     frames_dirty: bool = True
+    # A WebSocket upgrade completes before startup has yielded the terminal back
+    # to a freshly spawned login shell. Run-in-terminal callers must not release
+    # queued commands until this barrier has been crossed.
+    shell_ready: bool = False
+    # Bash receives a one-use init file that emits this randomized OSC marker
+    # only after its login profiles return. ``ready_probe`` retains the small
+    # suffix needed when the marker straddles two PTY reads; output itself is
+    # still forwarded byte-for-byte.
+    ready_marker: bytes | None = None
+    ready_probe: bytearray = field(default_factory=bytearray)
     # Serializes concurrent WS writes (reader loop + title poller + pong);
     # aiohttp's WebSocket writer is not safe for concurrent sends.
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Serializes WebSocket→PTY writes across handlers. A reconnect attaches a
+    # new WS handler by assignment (``existing.ws = ws``) without waiting for
+    # the previous handler's write loop to exit, so two handlers can hold
+    # in-flight writes for the same PTY at once. Each frame's bytes must land
+    # contiguously — ``_write_all`` may need several ``os.write`` calls when
+    # the tty input buffer backpressures — so the whole frame is written under
+    # this lock.
+    write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 def _get_registry(request: web.Request) -> dict[str, _TerminalSession | None]:
@@ -133,7 +186,7 @@ def _get_config(request: web.Request) -> dict:
     try:
         data = json.loads(config_path().read_text(encoding="utf-8"))
         return data.get("dashboard", {}).get("terminal", {})
-    except (OSError, json.JSONDecodeError, ValueError):
+    except (OSError, ValueError):
         return {}
 
 
@@ -341,6 +394,49 @@ def _session_title(sess: "_TerminalSession") -> str | None:
     if cwd:
         return os.path.basename(cwd.rstrip("/")) or cwd
     return None
+
+
+def _is_bash_shell(shell: str) -> bool:
+    """Whether *shell* supports the injected post-profile readiness marker."""
+    name = shell.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return name in {"bash", "bash.exe"}
+
+
+def _bash_init_script(token: str) -> bytes:
+    """Build the Bash init file that emulates ``-l`` then marks readiness.
+
+    Bash ignores ``--init-file`` for a login shell, so the injected interactive
+    init file sources the same profile chain itself. The marker comes strictly
+    after those files return, including shell builtins such as ``read`` that do
+    not change the PTY foreground process group.
+    """
+    return (
+        "if [ -r /etc/profile ]; then . /etc/profile; fi\n"
+        'if [ -r "$HOME/.bash_profile" ]; then\n'
+        '    . "$HOME/.bash_profile"\n'
+        'elif [ -r "$HOME/.bash_login" ]; then\n'
+        '    . "$HOME/.bash_login"\n'
+        'elif [ -r "$HOME/.profile" ]; then\n'
+        '    . "$HOME/.profile"\n'
+        "fi\n"
+        f"builtin printf '\\033]697;KiroCrewReady;{token}\\007'\n"
+    ).encode("utf-8")
+
+
+def _consume_ready_marker(sess: "_TerminalSession", data: bytes) -> bool:
+    """Advance the split-safe Bash marker matcher for one raw PTY read."""
+    marker = sess.ready_marker
+    if sess.shell_ready or marker is None:
+        return False
+    combined = bytes(sess.ready_probe) + data
+    if marker in combined:
+        sess.shell_ready = True
+        sess.ready_marker = None
+        sess.ready_probe.clear()
+        return True
+    keep = max(0, len(marker) - 1)
+    sess.ready_probe = bytearray(combined[-keep:]) if keep else bytearray()
+    return False
 
 
 def _sess_alive(sess: "_TerminalSession") -> bool:
@@ -596,6 +692,13 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         existing.last_cwd = None
         existing.frames_dirty = True
         sess = existing
+        if existing.shell_ready:
+            try:
+                async with existing.send_lock:
+                    if existing.ws is ws and not ws.closed:
+                        await ws.send_str(json.dumps({"type": "ready"}))
+            except (ConnectionResetError, RuntimeError, OSError):
+                pass
         _sel().log_api_access(
             caller=caller,
             operation="terminal.ws.reconnect",
@@ -649,8 +752,14 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
                 "terminal: configured shell %r not executable; falling back to %r",
                 rejected_shell, shell,
             )
-        # Spawn new PTY
+        # Spawn new PTY. Bash gets a one-use init stream so it can emit a
+        # definitive readiness marker after login profiles return. Foreground
+        # process ownership alone is insufficient: a profile's builtin `read`
+        # runs in the shell process and would consume an early command batch.
         master_fd, worker_fd = _pty.openpty()
+        init_read_fd: int | None = None
+        init_write_fd: int | None = None
+        ready_marker: bytes | None = None
         try:
             fcntl.ioctl(
                 worker_fd,
@@ -698,14 +807,28 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
                 # no Python allocation or lock acquisition.
                 fcntl.ioctl(0, tiocsctty, 0)
 
+            argv = [shell, "-l"]
+            pass_fds: tuple[int, ...] = ()
+            if _is_bash_shell(shell):
+                token = uuid.uuid4().hex
+                ready_marker = (
+                    f"\x1b]697;KiroCrewReady;{token}\x07".encode("ascii")
+                )
+                init_read_fd, init_write_fd = os.pipe()
+                os.write(init_write_fd, _bash_init_script(token))
+                os.close(init_write_fd)
+                init_write_fd = None
+                argv = [shell, "--init-file", f"/dev/fd/{init_read_fd}", "-i"]
+                pass_fds = (init_read_fd,)
+
             proc = await asyncio.create_subprocess_exec(
-                shell,
-                "-l",
+                *argv,
                 stdin=worker_fd,
                 stdout=worker_fd,
                 stderr=worker_fd,
                 start_new_session=True,
                 preexec_fn=_setup_ctty,
+                pass_fds=pass_fds,
                 cwd=cwd,
                 env=env,
             )
@@ -722,12 +845,17 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             return ws
         finally:
             os.close(worker_fd)
+            if init_read_fd is not None:
+                os.close(init_read_fd)
+            if init_write_fd is not None:
+                os.close(init_write_fd)
 
         sess = _TerminalSession(
             session_id=session_id,
             master_fd=master_fd,
             proc=proc,
             ws=ws,
+            ready_marker=ready_marker,
         )
         registry[session_id] = sess
         _sel().log_api_access(
@@ -737,6 +865,17 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             source="dashboard",
             resources=f"session={session_id},pid={proc.pid},shell={shell}",
         )
+        if ready_marker is None:
+            # The reliable injection above intentionally targets Bash, the
+            # reported shell. Preserve the historical transport-ready behavior
+            # for configured shells whose startup protocol we cannot control.
+            sess.shell_ready = True
+            try:
+                async with sess.send_lock:
+                    if sess.ws is ws and not ws.closed:
+                        await ws.send_str(json.dumps({"type": "ready"}))
+            except (ConnectionResetError, RuntimeError, OSError):
+                pass
 
     # --- Read loop: PTY → WebSocket ---
     async def read_pty():
@@ -750,6 +889,7 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
                 data = await loop.run_in_executor(None, reader)
                 if not data:
                     break
+                became_ready = _consume_ready_marker(sess, data)
                 sess.scrollback.extend(data)
                 sess.frames_dirty = True
                 if len(sess.scrollback) > _SCROLLBACK_MAX:
@@ -772,6 +912,19 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
                         if sess.ws is not live or live.closed:
                             continue  # client went away while we waited
                         await live.send_bytes(data)
+                        # ConPTY has no foreground-process-group probe. Its first
+                        # output is the earliest portable startup signal, so do
+                        # not release queued input before output reaches the client.
+                        if sess.winpty is not None and not sess.shell_ready:
+                            sess.shell_ready = True
+                            became_ready = True
+                        if became_ready:
+                            try:
+                                await live.send_str(json.dumps({"type": "ready"}))
+                            except (ConnectionResetError, RuntimeError, OSError):
+                                # Preserve shell_ready so a reconnect can receive
+                                # the frame even if this socket disappeared here.
+                                pass
         except OSError:
             pass
 
@@ -783,17 +936,29 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         async for msg in ws:
             if msg.type == web.WSMsgType.BINARY:
                 try:
-                    if sess.winpty is not None:
-                        await asyncio.get_running_loop().run_in_executor(
-                            None, sess.winpty.write, msg.data,
-                        )
-                    else:
-                        await asyncio.get_running_loop().run_in_executor(
-                            None,
-                            os.write,
-                            sess.master_fd,  # wokeignore:rule=master
-                            msg.data,
-                        )
+                    # A reconnect can leave the previous handler's write loop
+                    # draining its socket while this one starts; the lock keeps
+                    # each frame's bytes contiguous on the PTY even when
+                    # _write_all needs several os.write calls to land them.
+                    async with sess.write_lock:
+                        if sess.winpty is not None:
+                            # ConPTY's write buffers the full payload and returns
+                            # len(data) unconditionally (see conpty.WindowsPty.write),
+                            # so there is no short-write count to loop over here.
+                            await asyncio.get_running_loop().run_in_executor(
+                                None, sess.winpty.write, msg.data,
+                            )
+                        else:
+                            # Read the fd once before the offload: a concurrent kill
+                            # sets the fd to -1 before close, so os.write then
+                            # raises OSError and the loop below breaks — matching the
+                            # single-write behavior this replaces.
+                            await asyncio.get_running_loop().run_in_executor(
+                                None,
+                                _write_all,
+                                sess.master_fd,  # wokeignore:rule=master
+                                msg.data,
+                            )
                 except OSError:
                     break
                 # A submitted line may be a `cd`. Drop the completion route's
@@ -806,7 +971,7 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             elif msg.type == web.WSMsgType.TEXT:
                 try:
                     ctrl = json.loads(msg.data)
-                except (json.JSONDecodeError, ValueError):
+                except ValueError:
                     continue
                 if ctrl.get("type") == "resize":
                     try:
@@ -891,7 +1056,7 @@ async def api_terminal_create(request: web.Request) -> web.Response:
             resources=f"max_sessions={max_sessions}",
         )
         return web.json_response(
-            {"error": f"Max {max_sessions} sessions"},
+            {"error": f"Max {max_sessions} sessions", "code": "terminal_max_sessions"},
             status=429,
         )
 
@@ -962,9 +1127,15 @@ async def api_terminal_redact(request: web.Request) -> web.Response:
         if not isinstance(text, str):
             raise TypeError
     except Exception:
-        return web.json_response({"error": "expected JSON body {text: string}"}, status=400)
+        return web.json_response(
+            {"error": "expected JSON body {text: string}", "code": "terminal_invalid_body"},
+            status=400,
+        )
     if len(text.encode("utf-8", errors="replace")) > _REDACT_MAX_BYTES:
-        return web.json_response({"error": "selection too large"}, status=413)
+        return web.json_response(
+            {"error": "selection too large", "code": "terminal_selection_too_large"},
+            status=413,
+        )
     # This is the ONLY credential scan on the path from PTY output to a model,
     # so it runs unconditionally and there is no configuration that skips it.
     # A contiguous selection is also the only input the redactors can be
@@ -983,7 +1154,10 @@ async def api_terminal_redact(request: web.Request) -> web.Response:
     except Exception:
         # Fail closed: the caller gets no text to insert.
         logger.exception("terminal: selection redaction failed")
-        return web.json_response({"error": "redaction failed"}, status=500)
+        return web.json_response(
+            {"error": "redaction failed", "code": "terminal_redaction_failed"},
+            status=500,
+        )
     return web.json_response({"text": redacted})
 
 
@@ -1336,19 +1510,27 @@ async def api_terminal_complete(request: web.Request) -> web.Response:
     except Exception:
         _log_complete(caller, "denied", "invalid_body")
         return web.json_response(
-            {"error": "expected JSON body "
-                      "{session_id: string, token?: string, folders_only?: boolean, "
-                      "argv?: string[]}"},
+            {
+                "error": "expected JSON body "
+                         "{session_id: string, token?: string, folders_only?: boolean, "
+                         "argv?: string[]}",
+                "code": "terminal_invalid_body",
+            },
             status=400,
         )
     if len(token) > _COMPLETE_TOKEN_MAX:
         _log_complete(caller, "denied", "token_too_long")
-        return web.json_response({"error": "token too long"}, status=413)
+        return web.json_response(
+            {"error": "token too long", "code": "terminal_token_too_long"}, status=413
+        )
 
     sess = _get_registry(request).get(session_id)
     if sess is None:
         _log_complete(caller, "denied", "unknown_session")
-        return web.json_response({"error": "Unknown terminal session"}, status=404)
+        return web.json_response(
+            {"error": "Unknown terminal session", "code": "terminal_unknown_session"},
+            status=404,
+        )
 
     cwd = await _session_cwd_cached(sess)
     dir_part, prefix = _split_path_token(token)

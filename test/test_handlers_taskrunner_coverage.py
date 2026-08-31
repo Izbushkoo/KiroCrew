@@ -75,6 +75,16 @@ def _runner(tmp_path: Path) -> MagicMock:
     runner._plan_task = None
     runner._apersist_runs = AsyncMock()
     runner._group_parallel_tasks = MagicMock(return_value=[])
+    runner._auto_name = MagicMock(side_effect=lambda text: text)
+    runner._workflow_begin = AsyncMock()
+
+    async def _delete_run(task_id: str) -> bool:
+        runner._runs.pop(task_id, None)
+        runner._stall_cancelled_ids.discard(task_id)
+        await runner._apersist_runs()
+        return True
+
+    runner.delete_run = AsyncMock(side_effect=_delete_run)
     runner.start_background = AsyncMock(return_value="tid-1")
     runner.update_task = AsyncMock(return_value={"index": 0})
     runner.update_plan = AsyncMock()
@@ -89,6 +99,38 @@ def _state(runner: MagicMock | None) -> SimpleNamespace:
     return SimpleNamespace(task_runner=runner)
 
 
+class _Payload:
+    """Minimal stand-in for the request body stream.
+
+    Five of this module's handlers now read their body through
+    ``_shared.read_bounded_json`` with the shared 64 KB cap, which enforces the
+    ceiling BEFORE decoding by draining ``request.content`` incrementally --
+    so a mocked ``request.json`` alone no longer feeds them. Supplying a real
+    payload serves both paths: the capped handlers drain this stream, and the
+    uncapped ones still go through ``request.json()``.
+    """
+
+    def __init__(self, raw: bytes) -> None:
+        self._raw = raw
+
+    async def iter_chunked(self, n: int):
+        for i in range(0, len(self._raw), n):
+            yield self._raw[i : i + n]
+
+    async def read(self) -> bytes:
+        return self._raw
+
+    def set_read_chunk_size(self, size: int) -> None:
+        # ``request.read()`` configures the stream before draining it.
+        return None
+
+    def at_eof(self) -> bool:
+        # ``request.can_read_body`` is ``not payload.at_eof()``, and the
+        # allow_absent handlers branch on it: reporting EOF while bytes are
+        # waiting would make every request look bodyless and silently default.
+        return not self._raw
+
+
 def _request(
     state: Any,
     method: str = "POST",
@@ -99,17 +141,33 @@ def _request(
     raw_json_error: bool = False,
     request_app: str = "",
     with_content_length: bool = True,
+    body_present: bool = False,
 ) -> web.Request:
     app = web.Application()
     app["state"] = state
-    headers = {"Content-Length": "32"} if (json_body is not None and with_content_length) else {}
+    if raw_json_error:
+        raw = b"{bad json"
+    elif json_body is not None or body_present:
+        # ``body_present`` distinguishes a body whose CONTENT is the JSON
+        # literal ``null`` from no body at all -- the allow_absent handlers
+        # branch on that difference, and conflating them hides a non-object
+        # body behind a silent default.
+        raw = json.dumps(json_body).encode()
+    else:
+        raw = b""
+    headers = {"Content-Length": str(len(raw))} if (raw and with_content_length) else {}
     req = make_mocked_request(
-        method, path, app=app, match_info=match_info or {}, headers=headers
+        method,
+        path,
+        app=app,
+        match_info=match_info or {},
+        headers=headers,
+        payload=_Payload(raw),
     )
     req["app"] = request_app
     if raw_json_error:
         req.json = AsyncMock(side_effect=ValueError("bad json"))  # type: ignore[method-assign]
-    elif json_body is not None:
+    elif json_body is not None or body_present:
         req.json = AsyncMock(return_value=json_body)  # type: ignore[method-assign]
     return req
 
@@ -229,9 +287,7 @@ class TestStart:
         spec = tmp_path / "creds.md"
         spec.write_text("# t", encoding="utf-8")
         runner = _runner(tmp_path)
-        with patch(
-            "kiro_crew.dashboard.handlers.taskrunner.is_sensitive_path", return_value=True
-        ):
+        with patch("kiro_crew.dashboard.handlers.taskrunner.is_sensitive_path", return_value=True):
             resp = await api_taskrunner_start(
                 _request(_state(runner), json_body={"spec": str(spec)})
             )
@@ -279,9 +335,7 @@ class TestStart:
     async def test_unknown_source_coerced_to_dashboard(self, tmp_path: Path) -> None:
         runner = _runner(tmp_path)
         await api_taskrunner_start(
-            _request(
-                _state(runner), json_body={"spec": "__inline__:# t", "source": "bogus"}
-            )
+            _request(_state(runner), json_body={"spec": "__inline__:# t", "source": "bogus"})
         )
         assert runner.start_background.call_args.kwargs["source"] == "dashboard"
 
@@ -461,9 +515,7 @@ class TestUpdateTask:
     @pytest.mark.asyncio
     async def test_non_numeric_index_is_400(self, tmp_path: Path) -> None:
         resp = await api_taskrunner_update_task(
-            _request(
-                _state(_runner(tmp_path)), match_info={"task_id": "t1", "index": "abc"}
-            )
+            _request(_state(_runner(tmp_path)), match_info={"task_id": "t1", "index": "abc"})
         )
         assert resp.status == 400
         assert _body(resp)["error"] == "invalid index"
@@ -529,9 +581,7 @@ class TestRetry:
     @pytest.mark.asyncio
     async def test_default_from_step_is_one(self, tmp_path: Path) -> None:
         runner = _runner(tmp_path)
-        resp = await api_taskrunner_retry(
-            _request(_state(runner), match_info={"task_id": "t1"})
-        )
+        resp = await api_taskrunner_retry(_request(_state(runner), match_info={"task_id": "t1"}))
         assert _body(resp) == {"ok": True, "task_id": "t1"}
         assert runner.retry_from_task.await_args.args == ("t1", 1)
 
@@ -842,9 +892,7 @@ class TestPlan:
         assert runner._plan_task is None
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "exc", [FileNotFoundError("missing spec"), ValueError("empty input")]
-    )
+    @pytest.mark.parametrize("exc", [FileNotFoundError("missing spec"), ValueError("empty input")])
     async def test_expected_errors_are_400(self, tmp_path: Path, exc: Exception) -> None:
         runner = _runner(tmp_path)
         runner.plan = AsyncMock(side_effect=exc)
@@ -878,7 +926,9 @@ class TestUpdatePlan:
     async def test_invalid_json_is_400(self, tmp_path: Path) -> None:
         resp = await api_taskrunner_update_plan(
             _request(
-                _state(_runner(tmp_path)), "PUT", match_info={"task_id": "p1"},
+                _state(_runner(tmp_path)),
+                "PUT",
+                match_info={"task_id": "p1"},
                 raw_json_error=True,
             )
         )
@@ -889,9 +939,7 @@ class TestUpdatePlan:
         runner = _runner(tmp_path)
         runner.update_plan = AsyncMock(side_effect=ValueError("run is not planned"))
         resp = await api_taskrunner_update_plan(
-            _request(
-                _state(runner), "PUT", match_info={"task_id": "p1"}, json_body={"steps": []}
-            )
+            _request(_state(runner), "PUT", match_info={"task_id": "p1"}, json_body={"steps": []})
         )
         assert resp.status == 400
         assert _body(resp)["error"] == "run is not planned"
@@ -1022,7 +1070,9 @@ class TestFromChat:
         assert created.source == "chat"
         assert created.status == "planned"
         assert created.original_input == "make it"
+        assert created.name == "make it"
         assert Path(created.work_dir).is_dir()
+        runner._workflow_begin.assert_awaited_once_with(created)
 
     @pytest.mark.asyncio
     async def test_failed_new_plan_is_rolled_back(self, tmp_path: Path) -> None:
@@ -1035,6 +1085,35 @@ class TestFromChat:
         assert _body(resp)["error"] == "bad step"
         # The placeholder run must not survive a rejected plan.
         assert runner._runs == {}
+        runner.delete_run.assert_awaited_once()
+        assert list(runner._work_dir.glob("plan_*")) == []
+
+    @pytest.mark.asyncio
+    async def test_cancelled_new_plan_is_rolled_back(self, tmp_path: Path) -> None:
+        runner = _runner(tmp_path)
+        update_started = asyncio.Event()
+
+        async def block_update(_task_id: str, _steps: list[Any]) -> TaskRun:
+            update_started.set()
+            await asyncio.Future()
+
+        runner.update_plan = AsyncMock(side_effect=block_update)
+        request_task = asyncio.create_task(
+            api_taskrunner_from_chat(
+                _request(_state(runner), json_body={"steps": [{"title": "first"}]})
+            )
+        )
+        await asyncio.wait_for(update_started.wait(), timeout=1)
+        created = next(iter(runner._runs.values()))
+        created.workflow_run_id = "workflow-orphan-candidate"
+        request_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+
+        runner.delete_run.assert_awaited_once_with(created.task_id)
+        assert runner._runs == {}
+        assert list(runner._work_dir.glob("plan_*")) == []
 
 
 # ── refine ──
@@ -1067,9 +1146,7 @@ class TestRefineStart:
 
     @pytest.mark.asyncio
     async def test_blank_input_is_400(self) -> None:
-        resp = await api_taskrunner_refine(
-            _request(_refine_state(), json_body={"input": "  "})
-        )
+        resp = await api_taskrunner_refine(_request(_refine_state(), json_body={"input": "  "}))
         assert resp.status == 400
         assert _body(resp)["error"] == "input is required"
 
@@ -1144,9 +1221,7 @@ class TestRefineStatusAndCancel:
 class TestRefineAnswer:
     @pytest.mark.asyncio
     async def test_invalid_json_is_400(self) -> None:
-        resp = await api_taskrunner_refine_answer(
-            _request(_refine_state(), raw_json_error=True)
-        )
+        resp = await api_taskrunner_refine_answer(_request(_refine_state(), raw_json_error=True))
         assert resp.status == 400
 
     @pytest.mark.asyncio
@@ -1171,9 +1246,7 @@ class TestRefineAnswer:
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         future.set_result("earlier")
         state._refine_answer_future = future
-        resp = await api_taskrunner_refine_answer(
-            _request(state, json_body={"answer": "yes"})
-        )
+        resp = await api_taskrunner_refine_answer(_request(state, json_body={"answer": "yes"}))
         assert resp.status == 409
         assert _body(resp)["error"] == "no pending question"
 
@@ -1191,9 +1264,7 @@ class TestRefineAnswer:
 
         state = _refine_state()
         state._refine_answer_future = _RacingFuture()
-        resp = await api_taskrunner_refine_answer(
-            _request(state, json_body={"answer": "yes"})
-        )
+        resp = await api_taskrunner_refine_answer(_request(state, json_body={"answer": "yes"}))
         assert resp.status == 409
         assert _body(resp)["error"] == "question already resolved"
 
@@ -1202,9 +1273,7 @@ class TestRefineAnswer:
         state = _refine_state()
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         state._refine_answer_future = future
-        resp = await api_taskrunner_refine_answer(
-            _request(state, json_body={"answer": "  yes  "})
-        )
+        resp = await api_taskrunner_refine_answer(_request(state, json_body={"answer": "  yes  "}))
         assert _body(resp) == {"ok": True}
         assert future.result() == "yes"
         # `waiting` flips to False once the question is answered.
@@ -1334,3 +1403,45 @@ class TestRunRefine:
         state.sessions = sessions
         await _run_refine(state, "x")
         assert state._refine_status == "cancelled"
+
+
+class TestNonObjectBodiesAcrossConvertedHandlers:
+    """Every converted handler answers 400, never 5xx, on a non-object body.
+
+    ``[]`` / ``"s"`` / ``5`` / ``true`` / ``null`` are all VALID JSON, so
+    ``request.json()`` returned them and the ``.get()`` each handler performs
+    next raised ``AttributeError`` from OUTSIDE the parse ``try`` -- a 500 for
+    what is really malformed client input (issue #5587). Enumerated rather than
+    one test per handler so a handler that loses the guard fails by
+    construction; the cap decision for each of these sites is recorded in
+    ``_CAP_REGISTER`` in ``test_json_object_body_guard.py``.
+    """
+
+    _HANDLERS = [
+        (api_taskrunner_start, {}),
+        (api_taskrunner_cancel, {}),
+        (api_taskrunner_rename, {"task_id": "t1"}),
+        (api_taskrunner_update_task, {"task_id": "t1", "index": "0"}),
+        (api_taskrunner_retry, {"task_id": "t1"}),
+        (api_taskrunner_plan, {}),
+        (api_taskrunner_update_plan, {"task_id": "t1"}),
+        (api_taskrunner_execute_plan, {"task_id": "t1"}),
+        (api_taskrunner_from_chat, {}),
+        (api_taskrunner_refine, {}),
+        (api_taskrunner_refine_answer, {}),
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("payload", [[], "a string", 5, 1.5, True, None], ids=repr)
+    @pytest.mark.parametrize(
+        "handler,match_info", _HANDLERS, ids=lambda v: getattr(v, "__name__", "")
+    )
+    async def test_non_object_body_is_400_not_500(
+        self, handler: Any, match_info: dict[str, str], payload: Any, tmp_path: Path
+    ) -> None:
+        runner = _runner(tmp_path)
+        runner._runs["t1"] = TaskRun(spec_path="s.md", spec_content="s", task_id="t1")
+        req = _request(_state(runner), json_body=payload, match_info=match_info, body_present=True)
+        resp = await handler(req)
+        assert resp.status == 400, f"{handler.__name__} on {payload!r}: expected 400"
+        assert _body(resp)["code"] == "body_not_object", handler.__name__

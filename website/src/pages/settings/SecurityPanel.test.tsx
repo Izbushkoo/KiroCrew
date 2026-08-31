@@ -50,7 +50,7 @@ vi.mock('../../api/client', () => ({
 }))
 
 import { api } from '../../api/client'
-import type { GovernancePolicyData, SecurityPostureData, TrustedAppsData } from '../../api/client'
+import type { GovernanceDistributionData, GovernancePolicyData, SecurityPostureData, TrustedAppsData } from '../../api/client'
 import { SecurityPanel, trustFailureMessage, humaniseScopeLeaf } from './SecurityPanel'
 import { i18nT } from '../../i18n/t'
 
@@ -244,6 +244,28 @@ function govGoverned(overrides: Partial<GovernancePolicyData> = {}): GovernanceP
       { scope: 'capabilities.spawn', archetype: 'capability', governed: true, source: 'policy', detail: { enabled: true, inner: { agents: { mode: 'allow', allow_count: 1, deny_count: 0 } } } },
       { scope: 'capabilities.messaging', archetype: 'capability', governed: false, source: 'ungoverned', detail: {} },
     ],
+    ...overrides,
+  }
+}
+
+/** A configured central-distribution posture.
+ *
+ * The defaults describe the state a governed fleet actually runs in — an https
+ * source, a live poller on a 15-minute interval, a warm cache, and a poll that found
+ * nothing to change — so each case below overrides only the field it is about. */
+function govDistribution(overrides: Partial<GovernanceDistributionData> = {}): GovernanceDistributionData {
+  return {
+    configured: true,
+    source_scheme: 'https',
+    refresh_interval_seconds: 900,
+    max_cache_age_seconds: 86400,
+    on_unavailable: 'fail_closed',
+    refresher_running: true,
+    cache_present: true,
+    cache_age_seconds: 120,
+    last_refresh_status: 'unchanged',
+    last_refresh_age_seconds: 30,
+    error_code: '',
     ...overrides,
   }
 }
@@ -740,8 +762,8 @@ describe('SecurityPanel — governance policy viewer', () => {  beforeEach(() =>
     )
     renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
 
-    expect(await screen.findByText('Deny-all fallback in effect')).toBeInTheDocument()
-    expect(screen.getByText(/fail-closed deny-all ceiling/)).toBeInTheDocument()
+    expect(await screen.findByText('Fallback profile in effect')).toBeInTheDocument()
+    expect(screen.getByText(/policy fallback ceiling/)).toBeInTheDocument()
     expect(screen.getByText(/Affected: host\./)).toBeInTheDocument()
     // The remedy is only useful if it says WHERE the file is.
     expect(screen.getByText(/profiles folder of your Kiro Crew data home/)).toBeInTheDocument()
@@ -757,7 +779,7 @@ describe('SecurityPanel — governance policy viewer', () => {  beforeEach(() =>
     )
     renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
 
-    expect(await screen.findByText('Deny-all fallback in effect')).toBeInTheDocument()
+    expect(await screen.findByText('Fallback profile in effect')).toBeInTheDocument()
     expect(screen.getByText(/Affected: cron, subagent\./)).toBeInTheDocument()
   })
 
@@ -768,7 +790,7 @@ describe('SecurityPanel — governance policy viewer', () => {  beforeEach(() =>
     renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
 
     await screen.findByText('Policy v1')
-    expect(screen.queryByText('Deny-all fallback in effect')).not.toBeInTheDocument()
+    expect(screen.queryByText('Fallback profile in effect')).not.toBeInTheDocument()
   })
 
   it('does not show fallback banner when fallback_profiles is absent', async () => {
@@ -776,7 +798,248 @@ describe('SecurityPanel — governance policy viewer', () => {  beforeEach(() =>
     renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
 
     await screen.findByText('Policy v1')
-    expect(screen.queryByText('Deny-all fallback in effect')).not.toBeInTheDocument()
+    expect(screen.queryByText('Fallback profile in effect')).not.toBeInTheDocument()
+  })
+
+  it('lists unknown companion scopes per affected profile', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({
+        unknown_profile_scopes: {
+          host: ['capabilities.board', 'capabilities.channels'],
+          cron: ['capabilities.board'],
+        },
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Profile scopes not in this build')).toBeInTheDocument()
+    // One row per profile stem, each naming its own skipped scopes.
+    expect(screen.getByText('host')).toBeInTheDocument()
+    expect(screen.getByText('cron')).toBeInTheDocument()
+    // Joined via fmtList (Intl.ListFormat unit type), same contract as the
+    // fallback banner: en joins with ', ', zh with 、 and no spaces.
+    expect(screen.getByText('capabilities.board, capabilities.channels')).toBeInTheDocument()
+    // Rows are sorted with compareText: the fixture feeds insertion order
+    // host→cron, so an unsorted render would show host first. Node.compareDocumentPosition
+    // pins the DOM order the comparator produces.
+    const cron = screen.getByText('cron')
+    const host = screen.getByText('host')
+    expect(cron.compareDocumentPosition(host) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    // The explanation is a tooltip, not body copy: it must NOT be in the
+    // document until the InfoTip is opened.
+    expect(screen.queryByText(/companion edition/)).not.toBeInTheDocument()
+  })
+
+  it('explains companion scopes in the InfoTip on demand', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ unknown_profile_scopes: { host: ['capabilities.board'] } }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    const block = (await screen.findByText('Profile scopes not in this build')).parentElement!
+    fireEvent.click(within(block).getByRole('button', { name: /more information/i }))
+    expect(
+      await screen.findByText(/this build does not register.*no effect in this build/),
+    ).toBeInTheDocument()
+  })
+
+  it('renders unknown scopes stacked with the fallback banner they are siblings of', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({
+        fallback_profiles: ['cron'],
+        unknown_profile_scopes: { host: ['capabilities.board'] },
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    // Both sibling diagnostics render together — one must not suppress the other.
+    expect(await screen.findByText('Fallback profile in effect')).toBeInTheDocument()
+    expect(screen.getByText('Profile scopes not in this build')).toBeInTheDocument()
+  })
+
+  it('shows unknown scopes even with no policy and no host profile', async () => {
+    // The payload aggregates EVERY loaded profile, so a standalone install with
+    // only a companion-edition subagent.json is a valid producer state. The
+    // no-policy card must yield to the diagnostic rather than swallow it.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govNoPolicy({ unknown_profile_scopes: { subagent: ['capabilities.board'] } }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Profile scopes not in this build')).toBeInTheDocument()
+    expect(screen.getByText('subagent')).toBeInTheDocument()
+    expect(screen.queryByText('No enterprise policy in effect')).not.toBeInTheDocument()
+  })
+
+  it('renders no unknown-scopes block when the field is an empty object', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ unknown_profile_scopes: {} }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    await screen.findByText('Policy v1')
+    expect(screen.queryByText('Profile scopes not in this build')).not.toBeInTheDocument()
+  })
+
+  it('renders no row for a profile whose scope list is empty', async () => {
+    // The producer contract says an empty list cannot happen; the filter makes
+    // the UI true independent of it — no badge with nothing after it.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ unknown_profile_scopes: { host: [] } }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    await screen.findByText('Policy v1')
+    expect(screen.queryByText('Profile scopes not in this build')).not.toBeInTheDocument()
+  })
+
+  it('renders no unknown-scopes block when the field is absent', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govGoverned())
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    await screen.findByText('Policy v1')
+    expect(screen.queryByText('Profile scopes not in this build')).not.toBeInTheDocument()
+  })
+})
+
+describe('SecurityPanel — central policy distribution', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    ;(api.deniedCommands as ReturnType<typeof vi.fn>).mockResolvedValue(snapshot())
+    ;(api.kirocrewConfig as ReturnType<typeof vi.fn>).mockResolvedValue({})
+    ;(api.tailnetStatus as ReturnType<typeof vi.fn>).mockResolvedValue(TAILNET_OFF)
+  })
+
+  it('reports the transport, the poller, the cache age and the last refresh', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ distribution: govDistribution() }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Central policy distribution')).toBeInTheDocument()
+    // The SCHEME, never the URL: the producer withholds the endpoint, so a test that
+    // ever finds one here is reporting a leak of the fleet's control plane.
+    expect(screen.getByText('Source: https')).toBeInTheDocument()
+    // Durations go through fmtDuration, so assert the copy plus the magnitude rather
+    // than a unit spelling that is locale-owned.
+    expect(screen.getByText(/Refreshed every/).textContent).toMatch(/15/)
+    expect(screen.getByText(/Cached copy is/).textContent).toMatch(/2/)
+    expect(screen.getByText('Last refresh found no change')).toBeInTheDocument()
+    // A governed host has its ceiling, so the pending caveat must stay off.
+    expect(screen.queryByText(/enterprise ceiling restricts the host surface/)).not.toBeInTheDocument()
+  })
+
+  // The trap this block exists to close: `has_policy: false` + `profile: null` is
+  // BOTH "standalone, nothing governs this machine" and "centrally governed, the
+  // first fetch has not landed". Rendering the reassuring card for the second is
+  // telling an operator their ceiling is off when it is merely late.
+  it('does not claim "no enterprise policy" on a host whose first fetch has not landed', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govNoPolicy({
+        distribution: govDistribution({
+          cache_present: false,
+          cache_age_seconds: null,
+          last_refresh_status: '',
+          last_refresh_age_seconds: null,
+        }),
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Central policy distribution')).toBeInTheDocument()
+    expect(screen.getByText(/enterprise ceiling restricts the host surface/)).toBeInTheDocument()
+    // Not merely supplemented — the reassurance must be GONE.
+    expect(screen.queryByText('No enterprise policy in effect')).not.toBeInTheDocument()
+    // And the scope rows render in its place, so the page still says what is enforced.
+    expect(screen.getAllByText('Not restricted').length).toBeGreaterThan(0)
+  })
+
+  it('names the cache age when the copy is days old', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({
+        distribution: govDistribution({
+          cache_age_seconds: 3 * 86400,
+          last_refresh_status: 'unreachable',
+          last_refresh_age_seconds: 60,
+        }),
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    // dropZero is what keeps three days from rendering as "3d 0h 0m".
+    const cache = await screen.findByText(/Cached copy is/)
+    expect(cache.textContent).toMatch(/3\s* ?d/)
+    expect(cache.textContent).not.toMatch(/0/)
+    expect(screen.getByText('Source was unreachable on the last refresh')).toBeInTheDocument()
+  })
+
+  it('reports a misconfigured declaration even though it is not "configured"', async () => {
+    // The producer answers `configured: false` with an error code: the fleet DID
+    // point this host somewhere, the pins just do not parse. Gating the block on
+    // `configured` alone would drop the one state that most needs saying.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govNoPolicy({ distribution: { configured: false, error_code: 'misconfigured' } }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Distribution settings could not be read')).toBeInTheDocument()
+    expect(screen.queryByText('No enterprise policy in effect')).not.toBeInTheDocument()
+    // Nothing is known about the transport or the cache, so no badge claims one.
+    expect(screen.queryByText(/Source:/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Cached copy/)).not.toBeInTheDocument()
+  })
+
+  it('survives the unavailable short-circuit that hides every other governance fact', async () => {
+    // `unavailable` collapses the whole viewer to one soft notice, but the fail-safe
+    // snapshot still carries the distribution posture — and a stopped poller plus an
+    // unreachable source is exactly what an operator needs at that moment.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govNoPolicy({
+        unavailable: true,
+        distribution: govDistribution({ refresher_running: false, last_refresh_status: 'unreachable' }),
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText(/Governance status is temporarily unavailable/)).toBeInTheDocument()
+    expect(screen.getByText('Central policy distribution')).toBeInTheDocument()
+    expect(screen.getByText(/Background refresh is not running/)).toBeInTheDocument()
+    expect(screen.getByText('Source was unreachable on the last refresh')).toBeInTheDocument()
+    // The pending caveat must NOT fire here: the fail-safe snapshot reports
+    // `has_policy: false` because it could not resolve the ceiling, not because there
+    // is none, so reading it as pending would announce an unrestricted host surface on
+    // a machine whose ceiling is installed and enforcing.
+    expect(screen.queryByText(/enterprise ceiling restricts the host surface/)).not.toBeInTheDocument()
+  })
+
+  it('says a boot-only fetch is boot-only rather than calling the poller stopped', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({
+        distribution: govDistribution({ refresh_interval_seconds: 0, refresher_running: false }),
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Fetched at startup only')).toBeInTheDocument()
+    expect(screen.queryByText('Background refresh is not running')).not.toBeInTheDocument()
+  })
+
+  it('renders no block, and no empty section, when the payload omits distribution', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govNoPolicy())
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('No enterprise policy in effect')).toBeInTheDocument()
+    expect(screen.queryByText('Central policy distribution')).not.toBeInTheDocument()
+  })
+
+  it('renders no block when a build without the feature reports configured: false', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govNoPolicy({ distribution: { configured: false } }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('No enterprise policy in effect')).toBeInTheDocument()
+    expect(screen.queryByText('Central policy distribution')).not.toBeInTheDocument()
   })
 })
 
@@ -1443,7 +1706,7 @@ describe('SecurityPanel — inspector rail', () => {
     expect(screen.queryByText('30 credential paths')).not.toBeInTheDocument()
     // ...and the choice is a deep link, so the section survives a reload and can
     // be targeted by a command-palette result.
-    expect(screen.getByTestId('search')).toHaveTextContent('section=rules')
+    expect(screen.getByTestId('search')).toHaveTextContent('sub=rules')
   })
 
   it('an unreadable third-party-apps value gets NO rail summary, rather than reading "Off"', async () => {

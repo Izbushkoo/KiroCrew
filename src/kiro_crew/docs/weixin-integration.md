@@ -47,12 +47,16 @@ other channels (Telegram/Discord are fail-closed the same way). An unrecognized
 value also denies. To collect a user ID, have the person DM the bot once and read
 the id from the gateway log.
 
+Dashboard delivery uses `target_id` values `user:<user-id>`. Destinations include allowed user IDs and users seen by the gateway, while actual proactive delivery is rechecked against the current `dm_policy`.
+
 ## Commands
 
 | Command | Effect |
 |---|---|
 | `/new`, `新对话`, `清空` | Start a fresh session |
 | `/compact` | Compact the session context in place |
+| `/stop`, `/cancel`, `停止` | Stop the reply that is currently generating |
+| `/help`, `帮助` | List the commands |
 
 Context length is managed automatically: at `weixin.soft_threshold_pct` (80%) the
 bot suggests `/compact` or `/new`; at `weixin.hard_threshold_pct` (95%) it
@@ -78,12 +82,13 @@ Set under `weixin` in `config.json` (or via the Settings panel):
 | Key | Default | Description |
 |---|---|---|
 | `enabled` | `false` | Enable the channel |
-| `account_id` | — | iLink bot account id (from QR login) |
+| `account_id` | `""` | iLink bot account id (from QR login) |
 | `base_url` | `https://ilinkai.weixin.qq.com` | iLink API base URL |
 | `dm_policy` | `allowlist` | `allowlist` / `open` / `disabled` (default denies until an id is added) |
 | `allowed_user_ids` | `[]` | Permitted user IDs when `allowlist` |
 | `soft_threshold_pct` | `80` | Suggest compaction past this usage |
 | `hard_threshold_pct` | `95` | Force compaction past this usage |
+| `session_folder` | `""` | Folder that Weixin sessions are filed under |
 
 The credential is read from the `WEIXIN_TOKEN` credential (env / `.env` /
 credential store) and overrides `weixin.token`.
@@ -97,7 +102,7 @@ credential store) and overrides `weixin.token`.
 | `errcode -2` | iLink rate limit; the poller backs off automatically |
 | Bot ignores DMs | Check `dm_policy` — under `allowlist` the sender must be listed |
 | Group messages ignored | Expected: iLink bot identities do not receive group events |
-| Images / voice / files ignored | Expected: media is not supported yet (text only) |
+| An image, voice note or file isn't read | The message arrived but the file was skipped — the gateway log shows `attachment_skip` with the reason. Video is never read; send a screenshot instead |
 | Startup error about `aiohttp` | Install the messaging extra |
 
 ## Attribution

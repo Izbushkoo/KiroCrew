@@ -23,7 +23,9 @@
 #                                        its immutable signed CLI manifest
 #   --cdn <base-url>                     (default CloudFront; env KIROCREW_CDN_BASE)
 #   --managed-python                     skip the system interpreters and run on
-#                                        a uv-provisioned Python instead
+#                                        a uv-provisioned Python instead (sticky:
+#                                        later runs and updates keep the choice;
+#                                        opt out with --system-python)
 #                                        (env KIROCREW_MANAGED_PYTHON=1)
 # ──────────────────────────────────────────────────────────────────────
 set -eu
@@ -43,7 +45,10 @@ FEED_BASE="${KIROCREW_CDN_BASE:-https://updates.crew.kiro.dev}"
 ARTIFACT_BASE="${KIROCREW_CDN_BASE:-https://download.crew.kiro.dev}"
 CHANNEL="${KIROCREW_CHANNEL:-stable}"
 PIN_VERSION=""
-MANAGED_PYTHON="${KIROCREW_MANAGED_PYTHON:-0}"
+# Three states: "" = undecided (fall back to the persisted python-mode marker,
+# then to system), "1" = managed, "0" = system. An explicit env value or flag
+# always outranks the marker, so an operator can override a sticky choice.
+MANAGED_PYTHON="${KIROCREW_MANAGED_PYTHON:-}"
 
 # Pinned uv release used to provision a managed Python interpreter when the
 # system has none (or when --managed-python asks for one). uv is only ever
@@ -81,6 +86,7 @@ while [ $# -gt 0 ]; do
     --cdn) FEED_BASE="${2:?--cdn needs a value}"; ARTIFACT_BASE="$2"; shift 2 ;;
     --cdn=*) FEED_BASE="${1#*=}"; ARTIFACT_BASE="${1#*=}"; shift ;;
     --managed-python) MANAGED_PYTHON=1; shift ;;
+    --system-python) MANAGED_PYTHON=0; shift ;;
     -h|--help)
       cat <<'EOF'
 KiroCrew CLI installer (channel / wheel based).
@@ -101,7 +107,10 @@ Options / env:
                                        its immutable signed CLI manifest
   --cdn <base-url>                     (default CloudFront; env KIROCREW_CDN_BASE)
   --managed-python                     skip the system interpreters and run on a
-                                       uv-provisioned Python instead
+                                       uv-provisioned Python instead (sticky: later
+                                       runs and updates keep the choice)
+  --system-python                      opt back out of a recorded managed-python
+                                       choice and use the system interpreter
                                        (env KIROCREW_MANAGED_PYTHON=1)
   KIROCREW_VENV                        override the managed venv location
   KIROCREW_PYTHON_DIR                  override where uv-provisioned interpreters
@@ -293,8 +302,27 @@ _provision_python_via_uv() {
 }
 
 PY=""
+# The interpreter choice is STICKY: a completed install records its mode in
+# the data home (next to `channel`), and a later run without an explicit flag
+# or env value reuses it. Without this, every re-run of the one-liner -- most
+# importantly the one `kirocrew update` performs -- would silently flip a
+# --managed-python install back onto whatever system interpreter it finds.
+# Opt back out explicitly with --system-python (or KIROCREW_MANAGED_PYTHON=0).
+_DATA_HOME="${KIROCREW_HOME:-$HOME/.kiro/crew}"
+# The marker is agent-writable state, so the READ is guarded like the write:
+# only a plain regular file counts (a planted symlink -- e.g. to /dev/zero --
+# or a FIFO would wedge an unbounded read or spoof the mode), and the read is
+# bounded to the first bytes rather than slurping the file.
+_py_mode_file="$_DATA_HOME/python-mode"
+if [ -z "$MANAGED_PYTHON" ] && [ -f "$_py_mode_file" ] && [ ! -L "$_py_mode_file" ] \
+    && [ "$(head -c 16 "$_py_mode_file" 2>/dev/null || true)" = "managed" ]; then
+  echo "Reusing the recorded managed-python choice (override with --system-python)."
+  MANAGED_PYTHON=1
+fi
+[ -n "$MANAGED_PYTHON" ] || MANAGED_PYTHON=0
+
 if [ "$MANAGED_PYTHON" = "1" ]; then
-  echo "--managed-python: skipping system interpreters."
+  echo "managed-python: skipping system interpreters."
   _provision_python_via_uv \
     || err "could not provision a managed Python via uv. Check the network connection, or install Python >=3.10 yourself and re-run without --managed-python."
 else
@@ -353,6 +381,10 @@ expected = {
     "algorithm", "channel", "key_id", "pub_date", "python_requires",
     "schema", "sha256", "signature", "version", "wheel_url",
 }
+# Signed-but-optional: a breaking release adds a fleet floor. The signature
+# still covers it (it stays in the canonical payload below), so the set check
+# tolerates exactly this key and nothing else.
+optional = {"min_version"}
 
 def no_duplicates(pairs):
     value = {}
@@ -367,7 +399,9 @@ try:
     if len(raw) > 65536:
         raise ValueError("oversized manifest")
     manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=no_duplicates)
-    if not isinstance(manifest, dict) or set(manifest) != expected:
+    if not isinstance(manifest, dict):
+        raise ValueError("unexpected fields")
+    if not expected <= set(manifest) or set(manifest) - expected - optional:
         raise ValueError("unexpected fields")
     if not all(isinstance(value, str) and value for value in manifest.values()):
         raise ValueError("invalid field type")
@@ -418,8 +452,9 @@ expected_fields = {
     "algorithm", "channel", "key_id", "pub_date", "python_requires",
     "schema", "sha256", "version", "wheel_url",
 }
+optional_fields = {"min_version"}
 try:
-    if set(payload) != expected_fields:
+    if not expected_fields <= set(payload) or set(payload) - expected_fields - optional_fields:
         raise ValueError
     if payload["channel"] != expected_channel:
         raise ValueError
@@ -427,6 +462,12 @@ try:
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+]{0,127}", version) is None:
         raise ValueError
     if pinned_version and version != pinned_version:
+        raise ValueError
+    # The floor is metadata for RUNNING installs; this installer always
+    # installs the signed version itself, so format is all it checks.
+    if "min_version" in payload and re.fullmatch(
+        r"[0-9]+(?:\.[0-9]+)*", payload["min_version"]
+    ) is None:
         raise ValueError
     if re.fullmatch(r"[0-9a-f]{64}", payload["sha256"]) is None:
         raise ValueError
@@ -470,13 +511,12 @@ if command -v pipx >/dev/null 2>&1; then
   BIN="$(pipx environment --value PIPX_BIN_DIR 2>/dev/null || echo "$HOME/.local/bin")"
 else
   # The managed venv lives BESIDE the data home, never inside it. Nesting the
-  # interpreter in the data home put the runtime and the user's data in one
-  # blast radius: the one-time ~/.kirocrew -> ~/.kiro/crew data-home migration
-  # copied the whole legacy tree and then deleted it, which for a wheel install
-  # meant copying a non-relocatable venv (dead shebangs at the destination) and
-  # deleting the live interpreter mid-run — leaving a dangling
-  # ~/.local/bin/kirocrew and no working CLI. Keeping the venv out of the data
-  # home means no home-wide operation can ever reach the interpreter again.
+  # interpreter in the data home would put the runtime and the user's data in
+  # one blast radius: any home-wide operation (a bulk delete, a backup restore,
+  # a relocation) could reach the live interpreter — a non-relocatable venv with
+  # absolute shebangs — and leave a dangling ~/.local/bin/kirocrew and no working
+  # CLI. Keeping the venv out of the data home means no home-wide operation can
+  # ever reach the interpreter.
   _DATA_HOME_FOR_VENV="${KIROCREW_HOME:-$HOME/.kiro/crew}"
   VENV="${KIROCREW_VENV:-${_DATA_HOME_FOR_VENV%/}-venv}"
   _OLD_VENV="${_DATA_HOME_FOR_VENV%/}/venv"
@@ -515,6 +555,41 @@ else
   "$PY" -m venv "$VENV"
   "$VENV/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
   "$VENV/bin/pip" install --quiet "$WHL"
+  # Keep the stable launch path (`${VENV}-current`) naming the tree that holds
+  # the LAST-INSTALLED version. The gateway's shadow-venv updater
+  # (kiro_crew/platform/wheel_engine.py) promotes this same symlink to a fresh
+  # versioned tree; a later re-run of this installer writes into the fixed
+  # $VENV again, so without this repoint the stable link would keep naming the
+  # older versioned tree and a gateway restart would resurrect it. Replaced
+  # atomically (sibling symlink + rename) via the interpreter because POSIX
+  # `mv` onto a symlink-to-directory moves INTO the target and `ln -sfn` has
+  # an unlink/create window. A real directory at the stable name is corrupt
+  # state and is left alone — the updater refuses it too, so nothing consumes
+  # it. Failure is non-fatal: the stable link is an optimization layer, and
+  # the direct launcher symlink below keeps working without it.
+  _VENV_CURRENT="${VENV%/}-current"
+  if [ -L "$_VENV_CURRENT" ] || [ ! -e "$_VENV_CURRENT" ]; then
+    "$PY" -c 'import os,sys
+target, link = os.path.abspath(sys.argv[1]), sys.argv[2]
+tmp = f"{link}.{os.getpid()}.new"
+try:
+    # PID reuse can leave a stale tmp from a killed installer at this exact
+    # name; without removing it first os.symlink raises EEXIST, os.replace is
+    # skipped, and the restart stays pinned to the old version. Mirrors the
+    # pre-unlink the wheel-engine promote/launcher paths already do.
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    os.symlink(target, tmp)
+    os.replace(tmp, link)
+except OSError:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+' "$VENV" "$_VENV_CURRENT" || echo "WARNING: could not update $_VENV_CURRENT; continuing." >&2
+  fi
   mkdir -p "$HOME/.local/bin"
   ln -sf "$VENV/bin/kirocrew" "$HOME/.local/bin/kirocrew"
   BIN="$HOME/.local/bin"
@@ -558,7 +633,34 @@ fi
 
 _DATA_HOME="${KIROCREW_HOME:-$HOME/.kiro/crew}"
 mkdir -p "$_DATA_HOME"
-printf '%s\n' "$CHANNEL" > "$_DATA_HOME/channel"
+# Atomic, symlink-proof marker writes. A plain `>` redirection FOLLOWS a
+# pre-planted symlink at the destination -- the data home is agent-writable,
+# so a hostile `ln -sf ~/.bashrc .../python-mode` would turn the next install
+# run into an arbitrary-file overwrite. mktemp creates a fresh regular file
+# (O_EXCL, never a symlink); a pre-existing symlink at the destination is
+# removed first (mv would REPLACE a symlink-to-file, but would move the temp
+# file INSIDE a symlink-to-directory's target); a real directory at the
+# marker path is corrupt state and is refused loudly -- mv would otherwise
+# move the temp file inside it and every later read would silently miss the
+# marker. After those guards the destination is absent or a regular file, so
+# the rename is atomic and can never land outside the data home.
+_write_marker() {
+  _marker_dest="$_DATA_HOME/$1"
+  [ -L "$_marker_dest" ] && rm -f "$_marker_dest"
+  [ -d "$_marker_dest" ] \
+    && err "refusing to record $1: a directory occupies $_marker_dest -- remove it and re-run"
+  _marker_tmp="$(mktemp "$_DATA_HOME/.marker.XXXXXX")"
+  printf '%s\n' "$2" > "$_marker_tmp"
+  mv -f "$_marker_tmp" "$_marker_dest"
+}
+_write_marker channel "$CHANNEL"
+# Record the interpreter mode so the next run -- including the re-run that
+# `kirocrew update` performs -- keeps the same choice without the flag.
+if [ "$MANAGED_PYTHON" = "1" ]; then
+  _write_marker python-mode managed
+else
+  _write_marker python-mode system
+fi
 
 echo ""
 echo "Installed kirocrew $VER (channel: $CHANNEL)."

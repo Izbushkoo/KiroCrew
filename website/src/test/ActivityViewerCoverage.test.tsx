@@ -18,10 +18,6 @@ import { Provider } from 'react-redux'
 import { MemoryRouter, useLocation } from 'react-router-dom'
 import type { ReactNode } from 'react'
 
-// The approval entry's tiered trust control is a Radix dropdown, which never
-// opens under the test DOM; the repo's shared mock renders the menu inline.
-vi.mock('@radix-ui/react-dropdown-menu', async () => await import('./__mocks__/@radix-ui/react-dropdown-menu'))
-
 vi.mock('../api/client', () => ({
   api: {
     spawnStatus: vi.fn().mockResolvedValue({ result: '' }),
@@ -50,7 +46,8 @@ vi.mock('../components/MarkdownPanel', async () => {
   }
 })
 
-import ActivityViewer, { countDiffStats } from '../pages/chat/ActivityViewer'
+import ActivityViewer from '../pages/chat/ActivityViewer'
+import { countDiffStats } from '../utils/diffLineCounts'
 import { api } from '../api/client'
 import { createTestStore } from './helpers'
 import { openActivityToTab, selectSubagent } from '../store/chatSlice'
@@ -479,16 +476,20 @@ describe('ActivityViewer — spawn approval entries', () => {
     expect(screen.getByRole('button', { name: /Reject/ })).toBeInTheDocument()
   })
 
-  it('grants trust for the command through the dropdown', async () => {
+  it('offers only Approve / Reject and never reports a trust grant (#5400)', async () => {
     renderPanel(<ActivityViewer {...baseProps} view="subagents" toolLog={[pending]} />)
-    fireEvent.click(screen.getByText('Trust'))
 
-    const [trustThisCommand] = screen.getAllByRole('menuitem')
-    expect(trustThisCommand).toHaveTextContent('git push origin feature')
-    fireEvent.click(trustThisCommand)
+    // Spawn approvals resolve through the one-shot resolveApproval endpoint,
+    // which has no trust verb — offering trust tiers here would overstate the
+    // grant, because the next identical call prompts again (#5400).
+    const actionButtons = screen.getAllByRole('button', { name: /Approve|Reject|Trust/ })
+    expect(actionButtons.map(b => b.textContent)).toEqual([expect.stringContaining('Approve'), expect.stringContaining('Reject')])
+    expect(screen.queryByText('Trust')).not.toBeInTheDocument()
 
+    fireEvent.click(screen.getByRole('button', { name: /Approve/ }))
     await waitFor(() => expect(api.resolveApproval).toHaveBeenCalledWith('ap-9', 'approve'))
-    expect(await screen.findByText('Trusted command')).toBeInTheDocument()
+    expect(await screen.findByText('Approved')).toBeInTheDocument()
+    expect(screen.queryByText(/Trusted/)).not.toBeInTheDocument()
   })
 
   it('shows an already-resolved approval with no actions left', () => {
@@ -776,5 +777,134 @@ describe('ActivityViewer — panel behaviour', () => {
     fireEvent.click(await screen.findByRole('button', { name: /Browse all/ }))
 
     await waitFor(() => expect(screen.getByTestId('path')).toHaveTextContent('/artifacts'))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Live model-downgrade flag (#5326)
+// ---------------------------------------------------------------------------
+describe('ActivityViewer — live model downgrade flag (#5326)', () => {
+  it('shows normal accent chip when requested model matches resolved', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{
+          s1: mkAgent('s1', {
+            status: 'running',
+            model: 'claude-opus-4.8',
+            requestedModel: 'claude-opus-4.8',
+          }),
+        }}
+      />,
+    )
+    const chip = screen.getByTestId('subagent-model')
+    // No amber classes when there is no downgrade.
+    expect(chip.className).not.toContain('text-warn')
+    expect(chip.className).toContain('text-accent')
+  })
+
+  it('renders amber chip when resolved model differs from requested', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{
+          s1: mkAgent('s1', {
+            status: 'running',
+            model: 'claude-opus-4.7',
+            requestedModel: 'claude-opus-4.8',
+          }),
+        }}
+      />,
+    )
+    const chip = screen.getByTestId('subagent-model')
+    expect(chip.className).toContain('text-warn')
+    expect(chip.className).not.toContain('text-accent')
+  })
+
+  it('chip title contains requested and resolved when downgraded', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{
+          s1: mkAgent('s1', {
+            status: 'running',
+            model: 'claude-opus-4.7',
+            requestedModel: 'claude-opus-4.8',
+          }),
+        }}
+      />,
+    )
+    const chip = screen.getByTestId('subagent-model')
+    expect(chip.title).toContain('claude-opus-4.8')
+    expect(chip.title).toContain('claude-opus-4.7')
+  })
+
+  it('shows normal chip when requestedModel is absent', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{ s1: mkAgent('s1', { status: 'running', model: 'gpt-5.6' }) }}
+      />,
+    )
+    const chip = screen.getByTestId('subagent-model')
+    expect(chip.className).toContain('text-accent')
+    expect(chip.className).not.toContain('text-warn')
+  })
+
+  it('shows a neutral muted chip when only requestedModel is set (no resolved yet)', () => {
+    // Unpinned spawn: backend sets requested_model="auto", resolved="" — the
+    // frontend should show a neutral chip (not accent, not amber) using requestedModel.
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{
+          s1: mkAgent('s1', { status: 'running', model: undefined, requestedModel: 'auto' }),
+        }}
+      />,
+    )
+    const chip = screen.getByTestId('subagent-model')
+    expect(chip.textContent).toContain('auto')
+    expect(chip.className).not.toContain('text-accent')
+    expect(chip.className).not.toContain('text-warn')
+    expect(chip.className).toContain('text-muted')
+    // Tooltip uses model_effective ("backend selects the model") for the auto sentinel.
+    expect(chip.title).toContain('backend selects')
+  })
+
+  it('uses model_label tooltip for a concrete requested-only chip (pinned, pre-resolve)', () => {
+    // A pinned spawn before the session resolves: requestedModel is a concrete id,
+    // resolved is still "". No chip should render — showing an unconfirmed pin as
+    // fact is misleading. The chip appears once the model actually resolves.
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{
+          s1: mkAgent('s1', {
+            status: 'running',
+            model: undefined,
+            requestedModel: 'gpt-5.6-sol',
+          }),
+        }}
+      />,
+    )
+    // Concrete requested-only id must NOT render a chip.
+    expect(screen.queryByTestId('subagent-model')).toBeNull()
+  })
+
+  it('hides the chip when both model and requestedModel are absent', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{ s1: mkAgent('s1', { status: 'running' }) }}
+      />,
+    )
+    expect(screen.queryByTestId('subagent-model')).toBeNull()
   })
 })

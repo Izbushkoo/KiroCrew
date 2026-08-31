@@ -15,6 +15,7 @@ from aiohttp import web
 
 from kiro_crew import webhooks
 from kiro_crew.agent import _VALID_HOOK_EVENTS, _shipped_defaults, kiro_agents_dir_path
+from kiro_crew.agent_discovery import _read_agent_spec, list_agents
 from kiro_crew.config.loader import KiroCrewConfig, data_home
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.executors import run_in_embed_pool
@@ -99,10 +100,30 @@ async def api_kiro_hooks(request: web.Request) -> web.Response:
     from kiro_crew.platform import redact_via_context as redact
 
     agent_cfg = kiro_agents_dir_path() / "kirocrew.json"
-    try:
-        raw = json.loads(agent_cfg.read_text())
-        hooks = raw.get("hooks", {}) if isinstance(raw, dict) else {}
-    except (OSError, json.JSONDecodeError):
+    # ``kirocrew.json`` lives in the user-writable, tool-shared agents dir, so
+    # the read goes through the hardened agents-dir reader (size cap, symlink
+    # and sensitive-target screens, explicit UTF-8, non-object rejection).
+    # ``None`` covers every case the old ``except (OSError, JSONDecodeError)``
+    # caught — plus the ones it missed, e.g. non-UTF-8 bytes, which previously
+    # escaped as an unhandled 500 — and degrades the same way: no user hooks.
+    # Off-loop: the reader stats + reads up to the size cap, and this handler
+    # runs on the gateway event loop (review-adopted, no-blocking-call rule).
+    # The labels are passed explicitly: they name the SEL denial event's
+    # operation and interface channel, and without them a refusal here is
+    # recorded under the reader's ``list_agents`` defaults -- attributing a
+    # hooks request's denial to an agent-listing cache warm, the exact
+    # misattribution the labels exist to prevent.
+    raw = await asyncio.to_thread(
+        _read_agent_spec,
+        agent_cfg,
+        operation="api_kiro_hooks",
+        source="dashboard",
+    )
+    # The reader guarantees the TOP level is an object, not the "hooks" value:
+    # a user-writable {"hooks": []} would reach hooks.items() below and escape
+    # as a 500. Same degrade-as-absent rule as every other unusable shape.
+    hooks = raw.get("hooks") if raw is not None else None
+    if not isinstance(hooks, dict):
         hooks = {}
     # Load bundled defaults to tag source
     try:
@@ -185,6 +206,13 @@ async def api_hooks_create(request: web.Request) -> web.Response:
         hook = await _mutate_hook_store(store.create, validated)
     except _StoreUnavailable:
         return _store_unavailable_response()
+    except ValueError as exc:
+        # store.create now enforces the same invariants as store.update via the
+        # shared validator, so it can raise ValueError. The HOOK_CREATE_SCHEMA
+        # check above normally rejects bad input first, but catch it here too so
+        # any schema/validator drift surfaces as a 400 (like the update handler)
+        # rather than an unhandled 500.
+        return web.json_response({"error": str(exc), "code": "invalid_hook"}, status=400)
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="hook.create",
@@ -281,6 +309,7 @@ async def api_hook_test(request: web.Request) -> web.Response:
     # circular import: kiro_crew.hooks pulls dashboard state at module load, so
     # this handler defers the import to call time (matches _get_hook_store above).
     from kiro_crew.hooks import HOOK_EVENT_STOP, run_script_hook  # noqa: F811
+    from kiro_crew.platform import redact_via_context
 
     store = _get_hook_store(request.app["state"])
     hook_id = request.match_info["hook_id"]
@@ -318,7 +347,7 @@ async def api_hook_test(request: web.Request) -> web.Response:
             "hook_event": hook.event,
             "exit_code": result.exit_code,
             "duration_ms": result.duration_ms,
-            "context": context,
+            "context": redact_via_context(context),
         },
     )
     return web.json_response(
@@ -373,8 +402,11 @@ _hook_semaphore = asyncio.Semaphore(_HOOK_MAX_CONCURRENT)
 # and admits both.
 #
 # Mutated only from the event loop (single-threaded), so a plain set is safe
-# without a lock. Entries are removed in the runner's finally so a failed turn
-# cannot wedge a key permanently.
+# without a lock — PROVIDED the accept path tests membership and `.add()`s the
+# key in one synchronous critical section with no `await` between them. An await
+# there yields to the loop and lets a second same-key request pass the test
+# before the first claims, admitting both (TOCTOU). Entries are removed in the
+# runner's finally so a failed turn cannot wedge a key permanently.
 _hook_inflight_sessions: set[str] = set()
 
 
@@ -518,6 +550,11 @@ def _legacy_hook_token() -> str:
     hooks_cfg = cfg.hooks if isinstance(cfg.hooks, dict) else {}
     legacy = hooks_cfg.get("webhook_token", "")
     return legacy if isinstance(legacy, str) else ""
+
+
+def _installed_agent_names() -> set[str]:
+    """Return currently dispatchable global agent names (blocking filesystem read)."""
+    return {agent.name for agent in list_agents()}
 
 
 async def _json_object(
@@ -666,6 +703,56 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "unauthorized", "code": "unauthorized"}, status=401)
 
+    # A source pause is an operator-owned admission decision, so enforce it
+    # after the caller has authenticated but before allocating or parsing the
+    # body. This is deliberately a separate store read from HMAC verification:
+    # a revocation between the two checks must still fail closed there.
+    source_entry: dict[str, object] | None = None
+    if token_id != webhooks.LEGACY_TOKEN_ID:
+        try:
+            source_entry = await asyncio.to_thread(
+                webhooks.token_store().entry_for, token_id
+            )
+        except webhooks.WebhookStoreUnreadable:
+            return web.json_response(
+                {"error": "inbound webhooks are unavailable", "code": "webhooks_unavailable"},
+                status=503,
+            )
+        if source_entry is None:
+            # Revoked after bearer lookup: do not read the caller's body and do
+            # not let the vanished row silently become a legacy-style source.
+            _sel().log_api_access(
+                caller=source,
+                operation="hooks.agent",
+                outcome="denied",
+                source="webhook",
+                resources=f"token:{token_id}",
+                error="webhook source revoked during admission",
+            )
+            return web.json_response(
+                {"error": "unauthorized", "code": "unauthorized"}, status=401
+            )
+        if source_entry.get("enabled", True) is False:
+            _sel().log_api_access(
+                caller=source,
+                operation="hooks.agent",
+                outcome="denied",
+                source="webhook",
+                resources=f"token:{token_id}",
+                error="webhook source paused by operator",
+            )
+            await asyncio.to_thread(
+                webhooks.run_store().record,
+                outcome=webhooks.OUTCOME_DISABLED,
+                name=str(source_entry.get("label") or "Paused source"),
+                token_id=token_id,
+                detail="Webhook source is paused in the dashboard",
+            )
+            return web.json_response(
+                {"error": "webhook source is paused", "code": "source_disabled"},
+                status=503,
+            )
+
     # Read the RAW body before anything parses it: the signature covers the exact
     # bytes the caller signed, and re-serialising a parsed dict can never
     # reproduce them (key order, separators and unicode escaping all differ).
@@ -759,8 +846,8 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
         # the ephemeral session is already reset — the turn's output is gone
         # while the run history says it was delivered.
         return web.json_response({"error": "name must be a string", "code": "name_not_a_string"}, status=400)
-    agent = body.get("agent", "") or None
-    if agent is not None and not isinstance(agent, str):
+    requested_agent = body.get("agent", "") or None
+    if requested_agent is not None and not isinstance(requested_agent, str):
         return web.json_response({"error": "agent must be a string", "code": "agent_not_a_string"}, status=400)
     deliver = body.get("deliver", True)
     try:
@@ -771,8 +858,74 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
     except (ValueError, TypeError):
         return web.json_response({"error": "timeoutSeconds must be an integer", "code": "timeout_not_an_integer"}, status=400)
 
+    mapped_agent = str(source_entry.get("agent") or "") if source_entry else ""
+    if mapped_agent and requested_agent and requested_agent != mapped_agent:
+        _sel().log_api_access(
+            caller=source,
+            operation="hooks.agent",
+            outcome="denied",
+            source="webhook",
+            resources=f"token:{token_id};agent:{mapped_agent}",
+            error="request agent conflicts with source destination",
+        )
+        return web.json_response(
+            {
+                "error": "request agent conflicts with the source destination",
+                "code": "agent_conflict",
+                "destination_agent": mapped_agent,
+            },
+            status=409,
+        )
+    agent = mapped_agent or requested_agent
+    if mapped_agent:
+        try:
+            installed_agents = await asyncio.to_thread(_installed_agent_names)
+        except Exception:
+            logger.warning("webhook destination-agent discovery failed", exc_info=True)
+            _sel().log_api_access(
+                caller=source,
+                operation="hooks.agent",
+                outcome="denied",
+                source="webhook",
+                resources=f"token:{token_id};agent:{mapped_agent}",
+                error="destination-agent discovery unavailable",
+            )
+            return web.json_response(
+                {
+                    "error": "destination agent could not be verified",
+                    "code": "agent_discovery_unavailable",
+                },
+                status=503,
+            )
+        if mapped_agent not in installed_agents:
+            _sel().log_api_access(
+                caller=source,
+                operation="hooks.agent",
+                outcome="denied",
+                source="webhook",
+                resources=f"token:{token_id};agent:{mapped_agent}",
+                error="source destination agent is not installed",
+            )
+            return web.json_response(
+                {
+                    "error": "the webhook source destination agent is not installed",
+                    "code": "destination_agent_unavailable",
+                    "destination_agent": mapped_agent,
+                },
+                status=409,
+            )
+
     # One turn per sessionKey. Checked BEFORE the capacity gate so an overlapping
     # call is refused for the accurate reason rather than reported as "capacity".
+    #
+    # Check-and-claim is a single synchronous critical section: the membership
+    # test and the `.add()` run back-to-back with NO `await` between them, so on
+    # the single-threaded event loop no second same-key request can interleave
+    # and pass the test before this one has claimed. An `await` here (e.g. the
+    # capacity semaphore acquire, which yields) would reopen that TOCTOU window
+    # and let both callers proceed to a task — the very race this guards. The
+    # claim is unwound on every path below that does not spawn the runner; a
+    # spawned runner releases it in its own finally.
     if session_key in _hook_inflight_sessions:
         _sel().log_api_access(
             caller="webhook",
@@ -798,9 +951,11 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
             },
             status=409,
         )
+    _hook_inflight_sessions.add(session_key)  # claim — no await since the check above
 
-    # Fire-and-forget: run agent in background, return immediately
+    # From here the key is claimed; every non-spawning exit MUST release it.
     if _hook_semaphore.locked():
+        _hook_inflight_sessions.discard(session_key)
         _sel().log_api_access(
             caller="webhook",
             operation="hooks.agent",
@@ -819,18 +974,24 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
             detail=f"Rejected: {_HOOK_MAX_CONCURRENT} concurrent runs already in flight",
         )
         return web.json_response(
-            {"error": f"hook capacity reached ({_HOOK_MAX_CONCURRENT})", "code": "capacity_reached"}, status=429
+            {"error": f"hook capacity reached ({_HOOK_MAX_CONCURRENT})", "code": "capacity_reached"},
+            status=429,
         )
-    await _hook_semaphore.acquire()  # immediate — no race in single-threaded asyncio
-    _sel().log_api_access(
-        caller="webhook",
-        operation="hooks.agent",
-        outcome="accepted",
-        source="webhook",
-        resources=session_key,
-    )
-    _hook_inflight_sessions.add(session_key)
+
+    permit_acquired = False
     try:
+        # With a positive count acquire completes synchronously; the key was
+        # already claimed above even if a test double or future implementation
+        # makes this await yield.
+        await _hook_semaphore.acquire()
+        permit_acquired = True
+        _sel().log_api_access(
+            caller="webhook",
+            operation="hooks.agent",
+            outcome="accepted",
+            source="webhook",
+            resources=session_key,
+        )
         task = asyncio.create_task(
             _run_hook_agent(
                 state,
@@ -844,8 +1005,11 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
             )
         )
     except BaseException:
+        # No runner exists to release the claim or permit. This also covers
+        # audit failures between acquire and create_task.
         _hook_inflight_sessions.discard(session_key)
-        _hook_semaphore.release()
+        if permit_acquired:
+            _hook_semaphore.release()
         raise
     state._background_tasks.add(task)
     task.add_done_callback(state._background_tasks.discard)
@@ -1305,12 +1469,7 @@ async def api_webhooks(request: web.Request) -> web.Response:
 
 @_store_failure_guard
 async def api_webhook_token_create(request: web.Request) -> web.Response:
-    """POST /api/webhooks/tokens — mint a token; both secrets are shown once.
-
-    ``require_signature`` defaults to true. Pass it as false to mint a
-    bearer-only token for a caller that cannot compute an HMAC; the response
-    then omits ``signing_secret`` because none was generated.
-    """
+    """POST /api/webhooks/tokens — mint a routed source credential."""
     body = await _json_object(request)
     if body is None:
         return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
@@ -1319,11 +1478,31 @@ async def api_webhook_token_create(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "require_signature must be a boolean", "code": "require_signature_not_a_boolean"}, status=400
         )
+    agent = body.get("agent")
+    if not isinstance(agent, str) or not agent.strip():
+        return web.json_response(
+            {"error": "agent is required", "code": "agent_required"}, status=400
+        )
+    agent = agent.strip()
+    try:
+        installed_agents = await asyncio.to_thread(_installed_agent_names)
+    except Exception:
+        logger.warning("webhook destination-agent discovery failed", exc_info=True)
+        return web.json_response(
+            {"error": "destination agent could not be verified", "code": "agent_discovery_unavailable"},
+            status=503,
+        )
+    if agent not in installed_agents:
+        return web.json_response(
+            {"error": "destination agent is not installed", "code": "destination_agent_unavailable"},
+            status=400,
+        )
     try:
         raw, signing_secret, entry = await asyncio.to_thread(
             webhooks.token_store().create,
             body.get("label", ""),
             require_signature=require_signature,
+            agent=agent,
         )
     except webhooks.WebhookError as exc:
         _sel().log_api_access(
@@ -1339,7 +1518,7 @@ async def api_webhook_token_create(request: web.Request) -> web.Response:
         operation="webhooks.token_create",
         outcome="success",
         source="dashboard",
-        resources=f"token:{entry['id']}:{entry['label']}:signed={require_signature}",
+        resources=f"token:{entry['id']}:{entry['label']}:agent={agent}:signed={require_signature}",
     )
     payload: dict[str, object] = {"ok": True, "token": raw, "entry": entry}
     if signing_secret:
@@ -1347,6 +1526,85 @@ async def api_webhook_token_create(request: web.Request) -> web.Response:
         # the verifier, but no read endpoint echoes it back.
         payload["signing_secret"] = signing_secret
     return web.json_response(payload, status=201)
+
+
+@_store_failure_guard
+async def api_webhook_token_update(request: web.Request) -> web.Response:
+    """PATCH /api/webhooks/tokens/{token_id} — update source-owned settings."""
+    token_id = request.match_info["token_id"]
+    if token_id == webhooks.LEGACY_TOKEN_ID:
+        _sel().log_api_access(
+            caller=request.get("user", "dashboard"),
+            operation="webhooks.token_update",
+            outcome="denied",
+            source="dashboard",
+            resources=f"token:{token_id}",
+            error="legacy credential is config-managed",
+        )
+        return web.json_response(
+            {"error": "the legacy credential is config-managed", "code": "legacy_credential_in_config"},
+            status=400,
+        )
+    body = await _json_object(request)
+    if body is None:
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    allowed = {"agent", "enabled", "label"}
+    unknown = sorted(set(body) - allowed)
+    if unknown or not body:
+        return web.json_response(
+            {"error": "patch may only contain agent, enabled, or label", "code": "invalid_source_patch"},
+            status=400,
+        )
+    if "agent" in body:
+        agent = body["agent"]
+        if not isinstance(agent, str) or not agent.strip():
+            return web.json_response({"error": "agent is required", "code": "agent_required"}, status=400)
+        agent = agent.strip()
+        try:
+            installed_agents = await asyncio.to_thread(_installed_agent_names)
+        except Exception:
+            logger.warning("webhook destination-agent discovery failed", exc_info=True)
+            return web.json_response(
+                {"error": "destination agent could not be verified", "code": "agent_discovery_unavailable"},
+                status=503,
+            )
+        if agent not in installed_agents:
+            return web.json_response(
+                {"error": "destination agent is not installed", "code": "destination_agent_unavailable"},
+                status=400,
+            )
+    else:
+        agent = None
+    if "enabled" in body and not isinstance(body["enabled"], bool):
+        return web.json_response(
+            {"error": "enabled must be a boolean", "code": "enabled_not_a_boolean"}, status=400
+        )
+    if "label" in body and not isinstance(body["label"], str):
+        return web.json_response(
+            {"error": "label must be a string", "code": "label_not_a_string"}, status=400
+        )
+    try:
+        entry = await asyncio.to_thread(
+            webhooks.token_store().update,
+            token_id,
+            agent=agent,
+            enabled=body.get("enabled") if "enabled" in body else None,
+            label=body.get("label") if "label" in body else None,
+        )
+    except webhooks.WebhookStoreUnreadable:
+        raise
+    except webhooks.WebhookError as exc:
+        return web.json_response({"error": str(exc), "code": "source_update_rejected"}, status=400)
+    if entry is None:
+        return web.json_response({"error": "not found", "code": "credential_not_found"}, status=404)
+    _sel().log_api_access(
+        caller=request.get("user", "dashboard"),
+        operation="webhooks.token_update",
+        outcome="success",
+        source="dashboard",
+        resources=f"token:{token_id}:fields={','.join(sorted(body))}",
+    )
+    return web.json_response({"ok": True, "entry": entry})
 
 
 @_store_failure_guard
@@ -1417,12 +1675,38 @@ async def api_webhook_test(request: web.Request) -> web.Response:
             "This is a Kiro Crew webhook test request. Reply with a one-line "
             "confirmation that you received it; no other action is needed."
         )
+    agent = body.get("agent") or "kirocrew"
+    if not isinstance(agent, str):
+        return web.json_response(
+            {"error": "agent must be a string", "code": "agent_not_a_string"},
+            status=400,
+        )
+    try:
+        installed_agents = await asyncio.to_thread(_installed_agent_names)
+    except Exception:
+        logger.warning("webhook test destination-agent discovery failed", exc_info=True)
+        return web.json_response(
+            {
+                "error": "destination agent could not be verified",
+                "code": "agent_discovery_unavailable",
+            },
+            status=503,
+        )
+    if agent not in installed_agents:
+        return web.json_response(
+            {
+                "error": "the webhook source destination agent is not installed",
+                "code": "destination_agent_unavailable",
+                "destination_agent": agent,
+            },
+            status=409,
+        )
     session_key = f"{_HOOK_SESSION_PREFIX}test:{int(time.time())}"
 
     store = webhooks.token_store()
     try:
         raw, signing_secret, entry = await asyncio.to_thread(
-            store.create, "Test request (auto)"
+            store.create, "Test request (auto)", agent=agent
         )
     except webhooks.WebhookError as exc:
         _sel().log_api_access(
@@ -1454,6 +1738,7 @@ async def api_webhook_test(request: web.Request) -> web.Response:
         "message": message,
         "sessionKey": session_key,
         "name": "Webhook test",
+        "agent": agent,
         "deliver": False,
     }
     # Serialise once and send those exact bytes: the signature covers the raw

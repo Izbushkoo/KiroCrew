@@ -1,10 +1,12 @@
-import { memo, useEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { ChevronRight } from 'lucide-react'
+import { ChevronRight, Sparkles } from 'lucide-react'
 import { useRowDisclosure } from './rowDisclosure'
+import { ROW_PILL_BUTTON_CLASS, ROW_PILL_WRAPPER_CLASS, ROW_RAIL_CLASS } from './rowPill'
 import { useStreamIdle } from './ChatFooter'
 
 import { i18nT } from '../../i18n/t'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 
 /** Newest slice of the reasoning kept for the one-line live preview. Bounded so
  *  a long trace does not put tens of kB of nowrap text in the DOM on every
@@ -16,6 +18,16 @@ const LIVE_TAIL_CHARS = 240
  *  there a late hand-off shows a redundant indicator, here a short window makes
  *  the line appear and vanish across the gap between two reasoning bursts. */
 const PREVIEW_IDLE_MS = 1200
+
+/** Slack, in px, for "is the expanded trace at its end". An exact test never
+ *  re-arms following: sub-pixel offsets leave scrollTop a hair short, stranding
+ *  a reader who scrolled back down. Same value as ActivityViewer's log pane. */
+const TAIL_SLACK_PX = 20
+
+/** Within a line's slack of the bottom -- the one test both the scroll listener
+ *  and the pin effect latch on, so they cannot drift apart. */
+const isAtEnd = (el: HTMLElement) =>
+  el.scrollTop + el.clientHeight >= el.scrollHeight - TAIL_SLACK_PX
 
 /** The tail of the trace as a single line: whatever the model just wrote, with
  *  newlines collapsed so a multi-line thought still reads as one line. */
@@ -39,6 +51,7 @@ function liveTail(content: string): string {
  * partial/ill-formed and shouldn't run through the markdown renderer.
  */
 function ThinkingBlock({ content, disclosureKey }: { content: string; disclosureKey?: string }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   // Held outside the row: the transcript is virtualised, so this block is
   // unmounted whenever its row leaves the mounted window.
   const [expanded, setExpanded] = useRowDisclosure(disclosureKey, false)
@@ -46,6 +59,9 @@ function ThinkingBlock({ content, disclosureKey }: { content: string; disclosure
   const [clipped, setClipped] = useState(false)
   const lastContent = useRef<string | null>(null)
   const ticker = useRef<HTMLSpanElement | null>(null)
+  const bodyRef = useRef<HTMLDivElement | null>(null)
+  // A ref, not state: it changes on every scroll event and must not repaint.
+  const autoScroll = useRef(true)
 
   // Liveness is derived from the content GROWING rather than from the slot's
   // running flag: one turn keeps a single reasoning block, so a burst that
@@ -81,28 +97,79 @@ function ThinkingBlock({ content, disclosureKey }: { content: string; disclosure
     setClipped(c => (c === overflowing ? c : overflowing))
   }, [tail])
 
+  // Reasoning is APPENDED, so the newest text sits at the bottom and an
+  // unmanaged container shows the oldest. Follow the tail WHILE LIVE, yield as
+  // soon as the reader scrolls up, re-arm when they return -- the same contract
+  // as the subagent output pane in ActivityViewer.
+  // useEffect is safe despite writing scroll position: the panel mounts inside an
+  // AnimatePresence animating height in from 0, so there is no painted frame for
+  // a scrollTop-0 flash to land on.
+  useEffect(() => {
+    if (!expanded || !streaming) return
+    const el = bodyRef.current
+    if (el && autoScroll.current) el.scrollTop = el.scrollHeight
+  }, [expanded, content, streaming])
+
+  // Latch on where the reader IS -- deliberately NOT on `content`: an append
+  // commits a taller box before liveness flips, so re-deriving would stop follow.
+  useEffect(() => {
+    if (!expanded) { autoScroll.current = true; return }
+    const el = bodyRef.current
+    if (el && !streaming) autoScroll.current = isAtEnd(el)
+  }, [expanded, streaming])
+
+  const onBodyScroll = useCallback(() => {
+    const el = bodyRef.current
+    if (!el) return
+    autoScroll.current = isAtEnd(el)
+  }, [])
+
   if (!content) return null
 
   const fade = 'linear-gradient(to right, transparent 0, #000 36px)'
 
   return (
-    <div className="self-start max-w-[550px] w-full">
+    <div className="self-start w-full">
+      {/* The -ml-2 inside ROW_PILL_WRAPPER_CLASS cancels the button's px-2 so
+          the leading icon lands on the message column's text edge (x=0),
+          exactly like the tool pill's wrapper in ToolCallLine. */}
+      <div className={`${tail ? 'flex w-full' : 'inline-flex'} ${ROW_PILL_WRAPPER_CLASS}`}>
       <button
         type="button"
         onClick={() => setExpanded(v => !v)}
-        // The preview needs the full row to scroll in, but a row WITHOUT one
-        // keeps its content-sized hit area: widening it unconditionally would
-        // make empty space beside the label toggle every settled block.
-        className={`${tail ? 'flex w-full min-w-0 text-left' : 'inline-flex'} items-center gap-2 text-[12px] leading-5 text-muted hover:text-text transition-colors cursor-pointer bg-transparent border-none p-0 focus:outline-none focus-visible:ring-1 focus-visible:ring-accent rounded-sm`}
+        // Geometry comes from ROW_PILL_BUTTON_CLASS, shared with ToolCallLine,
+        // so a reasoning row and a tool row read as one component family and a
+        // later pill restyle moves both rows together. The preview needs the
+        // full row to scroll in, but a row WITHOUT one keeps its content-sized
+        // hit area: widening it unconditionally would make empty space beside
+        // the label toggle every settled block.
+        className={`${tail ? 'flex w-full min-w-0' : 'inline-flex'} ${ROW_PILL_BUTTON_CLASS} text-muted hover:text-text cursor-pointer bg-transparent border-none focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-none`}
         aria-expanded={expanded}
         aria-label={expanded ? i18nT('pages.chat.thinkingBlock.collapse_model_reasoning') : i18nT('pages.chat.thinkingBlock.expand_model_reasoning')}
         title={expanded ? i18nT('pages.chat.thinkingBlock.hide_reasoning') : i18nT('pages.chat.thinkingBlock.show_reasoning')}
       >
-        <span className="shrink-0">{i18nT('pages.chat.thinkingBlock.thinking')}</span>
+        {/* Same deterministic centering as the tool pill's status icon: the
+            label spans pin leading-5 (20px), so the 12px icon centers on the
+            first line at (20 − 12) / 2 = 4px. While reasoning is live the icon
+            gently pulses — the row's ONLY "in progress" motion, so a folded
+            row still reads as live even when the one-line tail is empty
+            between two bursts. */}
+        <Sparkles size={12} className={`shrink-0 text-accent${streaming ? ' animate-pulse' : ''}`} style={{ marginTop: '4px' }} />
+        {/* The label is tense-aware: several locales render `thinking` as an
+            explicitly in-progress form ("思考中", "考え中"), which reads wrong
+            once the burst has settled. It rides the same growth-derived
+            liveness as the preview line, so the row's whole header flips to
+            the finished form the moment the preview disappears — and a block
+            restored from history starts on the finished form. The label itself
+            stays static: `.streaming-glow` is sized for a full streaming
+            sentence, and on a 3-glyph CJK label its background chip + sweep
+            read as a smeared highlight, so liveness is carried by the pulsing
+            icon and the live preview tail instead. */}
+        <span className="shrink-0 leading-5">{streaming ? i18nT('pages.chat.thinkingBlock.thinking') : i18nT('pages.chat.thinkingBlock.thought_process')}</span>
         <ChevronRight
           size={13}
           className="shrink-0 transition-transform duration-200"
-          style={{ transform: expanded ? 'rotate(90deg)' : 'none' }}
+          style={{ transform: expanded ? 'rotate(90deg)' : 'none', marginTop: '3.5px' }}
         />
         {tail && (
           // Held scrolled to its end (see the effect above), so the words the
@@ -119,28 +186,42 @@ function ThinkingBlock({ content, disclosureKey }: { content: string; disclosure
             // implementation drops -- this mirrors the same state so the gate is
             // observable in a unit test as well as in a real browser.
             data-clipped={clipped ? 'true' : 'false'}
-            className="flex-1 min-w-0 overflow-hidden whitespace-nowrap opacity-70"
+            className="flex-1 min-w-0 overflow-hidden whitespace-nowrap opacity-70 leading-5 text-[12px]"
             style={clipped ? { maskImage: fade, WebkitMaskImage: fade } : undefined}
           >{tail}</span>
         )}
       </button>
+      </div>
       <AnimatePresence initial={false}>
         {expanded && (
           <motion.div
             key="reasoning"
-            initial={{ height: 0, opacity: 0, marginTop: 0 }}
-            animate={{ height: 'auto', opacity: 1, marginTop: 6 }}
-            exit={{ height: 0, opacity: 0, marginTop: 0 }}
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
             transition={{ type: 'spring', damping: 26, stiffness: 280, mass: 0.8 }}
             style={{ overflow: 'hidden' }}
           >
-            <div className="max-h-[360px] overflow-auto">
-              <div
-                className="flex gap-3 py-1 text-[12px] text-muted leading-5 whitespace-pre-wrap"
-                style={{ wordBreak: 'break-word' }}
-              >
-                <span aria-hidden className="w-[3px] shrink-0 self-stretch rounded-full bg-accent opacity-40" />
-                <span className="flex-1 min-w-0">{content}</span>
+            {/* The rail mirrors ToolDetails' spec exactly (2px solid, flush
+                form, pl-3 content inset) so the two collapsible blocks of a
+                turn share one left-edge geometry; only the colour differs —
+                reasoning keeps the accent identity where a tool rail carries
+                its status colour. Arbitrary-value class rather than a `/N`
+                opacity modifier: the theme colours are raw var() references,
+                so Tailwind opacity variants silently generate nothing. */}
+            <div className={`${ROW_RAIL_CLASS} border-l-[color-mix(in_srgb,var(--accent)_70%,transparent)]`}>
+              <div ref={bodyRef} onScroll={onBodyScroll} data-testid="thinking-body" className="max-h-[360px] overflow-auto">
+                {/* The RAIL spans the row so its edge aligns with the tool
+                    payload box, but the prose inside is capped at a readable
+                    measure — reasoning is sentences, not code, and ~140-char
+                    lines across the full column are harder to read than the
+                    alignment is worth. */}
+                <div
+                  className="py-1 max-w-[65ch] text-[12px] text-muted leading-5 whitespace-pre-wrap"
+                  style={{ wordBreak: 'break-word' }}
+                >
+                  {content}
+                </div>
               </div>
             </div>
           </motion.div>

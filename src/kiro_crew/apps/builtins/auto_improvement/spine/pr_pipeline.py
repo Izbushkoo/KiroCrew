@@ -47,6 +47,7 @@ import inspect
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from . import ledger as L
 from .contracts import BugGateResult, Measurement, Proposal, TargetProfile
@@ -84,6 +85,9 @@ class CrOutcome:
     # resulting sha after the push (so the ledger carries the real sha, not a placeholder).
     # ``filed`` stays False (no CR); ``reproduce`` is still carried for the commit message.
     committed_ready: bool = False
+    # The canonical clone was retired after untrusted build/agent execution changed
+    # repository safety. The driver must stop without commit/reset/teardown Git.
+    repository_retired: bool = False
 
 
 class CrPipeline:
@@ -106,6 +110,7 @@ class CrPipeline:
         logger: logging.Logger | None = None,
         direct_commit: bool = False,
         ruler_proven: bool = True,
+        retire_if_unsafe: Callable[[str], bool] | None = None,
     ) -> None:
         self.ledger = ledger
         self.measurer = measurer  # spine Measurer — supplies the REPRODUCE A/B
@@ -122,6 +127,7 @@ class CrPipeline:
         # verify/reproduce/RED-GREEN gates still run unchanged (they precede the draft step) —
         # direct-commit changes WHAT happens to a verified change, never WHETHER it's verified.
         self.direct_commit = bool(direct_commit)
+        self._retire_if_unsafe = retire_if_unsafe or (lambda _stage: False)
 
     # ── dedup short-circuit (§1.3 top of emit_cr; §2.1 invariant) ────────────
 
@@ -187,6 +193,13 @@ class CrPipeline:
                 gated_commit_sha=gated_commit_sha,
             )
         except Exception as e:  # noqa: BLE001
+            if self._retire_if_unsafe("reproduce"):
+                return CrOutcome(
+                    fp=fp,
+                    status=L.STATUS_ERROR,
+                    note="repository retired after reproduce",
+                    repository_retired=True,
+                )
             self.log.error("REPRODUCE errored for %s: %s", cand.target, e)
             self.ledger.record(
                 L.LedgerEntry(
@@ -199,6 +212,13 @@ class CrPipeline:
             )
             return CrOutcome(fp=fp, status=L.STATUS_ERROR, note="reproduce error")
 
+        if self._retire_if_unsafe("reproduce"):
+            return CrOutcome(
+                fp=fp,
+                status=L.STATUS_ERROR,
+                note="repository retired after reproduce",
+                repository_retired=True,
+            )
         if not self._reproduces(verify, reproduce):
             self.log.warning(
                 "did NOT reproduce (fluke): verify Δ=%s reproduce Δ=%s — no CR",
@@ -356,7 +376,7 @@ class CrPipeline:
 
             qdir = Path(qdir)
             qdir.mkdir(parents=True, exist_ok=True)
-            (qdir / f"{fp}.diff").write_text(diff or "")
+            (qdir / f"{fp}.diff").write_text(diff or "", encoding="utf-8")
             # Same shape as the recipe's queue copy ("# <summary>\n\n<description>"); strip
             # a leading H1 in the description so we don't render two titles.
             body = description or ""
@@ -367,7 +387,7 @@ class CrPipeline:
             # never reached this writer — so a direct-committed fix's description was written
             # to a filename nothing reads and silently never rendered. Raised by the GPT
             # review of this branch.
-            (qdir / f"{fp}.pr.md").write_text(f"# {summary}\n\n{body}\n")
+            (qdir / f"{fp}.pr.md").write_text(f"# {summary}\n\n{body}\n", encoding="utf-8")
         except Exception:  # noqa: BLE001 — the queue copy is for display; never fatal
             self.log.debug("direct-commit queue-copy write failed for %s", fp, exc_info=True)
 

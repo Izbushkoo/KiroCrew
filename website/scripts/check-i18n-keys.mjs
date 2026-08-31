@@ -153,11 +153,12 @@ for (const arg of process.argv.slice(2)) {
  * reference keys that do not exist, to assert the missing-key fallback behaviour
  * (`pseudoBracket.test.tsx` builds fixture keys, `navLabels.test.tsx` composes
  * `settings.tabs.${k}.${field}`). Failing on those would make the gate punish the
- * tests that exist to prove the failure mode. They are still parsed, and still
- * reported under `--report`, so the exclusion is visible rather than assumed.
+ * tests that exist to prove the failure mode. A normal gate run skips them before
+ * filesystem metadata or source parsing; `--report` still parses and reports them,
+ * so the exclusion stays visible without making every CI gate scan the test corpus.
  */
 const DECLARATION_FILE = 'i18n/t.ts'
-const isTestFile = (rel) => /\.test\.tsx?$/.test(rel) || rel.startsWith('test/')
+const isTestFile = (rel) => /\.test\.tsx?$/.test(rel) || rel === 'test' || rel.startsWith('test/')
 
 /**
  * Property names whose string-literal value IS a catalog key.
@@ -240,6 +241,11 @@ function walk(dir, out = []) {
   for (const entry of fs.readdirSync(dir)) {
     if (entry === 'node_modules' || entry === 'locales') continue
     const full = path.join(dir, entry)
+    const rel = path.relative(SRC, full).split(path.sep).join('/')
+    // Test references never affect the default verdict or its production-only
+    // coverage count. Skip their filesystem and AST work from the blocking gate;
+    // `--report` deliberately keeps the wider diagnostic scan.
+    if (!REPORT && isTestFile(rel)) continue
     if (fs.statSync(full).isDirectory()) walk(full, out)
     else if (/\.tsx?$/.test(entry)) out.push(full)
   }
@@ -713,7 +719,7 @@ if (shadowed.length > 0) {
   console.error(
     `\n${shadowed.length} key(s) exist in BOTH en.json and en.manual.json:\n`
     + `${shadowed.slice(0, 20).map((k) => `  ${k}`).join('\n')}\n\n`
-    + '`src/i18n/index.ts` deep-merges with the manual catalog winning, so the generated value is\n'
+    + '`src/i18n/enCatalog.ts` deep-merges with the manual catalog winning, so the generated value is\n'
     + 'dead while the codemod keeps regenerating it — the two drift apart with nothing to say so.\n'
     + 'Keep the key in exactly one file: en.manual.json if it has no source literal to extract,\n'
     + 'otherwise let the codemod own it and delete the manual copy.',

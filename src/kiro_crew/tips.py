@@ -24,7 +24,7 @@ from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.paths import config_dir
 from kiro_crew.context import ContextBuilder
 from kiro_crew.llm_helpers import run_bg_oneliner
-from kiro_crew.platform_compat import restrict_to_owner
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.tips_allowlist import TIP_DOC_ALLOWLIST
 from kiro_crew.tips_text import truncate_summary
@@ -356,17 +356,20 @@ def _save_state(st: TipsState) -> None:
         + "\n",
         # Owner-only: generated tips embed memory-derived content (preferences,
         # projects, recent activity) — must not be world-readable on shared
-        # machines. mode also corrects permissions of pre-existing 0644 files
-        # on the next write (atomic replace).
-        mode=0o600,
+        # machines. restrict_to_owner locks the temp file down BEFORE any content
+        # reaches it (a post-rename lockdown left the payload readable under the
+        # inherited DACL on Windows for the write window, issue #5285), implies
+        # 0o600 on POSIX — which also corrects permissions of pre-existing 0644
+        # files on the next write (atomic replace) — and applies the owner-only
+        # DACL on Windows, where mode bits are a no-op. Warn-and-continue: a
+        # lockdown failure must not break tips persistence, but it must be
+        # visible. The linked-parent refusal restrict_to_owner also implies is
+        # NOT covered by restrict_on_error — it raises unconditionally, which is
+        # correct for a secret-adjacent writer (#4381) and unreachable here in
+        # practice: the parent is config_dir(), a trust anchor.
+        restrict_to_owner=True,
+        restrict_on_error="warn",
     )
-    # mode= only sets POSIX bits; on Windows an owner-only DACL is needed too.
-    # Warn-and-continue: a lockdown failure must not break tips persistence,
-    # but it must be visible.
-    try:
-        restrict_to_owner(path)
-    except OSError:
-        logger.warning("Could not restrict tips_state.json to owner", exc_info=True)
 
 
 # ── Cache ──
@@ -382,11 +385,13 @@ class TipsCache:
     # directly are unaffected; populated only by get_tips_cache in production.
     curated: list[dict] = field(default_factory=list)  # type: ignore[type-arg]
     state: TipsState = field(default_factory=TipsState)
-    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # LoopBoundLock, not asyncio.Lock (#4800): the cache is stored on the
+    # long-lived DashboardState, which outlives any single event loop.
+    _lock: LoopBoundLock = field(default_factory=LoopBoundLock, repr=False)
     _task: asyncio.Task | None = field(default=None, repr=False)  # type: ignore[type-arg]
 
 
-_tips_init_lock = asyncio.Lock()
+_tips_init_lock = LoopBoundLock()
 
 # Path to the bundled pre-generated tips catalog (release-time artifact).
 _BUNDLED_CATALOG_FILE = Path(__file__).resolve().parent / "data" / "tips_catalog.json"
@@ -1019,6 +1024,12 @@ async def api_tips_status(request: web.Request) -> web.Response:
     )
 
 
+# Cap on the `id` a feedback call may name. Tip ids are catalog- or
+# curated-authored slugs; the bound exists so an unbounded client string is
+# never carried into the persisted dismissal state.
+_TIP_ID_MAX_CHARS = 100
+
+
 async def api_tips_feedback(request: web.Request) -> web.Response:
     """POST /api/tips/feedback — record user feedback on a tip.
 
@@ -1041,20 +1052,42 @@ async def api_tips_feedback(request: web.Request) -> web.Response:
 
     try:
         body = await request.json()
-    except (json.JSONDecodeError, ValueError):
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    except ValueError:
+        return web.json_response(
+            {"error": "invalid JSON", "code": "invalid_json"}, status=400
+        )
 
     if not isinstance(body, dict):
-        return web.json_response({"error": "body must be a JSON object"}, status=400)
+        return web.json_response(
+            {"error": "body must be a JSON object", "code": "body_not_object"},
+            status=400,
+        )
 
     tip_id = body.get("id", "")
     action = body.get("action", "")
-    if not isinstance(tip_id, str) or not isinstance(action, str) or len(tip_id) > 100:
-        return web.json_response({"error": "invalid fields"}, status=400)
+    if not isinstance(tip_id, str) or not isinstance(action, str):
+        return web.json_response(
+            {"error": "id and action must be strings", "code": "invalid_field_type"},
+            status=400,
+        )
+    # Split from the isinstance check above: a client fixes an oversized id by
+    # sending a shorter one, and a wrong type by sending a different type. A
+    # `code` is API surface that cannot be narrowed later, so the two refusals
+    # must not share one.
+    if len(tip_id) > _TIP_ID_MAX_CHARS:
+        return web.json_response(
+            {
+                "error": f"id exceeds {_TIP_ID_MAX_CHARS} characters",
+                "code": "tip_id_too_long",
+            },
+            status=400,
+        )
 
     valid_actions = ("shown", "ack", "dismiss", "snooze", "helpful", "optout", "optin")
     if action not in valid_actions:
-        return web.json_response({"error": "invalid action"}, status=400)
+        return web.json_response(
+            {"error": "invalid action", "code": "invalid_action"}, status=400
+        )
 
     now = time.time()
 

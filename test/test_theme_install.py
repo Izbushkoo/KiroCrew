@@ -31,6 +31,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import requires_symlinks
 from kiro_crew.dashboard.handlers.themes import (
     _atomic_write_theme_json,
     _clone_github,
@@ -977,6 +978,7 @@ class TestFullL2Fixture:
         assert info["chars"] == len(text)
         assert info["text"] == text
 
+    @requires_symlinks
     def test_descriptor_rejects_symlinked_persona(self, tmp_path: Path) -> None:
         # TOCTOU symlink-swap: persona.md replaced by a symlink to a file outside
         # the theme dir must NOT be read. The nolink chokepoint (O_NOFOLLOW +
@@ -1386,6 +1388,100 @@ class TestFontRoles:
         assert len(_theme_asset_descriptor(d, manifest, 1)["fonts"]) == 6
 
 
+class TestFontRoleRejectedAtInstall:
+    """A `fonts` entry whose `role` is neither "sans" nor "mono" is REFUSED at
+    install (`installing=True`) instead of silently coercing to "sans".
+    "monospace" (the CSS keyword) is the likeliest typo for exactly the role
+    most likely to be mistyped, and `_theme_asset_descriptor`'s lenient
+    coercion (covered by `TestFontRoles` above, which must keep passing
+    unchanged) made the failure silent: the mono face renders as Sans while
+    Mono keeps the built-in JetBrains Mono (#2750). Unlike that read path,
+    `_validate_theme_dir` reads `theme.json` from disk, so these build a real
+    on-disk pack rather than passing an in-memory manifest."""
+
+    def _pack_with_font_role(self, tmp_path: Path, role: object) -> Path:
+        d = tmp_path / "role-pack"
+        d.mkdir(parents=True, exist_ok=True)
+        _write(
+            d / "theme.json",
+            {
+                "slug": "role-pack",
+                "name": "Role Pack",
+                "emoji": "🎨",
+                "level": 1,
+                "formatVersion": 1,
+                "fonts": [{"family": "Manrope", "file": "sans.ttf", "role": role}],
+            },
+        )
+        _write(d / "variables.json", _VALID_VARS)
+        (d / "styles" / "fonts").mkdir(parents=True, exist_ok=True)
+        (d / "styles" / "fonts" / "sans.ttf").write_bytes(_TTF)
+        return d
+
+    def test_unknown_role_rejected_at_install(self, tmp_path: Path) -> None:
+        d = self._pack_with_font_role(tmp_path, "monospace")
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert summary is None
+        assert err is not None
+        assert "Manrope" in err
+        assert "monospace" in err
+        assert "'sans' and 'mono'" in err
+
+    def test_unknown_role_tolerated_on_re_read(self, tmp_path: Path) -> None:
+        # The theme-detail route re-runs this validator for every installed
+        # pack on read (installing=False, the default). A pack that predates
+        # this rule -- or installed before a narrower rule existed -- must
+        # keep loading there rather than 500ing and dropping out of the theme
+        # map, mirroring the font-pin rule's own install-only enforcement.
+        d = self._pack_with_font_role(tmp_path, "monospace")
+        summary, err = _validate_theme_dir(d)
+        assert err is None, err
+        assert summary is not None
+
+    @pytest.mark.parametrize("role", ["sans", "mono"])
+    def test_valid_roles_accepted_at_install(self, tmp_path: Path, role: str) -> None:
+        d = self._pack_with_font_role(tmp_path, role)
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert err is None, err
+
+    def test_absent_role_still_accepted_at_install(self, tmp_path: Path) -> None:
+        # Absent is the deliberate default case (coerces to sans on read) --
+        # not what this rule targets.
+        d = tmp_path / "no-role-pack"
+        d.mkdir()
+        _write(
+            d / "theme.json",
+            {
+                "slug": "no-role-pack",
+                "name": "No Role",
+                "emoji": "🎨",
+                "level": 1,
+                "formatVersion": 1,
+                "fonts": [{"family": "Manrope", "file": "sans.ttf"}],
+            },
+        )
+        _write(d / "variables.json", _VALID_VARS)
+        (d / "styles" / "fonts").mkdir(parents=True)
+        (d / "styles" / "fonts" / "sans.ttf").write_bytes(_TTF)
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert err is None, err
+
+    @pytest.mark.parametrize("bad_role", [[], {}, 7, True, ["sans"], None])
+    def test_non_string_role_rejected_at_install_without_crashing(
+        self, tmp_path: Path, bad_role: object
+    ) -> None:
+        # `role` is untrusted manifest JSON. Membership-testing an unhashable
+        # value (a list, a dict) against the frozenset raises TypeError if the
+        # isinstance guard is dropped -- this must return a clean error
+        # instead of crashing the install handler. An explicit JSON `null`
+        # (None) is a PRESENT non-string value: it is rejected like any other
+        # bad role, distinct from the absent-role default case above.
+        d = self._pack_with_font_role(tmp_path, bad_role)
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert summary is None
+        assert err is not None
+
+
 class TestOverridesFontPin:
     """overrides.css must not pin the UI font: a pin lands below where the Font
     Family preference is applied, so Mono/System would stop working with nothing
@@ -1587,98 +1683,6 @@ class TestServingReadNolink:
             pytest.skip("symlinks unsupported on this platform")
         # The swap happened AFTER resolution; the nolink read must refuse it.
         assert _read_theme_bytes_nolink("mypack", target) is None
-
-
-class TestWindowsGate:
-    """Arbiter item 4: the pack routes traverse hooks' POSIX-only
-    O_NOFOLLOW + fd-real-path chokepoint (no Windows impl), so they honestly
-    501 on Windows instead of 500-ing. The flag is monkeypatched True here;
-    on this (POSIX) host it defaults False, so the rest of the suite exercises
-    the normal path. The editor custom-record CRUD paths are NOT gated."""
-
-    @staticmethod
-    def _req(**match_info: object) -> object:
-        import types
-
-        async def _json() -> dict:
-            return {"source": {"type": "local", "path": "/tmp/does-not-matter"}}
-
-        r = types.SimpleNamespace(match_info=match_info)
-        r.json = _json  # type: ignore[attr-defined]
-        return r
-
-    def test_install_501_on_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        import asyncio
-
-        from kiro_crew.dashboard.handlers import themes as th_mod
-
-        monkeypatch.setattr(th_mod, "_THEMES_WIN_UNSUPPORTED", True)
-        resp = asyncio.run(th_mod.api_themes_install(self._req()))
-        assert resp.status == 501
-        assert b"not yet supported on Windows" in resp.body
-        assert b"KiroCrew#311" in resp.body
-
-    @pytest.mark.parametrize(
-        "handler,match_info",
-        [
-            ("api_theme_asset", {"slug": "wintheme", "path": "branding/logo.svg"}),
-            ("api_theme_overlay", {"slug": "wintheme", "id": "scanner"}),
-            ("api_theme_topbar", {"slug": "wintheme", "mode": "dark"}),
-        ],
-    )
-    def test_serving_routes_501_on_windows(
-        self, monkeypatch: pytest.MonkeyPatch, handler: str, match_info: dict
-    ) -> None:
-        import asyncio
-
-        from kiro_crew.dashboard.handlers import themes as th_mod
-
-        monkeypatch.setattr(th_mod, "_THEMES_WIN_UNSUPPORTED", True)
-        resp = asyncio.run(getattr(th_mod, handler)(self._req(**match_info)))
-        assert resp.status == 501
-        assert b"not yet supported on Windows" in resp.body
-
-    def test_delete_installed_dir_501_on_windows(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import asyncio
-        import types
-
-        import kiro_crew.dashboard.theme_validate as tv_mod
-        from kiro_crew.dashboard.handlers import themes as th_mod
-
-        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path)
-        slug = "wintheme"
-        d = tv_mod._installed_theme_dir(slug)
-        d.mkdir(parents=True)
-        (d / "theme.json").write_text(
-            '{"name": "W", "level": 0, "formatVersion": 1}', encoding="utf-8"
-        )
-        monkeypatch.setattr(th_mod, "_THEMES_WIN_UNSUPPORTED", True)
-        req = types.SimpleNamespace(method="DELETE", match_info={"slug": slug})
-        resp = asyncio.run(th_mod.api_theme_detail(req))
-        assert resp.status == 501
-        assert b"not yet supported on Windows" in resp.body
-        # The gate short-circuits before any rmtree — the dir is untouched.
-        assert d.is_dir()
-
-    def test_flag_false_does_not_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # With the flag False (the POSIX default), install is NOT short-circuited:
-        # it proceeds to parse the body, so invalid JSON yields the normal 400.
-        import asyncio
-        import types
-
-        from kiro_crew.dashboard.handlers import themes as th_mod
-
-        assert th_mod._THEMES_WIN_UNSUPPORTED is False  # POSIX host default
-
-        async def _bad_json() -> dict:
-            raise ValueError("no body")
-
-        req = types.SimpleNamespace(match_info={})
-        req.json = _bad_json  # type: ignore[attr-defined]
-        resp = asyncio.run(th_mod.api_themes_install(req))
-        assert resp.status == 400
 
 
 class TestCssParserCorpus:

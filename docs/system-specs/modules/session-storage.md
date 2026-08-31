@@ -30,12 +30,7 @@ pins the absence.
 
 ### Halves are always reclaimed together
 
-`_unit_paths()` is the single answer to "what files is this session made of", and
-move, restore and delete all resolve through it. Reclaiming one half produces a
-session that is broken rather than gone: without its replay log a session still
-lists but cannot resume, and without its transcript a resumable session has no
-history or search. `TestMoveTakesBothHalves` and `TestRestoreIsAllOrNothing` fail
-if either half is dropped.
+`_unit_paths()` is the single answer to "what files does staging move", including replay sidecars and transcript archive segments. Restore instead consumes one manifest entry at a time and either returns every listed file in that session or leaves the entry staged; emptying calls `_unlisted_files()` before deletion. Those distinct seams keep a move, undo, or deletion from producing a half-session. `TestMoveTakesBothHalves` and `TestRestoreIsAllOrNothing` fail if either half is dropped.
 
 Restore is all-or-nothing per session for the same reason. A file whose original
 path is occupied again blocks its whole session from being restored — the occupant
@@ -97,46 +92,11 @@ the legacy stem fails instead of agreeing with itself.
 
 ## An instance that cannot see who is live must not reclaim
 
-The exclusion set comes from **this** instance's session map, but the kiro-cli
-replay store can be shared. When `KIROCREW_HOME` is overridden while `KIRO_HOME` is
-not — a dev gateway or a pod — this instance has its own map and the machine-wide
-store, so every session belonging to the default instance is missing from the map it
-consults: a resumable conversation reads as retired and could be staged and then
-emptied out from under a gateway this process cannot see.
+`reclaim_block_reason()` blocks an isolated data home whose replay store is outside that home: its local session map cannot establish ownership of the shared store. It compares resolved paths and requires containment rather than checking environment-variable presence or a default path, so an unsafe override that falls back to the shared default cannot appear isolated. The legacy pre-migration home is a default, not isolation. `reclaim_block_reason` defaults to `cached=False` so mutation gates like `_move_to_trash_locked` always evaluate the live co-tenant state; display aggregators (`measure()`) pass `cached=True` to reuse the recent co-tenant scan from `list_units()`.
 
-`reclaim_block_reason()` detects that configuration and `move_to_trash` refuses
-outright. Two things about how it decides:
+`cotenant_sids()` handles discoverable pod candidates differently. A pod with its own replay store cannot own files in this store. A candidate that claims sessions but has no own store, or whose map cannot be read or parsed, makes `move_to_trash()` refuse because it can resume a session after the pre-move snapshot. A dev gateway at an arbitrary data home is not discoverable and remains a Known Limitation.
 
-- It compares **resolved paths**, never whether the environment variables are set.
-  Both overrides are validated and silently fall back to the default when they name
-  an unsafe target, so `KIRO_HOME=/etc` beside an isolated `KIROCREW_HOME` leaves
-  the process on the shared store while a presence test reports it isolated.
-- It decides by **containment**, not by comparing the store against its default
-  location. Once the data home is isolated, the store must be that data home or live
-  inside it. A default-location test would pass the arrangement where sharing is
-  least visible: two isolated instances pointed at one *custom* `KIRO_HOME` see
-  neither the default store nor each other's maps.
-- The **legacy pre-migration home counts as a default**, not as isolation. An
-  install that has not yet migrated legitimately resolves to `~/.kirocrew`, and
-  treating that as an isolated instance refused every such install.
-- The refusal is **symmetric**. A default instance is also blocked when a
-  discoverable co-tenant shares its store: a pod isolates `KIROCREW_HOME` but
-  deliberately not `KIRO_HOME`, so each pod home under the pod root reads the
-  machine-wide replay store while keeping its own session map — and from the default
-  side, the pod's sessions read as retired. `_replay_store_cotenants()` enumerates
-  the pod root (host-side state at a known location) and the message names the
-  eviction command, because a refusal a user cannot act on is not better than the
-  hazard. A dev gateway pointed at some other `KIROCREW_HOME` is **not**
-  discoverable and remains a Known Limitation.
-
-Because that check reads real host state, tests must isolate `KIROCREW_POD_ROOT`
-alongside the homes, or their result depends on whether the machine happens to have
-pods.
-
-The freshness floor narrows the window but does not close it, since a session idle
-for a day is still resumable. Isolating both homes, or neither, is safe. The reason
-is surfaced in the report as `reclaim_blocked_reason` so a client can explain rather
-than offer an action that can only be refused.
+The freshness floor narrows the window but does not establish ownership, so the report exposes `reclaim_blocked_reason` for a client to explain rather than offering an action that `move_to_trash()` must refuse. Tests that inspect this host state isolate `KIROCREW_POD_ROOT` with the homes.
 
 ### The index is re-read after the scan, inside the lock
 
@@ -147,11 +107,35 @@ making the authority check the freshest view available. The two active sets are
 **unioned**, so a re-read can only ever add protection, and a re-read that fails
 refuses the operation rather than proceeding on the stale view.
 
-The residual window is now the move loop itself. A session mapped during it is still
-staged — but staged means *in the trash*, fully restorable, and destroying it needs a
-second explicit `empty`. Closing the window completely needs the session/slot writer
-and this module to share one lock; that is recorded in Known Limitations rather than
-implied away.
+The move loop then closes most of what the re-read cannot. Every source file is
+stat'd there anyway, to record its size in the manifest, and that same stat carries
+an mtime. A candidate qualified by being untouched for `MIN_RECLAIM_AGE_DAYS`, so a
+source whose mtime is newer than the instant the reclaim began has been written to
+since every read that certified it — which an idle session's file cannot be. The
+whole session is left in place, whatever already moved for it is rolled back, and it
+is named in `TrashBatch.revived` so the caller can report it. This costs no extra
+syscall: the detection rides on a stat the loop already performs.
+
+Naming a session in `revived` is a claim -- "this one was left where it was" -- so it
+is only made when the rollback actually completed. Putting a file back is
+deliberately non-overwriting, so the very resume that triggered the detection can
+have recreated an origin and made the rollback decline. Two things then have to hold
+before the call returns: whatever is still staged is **appended to the manifest**, so
+restore and empty can both reach it (safe because restore also moves exclusively, and
+therefore declines the origin the resume recreated rather than overwriting the live
+session with the stale copy); and the call **raises**, naming the batch, instead of
+reporting a revival that is not true. Everything that did move is still described by
+the manifest, so the partial batch stays restorable.
+
+The anchor is taken **before** the scan, not after the authority checks. Taken later
+it would miss a session resumed during the scan or between the index re-read and the
+loop, which is most of the elapsed time. Taking it early adds no false positives,
+because a candidate has to be untouched for `MIN_RECLAIM_AGE_DAYS` to qualify at all.
+
+Detection, not prevention: a session revived *after* its last file was stat'd and
+moved is still staged. The window is therefore the gap between one file's stat and
+its rename rather than the whole loop, and what lands in that gap lands in the
+trash — fully restorable, with destruction still needing a second explicit `empty`.
 
 ## What is reclaimable
 
@@ -309,19 +293,9 @@ its own payload.
 
 ### Manifests
 
-Every batch carries an append-only `manifest.jsonl`: a header line, then one line
-per session recording each file's staged path, original absolute path, and size.
-Restore reads origins from the manifest instead of reconstructing them, so a layout
-change in either store cannot send a restored file to the wrong place.
+Every new batch starts an append-only `manifest.jsonl`: a header line followed by one entry per staged session recording each file's relative staged path, original path, and size. `_append_entry()` flushes each entry, but it does not `fsync`, so the implementation does not promise device-persistent durability across a power loss. `_manifest_records()` retains every valid record it can read and ignores a trailing malformed record, while `_unlisted_files()` prevents deletion of files that no retained manifest entry names. `TestTrashAccounting::test_a_truncated_final_line_does_not_lose_the_batch` pins that recovery posture.
 
-Append-only is load-bearing twice over. A batch can span six figures of sessions,
-so rewriting a whole-document manifest per session would cost quadratic bytes; and
-an interruption leaves every completed line intact, so a partial batch stays
-restorable. A trailing partial line is skipped rather than failing the batch —
-`TestTrashAccounting::test_a_truncated_final_line_does_not_lose_the_batch`.
-
-A batch with no readable manifest is omitted from `list_trash()`: its files could
-not be put back, so offering it as restorable would be a false promise.
+A partial restore is the exception to append-only growth: `_rewrite_manifest()` writes a temporary replacement and uses `os.replace`. That gives readers the old or replacement pathname during the running filesystem operation, not a power-loss durability guarantee. A batch with no readable manifest is omitted from `list_trash()`: its files could not be put back, so offering it as restorable would be a false promise.
 
 **The directory is the batch's identity, not the manifest header.** A header
 claiming a different batch id would make a targeted empty delete the batch it named
@@ -373,6 +347,49 @@ with the link test removed: the live archive segment is enumerated as a batch an
 "empty everything"; naming that id explicitly is still refused.
 `empty_trash()` additionally re-resolves each target and confirms it is inside the
 trash root, so a tampered manifest cannot direct the delete outside it.
+
+Removal itself is `shutil.rmtree(batch, ignore_errors=True)`, one call per batch, so
+progress is reported per batch. That is coarser than the store this exists for deserves
+— one staged batch can hold tens of thousands of sessions, where "one batch done" is a
+single step from nothing to finished minutes later — and it is also unhardened against an
+ancestor directory swapped to a link mid-delete, since `rmtree` re-resolves the path it
+was given. Both are addressed by a descriptor-walk removal tracked separately: it is a
+security change with its own reasoning and its own review, and folding it into a progress
+fix put a bespoke security-critical surface inside a UX change.
+
+What the delete does add over a bare `rmtree` is honest REPORTING. The bytes freed are
+measured after the attempt and the survivors subtracted, because `ignore_errors=True`
+returns quietly when a locked file leaves the batch standing — the up-front figure would
+otherwise be reported as reclaimed with the bytes still on disk. And the batch's absence
+is checked as a post-condition, so a tree that could not be removed is reported as kept
+rather than counted as emptied.
+
+The byte figures come from the MANIFEST rather than from a directory walk. Callers reach
+the delete only after the unlisted-file guard has confirmed the batch holds nothing the
+manifest omits, so the manifest's own sums describe the whole batch — and a walk would be
+the unsafe way to learn the same number, because on Windows a junction is not a symlink
+(`os.path.islink` reports False for one), so a walk descends into it and would measure,
+and later delete, files outside the trash entirely.
+
+Every manifest name goes through one validator, `_plain_parts`, before it is stat'd or
+unlinked. Absoluteness is asked of the PATH in BOTH flavours rather than by comparing
+components against separator spellings: `PurePosixPath("//tmp/x").parts` is
+`("//", "tmp", "x")`, whose root a check against `"/"` misses, and an absolute path
+handed to `os.open` ignores `dir_fd` entirely; on Windows `..\x` is a parent reference
+and `C:\x` is absolute, neither of which POSIX parsing sees. A Windows DRIVE is refused
+separately from absoluteness, because they are different questions: `C:.ssh/id_rsa` is
+drive-relative and not absolute, yet joining it onto the batch replaces the anchor and
+resolves against that drive's working directory, so the size read would stat a file
+outside the batch and report its existence and size. Refusing any `.drive` also catches
+`c:y`, and as collateral refuses a POSIX file named `a:b` — accepted, since this store
+names its own files and the cost is a batch kept as incomplete rather than an escape.
+An embedded NUL is refused with no such trade, because no file name can hold one: a JSON
+manifest CAN carry `\u0000`, and `os` then raises `ValueError` rather than `OSError`, so
+it escaped the handler that is supposed to skip a bad name and aborted the delete partway
+through — leaving a batch half-removed. The one site that hands a manifest name to a
+syscall therefore catches `(OSError, ValueError)`: one unusable entry costs its own file
+and nothing more. The rule lives at the name because the version that wrote it inline at
+one call site left the sibling size read statting whatever the manifest said.
 
 Restore refuses a staged path that is a **symlink**, because `is_file()` follows
 links: one resolving inside the batch passes the `rel` validation, and moving it
@@ -431,9 +448,7 @@ ends of every record rather than acting on it:
   `Path("/a/b") / "/etc/passwd"` is `/etc/passwd` — joining an absolute string
   discards the base entirely, so an unchecked `rel` would let restore pick up any
   file on the host.
-- `_origin_path()` accepts an origin only inside the session or archive stores.
-  Restore *writes* to that path, so an unconstrained origin is an arbitrary-write
-  primitive: a tampered manifest could otherwise relocate a credential file.
+- `_canonical_origin()` derives the restore destination from `rel`; `_origin_path()` only validates the recorded origin before restore requires it to agree with that derived destination. A manifest cannot choose another in-store session file or an arbitrary host path as the write target.
 
 A record failing either check blocks its whole session, consistent with
 all-or-nothing restore. `TestManifestIsUntrusted` covers the absolute, traversing
@@ -452,20 +467,84 @@ SEL. Every non-2xx body carries a machine-readable `code`.
 | POST | `/api/system/session-storage/cleanup` | Stage sessions older than a threshold; `dry_run` reports without moving |
 | POST | `/api/system/session-storage/trash` | Stage an explicit selection of `uids`; reports `refused` per uid |
 | POST | `/api/system/session-storage/restore` | Return a batch, or named sessions within it |
-| POST | `/api/system/session-storage/empty` | Delete staged batches for good; needs `batch_ids` or `all: true` |
+| POST | `/api/system/session-storage/empty` | Start deleting staged batches for good; needs `batch_ids` or `all: true`. Answers **202** with a job |
+| GET | `/api/system/session-storage/empty` | The running or recently-finished empty, or `{"job": null}` |
 
 Rows are sorted biggest-first on the **units**, before the payload is built:
 sorting heterogeneous dicts does not type-check.
 
-The GET is uncached: it walks both stores, so it is meant to be fetched when a
-screen opens or after an action, not on a poll. Every operation is offloaded with
-`asyncio.to_thread` because a store reaching six figures of files is far too much
-filesystem work for the event loop.
+The collection GETs are not HTTP-cached and are not polling endpoints, but `measure()` and `list_units()` may reuse a short-lived process-local filesystem scan. `select_reclaimable()`, `move_to_trash()`, and the handler's `_classify()` pass an uncached read because a stale scan or co-tenant map must never decide a refusal. `invalidate_scan_cache()` runs after every mutation. `test_a_reclaim_does_not_select_against_a_cached_pass` and `test_the_pre_classification_never_reads_a_cached_cotenant_pass` pin that boundary.
+
+The dashboard handlers offload every store-accessing path with `asyncio.to_thread`; `kiro_crew.session_storage` itself is synchronous, so any other async caller must do the same. `GET .../empty` is the exception that can run on the event loop because it reads only process-local job counters and touches no store.
 
 Error codes: `restricted_session` (403), `unknown` (404, no such uid on the detail
 route), `invalid_body`, `invalid_threshold`, `cleanup_refused`, `invalid_batch`,
 `invalid_uid`, `invalid_selection`, `selection_too_large`, `nothing_specified`,
-`trash_refused`, `restore_refused`, `empty_refused` (400).
+`trash_refused`, `restore_refused`, `empty_refused` (400), `empty_in_progress`
+(409, an empty is already running — the body carries that job under `job`).
+
+### Emptying is a job, not a response
+
+Emptying tens of thousands of staged sessions is minutes of filesystem work. Holding
+the request open for it left a client unable to say anything during the run: the only
+irreversible operation in this surface, and no way to tell a running delete from a
+stuck one. So the POST resolves what it will destroy, starts the work, and answers
+202 with a job; progress is read from the GET.
+
+The job is process-local, single-slot and NOT persisted. A second empty is refused
+with 409 rather than queued (the storage mutation lock would serialize it anyway, and
+one "working" state for two operations says nothing about either), and a job that
+outlived its gateway would claim a delete is running when no thread is.
+
+Its shape is `job_id`, `running`, `total_bytes`, `freed_bytes`, `error`, `skipped`.
+`total_bytes` is what the staged manifests say the resolved batches hold — the same
+figure the trash listing showed — so it is a denominator, not a remeasurement.
+Progress is counted in BYTES, not sessions: the delete walks files and a session is
+more than one file.
+
+Two properties are load-bearing:
+
+* **The set is resolved at request time, under the mutation lock, not in the
+  worker.** `staged_targets()` takes the same lock staging holds, because
+  `list_trash()` does not: an unlocked read can see a batch whose directory and
+  manifest header exist while its sessions are still being moved in, and selecting
+  that id makes the delete wait for staging and then destroy the finished batch -
+  sessions the user never saw included. Under the lock a batch is either fully staged
+  or not visible. Explicit ids are resolved through `_batch_dir()` first, the way
+  every other caller resolves one: filtering the staged list alone silently dropped an
+  id that is not a batch, so the worker got an empty list and the caller was told a
+  delete it asked for had succeeded. A bad id is still a 400 `empty_refused`, and so is a well-formed id whose batch is
+  no longer staged: `_batch_dir()` does not require the directory to exist, and
+  filtering such an id out turned "destroy this" into a zero-byte success. `empty_trash(None)`
+  enumerates the trash when it runs, which is now well after the click and can queue
+  behind another mutation — so a batch staged in between would be destroyed although
+  the user never saw it, and a staged batch is the only copy of those sessions. The
+  handler resolves ids up front and hands the worker an explicit list. If that read
+  fails for `all: true` the job settles with a reason and deletes NOTHING; for an
+  explicit selection it proceeds, because the caller already named the set.
+* **A finished job stops being reported after `_JOB_TTL_SECONDS`.** The slot would
+  otherwise hold the last outcome for the life of the process and a screen would
+  present it as current days later. The cutoff is applied server-side, where the
+  clock is, so no client needs a timestamp.
+
+`skipped` carries `SKIP_*` reason codes for every batch that is still there
+afterwards, whether it was refused up front or survived its own delete: the delete
+checks as a POST-CONDITION that the directory is gone, because
+`rmtree(ignore_errors=True)` reports nothing and a tree it could not remove otherwise
+left the batch on screen under a job that said it had succeeded.
+
+`skipped` carries codes for batches deliberately KEPT. That is a
+refusal a user has to be told: keeping a batch raises nothing, so an outcome read
+only from the exception reported "0 bytes freed, success" above a batch still on
+screen, with the reason in a log the user cannot read.
+
+**The snapshot approves a name, not an object.** `staged_targets()` fixes WHICH batches
+an empty will destroy, under the mutation lock, so the worker cannot re-enumerate later
+and destroy a batch the user never saw. It returns ids, and an id is only a name: the lock
+is released for the async handoff, so a directory moved into an approved name would be
+deleted on consent given for a different one. Closing that needs the batch re-checked
+against a descriptor at delete time, which only works once removal goes through
+descriptors — so it travels with the descriptor-walk change rather than with this one.
 
 A selection larger than `_MAX_SELECTION` stages the **oldest** that many sessions
 and returns `remaining` rather than refusing. Refusing would dead-end the install
@@ -493,6 +572,13 @@ handler answers 400 `trash_refused` and nothing moves, with no per-uid breakdown
 That is the conservative direction (never a wrong move), but a client cannot
 distinguish it from a malformed request without reading the code, and retrying is
 the only recovery.
+
+A session that goes live *later still* — after the `refresh`, while the move loop is
+running — is not all-or-nothing. The loop's mtime check leaves that one session in
+place and the rest of the batch proceeds, and the handler folds each such uid into
+the same `refused` list under `in_use`. The mechanism differs from the pre-pass
+(caught by a stat during the move rather than by the index before it) but the reason
+a reader needs is identical, so it carries no new code.
 
 **The guarantee is not weakened.** `move_to_trash()` still re-reads the session map
 inside the mutation lock and still unions the active sets, so the pre-pass can only
@@ -551,47 +637,27 @@ instead of the trash over-deleting. `TestEmptyTrash` and
 
 ## Constants
 
-| Constant | Value | Location |
-|---|---|---|
-| `TRASH_DIR_NAME` / `TRASH_SESSIONS_LEAF` | `trash` / `sessions` | `session_storage.py` |
-| `STAGE_CLI_LEAF` / `STAGE_CREW_LEAF` | `cli` / `crew` | `session_storage.py` |
-| `MANIFEST_NAME` | `manifest.jsonl` | `session_storage.py` |
-| `MANIFEST_SCHEMA` | `1` | `session_storage.py` |
-| `BUCKET_DAYS` | `(7, 30, 90)` | `session_storage.py` |
-| `MIN_RECLAIM_AGE_DAYS` | `1.0` | `session_storage.py` |
-| `MUTATION_LOCK_NAME` | `session-storage.lock` | `session_storage.py` |
-| `ARCHIVE_SEGMENT_DELIMITER` | `__` | `history.py` |
-| `_MAX_SELECTION` | `200000` | `dashboard/handlers/session_storage.py` |
+`kiro_crew.session_storage` owns the trash layout, manifest schema, age policy, and mutation-lock constants; `kiro_crew.dashboard.handlers.session_storage` owns the request selection bound. Callers import those constants rather than duplicating their literals, so code and tests remain the source of truth when the policy changes.
 
 ## Known Limitations
 
-- **A residual race with session-map writes remains.** The authority check is
-  re-read after the scan and inside the reclaim lock, so the window is the move loop
-  rather than the whole scan, but the session map's writer does not take that lock. A
-  session mapped during the loop would still be staged. It stays restorable — nothing
-  is destroyed without a second explicit action — but closing this fully requires the
-  session/slot code and this module to share one lock, which is a wider change than
-  this surface.
+- **A much smaller residual race with session-map writes remains.** The authority
+  check is re-read after the scan and inside the reclaim lock, and the move loop then
+  rejects any source whose mtime is newer than the batch's validation instant, so a
+  session resumed *during* the loop is left in place and reported rather than staged.
+  What is left is detection, not prevention: the session map's writer still does not
+  take the reclaim lock, so a session revived between one file's stat and its rename
+  is staged anyway. That gap is microseconds rather than the whole loop, and it stays
+  restorable — nothing is destroyed without a second explicit action. Removing it
+  entirely still requires the session/slot code and this module to share one lock,
+  which is a wider change than this surface.
 - Reclaiming is offered both by age (`cleanup`) and by explicit selection
   (`trash`). Neither can take a session the map still lists, so targeting one large
   conversation only works if that conversation is unmapped.
 - The trash never expires. It grows until a user empties it, which means reclaiming
   space takes two deliberate actions rather than one.
-- `measure()` walks both stores on every call with no caching, so a store with
-  hundreds of thousands of files makes the endpoint slow to answer.
-- **Every mapped session is unreclaimable, and on a long-lived install that is most
-  of what a user recognises.** `active_sids` is `frozenset(mapping.values())`, so
-  being *paired* in the session map and being *resumable* are read as the same fact,
-  and nothing retires a map entry while its files exist. The invariant: a mapped
-  session is always refused as `resumable`, so the reclaimable space is dominated by
-  replay logs that never had a transcript half. A session is refused rather than
-  having its mapping cleaned up first, so a stale entry blocks reclaiming until
-  `SessionMap.prune()` removes it — and `prune()` checks `<sid>.json`, which kiro-cli
-  never deletes, so it rarely fires. Fixing this needs a retire-then-move ordering
-  with a crash-safe tombstone, so that an interruption leaves an ordinary orphan
-  rather than a map entry pointing at missing files. (For scale, one install measured
-  in 2026-08 had 121 mapped sessions holding 198 MB against 166,476 unpaired replay
-  logs holding 27.3 GB. Illustrative only — the ratio drifts as an install ages.)
+- `measure()` and `list_units()` may reuse a short-lived process-local scan, but the uncached selection and mutation paths still enumerate the stores; a large store remains expensive whenever a current answer is required.
+- **Every SID returned by `SessionMap.mapped_sids_by_key()` is unreclaimable.** `_build_index()` makes those SIDs `active_sids`, and `move_to_trash()` refuses active units. `SessionMap.prune()` clears a stale SID only after its metadata file is absent; reclamation cannot clean the mapping first because that would make an otherwise resumable session eligible. A safe retirement flow needs ordering that remains correct if the process stops between changing the map and staging the files.
 - The detail route reads whole files, so a client that calls it per row instead of on
   expand converts a cheap screen into a full scan of both stores.
 - A session's size counts its identifying `.json` / `.jsonl` pair and its transcript

@@ -886,6 +886,143 @@ class TestEndpoints:
             assert "entries" in (await resp2.json())
 
 
+class TestApiSkillsAgentScoping:
+    """#3348: GET /api/skills?agent=<name> scopes the listing to that
+    agent's own skill:// mapping, instead of the chat `$` picker always
+    showing the unfiltered global catalog regardless of the active agent
+    template."""
+
+    @pytest.fixture(autouse=True)
+    def _redirect_agents_dir(self, fake_home, monkeypatch):
+        """Point agent discovery at the fixture home's agents dir.
+
+        ``_KIRO_AGENTS_DIR`` is computed at import time from the real home, so
+        this module's ``fake_home`` (which patches only ``HOME`` and
+        ``Path.home``) does not redirect the default-argument lookup that
+        ``agent_skill_globs`` performs — leaving it to read the operator's real
+        ``~/.kiro/agents``, return ``[]``, and skip the filter entirely. Mirrors
+        the same override in ``test_agent_template_skills.py``'s fixture.
+        """
+        monkeypatch.setattr(
+            "kiro_crew.agent_discovery._KIRO_AGENTS_DIR",
+            fake_home / ".kiro" / "agents",
+        )
+
+    @staticmethod
+    def _state() -> MagicMock:
+        from kiro_crew.skills import SkillsLoader
+
+        # A real SkillsLoader, not a bare MagicMock: `_get_skills` treats
+        # `hasattr(state, "_standalone_skills")` as "already built", but a
+        # MagicMock auto-vivifies ANY attribute access as truthy, so an
+        # unseeded MagicMock state silently returns a mock in place of the
+        # loader — collect_skills_blocking then serializes that mock into
+        # the response and 500s. Matches the pattern already used above for
+        # api_skill_detail's fake state.
+        state = MagicMock(_slots={}, context_builder=None)
+        state._standalone_skills = SkillsLoader(install_builtins=False)
+        return state
+
+    @pytest.mark.asyncio
+    async def test_agent_with_an_explicit_mapping_sees_only_its_own_skills(self, fake_home):
+        _write_skill(fake_home / ".kiro" / "skills", "alpha")
+        _write_skill(fake_home / ".kiro" / "skills", "beta")
+        agents_dir = fake_home / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "custom.json").write_text(json.dumps({
+            "name": "custom",
+            "resources": ["skill://~/.kiro/skills/alpha/SKILL.md"],
+        }))
+
+        async with TestClient(TestServer(_make_app(self._state()))) as client:
+            resp = await client.get("/api/skills", params={"agent": "custom"})
+            assert resp.status == 200
+            payload = await resp.json()
+        # #6028: an applied agent filter answers with the scoped envelope —
+        # the arrays alone are byte-identical to the legacy shape, so this
+        # flag is the ONLY way the picker can cue that filtering happened.
+        assert payload["agent_scoped"] is True
+        assert payload["agent"] == "custom"
+        assert {s["name"] for s in payload["skills"]} == {"alpha"}
+
+    @pytest.mark.asyncio
+    async def test_scoped_envelope_is_kept_when_the_mapping_matches_nothing(self, fake_home):
+        """#6028: an agent whose skill:// mapping resolves to zero listed
+        skills still gets the envelope (``skills: []``, ``agent_scoped``
+        true). This is the empty state the picker must attribute to the
+        MAPPING ("no skills mapped to this agent"), not to the catalog
+        ("no skills exist") — without the flag both are a bare ``[]``."""
+        _write_skill(fake_home / ".kiro" / "skills", "alpha")
+        agents_dir = fake_home / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "custom.json").write_text(json.dumps({
+            "name": "custom",
+            "resources": ["skill://~/.kiro/skills/gamma/SKILL.md"],
+        }))
+
+        async with TestClient(TestServer(_make_app(self._state()))) as client:
+            resp = await client.get("/api/skills", params={"agent": "custom"})
+            assert resp.status == 200
+            payload = await resp.json()
+        assert payload["agent_scoped"] is True
+        assert payload["agent"] == "custom"
+        assert payload["skills"] == []
+
+    @pytest.mark.asyncio
+    async def test_agent_without_an_explicit_mapping_sees_everything(self, fake_home):
+        """An agent with NO skill:// resources of its own (empty
+        ``agent_skill_globs``) must keep the unfiltered, legacy
+        all-or-nothing listing — the majority of agents that never
+        customized their skill set must not lose access just because a
+        DIFFERENT, customized agent exists on the same install."""
+        _write_skill(fake_home / ".kiro" / "skills", "alpha")
+        _write_skill(fake_home / ".kiro" / "skills", "beta")
+        agents_dir = fake_home / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "plain.json").write_text(json.dumps({"name": "plain"}))
+        (agents_dir / "custom.json").write_text(json.dumps({
+            "name": "custom",
+            "resources": ["skill://~/.kiro/skills/alpha/SKILL.md"],
+        }))
+
+        async with TestClient(TestServer(_make_app(self._state()))) as client:
+            resp = await client.get("/api/skills", params={"agent": "plain"})
+            assert resp.status == 200
+            payload = await resp.json()
+        # No filter applied → the legacy bare-array shape, no envelope: the
+        # picker must render this with zero scope cues (#6028).
+        assert isinstance(payload, list)
+        assert {s["name"] for s in payload} == {"alpha", "beta"}
+
+    @pytest.mark.asyncio
+    async def test_unknown_agent_name_sees_everything(self, fake_home):
+        _write_skill(fake_home / ".kiro" / "skills", "alpha")
+        async with TestClient(TestServer(_make_app(self._state()))) as client:
+            resp = await client.get("/api/skills", params={"agent": "does-not-exist"})
+            assert resp.status == 200
+            payload = await resp.json()
+        assert isinstance(payload, list)
+        assert {s["name"] for s in payload} == {"alpha"}
+
+    @pytest.mark.asyncio
+    async def test_no_agent_param_is_unfiltered_as_before(self, fake_home):
+        _write_skill(fake_home / ".kiro" / "skills", "alpha")
+        _write_skill(fake_home / ".kiro" / "skills", "beta")
+        agents_dir = fake_home / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "custom.json").write_text(json.dumps({
+            "name": "custom",
+            "resources": ["skill://~/.kiro/skills/alpha/SKILL.md"],
+        }))
+
+        async with TestClient(TestServer(_make_app(self._state()))) as client:
+            resp = await client.get("/api/skills")
+            assert resp.status == 200
+            payload = await resp.json()
+        assert isinstance(payload, list)
+        assert {s["name"] for s in payload} == {"alpha", "beta"}
+
+
 class TestSessionScopedSkillResolution:
     """#2457: kiro-workspace/ resolution is scoped to the requesting chat slot.
 
@@ -969,3 +1106,130 @@ class TestSessionScopedSkillResolution:
             assert keyed.status == 200
             keyless = await client.get(path)
             assert keyless.status == 404  # two projects, no key -> fail closed
+
+    @pytest.mark.asyncio
+    async def test_app_skill_catalog_requires_positive_slot_ownership(
+        self, fake_home, tmp_path, monkeypatch
+    ):
+        """An app permission is not authority to select another app's project.
+
+        The session header chooses which project contributes workspace skill
+        metadata. An app caller must therefore own that exact slot; a foreign,
+        unscoped, missing, or absent slot key is indistinguishable from missing.
+        """
+        from kiro_crew.dashboard.handlers import prompts
+
+        project = tmp_path / "foreign-project"
+        _write_skill(
+            project / ".kiro" / "skills",
+            "foreign-skill",
+            description="foreign metadata",
+        )
+        state = MagicMock(
+            _slots={
+                "foreign": MagicMock(project=str(project), _app="app-B"),
+                "unscoped": MagicMock(project=str(project), _app=""),
+                "owned": MagicMock(project=str(project), _app="app-A"),
+            },
+            context_builder=None,
+        )
+        audit = MagicMock()
+        monkeypatch.setattr(prompts, "_sel", lambda: audit)
+        monkeypatch.setattr(
+            prompts,
+            "collect_skills_blocking",
+            lambda _skills, _package, project_dir: [
+                {"key": "kiro-workspace/foreign-skill", "project": str(project_dir)}
+            ],
+        )
+        app = _make_app(state)
+
+        @web.middleware
+        async def inject_app(request, handler):
+            request["app"] = "app-A"
+            return await handler(request)
+
+        app.middlewares.insert(0, inject_app)
+        async with TestClient(TestServer(app)) as client:
+            for session_key in ("foreign", "unscoped", "missing", ""):
+                headers = {"X-Session-Key": session_key} if session_key else {}
+                response = await client.get("/api/skills", headers=headers)
+                assert response.status == 404, session_key
+                assert (await response.json())["code"] == "slot_not_found"
+
+            response = await client.get("/api/skills", headers={"X-Session-Key": "owned"})
+            assert response.status == 200
+            assert "kiro-workspace/foreign-skill" in {row["key"] for row in await response.json()}
+
+        denied = [
+            call
+            for call in audit.log_api_access.call_args_list
+            if call.kwargs.get("outcome") == "denied"
+        ]
+        assert len(denied) == 4
+        assert all(call.kwargs["source"] == "app_isolation" for call in denied)
+        allowed = [
+            call
+            for call in audit.log_api_access.call_args_list
+            if call.kwargs.get("outcome") == "allowed"
+        ]
+        assert len(allowed) == 1
+        assert allowed[0].kwargs == {
+            "caller": "app-A",
+            "operation": "skills_list",
+            "outcome": "allowed",
+            "source": "app_isolation",
+            "resources": "slot=owned",
+        }
+
+    @pytest.mark.asyncio
+    async def test_app_projectless_slot_cannot_fall_back_to_foreign_project(
+        self, fake_home, tmp_path, monkeypatch
+    ):
+        """An owned slot without a project must not inherit another slot's project."""
+        from kiro_crew.dashboard.handlers import api_skill_detail, prompts
+        from kiro_crew.skills import SkillsLoader
+
+        project = tmp_path / "foreign-project"
+        _write_skill(project / ".kiro" / "skills", "foreign-skill")
+        state = MagicMock(
+            _slots={
+                "foreign": MagicMock(project=str(project), _app="app-B"),
+                "owned-projectless": MagicMock(
+                    project="", project_dir="", _app="app-A"
+                ),
+            },
+            context_builder=None,
+        )
+        state._standalone_skills = SkillsLoader(install_builtins=False)
+        audit = MagicMock()
+        monkeypatch.setattr(prompts, "_sel", lambda: audit)
+        app = _make_app(state)
+        app.router.add_get("/api/skills/{name:.+}", api_skill_detail)
+
+        @web.middleware
+        async def inject_app(request, handler):
+            request["app"] = "app-A"
+            return await handler(request)
+
+        app.middlewares.insert(0, inject_app)
+        headers = {"X-Session-Key": "owned-projectless"}
+        paths = (
+            "/api/skills",
+            "/api/skills/kiro-workspace/foreign-skill/-/tree",
+            "/api/skills/kiro-workspace/foreign-skill/-/file?path=SKILL.md",
+            "/api/skills/kiro-workspace/foreign-skill",
+        )
+        async with TestClient(TestServer(app)) as client:
+            for path in paths:
+                response = await client.get(path, headers=headers)
+                assert response.status == 404, path
+                assert (await response.json())["code"] == "slot_not_found"
+
+        denied = [
+            call
+            for call in audit.log_api_access.call_args_list
+            if call.kwargs.get("outcome") == "denied"
+        ]
+        assert len(denied) == len(paths)
+        assert all(call.kwargs["source"] == "app_isolation" for call in denied)

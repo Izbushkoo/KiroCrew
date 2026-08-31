@@ -30,6 +30,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_KIRO
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import KiroCrewAgentConfig
 from kiro_crew.messaging.link import ChannelLink
@@ -38,6 +39,7 @@ from kiro_crew.session import (
     _STUCK_TURN_REPORT_SECS,
     BACKGROUND_KEY,
     HEARTBEAT_KEY,
+    FirstTurnState,
     SessionManager,
     _context_pct_is_unknown,
     _model_fallback,
@@ -259,7 +261,7 @@ class TestAdoptProvider:
             prev_turn_cancelled=True,
             provider_switch_replay=True,
             needs_context_reinjection=True,
-            resumed_armed=True,
+            first_turn=FirstTurnState.RESUMED,
         )
 
         sess.adopt_provider(new)
@@ -270,9 +272,25 @@ class TestAdoptProvider:
         assert sess.prev_turn_cancelled is False
         assert sess.provider_switch_replay is False
         assert sess.needs_context_reinjection is False
-        assert sess.resumed_armed is False, "a replacement is fresh, not resumed"
+        assert sess.first_turn is FirstTurnState.FRESH, "a replacement is fresh, not resumed"
         assert sess.agent == "researcher"
         assert sess.approval_policy == "auto"
+
+    @pytest.mark.parametrize(
+        "start", [FirstTurnState.NOTHING_ARMED, FirstTurnState.FRESH]
+    )
+    def test_non_resumed_first_turn_states_survive_adoption(self, start) -> None:
+        """Only the RESUMED half of the observation is stale on a replacement.
+        The production caller recycles a mid-life, already-claimed session
+        (NOTHING_ARMED): re-arming it here would make the next turn report
+        ``is_new=True`` and re-inject Kiro Crew history onto a live
+        transcript — the exact failure shape the one-shot state exists to
+        prevent."""
+        sess = _Session(provider=_stub_provider(), first_turn=start)
+
+        sess.adopt_provider(_stub_provider())
+
+        assert sess.first_turn is start
 
 
 # ── _ProviderBgSession ───────────────────────────────────────────────────────
@@ -367,8 +385,11 @@ class TestProviderBgSession:
 
 class TestGetBgSessionNonKiro:
     @pytest.mark.asyncio
-    async def test_non_kiro_backend_gets_the_provider_backed_adapter(self, cfg) -> None:
-        cfg.agent.provider = "claude_code"
+    async def test_non_runtime_backend_gets_the_provider_backed_adapter(self, cfg) -> None:
+        # A backend the multiplexed AcpRuntime cannot serve must fall through
+        # to the provider path even though agent.provider is still "acp" (a
+        # one-member enum) — dispatch is keyed on acp_backend, not provider.
+        cfg.agent.acp_backend = ACP_BACKEND_CLAUDE
         mgr = SessionManager(cfg)
         sess = _register(mgr, BACKGROUND_KEY, provider=_StreamingProvider())
 
@@ -382,12 +403,35 @@ class TestGetBgSessionNonKiro:
     async def test_missing_background_session_is_a_named_error(self, cfg) -> None:
         """Silently returning None here surfaces much later as an
         AttributeError inside a chat-title turn."""
-        cfg.agent.provider = "bedrock"
+        cfg.agent.acp_backend = ACP_BACKEND_CLAUDE
         mgr = SessionManager(cfg)
 
         with patch.object(mgr, "_ensure_background", AsyncMock()):
             with pytest.raises(RuntimeError, match="background session unavailable"):
                 await mgr.get_bg_session()
+
+    @pytest.mark.asyncio
+    async def test_provider_path_retires_a_drained_runtime_left_by_a_switch(self, cfg) -> None:
+        """After a switch to a backend the runtime cannot serve, the runtime
+        branch is never taken again — so the provider path itself must finish
+        a retirement that refresh_defaults deferred while handles were live."""
+        cfg.agent.acp_backend = ACP_BACKEND_CLAUDE
+        mgr = SessionManager(cfg)
+        _register(mgr, BACKGROUND_KEY, provider=_StreamingProvider())
+
+        stranded = AsyncMock()
+        stranded.acp_backend = ACP_BACKEND_KIRO  # spawned before the switch
+        stranded.has_active_or_initializing_sessions = lambda: False
+        stranded.kill = AsyncMock()
+        stranded.pid = 555
+        mgr._bg_runtime = stranded
+
+        with patch.object(mgr, "_ensure_background", AsyncMock()):
+            handle = await mgr.get_bg_session()
+
+        assert isinstance(handle, _ProviderBgSession)
+        stranded.kill.assert_awaited_once()
+        assert mgr._bg_runtime is None
 
 
 # ── Registry reads ───────────────────────────────────────────────────────────
@@ -550,21 +594,21 @@ class TestRemoveIfUnclaimed:
 
     @pytest.mark.asyncio
     async def test_a_consumed_session_is_kept(self, mgr) -> None:
-        sess = _register(mgr, "dashboard:1", is_new=False)
+        sess = _register(mgr, "dashboard:1", first_turn=FirstTurnState.NOTHING_ARMED)
         assert await mgr.remove_if_unclaimed("dashboard:1") is False
         assert mgr._sessions["dashboard:1"] is sess
         sess.provider.shutdown.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_session_mid_turn_is_kept(self, mgr) -> None:
-        sess = _register(mgr, "dashboard:1", is_new=True)
+        sess = _register(mgr, "dashboard:1", first_turn=FirstTurnState.FRESH)
         await sess.semaphore.acquire()
         assert await mgr.remove_if_unclaimed("dashboard:1") is False
         assert "dashboard:1" in mgr._sessions
 
     @pytest.mark.asyncio
     async def test_an_unclaimed_session_is_shut_down_and_forgotten(self, mgr) -> None:
-        sess = _register(mgr, "dashboard:1", is_new=True)
+        sess = _register(mgr, "dashboard:1", first_turn=FirstTurnState.FRESH)
         mgr._compact_cooldown_until["dashboard:1"] = 123.0
         mgr.set_origin_link("dashboard:1", ChannelLink(channel_type="dashboard"))
 
@@ -574,6 +618,19 @@ class TestRemoveIfUnclaimed:
         assert "dashboard:1" not in mgr._compact_cooldown_until
         assert mgr.get_origin_link("dashboard:1") is None
         sess.provider.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_an_unclaimed_session_unlinks_its_queued_temp_files(
+        self, mgr, tmp_path
+    ) -> None:
+        img = tmp_path / "img.png"
+        img.write_bytes(b"fake")
+        sess = _register(mgr, "dashboard:1", first_turn=FirstTurnState.FRESH)
+        sess.queue.append(("ts1", "queued", {"image_temp_paths": [str(img)]}))
+
+        assert await mgr.remove_if_unclaimed("dashboard:1") is True
+
+        assert not img.exists()
 
 
 class TestRecycleHeartbeat:

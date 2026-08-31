@@ -245,9 +245,13 @@ describe('useWebSocket frame router', () => {
     }
   })
 
-  it('applies the yolo and channel-trust side channels riding a slots frame', () => {
+  it('applies slots-frame side channels without discarding dashboard status', () => {
     const { ws } = mount()
     act(() => {
+      ws.simulateMessage({
+        type: 'dashboard',
+        data: { version: '1.0.0', yolo: false, yolo_duration: 'until_shutdown' },
+      })
       ws.simulateMessage({
         type: 'slots',
         data: [slotFixture(ACTIVE)],
@@ -257,6 +261,7 @@ describe('useWebSocket frame router', () => {
     })
     expect(dash().slots.map(s => s.key)).toEqual([ACTIVE])
     expect(dash().approvalMode).toBe('yolo')
+    expect(dash().status).toMatchObject({ yolo: true, yolo_duration: 'until_shutdown' })
     expect(dash().channelTrusted).toBe(true)
   })
 
@@ -630,7 +635,7 @@ describe('useWebSocket frame router', () => {
       })
     })
     expect(chat().folderSuggestions[ACTIVE]).toEqual({
-      folderId: 'f1', folderName: 'Reviews', breadcrumb: 'Work / Reviews', ts: 12,
+      folderId: 'f1', folderName: 'Reviews', breadcrumb: 'Work / Reviews', ts: 12, turns: 0,
     })
 
     act(() => {
@@ -660,6 +665,8 @@ describe('useWebSocket frame router', () => {
       ws.simulateMessage({ type: 'subagent_chunk', data: { slot: ACTIVE, id: 'ag-1', text: 'partial ' } })
       ws.simulateMessage({ type: 'subagent_tool', data: { slot: ACTIVE, id: 'ag-1', tool: 'fs_read', tool_count: 2 } })
     })
+    // Subagent chunks are now buffered and flushed per animation frame (PR #5945).
+    act(() => { const pending = rafCbs; rafCbs = []; pending.forEach(cb => cb(0)) })
     expect(chat().subagents['ag-1']?.streaming).toBe('partial ')
     expect(chat().subagents['ag-1']?.lastTool).toBe('fs_read')
 
@@ -977,6 +984,26 @@ describe('useWebSocket frame router', () => {
     // Draining the last chunk stops the playing indicator.
     act(() => { MockAudio.instances[1].onended?.() })
     expect(chat().voicePlaying).toBe(false)
+  })
+
+  it('uses the WAV MIME type supplied with a local voice chunk', async () => {
+    const blobs: Blob[] = []
+    URL.createObjectURL = vi.fn((blob: Blob) => {
+      blobs.push(blob)
+      return 'blob:voice-wav'
+    })
+    vi.stubGlobal('Audio', MockAudio)
+    const { ws } = mount()
+
+    await act(async () => {
+      ws.simulateMessage({
+        type: 'voice_chunk',
+        data: { slot: ACTIVE, audio: btoa('wav'), audioMime: 'audio/wav' },
+      })
+    })
+
+    expect(blobs).toHaveLength(1)
+    expect(blobs[0].type).toBe('audio/wav')
   })
 
   it('advances past a chunk whose audio element errors', async () => {

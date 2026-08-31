@@ -5,7 +5,7 @@
  * of them resolve their options through `./config` — the single place the
  * look/behavior of code and diff rendering is decided.
  */
-import { useMemo } from 'react'
+import { useId, useMemo } from 'react'
 import type { BaseCodeOptions, FileContents, SupportedLanguages } from '@pierre/diffs'
 import { EXTENSION_TO_FILE_FORMAT, parsePatchFiles, setCustomExtension } from '@pierre/diffs'
 import { File, FileDiff, MultiFileDiff, Virtualizer, WorkerPoolContext } from '@pierre/diffs/react'
@@ -14,6 +14,7 @@ import { useIsDark } from '../hooks/useIsDark'
 import { PlainCodeFallback } from './PlainCodeFallback'
 import {
   PIERRE_EXTENSION_OVERRIDES,
+  PIERRE_REGEX_ENGINE,
   PIERRE_THEMES,
   PIERRE_VIRTUALIZER_CONFIG,
   PIERRE_WORKER_POOL_SIZE,
@@ -64,11 +65,22 @@ export function fenceLanguage(tag?: string): SupportedLanguages {
  *  NAME and caches highlight results by it, so two renders of the same file
  *  name with different text (a streaming patch, a live-edited buffer) would
  *  serve the first render's cached tokens forever. Keying on content keeps the
- *  cache correct while still deduping identical re-renders. */
-export function contentCacheKey(name: string, contents: string): string {
+ *  cache correct while still deduping identical re-renders.
+ *
+ *  `surface` identifies the MOUNTED SURFACE INSTANCE for the churn accounting
+ *  ONLY — it never enters the returned key, so cache identity is unchanged. It
+ *  must be instance-qualified (each caller prefixes a React `useId()`), because
+ *  every content-derived proxy identity admits collisions: a filename conflates
+ *  a diff's two sides, and a surface KIND still conflates two same-named fences
+ *  rendered independently. Only the component instance is the true unit of
+ *  tokenization — two instances can never share a `useId`, while a streaming
+ *  block is one instance re-rendering, so churn attribution is exact in both
+ *  directions. */
+export function contentCacheKey(name: string, contents: string, _surface = 'file'): string {
   let h = 5381
   for (let i = 0; i < contents.length; i++) h = ((h << 5) + h + contents.charCodeAt(i)) | 0
-  return `${name}:${contents.length}:${(h >>> 0).toString(36)}`
+  const key = `${name}:${contents.length}:${(h >>> 0).toString(36)}`
+  return key
 }
 
 /** Rewrites hand-written patches into ones Pierre's parser accepts.
@@ -238,7 +250,7 @@ const workerPool = typeof window === 'undefined' || typeof Worker === 'undefined
             type: 'module',
           }),
       },
-      highlighterOptions: { theme: PIERRE_THEMES },
+      highlighterOptions: { theme: PIERRE_THEMES, preferredHighlighter: PIERRE_REGEX_ENGINE },
     })
 
 /** Hands every descendant the shared pool. Exported because the editor surface
@@ -264,6 +276,10 @@ export function PierreCodeImpl({ file, options, className, langHint, scrollClass
   scrollClassName?: string
 }) {
   const dark = useIsDark()
+  // Instance identity for churn accounting: two independently mounted blocks —
+  // even with identical fence names — must never share an identity, while this
+  // one instance re-rendering with streamed content must keep its own.
+  const surfaceId = useId()
   const resolved = useMemo(
     () => pierreFileOptions({ themeType: pierreThemeType(dark), ...options }),
     [dark, options],
@@ -272,8 +288,8 @@ export function PierreCodeImpl({ file, options, className, langHint, scrollClass
     const withLang = file.lang || !langHint ? file : { ...file, lang: fenceLanguage(langHint) }
     return withLang.cacheKey
       ? withLang
-      : { ...withLang, cacheKey: contentCacheKey(withLang.name, withLang.contents) }
-  }, [file, langHint])
+      : { ...withLang, cacheKey: contentCacheKey(withLang.name, withLang.contents, surfaceId + ':file') }
+  }, [file, langHint, surfaceId])
   const code = <File className={className} file={resolvedFile} options={resolved} />
   return (
     <PierreShell>
@@ -291,6 +307,7 @@ export function PierrePatchImpl({ patch, options, className, renderHeaderMetadat
   renderHeaderMetadata?: () => React.ReactNode
 }) {
   const dark = useIsDark()
+  const surfaceId = useId()
   const resolved = useMemo(
     () => pierreDiffOptions({ themeType: pierreThemeType(dark), ...options }),
     [dark, options],
@@ -311,13 +328,13 @@ export function PierrePatchImpl({ patch, options, className, renderHeaderMetadat
           const prev = f.prevName.slice(2)
           f.prevName = prev === f.name ? undefined : prev
         }
-        f.cacheKey = contentCacheKey(f.name ?? '', patch)
+        f.cacheKey = contentCacheKey(f.name ?? '', patch, surfaceId + ':patch')
       }
       return parsed
     } catch {
       return []
     }
-  }, [patch])
+  }, [patch, surfaceId])
   // Zero files is an outright parse failure. Zero HUNKS across every file is
   // the subtler one: Pierre reads that as a pure rename and draws a header with
   // `+0 −0` and no rows — so when the raw text plainly carries changes, treat
@@ -358,6 +375,7 @@ export function PierreFilePairImpl({ oldFile, newFile, options, className, rende
   renderHeaderFilenameSuffix?: () => React.ReactNode
 }) {
   const dark = useIsDark()
+  const surfaceId = useId()
   const resolved = useMemo(
     () => pierreDiffOptions({ themeType: pierreThemeType(dark), ...options }),
     [dark, options],
@@ -366,12 +384,12 @@ export function PierreFilePairImpl({ oldFile, newFile, options, className, rende
   // happen from our call sites (DiffPanel banners the identical case away and
   // new/deleted files carry one side), but the type demands the narrowing.
   const keyedOld = useMemo(
-    () => (oldFile ? { ...oldFile, cacheKey: contentCacheKey(oldFile.name, oldFile.contents) } : null),
-    [oldFile],
+    () => (oldFile ? { ...oldFile, cacheKey: contentCacheKey(oldFile.name, oldFile.contents, surfaceId + ':diff-old') } : null),
+    [oldFile, surfaceId],
   )
   const keyedNew = useMemo(
-    () => (newFile ? { ...newFile, cacheKey: contentCacheKey(newFile.name, newFile.contents) } : null),
-    [newFile],
+    () => (newFile ? { ...newFile, cacheKey: contentCacheKey(newFile.name, newFile.contents, surfaceId + ':diff-new') } : null),
+    [newFile, surfaceId],
   )
   if (!keyedOld && !keyedNew) return null
   const input = (keyedOld && keyedNew

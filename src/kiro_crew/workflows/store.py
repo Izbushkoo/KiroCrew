@@ -40,6 +40,8 @@ except ImportError:  # pragma: no cover - config layer optional for standalone e
 
 logger = logging.getLogger(__name__)
 
+WORKFLOW_LIBRARY_DIR_NAME = "workflow_library"
+
 # Default subdirectory under the resolved workflows dir.
 _RUNS_SUBDIR = "runs"
 
@@ -62,6 +64,11 @@ def default_workflows_dir() -> Path:
         except Exception:  # noqa: BLE001 - config optional / may not declare the key yet
             logger.debug("workflows.dir config lookup failed; using default", exc_info=True)
     return config_dir() / "workflows"
+
+
+def default_workflow_library_dir() -> Path:
+    """Return the agent-protected global definition-library directory."""
+    return config_dir() / WORKFLOW_LIBRARY_DIR_NAME
 
 
 def _redact(obj):
@@ -116,7 +123,11 @@ class WorkflowRunStore:
         if not run_id or not self._ensure_dir():
             return
         try:
-            payload = json.dumps(_redact(store_json), default=str)
+            redacted = _redact(store_json)
+            redacted["source_is_original"] = bool(store_json.get("source_is_original")) and (
+                redacted.get("source") == store_json.get("source")
+            )
+            payload = json.dumps(redacted, default=str)
         except Exception:  # noqa: BLE001
             logger.debug("workflow store: serialize failed for %s", run_id, exc_info=True)
             return
@@ -126,7 +137,16 @@ class WorkflowRunStore:
             tmp.write_text(payload, encoding="utf-8")
             os.replace(tmp, path)  # atomic on POSIX
             try:
-                os.chmod(path, 0o600)
+                # POSIX tightening only, deliberately still NOT
+                # ``platform_compat.restrict_to_owner``: on POSIX that helper IS
+                # this exact call, so a swap would add only the Windows
+                # owner-only DACL — and ``save`` runs on the event loop via the
+                # registry's persist hooks, where a DACL write to a UNC or
+                # mapped-drive path costs an unbounded SMB round-trip. The
+                # payload is already passed through ``_redact`` above, so
+                # what a wider Windows DACL could expose is the redacted
+                # run record, not credentials. Tracked in #6359.
+                os.chmod(path, 0o600)  # lockdown-ok: #5228 -- unbounded SMB round-trip on the loop
             except OSError:
                 pass
         except Exception:  # noqa: BLE001 - persistence must never break a run

@@ -29,7 +29,6 @@ src/apps/crew-companion/useWalking.ts 28.3   # 17/60
 src/apps/design-critique/api.ts 0.0   # 0/30
 src/apps/issue-radar/components/PrFiltersSection.tsx 0.0   # 0/16
 src/apps/issue-radar/components/ReviewButton.tsx 0.0   # 0/17
-src/apps/issue-radar/lib/agentSession.ts 16.4   # 9/55
 src/apps/issue-radar/views/ComingSoon.tsx 0.0   # 0/2
 src/apps/issue-radar/views/OverviewView.tsx 29.5   # 23/78
 src/apps/issue-radar/views/SettingsView.tsx 0.0   # 0/3
@@ -64,13 +63,10 @@ src/apps/pptx-maker/api.ts 3.5   # 2/57
 src/apps/spec-builder/components/ChatColumn.tsx 0.0   # 0/2
 src/apps/workflows/WorkflowRunTree.tsx 3.4   # 1/29
 src/apps/workflows/WorkflowSourcePanel.tsx 4.7   # 2/43
-src/apps/workflows/WorkflowsRuns.tsx 35.5   # 22/62
 src/components/AddJobSplitButton.tsx 66.7   # 2/3
 src/components/AppIcon.tsx 51.1   # 24/47
 src/components/BottomTerminalPanel.tsx 55.1   # 49/89
-src/components/ChatPane.tsx 69.0   # 100/145
 src/components/CommentThreadPopover.tsx 59.0   # 46/78
-src/components/EmbeddedDragRegionReporter.tsx 13.9   # 5/36
 src/components/ExecutionsView.tsx 48.8   # 20/41
 src/components/FileArtifactComments.tsx 52.0   # 52/100
 src/components/GitPanel.tsx 0.0   # 0/44
@@ -81,14 +77,11 @@ src/components/SessionPulseSurveyCard.tsx 47.9   # 34/71
 src/components/Strands.tsx 52.2   # 71/136
 src/components/folderColorPaint.ts 0.0   # 0/4
 src/components/notifications/NotificationDetailPanel.tsx 43.2   # 16/37
-src/hooks/sceneCanvas.ts 39.1   # 18/46
-src/hooks/useAgentSync.ts 0.0   # 0/31
 src/hooks/useArtifactFolders.ts 29.6   # 8/27
 src/hooks/useBottomTerminal.ts 66.3   # 65/98
 src/hooks/useCronActions.ts 31.0   # 9/29
 src/hooks/usePopoutSync.ts 0.0   # 0/51
 src/hooks/useQuickSearchShortcut.ts 40.5   # 17/42
-src/hooks/useSSE.ts 0.0   # 0/32
 src/hooks/useStreamingStt.ts 73.3   # 154/210
 src/lib/disintegrate.ts 0.0   # 0/54
 src/lib/embedded.ts 75.0   # 3/4
@@ -98,7 +91,6 @@ src/pages/MigrationPage.tsx 0.0   # 0/38
 src/pages/chat/KnowledgePicker.tsx 0.0   # 0/23
 src/pages/chat/PinnedPrompt.tsx 3.5   # 2/57
 src/pages/chat/SidePanel.tsx 69.3   # 124/179
-src/pages/chat/WorkflowProgressBar.tsx 51.2   # 22/43
 src/pages/overview/EmbeddingModelCard.tsx 58.7   # 64/109
 src/pages/overview/MemoryGraphTab.tsx 68.3   # 97/142
 src/pages/overview/PortabilityTab.tsx 0.0   # 0/60

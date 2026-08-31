@@ -4,11 +4,13 @@ sessions/provider/context."""
 
 from __future__ import annotations
 
+import contextlib
 from types import SimpleNamespace
 
 import pytest
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, AcpEvent
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.teams.client import TeamsInbound
 from kiro_crew.teams.transport_dispatch import TeamsDispatcher
 
@@ -60,12 +62,65 @@ class FakeSessions:
         self.channels: list = []
         self.last_agent = None
         self._busy = False
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
+        # Mid-turn queue + dashboard-mirror surface the dispatcher now uses.
+        self.queues: dict[str, list] = {}
+        self.cleared: list = []
+        self.mirror_links: dict = {}
+        self.opt_outs: dict = {}
+        self.locked = False
+
+    # -- dashboard mirror -------------------------------------------------
+    def mirror_opt_out(self, key) -> bool:
+        return bool(self.opt_outs.get(key))
+
+    def set_mirror_opt_out(self, key, value) -> None:
+        self.opt_outs[key] = value
+
+    def get_mirror_link(self, key):
+        return self.mirror_links.get(key)
+
+    def set_mirror_link(self, key, link, *, reason="") -> None:
+        self.mirror_links[key] = link
+
+    def clear_mirror_link(self, key, *, reason="") -> bool:
+        return self.mirror_links.pop(key, None) is not None
+
+    def is_mirror_paused(self, key, *, origin=False) -> bool:
+        return False
+
+    def batched_save(self):
+        return contextlib.nullcontext()
+
+    # -- mid-turn queue ---------------------------------------------------
+    def enqueue(self, key, msg_ts, text, *, force=False, **kwargs) -> bool:
+        if not force and not self._busy:
+            return False
+        self.queues.setdefault(key, []).append((msg_ts, text, kwargs))
+        return True
+
+    def dequeue(self, key):
+        queue = self.queues.get(key) or []
+        return queue.pop(0) if queue else None
+
+    def clear_queue(self, key) -> None:
+        self.cleared.append(key)
+        self.queues.pop(key, None)
 
     async def get_or_create(self, key, *, agent, channel_id):
         self.last_agent = agent
         if self._raise is not None:
             raise self._raise
         return self._p, self._is_new, False
+
+    def begin_turn(self, key):
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key, cid) -> None:
         self.channels.append((key, cid))
@@ -92,6 +147,19 @@ class FakeSessions:
     def has_session(self, key) -> bool:
         return self._p is not None
 
+    async def aflush(self) -> None:
+        # The resume release flushes the session map before it reports success; a
+        # double without this correctly surfaces as a release FAILURE.
+        return None
+
+    def clear_mirror_links_at(self, link, *, reason: str = "") -> list:
+        return []
+
+    def find_mirror_sessions(self, link, *, inbound_only: bool = False) -> list:
+        # No resumed dashboard session in these tests, so routing is a no-op. Present
+        # because Teams routes EVERY message through the resume resolver.
+        return []
+
     def is_busy(self, key) -> bool:
         return self._busy
 
@@ -115,7 +183,11 @@ class FakeCtx:
     def __init__(self) -> None:
         self.hooks = FakeHooks()
 
-    def build_message(self, text, is_new, key, *, channel_id, agent, resumed, runtime_source):
+    # Names only the kwargs it asserts on and takes ``**kw`` for the rest: the
+    # shared pipeline owns the call shape, so a fake that pins every kwarg
+    # breaks on any field the pipeline later forwards, without that field
+    # having anything to do with this channel. Mirrors the pipeline's own fake.
+    def build_message(self, text, is_new, key, *, channel_id, agent, resumed, runtime_source, **kw):
         assert runtime_source == "teams"
         return (text, None)
 
@@ -174,7 +246,7 @@ def _dispatcher(sessions, ctx, client, *, conv_log=None, agent=None, cfg=None):
 
 
 _EMAIL = "kyle@example.com"
-_SVC = "https://smba.example.com/"
+_SVC = "https://smba.trafficmanager.net/"
 
 
 def _inbound(text: str = "hello", email: str = _EMAIL) -> TeamsInbound:
@@ -323,9 +395,7 @@ class TestInboundGovernance:
         # ``inbound_permitted`` wrapper, which resolves
         # ``channel_inbound_permitted`` from dispatch's globals at call time --
         # so this one patch covers both the channel-side and pipeline gates.
-        monkeypatch.setattr(
-            "kiro_crew.messaging.dispatch.channel_inbound_permitted", _deny
-        )
+        monkeypatch.setattr("kiro_crew.messaging.dispatch.channel_inbound_permitted", _deny)
         provider = FakeProvider([AcpEvent(kind=EVENT_COMPLETE)])
         sessions = FakeSessions(provider)
         client = FakeClient()

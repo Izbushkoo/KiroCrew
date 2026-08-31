@@ -20,7 +20,6 @@ ungoverned default, where the gateway keeps its built-in update behaviour).
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import os
 import platform
@@ -29,6 +28,7 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from typing import Protocol, runtime_checkable
 
+from kiro_crew import platform_compat
 from kiro_crew.platform_compat import (
     IS_POSIX,
     trusted_system_bin,
@@ -77,41 +77,23 @@ async def _read_bounded_output(
 
 
 async def _kill_and_reap(proc: asyncio.subprocess.Process) -> None:
-    """Kill *proc* AND its descendants, then wait for it under a bound.
+    """Delegate to :func:`kiro_crew.platform_compat.kill_and_reap`.
 
-    Used on BOTH the timeout and the cancellation path. Cancellation matters as
-    much as timeout: a gateway shutdown (SIGTERM) cancels the update task, and
-    without this the updater keeps replacing files after the process that
-    started it is gone, leaving a half-updated installation nobody supervises.
-
-    The whole TREE is signalled, not just the direct child. An update command is
-    a shell line (``curl … | sh``, ``pkg update | tee log``), so killing only
-    the shell leaves the pipeline members running and can leave ``communicate()``
-    waiting on pipes those survivors still hold. Every spawn that reaches here
-    is started with ``start_new_session`` on POSIX so the tree is its own process
-    group and cannot reach back into the gateway's.
-
-    The reap is bounded: a descendant that ignores the signal must not turn
-    cleanup into a hang on the shutdown path. Both the kill and the reap are
-    best-effort, since the caller is already handling a timeout or a
-    cancellation and must not have it masked by a cleanup error.
+    Kept as a module-level seam rather than a bare re-export so the
+    module-local ceiling below keeps bounding the reap: existing callers
+    (including function-local imports elsewhere) and tests resolve both
+    names on THIS module.
     """
-    # Function-local deliberately: the tests patch
-    # ``kiro_crew.platform_compat.kill_process_tree_async`` on the SOURCE module,
-    # and a module-scope ``from`` import would freeze the reference so the patch
-    # could not reach it.
-    from kiro_crew import platform_compat
-
-    with contextlib.suppress(Exception):
-        await platform_compat.kill_process_tree_async(proc.pid, platform_compat.SIGKILL)
-    with contextlib.suppress(Exception):
-        proc.kill()
-    with contextlib.suppress(Exception, asyncio.TimeoutError):
-        await asyncio.wait_for(proc.communicate(), timeout=_REAP_TIMEOUT_SECS)
+    # Module-object attribute lookup happens at call time, so tests patching
+    # ``kiro_crew.platform_compat.kill_process_tree_async`` (inside the shared
+    # helper) still intercept the tree kill.
+    await platform_compat.kill_and_reap(proc, timeout=_REAP_TIMEOUT_SECS)
 
 
 #: Ceiling on waiting for a killed updater tree. A descendant that ignores the
 #: signal must not turn cleanup into a hang while the gateway is shutting down.
+#: Mirrors the shared default so the updater's bound stays independently
+#: patchable without touching every other reap site.
 _REAP_TIMEOUT_SECS = 10
 
 
@@ -334,6 +316,25 @@ class CommandProvider:
             return overrides[field]
         return getattr(self, field, "")
 
+    def can_apply(self) -> bool:
+        """True when an ``apply_command`` is configured AND can run here.
+
+        The dashboard's check path uses this to decide whether to offer an
+        Update button at all: a provider configured with only a
+        ``check_command`` can report availability but cannot act, and a button
+        that can only fail would contradict the honesty contract the check
+        cache carries. The runnability half matters on Windows, where
+        :func:`_shell_exec_args` refuses every command — a configured
+        ``apply_command`` there must not render a button whose only possible
+        outcome is ``policy_update_failed``.
+
+        NOTE: True means the PROVIDER can apply. It does NOT imply a git
+        checkout — callers that git-reset must gate on
+        :func:`resolve_provider` first, as both existing callers do.
+        """
+        cmd = self._resolve_command("apply_command")
+        return bool(cmd) and _shell_exec_args(cmd) is not None
+
     async def check(self) -> UpdateCheckResult:
         """Run check_command. Exit 0 + non-empty stdout version = available."""
         cmd = self._resolve_command("check_command")
@@ -363,9 +364,7 @@ class CommandProvider:
                 # agent-writable checkout. Operator commands name absolute paths.
                 cwd="/",
             )
-            stdout, _stderr = await _read_bounded_output(
-                proc, timeout=60, want_stdout=True
-            )
+            stdout, _stderr = await _read_bounded_output(proc, timeout=60, want_stdout=True)
         except asyncio.CancelledError:
             if proc is not None:
                 await _kill_and_reap(proc)
@@ -429,9 +428,7 @@ class CommandProvider:
                 # agent-writable checkout. Operator commands name absolute paths.
                 cwd="/",
             )
-            _stdout, stderr = await _read_bounded_output(
-                proc, timeout=600, want_stdout=False
-            )
+            _stdout, stderr = await _read_bounded_output(proc, timeout=600, want_stdout=False)
         except asyncio.CancelledError:
             if proc is not None:
                 await _kill_and_reap(proc)
@@ -451,16 +448,22 @@ class CommandProvider:
             # Redact credentials AND token-bearing URLs before logging stderr,
             # so neither an inline token nor a presigned/token URL enters the
             # persistent ring buffer or the /api/logs dashboard stream.
-            from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+            #
+            # Through the CONTEXT, not `security.redact` directly: an installer
+            # error is prime territory for a host-specific credential shape (an
+            # internal registry cookie, an SSO token in a fetch URL), and those
+            # live in a loaded companion's regexes rather than in the OSS
+            # baseline. Reading the baseline here would scan a companion host's
+            # stderr with the weaker pass and log what it missed. The `_log_`
+            # spelling is the one that cannot raise -- see its docstring.
+            from kiro_crew.platform.context import redact_log_via_context
 
             # Redact BEFORE truncating. Slicing first can cut a credential in
             # half, and half a token no longer matches the redactors' patterns
             # (an AWS key needs its full 20 chars to match), so the surviving
             # fragment would reach gateway.log and /api/logs verbatim. The
             # 500-char cap is for log volume, so it belongs last.
-            err_text = (stderr or b"").decode(errors="replace")
-            err_text, _ = redact_exfiltration_urls(err_text)
-            err_text, _ = redact_credentials(err_text)
+            err_text = redact_log_via_context((stderr or b"").decode(errors="replace"))
             err_text = err_text[:500]
             logger.error(
                 "CommandProvider.apply: failed (rc=%d): %s",

@@ -53,8 +53,8 @@ _POSIX_ONLY = pytest.mark.skipif(
 #
 # This file's method is to simulate BOTH platform branches from one host: it
 # flips ``IS_POSIX`` / ``IS_WINDOWS`` and monkeypatches ``os.getuid``,
-# ``os.getpgid``, ``os.killpg``, ``os.fchmod``, ``/proc/locks`` reads and the
-# Windows ``icacls`` subprocess. On real Windows those attributes do not exist
+# ``os.getpgid``, ``os.killpg``, ``os.fchmod`` and ``/proc/locks`` reads.
+# On real Windows those attributes do not exist
 # (so ``monkeypatch.setattr`` raises before any assertion) and the faked
 # branches diverge from what the OS actually does -- which produced 13 failures
 # across two CI rounds in TestFlockOwnerPid, TestRestrictToOwner,
@@ -266,11 +266,15 @@ class _StubbornStream:
 
 
 class TestEnsureUtf8Console:
-    def test_noop_off_windows(self, monkeypatch):
+    def test_off_windows_only_publishes_environment(self, monkeypatch):
         monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        monkeypatch.setenv("PYTHONUTF8", "0")
+        monkeypatch.setenv("PYTHONIOENCODING", "ascii")
         before = sys.stdout
         pc.ensure_utf8_console()
         assert sys.stdout is before
+        assert os.environ["PYTHONUTF8"] == "1"
+        assert os.environ["PYTHONIOENCODING"] == "utf-8:backslashreplace"
 
     def test_reconfigure_in_place_is_preferred(self, monkeypatch):
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
@@ -1299,6 +1303,31 @@ class TestRmtreeForce:
         monkeypatch.setattr(pc.shutil, "rmtree", lambda *_a, **_k: None)
         assert pc.rmtree_force(root) is False
 
+    def test_missing_tree_is_already_removed(self, tmp_path):
+        assert pc.rmtree_force(tmp_path / "missing") is True
+
+    def test_nested_missing_race_does_not_hide_a_surviving_root(self, monkeypatch, tmp_path):
+        root = tmp_path / "tree"
+        root.mkdir()
+
+        def _nested_missing(*_args: Any, **_kwargs: Any) -> None:
+            raise FileNotFoundError("nested entry disappeared")
+
+        monkeypatch.setattr(pc.shutil, "rmtree", _nested_missing)
+        assert pc.rmtree_force(root) is False
+        assert root.exists()
+
+    def test_delete_error_is_reported_without_raising(self, monkeypatch, tmp_path):
+        root = tmp_path / "tree"
+        root.mkdir()
+
+        def _boom(*_args: Any, **_kwargs: Any) -> None:
+            raise OSError("denied")
+
+        monkeypatch.setattr(pc.shutil, "rmtree", _boom)
+        assert pc.rmtree_force(root) is False
+        assert root.exists()
+
     def test_readonly_hook_retries_the_operation(self, tmp_path):
         victim = tmp_path / "ro.txt"
         victim.write_text("x")
@@ -1575,120 +1604,6 @@ class TestProcessTokenSid:
         assert pc.process_owner_sid(7) is None
 
 
-class TestCurrentUserSid:
-    @staticmethod
-    def _fresh_caches(monkeypatch: pytest.MonkeyPatch) -> None:
-        # Both memos are module-scoped; give each test its own so no test
-        # depends on another having run (or not run) first.
-        monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
-        monkeypatch.setattr(pc, "_TOKEN_SID_CACHE", [])
-
-    def test_none_on_posix(self, monkeypatch):
-        self._fresh_caches(monkeypatch)
-        monkeypatch.setattr(pc, "IS_POSIX", True)
-        assert pc._current_user_sid() is None
-
-    def test_prefers_the_access_token_and_memoises_it(self, monkeypatch):
-        self._fresh_caches(monkeypatch)
-        calls: list[int] = []
-
-        def _token() -> str:
-            calls.append(1)
-            return "S-1-5-21-9"
-
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_process_token_sid", _token)
-
-        assert pc._current_user_sid() == "*S-1-5-21-9"
-        assert pc._current_user_sid() == "*S-1-5-21-9"
-        assert len(calls) == 1
-
-    def test_falls_back_to_whoami_when_the_token_is_unavailable(self, monkeypatch):
-        self._fresh_caches(monkeypatch)
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_process_token_sid", lambda: None)
-        monkeypatch.setattr(pc.shutil, "which", lambda _n: r"C:\whoami.exe")
-        result = types.SimpleNamespace(
-            returncode=0, stdout=b'"CORP\\zezhen","S-1-5-21-7-7-7-500"\n'
-        )
-        monkeypatch.setattr(pc.subprocess, "run", lambda *_a, **_k: result)
-        assert pc._current_user_sid() == "*S-1-5-21-7-7-7-500"
-
-    def test_a_failing_whoami_is_not_cached(self, monkeypatch):
-        # A transient failure must stay retryable — memoising None would poison
-        # every later restrict_to_owner for the process lifetime.
-        self._fresh_caches(monkeypatch)
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_process_token_sid", lambda: None)
-        monkeypatch.setattr(pc.shutil, "which", lambda _n: r"C:\whoami.exe")
-        monkeypatch.setattr(
-            pc.subprocess,
-            "run",
-            lambda *_a, **_k: types.SimpleNamespace(returncode=1, stdout=b""),
-        )
-        assert pc._current_user_sid() is None
-        assert pc._USER_SID_CACHE == []
-
-    def test_a_whoami_spawn_error_is_none(self, monkeypatch):
-        self._fresh_caches(monkeypatch)
-
-        def _boom(*_a: Any, **_k: Any) -> Any:
-            raise OSError("not found")
-
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_process_token_sid", lambda: None)
-        monkeypatch.setattr(pc.shutil, "which", lambda _n: None)
-        monkeypatch.setattr(pc.subprocess, "run", _boom)
-        assert pc._current_user_sid() is None
-
-    @pytest.mark.parametrize("stdout", [b'"only-one-field"\n', b'"CORP\\u","NOT-A-SID"\n'])
-    def test_unparseable_whoami_output_is_none(self, monkeypatch, stdout):
-        self._fresh_caches(monkeypatch)
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_process_token_sid", lambda: None)
-        monkeypatch.setattr(pc.shutil, "which", lambda _n: r"C:\whoami.exe")
-        monkeypatch.setattr(
-            pc.subprocess,
-            "run",
-            lambda *_a, **_k: types.SimpleNamespace(returncode=0, stdout=stdout),
-        )
-        assert pc._current_user_sid() is None
-
-    def test_bare_sid_strips_the_icacls_prefix_and_memoises(self, monkeypatch):
-        self._fresh_caches(monkeypatch)
-        calls: list[int] = []
-
-        def _token() -> str:
-            calls.append(1)
-            return "*S-1-5-21-4"
-
-        monkeypatch.setattr(pc, "_process_token_sid", _token)
-        assert pc.current_user_sid() == "S-1-5-21-4"
-        assert pc.current_user_sid() == "S-1-5-21-4"
-        assert len(calls) == 1
-
-    def test_bare_sid_is_none_when_the_token_read_fails(self, monkeypatch):
-        self._fresh_caches(monkeypatch)
-        monkeypatch.setattr(pc, "_process_token_sid", lambda: None)
-        assert pc.current_user_sid() is None
-
-    def test_local_user_id_is_the_uid_on_posix(self, monkeypatch):
-        monkeypatch.setattr(pc, "IS_POSIX", True)
-        assert pc.local_user_id() == os.getuid()
-
-    def test_local_user_id_is_a_stable_crc_of_the_sid_on_windows(self, monkeypatch):
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "current_user_sid", lambda: "S-1-5-21-4")
-        first = pc.local_user_id()
-        assert isinstance(first, int) and first != 0
-        assert pc.local_user_id() == first
-
-    def test_local_user_id_collapses_to_zero_without_a_sid(self, monkeypatch):
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "current_user_sid", lambda: None)
-        assert pc.local_user_id() == 0
-
-
 class TestRestrictToOwner:
     def test_posix_applies_owner_only_mode(self, tmp_path):
         secret = tmp_path / "token.key"
@@ -1701,75 +1616,68 @@ class TestRestrictToOwner:
         # An Owner-Rights-only DACL would lock the caller out of a file created
         # by a different principal, so an unresolvable SID must fail loud.
         monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_current_user_sid", lambda: None)
+        monkeypatch.setattr(pc, "current_user_sid", lambda: None)
 
         def _never(*_a: Any, **_k: Any) -> Any:
-            pytest.fail("icacls must not run without a resolved SID")
+            pytest.fail("no DACL may be written without a resolved SID")
 
-        monkeypatch.setattr(pc.subprocess, "run", _never)
+        monkeypatch.setattr(pc.windows_acl, "apply_owner_only", _never)
         with pytest.raises(OSError, match="cannot resolve current user SID"):
             pc.restrict_to_owner(tmp_path / "token.key")
 
     def test_windows_grants_both_owner_rights_and_the_caller(self, monkeypatch, tmp_path):
         seen: dict[str, Any] = {}
 
-        def _run(argv: Any, **kwargs: Any) -> Any:
-            seen["argv"] = argv
-            seen["kwargs"] = kwargs
-            return types.SimpleNamespace(returncode=0, stderr=b"", stdout=b"")
+        def _apply(path: Any, *, inherit: bool, sids: Any, **_kw: Any) -> None:
+            seen["path"] = path
+            seen["inherit"] = inherit
+            seen["sids"] = tuple(sids)
 
         monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_current_user_sid", lambda: "*S-1-5-21-3")
-        monkeypatch.setattr(pc.shutil, "which", lambda _n: r"C:\icacls.exe")
-        monkeypatch.setattr(pc.subprocess, "run", _run)
+        monkeypatch.setattr(pc, "current_user_sid", lambda: "S-1-5-21-3")
+        monkeypatch.setattr(pc.windows_acl, "apply_owner_only", _apply)
 
         pc.restrict_to_owner(tmp_path / "token.key")
 
-        argv = seen["argv"]
-        assert "/inheritance:r" in argv
-        assert f"{pc._OWNER_RIGHTS_SID}:F" in argv
-        assert "*S-1-5-21-3:F" in argv
-        assert seen["kwargs"]["creationflags"] == pc._SUBPROCESS_NO_WINDOW
+        # Bare SIDs, both grants present, file shape (no inheritance).
+        assert seen["sids"] == ("S-1-3-4", "S-1-5-21-3"), seen
+        assert seen["inherit"] is False, seen
 
     def test_windows_does_not_duplicate_the_owner_rights_grant(self, monkeypatch, tmp_path):
         seen: dict[str, Any] = {}
 
-        def _run(argv: Any, **_kwargs: Any) -> Any:
-            seen["argv"] = argv
-            return types.SimpleNamespace(returncode=0, stderr=b"", stdout=b"")
+        def _apply(path: Any, *, inherit: bool, sids: Any, **_kw: Any) -> None:
+            seen["sids"] = tuple(sids)
 
         monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_current_user_sid", lambda: pc._OWNER_RIGHTS_SID)
-        monkeypatch.setattr(pc.shutil, "which", lambda _n: r"C:\icacls.exe")
-        monkeypatch.setattr(pc.subprocess, "run", _run)
+        monkeypatch.setattr(
+            pc, "current_user_sid", lambda: pc._OWNER_RIGHTS_SID.removeprefix("*")
+        )
+        monkeypatch.setattr(pc.windows_acl, "apply_owner_only", _apply)
         pc.restrict_to_owner(tmp_path / "token.key")
-        assert seen["argv"].count(f"{pc._OWNER_RIGHTS_SID}:F") == 1
+        assert seen["sids"].count("S-1-3-4") == 1, seen
 
     @_POSIX_ONLY
-    def test_windows_raises_on_a_non_zero_icacls(self, monkeypatch, tmp_path):
+    def test_windows_raises_when_the_dacl_write_fails(self, monkeypatch, tmp_path):
         monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_current_user_sid", lambda: "*S-1-5-21-3")
-        monkeypatch.setattr(pc.shutil, "which", lambda _n: r"C:\icacls.exe")
-        monkeypatch.setattr(
-            pc.subprocess,
-            "run",
-            lambda *_a, **_k: types.SimpleNamespace(
-                returncode=5, stderr=b"Access is denied.", stdout=b""
-            ),
-        )
-        with pytest.raises(OSError, match="Access is denied"):
+        monkeypatch.setattr(pc, "current_user_sid", lambda: "S-1-5-21-3")
+
+        def _boom(*_a: Any, **_k: Any) -> None:
+            raise pc.windows_acl.AclWriteFailed("SetNamedSecurityInfoW failed (error 5)")
+
+        monkeypatch.setattr(pc.windows_acl, "apply_owner_only", _boom)
+        with pytest.raises(OSError, match="owner-only DACL could not be applied"):
             pc.restrict_to_owner(tmp_path / "token.key")
 
     @_POSIX_ONLY
-    def test_windows_raises_when_icacls_cannot_be_spawned(self, monkeypatch, tmp_path):
+    def test_windows_raises_when_the_security_api_is_unavailable(self, monkeypatch, tmp_path):
         def _boom(*_a: Any, **_k: Any) -> Any:
-            raise subprocess.SubprocessError("timeout")
+            raise pc.windows_acl.AclUnavailable("cannot load the Windows security API")
 
         monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_current_user_sid", lambda: "*S-1-5-21-3")
-        monkeypatch.setattr(pc.shutil, "which", lambda _n: r"C:\icacls.exe")
-        monkeypatch.setattr(pc.subprocess, "run", _boom)
-        with pytest.raises(OSError, match="icacls invocation failed"):
+        monkeypatch.setattr(pc, "current_user_sid", lambda: "S-1-5-21-3")
+        monkeypatch.setattr(pc.windows_acl, "apply_owner_only", _boom)
+        with pytest.raises(OSError, match="owner-only DACL could not be applied"):
             pc.restrict_to_owner(tmp_path / "token.key")
 
     def test_make_owner_only_dir_warns_instead_of_raising(self, monkeypatch, caplog, tmp_path):
@@ -1779,7 +1687,11 @@ class TestRestrictToOwner:
             raise OSError("no perms")
 
         monkeypatch.setattr(pc, "IS_WINDOWS", False)
-        monkeypatch.setattr(pc.Path, "chmod", _boom)
+        # The POSIX tightening now goes through restrict_dir_to_owner, which
+        # calls os.chmod rather than Path.chmod -- patching the old seam would
+        # intercept nothing, the raise would never fire, and this test would
+        # pass without ever exercising the warn-and-continue handler.
+        monkeypatch.setattr(pc.os, "chmod", _boom)
         with caplog.at_level(logging.WARNING, logger=pc.logger.name):
             pc.make_owner_only_dir(target)
         assert target.is_dir()
@@ -1787,11 +1699,17 @@ class TestRestrictToOwner:
 
     def test_make_owner_only_dir_uses_the_dacl_on_windows(self, monkeypatch, tmp_path):
         called: list[Any] = []
+        wrong: list[Any] = []
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "restrict_to_owner", called.append)
+        # Must be the DIRECTORY helper: restrict_to_owner's grants are
+        # file-shaped (no (OI)(CI)), so files created inside would not inherit
+        # the lockdown.
+        monkeypatch.setattr(pc, "restrict_dir_to_owner", lambda p: called.append(p))
+        monkeypatch.setattr(pc, "restrict_to_owner", lambda p: wrong.append(p))
         target = tmp_path / "secrets"
         pc.make_owner_only_dir(target)
         assert called and str(called[0]) == str(target)
+        assert wrong == []
 
 
 # ---------------------------------------------------------------------------
@@ -1912,47 +1830,142 @@ def _fake_resource(monkeypatch: pytest.MonkeyPatch, **members: Any) -> None:
     monkeypatch.setattr(pc, "resource", types.SimpleNamespace(**defaults), raising=False)
 
 
-def _memory_info_dll(working_set: int, *, ok: bool = True) -> Any:
+def _memory_info_dll(working_set: int, *, ok: bool = True, peak: int = 0) -> Any:
     def _get_memory_info(_handle: Any, counters: Any, _cb: Any) -> int:
         counters._obj.WorkingSetSize = working_set
+        counters._obj.PeakWorkingSetSize = peak
         return 1 if ok else 0
 
     return types.SimpleNamespace(GetProcessMemoryInfo=_Fn(_get_memory_info))
 
 
+def _fake_mach_libsystem(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    resident: int,
+    resident_max: int,
+    kern_return: int = 0,
+) -> None:
+    """Stand in for ``libSystem``'s ``task_info``, filling the real struct.
+
+    The struct is the module-level layout, so a wrong field order in production
+    surfaces here as the wrong number rather than passing on a hand-built dict.
+    """
+
+    def _task_info(_task: Any, _flavor: Any, out: Any, _count: Any) -> int:
+        out._obj.resident_size = resident
+        out._obj.resident_size_max = resident_max
+        return kern_return
+
+    fake = types.SimpleNamespace(
+        mach_task_self=_Fn(lambda: 1),
+        task_info=_Fn(_task_info),
+    )
+    monkeypatch.setattr(pc.ctypes, "CDLL", lambda _path, **_kw: fake)
+
+
 class TestProcRss:
-    def test_linux_scales_kib_to_bytes(self, monkeypatch):
+    """``proc_rss_bytes`` must report CURRENT residency, not the peak.
+
+    ``ru_maxrss`` is a high-water mark that never decreases for the life of the
+    process, so using it made the dashboard's per-process memory figure a
+    monotonic peak-since-boot that no ``ps -o rss=`` reading could reproduce.
+    These tests pin the live source per platform and keep ``ru_maxrss`` confined
+    to the labelled fallback.
+    """
+
+    def test_linux_reads_statm_not_the_getrusage_peak(self, monkeypatch):
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(pc.sys, "platform", "linux")
+        _fake_resource(
+            monkeypatch,
+            getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=9_999_999),
+        )
+        monkeypatch.setattr(pc, "_linux_current_rss_bytes", lambda: 4096)
+        assert pc.proc_rss_bytes() == 4096
+
+    @_LINUX_ONLY
+    def test_linux_current_reader_agrees_with_proc_status(self):
+        # statm's resident pages and status' VmRSS are the same quantity, and
+        # VmRSS is what `ps -o rss=` prints -- the number a user compares against.
+        vm_rss_kb = 0
+        with open("/proc/self/status", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    vm_rss_kb = int(line.split()[1])
+                    break
+        assert vm_rss_kb > 0
+        measured = pc._linux_current_rss_bytes()
+        assert measured is not None
+        # Sampled a moment apart, so allow drift rather than demanding equality.
+        assert abs(measured - vm_rss_kb * 1024) < 4 * 1024 * 1024
+
+    def test_linux_fallback_scales_the_peak_from_kib_to_bytes(self, monkeypatch):
+        # Unit handling is the trap: ru_maxrss is KiB on Linux and bytes on
+        # macOS, with nothing in the value to tell them apart.
         monkeypatch.setattr(pc, "IS_POSIX", True)
         monkeypatch.setattr(pc.sys, "platform", "linux")
         _fake_resource(
             monkeypatch,
             getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=2048),
         )
+        monkeypatch.setattr(pc, "_linux_current_rss_bytes", lambda: None)
         assert pc.proc_rss_bytes() == 2048 * 1024
 
-    def test_macos_reports_bytes_directly(self, monkeypatch):
+    def test_macos_reads_the_mach_resident_size(self, monkeypatch):
+        # Not resident_size_max, which is the same peak bug in Mach clothing.
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(pc.sys, "platform", "darwin")
+        _fake_resource(
+            monkeypatch,
+            getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=7_777_777),
+        )
+        _fake_mach_libsystem(monkeypatch, resident=123_456, resident_max=999_999_999)
+        assert pc.proc_rss_bytes() == 123_456
+
+    def test_macos_task_info_failure_falls_back_to_the_peak_in_bytes(self, monkeypatch):
         monkeypatch.setattr(pc, "IS_POSIX", True)
         monkeypatch.setattr(pc.sys, "platform", "darwin")
         _fake_resource(
             monkeypatch,
             getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=999),
         )
+        _fake_mach_libsystem(monkeypatch, resident=1, resident_max=2, kern_return=5)
+        # macOS ru_maxrss is ALREADY bytes -- scaling it by 1024 here would
+        # over-report by three orders of magnitude.
         assert pc.proc_rss_bytes() == 999
 
-    def test_a_getrusage_failure_is_zero(self, monkeypatch):
+    def test_macos_missing_libsystem_falls_back(self, monkeypatch):
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(pc.sys, "platform", "darwin")
+        _fake_resource(
+            monkeypatch,
+            getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=555),
+        )
+
+        def _no_libsystem(_path: Any, **_kw: Any) -> Any:
+            raise OSError("no libSystem")
+
+        monkeypatch.setattr(pc.ctypes, "CDLL", _no_libsystem)
+        assert pc.proc_rss_bytes() == 555
+
+    def test_a_total_posix_failure_is_zero(self, monkeypatch):
         def _boom(_who: Any) -> Any:
             raise OSError("no rusage")
 
         monkeypatch.setattr(pc, "IS_POSIX", True)
         _fake_resource(monkeypatch, getrusage=_boom)
+        monkeypatch.setattr(pc, "_linux_current_rss_bytes", lambda: None)
+        monkeypatch.setattr(pc, "_macos_current_rss_bytes", lambda: None)
         assert pc.proc_rss_bytes() == 0
 
     def test_windows_reads_the_working_set(self, monkeypatch):
         _fake_windows(
             monkeypatch,
-            psapi=_memory_info_dll(8192),
+            psapi=_memory_info_dll(8192, peak=4_000_000),
             kernel32=types.SimpleNamespace(GetCurrentProcess=_const(1)),
         )
+        # WorkingSetSize is already current; PeakWorkingSetSize must not leak in.
         assert pc.proc_rss_bytes() == 8192
 
     def test_windows_failure_is_zero(self, monkeypatch):
@@ -1968,6 +1981,147 @@ class TestProcRss:
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         monkeypatch.delattr(pc.ctypes, "WinDLL", raising=False)
         assert pc.proc_rss_bytes() == 0
+
+
+class TestMachTaskBasicInfoLayout:
+    """A wrong layout reads a neighbouring field and looks plausible.
+
+    ``task_info`` writes into raw memory and reports back how many
+    ``natural_t``-sized elements it filled, so a struct whose size disagrees
+    with the kernel's yields a number with no error -- exactly the failure mode
+    that is indistinguishable from the peak-vs-current bug being fixed.
+    """
+
+    def test_the_element_count_matches_mach_task_basic_info_count(self):
+        # MACH_TASK_BASIC_INFO_COUNT from <mach/task_info.h>.
+        assert pc._MACH_TASK_BASIC_INFO_COUNT == 12
+        assert ctypes.sizeof(pc._MachTaskBasicInfo) == 48
+
+    def test_resident_size_precedes_its_own_high_water_mark(self):
+        # Both are uint64 and adjacent, so transposing them is a silent revert
+        # to reporting the peak.
+        assert pc._MachTaskBasicInfo.resident_size.offset == 8
+        assert pc._MachTaskBasicInfo.resident_size_max.offset == 16
+
+    def test_the_flavor_selector_is_mach_task_basic_info(self):
+        assert pc._MACH_TASK_BASIC_INFO == 20
+
+
+class TestProcPeakRss:
+    """The peak is still reported, but as its own clearly-named reading."""
+
+    def test_posix_scales_kib_to_bytes_on_linux(self, monkeypatch):
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(pc.sys, "platform", "linux")
+        _fake_resource(
+            monkeypatch,
+            getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=2048),
+        )
+        assert pc.proc_peak_rss_bytes() == 2048 * 1024
+
+    def test_posix_reports_bytes_directly_on_macos(self, monkeypatch):
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(pc.sys, "platform", "darwin")
+        _fake_resource(
+            monkeypatch,
+            getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=999),
+        )
+        assert pc.proc_peak_rss_bytes() == 999
+
+    def test_a_getrusage_failure_is_zero(self, monkeypatch):
+        def _boom(_who: Any) -> Any:
+            raise OSError("no rusage")
+
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        _fake_resource(monkeypatch, getrusage=_boom)
+        assert pc.proc_peak_rss_bytes() == 0
+
+    def test_windows_reads_the_peak_working_set(self, monkeypatch):
+        _fake_windows(
+            monkeypatch,
+            psapi=_memory_info_dll(8192, peak=4_000_000),
+            kernel32=types.SimpleNamespace(GetCurrentProcess=_const(1)),
+        )
+        assert pc.proc_peak_rss_bytes() == 4_000_000
+
+    def test_windows_failure_is_zero(self, monkeypatch):
+        _fake_windows(
+            monkeypatch,
+            psapi=_memory_info_dll(8192, ok=False, peak=4_000_000),
+            kernel32=types.SimpleNamespace(GetCurrentProcess=_const(1)),
+        )
+        assert pc.proc_peak_rss_bytes() == 0
+
+
+class TestCountOpenFds:
+    """``count_open_fds`` is the ONE shared open-fd probe.
+
+    Both the ``kirocrew.process.open_fds`` gauge and gatewayd's
+    zombie-diagnostic ``fd_count`` delegate here, so these tests pin the probe
+    once: the POSIX steady-state correction, the None contract, and the
+    Windows handle-count route the gauge previously lacked.
+    """
+
+    def test_posix_count_is_positive_and_excludes_the_probe_fd(self):
+        count = pc.count_open_fds()
+        if count is None:
+            pytest.skip("no fd probe on this platform")
+        # stdin/stdout/stderr at minimum; the enumeration fd itself excluded.
+        assert count >= 3
+
+    def test_posix_correction_never_goes_negative(self, monkeypatch, tmp_path):
+        empty = tmp_path / "fd"
+        empty.mkdir()
+        monkeypatch.setattr(pc, "_FD_DIRS", (str(empty),))
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        assert pc.count_open_fds() == 0
+
+    def test_second_fd_dir_is_the_fallback(self, monkeypatch, tmp_path):
+        fallback = tmp_path / "fd"
+        fallback.mkdir()
+        for name in ("0", "1", "2", "3"):
+            (fallback / name).write_text("")
+        monkeypatch.setattr(pc, "_FD_DIRS", (str(tmp_path / "missing"), str(fallback)))
+        # Four entries, minus the enumeration fd the listing itself opens.
+        assert pc.count_open_fds() == 3
+
+    def test_none_when_no_probe_works_on_posix(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(pc, "_FD_DIRS", (str(tmp_path / "missing"),))
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        assert pc.count_open_fds() is None
+
+    def test_windows_reads_the_kernel_handle_count_raw(self, monkeypatch, tmp_path):
+        def _get_handle_count(_process: Any, out: Any) -> int:
+            out._obj.value = 42
+            return 1
+
+        _fake_windows(
+            monkeypatch,
+            kernel32=types.SimpleNamespace(
+                GetCurrentProcess=_const(1),
+                GetProcessHandleCount=_Fn(_get_handle_count),
+            ),
+        )
+        monkeypatch.setattr(pc, "_FD_DIRS", (str(tmp_path / "missing"),))
+        # Raw: the handle query opens no extra handle, so no -1 correction.
+        assert pc.count_open_fds() == 42
+
+    def test_windows_api_failure_is_none(self, monkeypatch, tmp_path):
+        _fake_windows(
+            monkeypatch,
+            kernel32=types.SimpleNamespace(
+                GetCurrentProcess=_const(1),
+                GetProcessHandleCount=_const(0),
+            ),
+        )
+        monkeypatch.setattr(pc, "_FD_DIRS", (str(tmp_path / "missing"),))
+        assert pc.count_open_fds() is None
+
+    def test_windows_loader_failure_is_none(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.delattr(pc.ctypes, "WinDLL", raising=False)
+        monkeypatch.setattr(pc, "_FD_DIRS", (str(tmp_path / "missing"),))
+        assert pc.count_open_fds() is None
 
 
 class TestProcRssForPid:

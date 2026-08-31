@@ -115,13 +115,38 @@ class TestDisqualifiers:
         assert verdict.recommend_share is False
         assert "rotating_secret_env" in _codes(verdict)
 
+    def test_a_named_identity_key_stops_withholding_the_share(self) -> None:
+        """The withholding follows the guard, in BOTH directions.
+
+        The test above pins that the page declines a share the rewriter declines.
+        Once ``mcp_gateway.pool_identity_env`` names the key the rewriter DOES pool
+        the entry (``_withheld_env_count`` stops counting it, because the key is
+        now inside ``effective_env_hash`` and really is forwarded). If the note
+        survived that, the page would decline a share the broker performs -- the
+        same two-components-disagreeing failure, mirrored.
+        """
+        evidence = ShareEvidence(
+            name="x",
+            probe_ok=True,
+            has_tools=True,
+            declared_env_names=("OAUTH_TOKEN",),
+            capabilities={"experimental": {shareability.CALLER_IDENTITY_CAPABILITY: {}}},
+            preflight_ran=True,
+        )
+        verdict = assess(evidence, {"OAUTH_TOKEN"})
+        assert verdict.recommend_share is True
+        assert "rotating_secret_env" not in _codes(verdict)
+        # A DIFFERENT name in the list must not silence this key's note.
+        assert "rotating_secret_env" in _codes(assess(evidence, {"OTHER_TOKEN"}))
+
     def test_a_broker_gap_does_not_borrow_that_withholding(self) -> None:
         """The two must not collapse into one rule.
 
         ``rotating_secret_env`` withholds because a live guard declines the work.
-        A broker gap has no such guard -- pooling proceeds and a subscription simply
-        stops firing -- so it must stay pure information. Sharing one flag between
-        them would silently re-introduce the disqualifier this change removed.
+        A broker gap has no such guard -- pooling proceeds and log verbosity simply
+        follows the last caller's level -- so it must stay pure information.
+        Sharing one flag between them would silently re-introduce the disqualifier
+        this change removed.
         """
         verdict = assess(
             ShareEvidence(
@@ -130,7 +155,7 @@ class TestDisqualifiers:
                 has_tools=True,
                 capabilities={
                     "experimental": {shareability.CALLER_IDENTITY_CAPABILITY: {}},
-                    "resources": {"subscribe": True},
+                    "logging": {},
                 },
                 preflight_ran=True,
             )
@@ -204,15 +229,17 @@ class TestDisqualifiers:
         verdict = assess(ShareEvidence(name="x", is_stdio=False, probe_ok=True))
         assert _codes(verdict) == {"not_stdio"}
 
-    def test_resources_subscribe_is_a_note_not_a_disqualifier(self) -> None:
-        """A lost feature is not a hazard.
+    def test_resources_subscribe_no_longer_produces_a_degradation_note(self) -> None:
+        """Subscriptions survive pooling, so there is nothing to warn about.
 
-        ``notifications/resources/updated`` carries no request id, so a shared
-        backend cannot attribute it and DROPS it (deny-by-default in
-        ``backend._notification_owner``). The subscription silently stops working
-        -- nobody receives anybody else's content. That costs the operator a
-        feature, which is worth reporting, and it is not a reason to refuse the
-        stub: a stub keeps the backend 1:1 with the session.
+        The broker keeps a ``uri -> {stub_uuid}`` table
+        (``backend._resource_subscriptions``) and routes each
+        ``notifications/resources/updated`` to exactly the stubs subscribed to
+        its URI. The degradation table's contract is delete-not-relax: an
+        entry leaves the moment the broker learns to attribute the frames it
+        covers, and this test pins ``resources.subscribe``'s absence. A
+        subscribe-capable server is otherwise unremarkable evidence and lands
+        on the ordinary no-objection tier.
         """
         verdict = assess(
             ShareEvidence(
@@ -226,19 +253,7 @@ class TestDisqualifiers:
         assert verdict.recommend_stub is True
         assert verdict.recommend_share is False
         notes = [r for r in verdict.reasons if r.code == "degrades_when_shared"]
-        assert [r.detail for r in notes] == ["resources_subscribe"]
-
-    def test_subscribe_false_is_an_explicit_no_and_does_not_count(self) -> None:
-        """``{"subscribe": false}`` is the server saying it does NOT subscribe."""
-        verdict = assess(
-            ShareEvidence(
-                name="x",
-                probe_ok=True,
-                has_tools=True,
-                capabilities={"resources": {"subscribe": False, "listChanged": True}},
-            )
-        )
-        assert verdict.strength is Strength.NO_OBJECTION
+        assert notes == []
 
     def test_list_changed_alone_is_not_a_disqualifier(self) -> None:
         """Those notifications are global broadcasts, safe to fan out."""
@@ -406,16 +421,19 @@ class TestPositiveDeclaration:
     def test_a_broker_gap_is_reported_but_does_not_withhold_sharing(self) -> None:
         """The note names OUR missing feature, so it cannot be the server's cost.
 
-        ``notifications/resources/updated`` carries no request id, but it does not
-        need one: the broker saw which stub subscribed to which URI, so a
-        ``uri -> {stub_uuid}`` table would route the update exactly. It keeps no
-        such table today -- that is the defect, and it is ours. Withholding
-        pooling here would charge the operator for work we have not done, which is
-        the failure mode of a layer whose whole job is to say yes.
+        ``logging/setLevel`` is process-global, but a proxy can emit at the
+        finest level any tenant asked for and filter DOWN per stub, giving each
+        tenant the verbosity it requested from one process. The broker does not
+        do that today -- that is the defect, and it is ours. Withholding pooling
+        here would charge the operator for work we have not done, which is the
+        failure mode of a layer whose whole job is to say yes.
 
-        The note still ships, because until the broker learns to attribute them a
-        subscription really does stop firing once pooled, and the operator is
-        entitled to know that before pressing a bulk action.
+        The note still ships, because until the broker learns to attribute it,
+        log verbosity really does follow the last caller's level once pooled,
+        and the operator is entitled to know that before pressing a bulk action.
+        The degradation table's contract is delete-not-relax: an entry leaves
+        the moment the broker attributes the frames it covers, as
+        ``resources.subscribe``'s absence demonstrates.
         """
         verdict = assess(
             ShareEvidence(
@@ -424,7 +442,7 @@ class TestPositiveDeclaration:
                 has_tools=True,
                 capabilities={
                     "experimental": {shareability.CALLER_IDENTITY_CAPABILITY: {}},
-                    "resources": {"subscribe": True},
+                    "logging": {},
                 },
                 preflight_ran=True,
             )
@@ -777,6 +795,120 @@ class TestHazardLedger:
         on_disk = hazards.load_ledger(tmp_path).as_dict()
         assert "first" in on_disk
         assert "second" in on_disk, "the newer observation was reverted by an older flush"
+
+    def test_record_and_flush_interleave_repeatedly_without_crashing(self, tmp_path) -> None:
+        """``flush`` builds its JSON payload by iterating ``self._records``
+        (and each record's ``codes`` set) off-loop, in a real worker thread
+        (``asyncio.to_thread``), while ``record``/``clear`` run on gatewayd's
+        event loop thread -- genuinely concurrent OS threads, not just
+        interleaved coroutines. Without ``record``/``clear``'s copy-on-write
+        discipline (never mutating an existing dict/set in place, only ever
+        building new ones and swapping ``self._records`` in one atomic
+        assignment), a write landing mid-iteration on the flushing thread can
+        raise "dictionary/set changed size during iteration", crashing the
+        flush before its payload ever reaches ``atomic_write`` -- so even a
+        caller that catches the exception still silently loses the write.
+
+        Real, sustained thread contention (not a single synchronized
+        handoff): one thread continuously records under EVER-NEW identities
+        (so ``self._records`` keeps genuinely resizing, not just updating
+        existing entries) while another continuously flushes, for long
+        enough that the original bug reproduced the crash on every run
+        before the fix.
+        """
+        import threading
+        import time as _time
+
+        led = hazards.HazardLedger(hazards.ledger_path(tmp_path))
+        stop = threading.Event()
+        errors: list[BaseException] = []
+
+        def writer() -> None:
+            i = 0
+            while not stop.is_set():
+                led.record(f"server-{i % 5}", hazards.HAZARD_UNROUTABLE_SERVER_REQUEST, identity=f"id-{i}")
+                i += 1
+
+        def flusher() -> None:
+            end = _time.monotonic() + 1.5
+            while _time.monotonic() < end:
+                try:
+                    led.flush()
+                except Exception as exc:  # noqa: BLE001 - capturing for the assertion below
+                    errors.append(exc)
+                    return
+
+        writer_thread = threading.Thread(target=writer, daemon=True)
+        flusher_thread = threading.Thread(target=flusher)
+        writer_thread.start()
+        flusher_thread.start()
+        flusher_thread.join(10)
+        stop.set()
+
+        assert errors == []
+
+    def test_record_does_not_block_while_a_flush_disk_write_is_in_progress(self, tmp_path) -> None:
+        """``record`` runs synchronously ON gatewayd's event loop -- it must
+        never wait on a lock that a concurrent ``flush`` holds across real
+        disk I/O (a slow or contended filesystem would stall the entire
+        event loop, not just this one call). ``record``/``clear`` take no
+        lock at all (copy-on-write; see the class docstring), so a flush
+        parked in ``atomic_write`` -- holding only ``_flush_lock``, which
+        neither of them ever touches -- cannot block a concurrent ``record``
+        for any duration. This asserts the actual mechanism, not just that
+        no exception happened to occur in one run.
+        """
+        import threading
+
+        led = hazards.HazardLedger(hazards.ledger_path(tmp_path))
+        led.record("first", hazards.HAZARD_UNROUTABLE_SERVER_REQUEST)
+
+        real_write = hazards.atomic_write
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_write(path, text):
+            entered.set()
+            release.wait(2)
+            return real_write(path, text)
+
+        hazards.atomic_write = slow_write  # type: ignore[assignment]
+        record_thread: threading.Thread | None = None
+        try:
+            flush_thread = threading.Thread(target=led.flush)
+            flush_thread.start()
+            assert entered.wait(2), "flush never reached the write"
+
+            record_done = threading.Event()
+
+            def do_record() -> None:
+                led.record("second", hazards.HAZARD_UNATTRIBUTABLE_NOTIFICATION)
+                record_done.set()
+
+            record_thread = threading.Thread(target=do_record)
+            record_thread.start()
+            # flush is parked inside slow_write (real disk I/O in production),
+            # holding only _flush_lock -- record() takes no lock at all, so
+            # it must complete promptly rather than waiting for the write.
+            assert record_done.wait(1), (
+                "record() blocked on a lock held across a flush's disk write"
+            )
+        finally:
+            # Unpark and JOIN in the finally: on an assertion failure the
+            # unparked flush thread would otherwise run the real atomic_write
+            # into tmp_path while pytest tears the directory down, masking
+            # the real failure with a stray late write.
+            release.set()
+            flush_thread.join(5)
+            if record_thread is not None:
+                record_thread.join(5)
+            hazards.atomic_write = real_write  # type: ignore[assignment]
+
+        # Neither observation was lost across the interleaving.
+        led.flush()
+        on_disk = hazards.load_ledger(tmp_path).as_dict()
+        assert "first" in on_disk
+        assert "second" in on_disk
 
     def test_ledger_feeds_the_verdict(self, tmp_path) -> None:
         """End to end: what gatewayd observed withdraws the recommendation."""
@@ -1526,7 +1658,11 @@ class TestBackendRecordsHazards:
         hazards.flush_sink()  # must not raise
 
     def test_both_observation_sites_call_the_recorder(self) -> None:
-        """Ratchet: the two hazard sites must stay wired to the ledger.
+        """Ratchet: the hazard sites must stay wired to the ledger.
+
+        Three sites: the unattributable request-scoped notification drop, the
+        unroutable server->client request recycle, and the terminal
+        resources/updated drop for a URI nobody subscribed to.
 
         Asserted on the source because reproducing either frame end to end
         needs a live shared backend and a misbehaving server; the value here is
@@ -1537,6 +1673,6 @@ class TestBackendRecordsHazards:
         import kiro_crew.mcp_gateway.backend as backend_mod
 
         src = _Path(backend_mod.__file__).read_text(encoding="utf-8")
-        assert src.count("self._record_hazard(") == 2, "expected exactly two hazard sites"
+        assert src.count("self._record_hazard(") == 3, "expected exactly three hazard sites"
         assert "hazards.HAZARD_UNATTRIBUTABLE_NOTIFICATION" in src
         assert "hazards.HAZARD_UNROUTABLE_SERVER_REQUEST" in src

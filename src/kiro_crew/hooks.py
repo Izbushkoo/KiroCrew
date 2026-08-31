@@ -19,18 +19,42 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from kiro_crew import platform_compat, security, webhooks
+
+# The xattr ACL-carry policy is shared with atomic_write.atomic_write: both
+# install a fresh inode and must reproduce the source's access controls or
+# refuse. atomic_write is a leaf module (imported here transitively already via
+# platform_compat), so importing these from there keeps one spelling of the
+# policy without a cycle.
+from kiro_crew.atomic_write import (
+    _XATTR_UNSUPPORTED_ERRNOS,
+    _is_access_control_xattr,
+    _should_carry_xattr,
+)
 from kiro_crew.config import paths as _config_paths
-from kiro_crew.platform import current_context
+from kiro_crew.platform import current_context, redact_via_context
 from kiro_crew.platform.governance import (
     CU_CLASS_OBSERVE,
     computer_use_action_classes,
     computer_use_action_from_title,
+)
+
+# The bounded, depth-aware target-path walk lives one layer below both this
+# module and governance (see the re-export note where the keystone consumers
+# are defined). Imported here so ``hooks.TARGET_PATH_KEYS`` / ``hooks.TargetPaths``
+# / ``hooks.target_paths`` (and the work caps) stay importable at their historic
+# names; hooks keeps its HARD-DENY reading of ``TargetPaths.truncated``.
+from kiro_crew.platform.tool_paths import (  # noqa: F401  (re-exported for callers)
+    _TARGET_PATH_MAX_NODES,
+    _TARGET_PATH_MAX_PATHS,
+    TARGET_PATH_KEYS,
+    TargetPaths,
+    target_paths,
 )
 from kiro_crew.security import (
     audit_bash_exfiltration,
@@ -39,6 +63,7 @@ from kiro_crew.security import (
     is_sensitive_write_path,
 )
 from kiro_crew.sel import sel
+from kiro_crew.session_directive import CORE_MCP_SERVER
 from kiro_crew.validation import _bounded_pattern_search
 
 logger = logging.getLogger(__name__)
@@ -381,6 +406,48 @@ class HooksConfig:
         }
 
 
+# ── Spawn auto-approve identity ──
+
+
+def event_is_spawn_run(event: object) -> bool:
+    """True when a permission event is genuinely the ``spawn_run`` MCP tool.
+
+    The ``auto_approve_subagent_spawn`` rung must key on canonical,
+    NON-model-authored identity: ``event.title`` is LLM-authored prose (for
+    shell tools ``select_tool_title`` even prefers the model's description),
+    so ANY event whose title is forged to ``spawn_run`` — a shell command, a
+    re-titled ``send_file``, anything — must never satisfy this rung.
+
+    Canonical identity only, deny-by-default: ``event.tool_name`` (from
+    ``_meta.kiro``, never model-authored) must be ``spawn_run``, carry the
+    ``mcp_identity_trusted`` provenance flag (non-emptiness alone is not
+    proof of provenance; a future inline population path must fail closed),
+    and be served by the crew's own MCP server (``CORE_MCP_SERVER``), so a
+    foreign server or a built-in that merely NAMES a tool ``spawn_run``
+    cannot ride the rung.
+
+    The title must ALSO read ``spawn_run``. Not as identity — the title is
+    forgeable and never sufficient — but because the channel PreToolUse gate
+    (``build_tool_gate``) keys deny rules on the title: a genuine spawn whose
+    display title was rephrased must fall to the approval ladder rather than
+    let this rung approve past a title-keyed deny that would otherwise have
+    fired. This exactly preserves the rung's pre-fix approval surface (title
+    ``spawn_run``), minus the forgeries.
+
+    There is deliberately NO title fallback: on a backend that does not emit
+    ``_meta.kiro`` (or on the correlated provenance-cache miss) the rung
+    simply does not fire and the request falls to the channel's normal
+    approval ladder (session trust / YOLO / interactive) — a downgrade,
+    never a hard block.
+    """
+    return (
+        (getattr(event, "title", "") or "") == "spawn_run"
+        and (getattr(event, "tool_name", "") or "") == "spawn_run"
+        and bool(getattr(event, "mcp_identity_trusted", False))
+        and (getattr(event, "mcp_server_name", "") or "") == CORE_MCP_SERVER
+    )
+
+
 # ── HookManager ──
 
 
@@ -506,14 +573,31 @@ class HookManager:
         default, or a backend that omits ``_meta.kiro``) fails closed: no match.
 
         ``mcp_tool_name`` is the sibling NON-model-authored tool identity from
-        ``_meta.kiro.toolName`` (``AcpEvent.tool_name``), set by kiro-cli
-        alongside ``mcp_server_name`` for MCP-served calls. It is used to
-        reconstruct the canonical ``mcp__<server>__<tool>`` name and govern the
-        REAL tool before the app-own-server auto-approve — because the ``tool_name``
-        title above is LLM-authored prose (``select_tool_title`` prefers the
-        model's ``description``) and may not carry the canonical form a per-tool
-        MCP policy matches on. Empty (no ``_meta.kiro.toolName``) means the tool
-        cannot be identified for governance, so the own-server auto-approve does
+        ``_meta.kiro.toolName`` (``AcpEvent.tool_name``). Despite the name it is
+        NOT MCP-only: kiro-cli sets it for every tool call it serves, built-ins
+        included, and sets ``mcp_server_name`` only for MCP-served ones. It is
+        therefore evaluated on the deny and governance planes whenever present,
+        server or no server -- otherwise a built-in's real name (``fs_write``)
+        reaches no check at all and a deny/ceiling rule naming it is bypassable
+        behind a benign model-authored title. With both present the
+        gate reconstructs the canonical ``mcp__<server>__<tool>`` name and runs
+        the effective deny set AND the governance ceiling against it as well as
+        against the title — because the ``tool_name`` title above is LLM-authored
+        prose (``select_tool_title`` prefers the model's ``description``) and may
+        not carry the canonical form a per-tool MCP policy matches on. Without
+        this, an ordinary MCP call whose policy-denied tool arrives under a benign
+        description would pass the gate and reach the human prompt, where an
+        "allow" would run a tool the ceiling forbids.
+
+        The canonical name is ADDED to those checks, never SUBSTITUTED for the
+        title: the two carry different security signals. The canonical name is
+        the trusted statement of WHICH MCP tool is being invoked, and is what a
+        per-tool ceiling or deny rule matches. The title and raw command carry
+        the path, command and content signals that a tool identity does not
+        express — ``~/.aws/credentials`` read through an innocuously named MCP
+        tool is denied by the title, not by the identity. Different dimensions,
+        so a deny on EITHER denies the call. Empty (no ``_meta.kiro.toolName``)
+        means the tool cannot be identified, so the own-server auto-approve does
         NOT fire (fall through to interactive approval — fail-closed).
         """
         # Deny-by-default: a shell tool whose command could not be recovered
@@ -573,10 +657,26 @@ class HookManager:
         # trust-root files (security_policy.json / profiles) is blocked even when
         # the title hides it. This is the keystone the governance model leans on
         # (agent-cannot-rewrite-its-own-ceiling), so it must not be title-gated.
+        # EVERY accepted spelling, and a deny on any of them denies: a backend that
+        # sends ``filePath`` (the camel-case form the search plane has always
+        # accepted) reached NEITHER of the two snake_case reads this used to do, so
+        # a write to ~/.ssh under that key was never gated and the human was asked
+        # to approve a path the keystone should have refused outright.
         if raw_params:
-            real_path = raw_params.get("path") or raw_params.get("file_path")
-            if isinstance(real_path, str) and real_path and is_sensitive_path(real_path):
-                return ToolHookResult.deny(f"Blocked: access to sensitive path: {real_path}")
+            real_paths = target_paths(raw_params)
+            if real_paths.truncated:
+                # The walk hit its work cap, so the list may be INCOMPLETE. A
+                # partial scan must not be trusted as a full one — deny, same
+                # deny-by-default shape as the unrecoverable shell command
+                # above. No legitimate tool call carries hundreds of target
+                # paths, so this refuses only attacker-shaped payloads.
+                return ToolHookResult.deny(
+                    "Blocked: tool arguments too large to verify for sensitive "
+                    "paths (deny-by-default)"
+                )
+            for real_path in real_paths:
+                if is_sensitive_path(real_path):
+                    return ToolHookResult.deny(f"Blocked: access to sensitive path: {real_path}")
         # Config files are WRITE-protected (reads stay allowed): block the agent's
         # file-EDIT tool from modifying config.json / config.local.json so a
         # prompt-injected agent cannot rewrite its own resource ceilings
@@ -600,11 +700,14 @@ class HookManager:
         # ``edit``); not hard-denying them keeps the two write-gates from drifting
         # into a read regression, and the bash gate covers the shell surface.
         if tool_kind == _EDIT_TOOL_KIND and raw_params:
-            wpath = raw_params.get("path") or raw_params.get("file_path")
-            if isinstance(wpath, str) and wpath and is_sensitive_write_path(wpath):
-                return ToolHookResult.deny(
-                    f"Blocked: modification of write-protected config path: {wpath}"
-                )
+            # Same spelling coverage as the sensitive-path keystone above, for the
+            # same reason: the write-protected tier is worthless if a config edit
+            # can name its target under a key the check never reads.
+            for wpath in target_paths(raw_params):
+                if is_sensitive_write_path(wpath):
+                    return ToolHookResult.deny(
+                        f"Blocked: modification of write-protected config path: {wpath}"
+                    )
         # Built-in security deny list (always enforced).  Route through the
         # active PlatformContext's PolicyAuthority so the Amazon companion's
         # ADD-only deny overlay (+ internal patterns) applies when loaded.  The
@@ -619,14 +722,64 @@ class HookManager:
         denied_regexes = self._effective_denied(ctx)
         denied_notes = self._denied_notes()
         deny_targets = [normalized, tool_name]
+        # The canonical ``mcp__<server>__<tool>`` identity, when kiro-cli supplied
+        # BOTH trusted ``_meta.kiro`` fields. ``select_tool_title`` prefers the
+        # model's prose ``description``, so ``tool_name`` for an MCP call may be
+        # "Look up the weather" rather than the canonical form a per-tool deny
+        # rule or MCP policy matches on. Reconstructing it here — on the COMMON
+        # path, before the deny floor and governance — is what makes a rule keyed
+        # on the real tool identity bind for every consumer of this gate, not
+        # only for the first-party own-server auto-approve below.
+        #
+        # ADDITIVE, never a substitution: the display title and the raw command
+        # stay in every check they were already in. They are not competing
+        # spellings of one fact — the canonical name is the trusted statement of
+        # WHICH tool runs, which is what a per-tool rule matches, while the title
+        # and command carry the path/command/content signals that identity does
+        # not express. Each covers a security dimension the other cannot, so both
+        # are evaluated and a deny on either denies. Both fields empty (a non-MCP
+        # call, or a backend that omits ``_meta.kiro``) leaves every target
+        # exactly as before.
+        canonical_mcp_name = (
+            f"mcp__{mcp_server_name}__{mcp_tool_name}" if mcp_server_name and mcp_tool_name else ""
+        )
+        if canonical_mcp_name:
+            deny_targets.append(canonical_mcp_name)
+        # The trusted tool identity on its own, which is the ONLY form a built-in
+        # carries: kiro-cli sets ``_meta.kiro.toolName`` for every tool call but
+        # ``mcpServerName`` only for MCP-served ones, so the canonical form above
+        # is empty for a built-in and its real name would otherwise reach no check
+        # at all -- leaving ``deny = ["fs_write"]`` bypassable behind a benign
+        # model-authored title. Appended whenever present, MCP or not, because a
+        # deny target can only ever DENY: an identity the model could influence
+        # cannot waive a rule here, at most it matches one it did not need to.
+        if mcp_tool_name and mcp_tool_name not in deny_targets:
+            deny_targets.append(mcp_tool_name)
+        # What the GOVERNANCE plane is asked about, which is NOT the same string,
+        # because that plane has a SERVER level the deny plane does not and it
+        # matches canonical references rather than raw titles.
+        #
+        # The ``mcp__<server>__<tool>`` title is a LOSSY encoding: the parser that
+        # reads it splits on the LAST ``__``, so it can carry any server name but
+        # never a tool name containing ``__``. ``@github`` + ``repo__delete``
+        # encodes to ``mcp__github__repo__delete`` and reads back as server
+        # ``github__repo`` with tool ``delete``, so a ``deny @github/repo__delete``
+        # ceiling never binds and a human is asked to approve a tool the policy
+        # forbids. No spelling of that title fixes it -- the ambiguity is in the
+        # format -- so the trusted fields are composed straight into the canonical
+        # ``@server/tool`` form the matcher documents, where ``/`` separates and
+        # neither segment can contain it. A server with no proven tool asks the
+        # server-level question ``@server``, which a ``@server`` rule matches and
+        # a ``@server/tool`` rule correctly does not.
+        #
+        # Deliberately NOT added to ``deny_targets``: that plane matches raw text
+        # and operator regexes, where a canonical reference is a DIFFERENT string
+        # from the raw identity a rule is written against rather than a broader
+        # form of it, and feeding it there would widen matching by accident
+        # instead of by grammar.
+        governance_mcp_ref = mcp_identity_ref(mcp_server_name, mcp_tool_name)
         if command:
             deny_targets.append(command)
-        # A file-search builtin's scope lives only in its arguments — it carries no
-        # ``command``, and its title need not name the root it walks — so this target is
-        # the only form in which a deny rule can see a whole-tree walk.
-        search_target = _search_deny_target(raw_params)
-        if search_target:
-            deny_targets.append(search_target)
         for target in deny_targets:
             reason = authority.is_denied(
                 target,
@@ -637,16 +790,76 @@ class HookManager:
             if reason:
                 return ToolHookResult.deny(reason)
 
+        # A file-search builtin's scope lives only in its arguments -- it carries no
+        # ``command``, and its title need not name the root it walks -- so this target is
+        # the only form in which a deny rule can see a whole-tree walk.
+        #
+        # It is evaluated in its OWN tier, not appended to the loop above, because it is
+        # not a command line: run through the shared rule set it collides with the
+        # command-oriented built-ins on argument text (the ``mkfs.*`` rule denying a
+        # read-only search of a directory named ``mkfs-tests``), and the only per-rule
+        # remedy -- disabling that rule by id -- also stops it protecting real shell
+        # commands.
+        #
+        # The patterns that PARTICIPATE are passed explicitly: the operator's own enabled
+        # regexes, never the merged effective set.  That is what makes provenance
+        # structural rather than inferred -- classifying the merged set by pattern TEXT
+        # cannot tell an operator's rule from a shipped one when the text coincides
+        # (``mkfs.*`` is a natural thing to type), and reading the operator's own rule as
+        # shipped would silently drop an explicit deny.  The shipped catalogue takes no
+        # part here at all: none of its rules is authored against the synthesized grammar
+        # (ratcheted in the tests), so a built-in's only possible hit is the incidental
+        # one this tier exists to drop.
+        search_target = _search_deny_target(raw_params)
+        if search_target:
+            reason = authority.is_denied_synthesized_target(
+                search_target,
+                [p.pattern for p in self._config.denied_commands_user_added if p.enabled],
+                extra_patterns=self._config.auto_deny_tools,
+                reason_notes=denied_notes,
+            )
+            if reason:
+                return ToolHookResult.deny(reason)
+
         # Governance ceiling ∩ active profile (Level 1 ∩ Level 2).  Runs BEFORE
         # the auto-approve loop so a governance deny wins over a user
         # auto-approve and is never bypassed.  This is the layer that denies a
-        # tool/MCP call even when the kiro agent config granted it: the title for
-        # an MCP tool arrives as ``mcp__server__tool`` and is governed by name
-        # here regardless of kiro's allowedTools.  No-op on a standalone host
-        # with no policy and no bound profile (gate_decision permits), so today's
+        # tool/MCP call even when the kiro agent config granted it, by name,
+        # regardless of kiro's allowedTools.  No-op on a standalone host with no
+        # policy and no bound profile (gate_decision permits), so today's
         # behavior is preserved unless governance is configured.
+        #
+        # Governed under BOTH identities for the reason spelled out at
+        # ``canonical_mcp_name``: a ceiling/profile rule naming the real MCP tool
+        # must bind even when the title is model-authored prose, and a rule
+        # naming the title must still bind. Tightest-wins, so evaluating both and
+        # denying on either preserves the governance contract. The MCP identity
+        # is ``governance_mcp_name``, which falls back to the server alone when
+        # that is all the backend proved.
+        # Governance is asked about the display title AND, separately, the trusted
+        # MCP identity. The identity travels as a canonical reference rather than a
+        # title because the title grammar cannot round-trip every name (see
+        # ``mcp_identity_ref``); a deny on either is final. An absent identity
+        # (a non-MCP call) is not asked about at all -- an empty title classifies
+        # to the unprefixed scopes, where it is a queryable item rather than a
+        # no-op, so querying it could deny on a rule it has nothing to do with.
+        # ONE query, every identity. The title, the trusted tool name and the MCP
+        # reference are all asked against a SINGLE resolved profile: asking them
+        # as separate calls re-resolved the active profile each time, so a profile
+        # hot-reloaded mid-call could answer each question from a different
+        # snapshot and permit a tool that both complete profiles deny -- and each
+        # extra call walked ``profiles/`` synchronously on the event loop.
+        # Tightest-wins is preserved: a deny on any identity denies the call.
         gov_reason = _governance_denial(
-            ctx, tool_name, session_key, agent, app, tool_kind, raw_params
+            ctx,
+            tool_name,
+            session_key,
+            agent,
+            app,
+            tool_kind,
+            raw_params,
+            mcp_ref=governance_mcp_ref,
+            extra_titles=(mcp_tool_name,) if mcp_tool_name and mcp_tool_name != tool_name else (),
         )
         if gov_reason:
             return ToolHookResult.deny_policy(gov_reason)
@@ -715,40 +928,21 @@ class HookManager:
             and _is_first_party_app(owner_app)
             and _is_declared_builtin_mcp_server(mcp_server_name)
         ):
-            # Govern the REAL tool by its TRUSTED _meta.kiro identity before
-            # granting the intra-app auto-approve. ``select_tool_title`` prefers
-            # the model's prose ``description``, so ``tool_name`` (and thus the
-            # ``_governance_denial`` above) may not carry the canonical
-            # ``mcp__server__tool`` a per-tool policy matches on — a ceiling /
-            # profile that denies ONE tool of this server would otherwise be
-            # skipped here and the tool auto-executed. Reconstruct the canonical
-            # title from the NON-model-authored server + tool names (mirroring
-            # the ``mcp__<server>__<tool>`` form ``mcp_title_to_ref`` parses) and
-            # re-check governance. A missing trusted tool name (a backend without
-            # ``_meta.kiro.toolName``, or an uncached permission event) means we
-            # cannot prove WHICH tool this is, so we do NOT auto-approve — fall
-            # through to interactive approval (fail-closed), never silent execute.
-            if mcp_tool_name:
-                canonical_mcp_name = f"mcp__{mcp_server_name}__{mcp_tool_name}"
-                # Re-apply the always-on deny floor to the canonical name too:
-                # the top-of-method ``authority.is_denied`` ran against the prose
-                # title / command, so a configured deny rule (``auto_deny_tools``
-                # or a denied regex) keyed on the canonical ``mcp__server__tool``
-                # would have MISSED — and this auto-approve must never re-admit a
-                # tool the deny floor forbids. Mirrors the governance re-check.
-                deny_reason = authority.is_denied(
-                    canonical_mcp_name,
-                    self._config.auto_deny_tools,
-                    denied_regexes=denied_regexes,
-                    reason_notes=denied_notes,
-                )
-                if deny_reason:
-                    return ToolHookResult.deny(deny_reason)
-                gov_reason = _governance_denial(
-                    ctx, canonical_mcp_name, session_key, agent, app, tool_kind, raw_params
-                )
-                if gov_reason:
-                    return ToolHookResult.deny_policy(gov_reason)
+            # The deny floor has already run against ``canonical_mcp_name`` and
+            # governance against ``governance_mcp_name`` on the common path above,
+            # so a ceiling or profile denying ONE tool of this server — or the
+            # server as a whole — has returned a deny and cannot reach this
+            # auto-approve. Those checks live there only, so there is one copy to
+            # keep in step rather than two.
+            #
+            # The identity requirement is what this branch enforces: a missing
+            # trusted tool name (a backend without ``_meta.kiro.toolName``, or an
+            # uncached permission event) leaves ``canonical_mcp_name`` empty,
+            # which means WHICH tool this is cannot be proven — and an
+            # unidentifiable tool must not be auto-approved on the strength of its
+            # server alone. Fall through to interactive approval (fail-closed),
+            # never silent execute.
+            if canonical_mcp_name:
                 return ToolHookResult.auto_approve()
 
         # Auto-approve — match against both the original title (preserves
@@ -1029,8 +1223,16 @@ def _governance_denial(
     app: str,
     tool_kind: str = "",
     raw_params: dict | None = None,
+    mcp_ref: str = "",
+    extra_titles: tuple[str, ...] = (),
 ) -> str | None:
     """Return a denial reason if governance forbids *tool_name*, else None.
+
+    *mcp_ref* is an already-canonical ``@server`` / ``@server/tool`` reference
+    for the trusted MCP identity, evaluated in addition to (or instead of) the
+    display title. It is passed as a reference rather than folded into
+    *tool_name* because the title grammar cannot encode every identity; both are
+    empty for a non-MCP call with no title, which governs nothing.
 
     Resolves the active profile (Level 2) for the calling surface and intersects
     it with the boot-frozen ceiling (Level 1).  Fast no-op when the host has
@@ -1055,10 +1257,20 @@ def _governance_denial(
         if ceiling is None and profile is None:
             return None
         decision = gate_decision(
-            ceiling, profile, tool_name, tool_kind=tool_kind, raw_params=raw_params
+            ceiling,
+            profile,
+            tool_name,
+            tool_kind=tool_kind,
+            raw_params=raw_params,
+            mcp_ref=mcp_ref,
+            extra_titles=extra_titles,
         )
         if not decision.permitted:
-            _audit_governance(session_key, agent, tool_name, decision)
+            # The denied identity when the decision names one -- with the title,
+            # the trusted tool name and the MCP reference all in one query, the
+            # subject is whichever of them the rule matched, not always the title.
+            subject = getattr(decision, "item", "") or tool_name or mcp_ref
+            _audit_governance(session_key, agent, subject, decision)
             return f"Blocked by governance policy: {decision.reason}"
         return None
     except PlatformCompositionError:
@@ -1328,6 +1540,20 @@ _RECURSIVE_SEARCH_OPERATIONS: frozenset[str] = frozenset(
 # number and needs no such treatment.
 _SEARCH_PATH_FIELD = "path"
 
+# The sensitive-path keystone's target extraction — ``TARGET_PATH_KEYS``, the
+# ``_TARGET_PATH_MAX_PATHS`` / ``_TARGET_PATH_MAX_NODES`` work caps, the
+# ``TargetPaths`` list-subclass carrying ``truncated``, and the bounded,
+# depth-aware ``target_paths`` walk — now live in
+# ``kiro_crew.platform.tool_paths`` (imported at module top) so the governance
+# intersection plane can share the SAME traversal. governance cannot import
+# hooks — hooks imports governance — so the walk moved DOWN a layer that both
+# import. The names are re-exported from ``hooks`` (see the top-level import)
+# unchanged so the keystone consumers below and any caller that imports them
+# from ``hooks`` keep working. hooks still applies HARD-DENY semantics to
+# ``truncated`` (deny an unverifiable scan); governance applies its own
+# permit-by-default policy to the same flag.
+
+
 # The SCOPE-bearing arguments of a file search as ``(canonical, accepted spellings)``,
 # in a fixed order so the synthesized target is deterministic. Scope is the root walked
 # and the depth cap — NOT what is being looked for. ``pattern`` and ``include`` are
@@ -1499,6 +1725,30 @@ def _is_search_shaped(raw_params: Mapping) -> bool:
     return isinstance(operation, str) and operation in _RECURSIVE_SEARCH_OPERATIONS
 
 
+def mcp_identity_ref(mcp_server_name: str, mcp_tool_name: str) -> str:
+    """The canonical MCP reference governance is asked about, or ``""``.
+
+    Composes the trusted fields straight into the ``@server`` / ``@server/tool``
+    form :func:`_match_mcp` documents, instead of encoding them into an
+    ``mcp__<server>__<tool>`` title and having the parser split it back apart.
+    That round trip is lossy in one direction: the split takes the LAST ``__``,
+    so any tool name containing ``__`` re-parses into a different server and
+    tool, and a per-tool ceiling written against the real identity stops binding.
+    Composing the reference directly cannot mis-split, because the segments are
+    joined by ``/`` and neither an MCP server nor an MCP tool name contains one.
+
+    A server with no proven tool yields the server-level ``@server``: a
+    ``@server`` rule covers every tool under it, while a ``@server/tool`` rule
+    does not match it, so an unproven tool is never denied by a rule naming a
+    specific one.
+    """
+    if not mcp_server_name:
+        return ""
+    if not mcp_tool_name:
+        return f"@{mcp_server_name}"
+    return f"@{mcp_server_name}/{mcp_tool_name}"
+
+
 def _search_deny_target(raw_params: dict | None) -> str:
     """Synthesize a deny-matcher target from a file-search call's scope arguments.
 
@@ -1572,12 +1822,12 @@ def _context_matches(matcher: str, mode: str, context: str) -> bool:
     - ``contains``: pipe-delimited substrings, case-insensitive OR.
     """
     if mode == "regex":
-        # Prepend (?i) for case-insensitive matching (the subprocess runs raw re.search).
-        # Only skip the prepend when the pattern already starts with an inline-flag
-        # group (e.g. (?i), (?im), (?aiLmsux)).  Non-flag groups like (?:, (?=, (?<,
-        # (?P must still get the (?i) prefix.
-        _has_inline_flags = re.match(r"^\(\?[aiLmsux]+[):]", matcher) is not None
-        pattern = matcher if _has_inline_flags else f"(?i){matcher}"
+        # Prepend (?i) for the default case-insensitive behavior unless the
+        # pattern already starts with a GLOBAL flag directive such as (?i).
+        # Scoped groups only govern their own body: (?-i:foo)bar intentionally
+        # still inherit the matcher default. Suppressing the prefix for every
+        # scoped group accidentally made the suffix case-sensitive too.
+        pattern = matcher if _has_global_inline_flags(matcher) else f"(?i){matcher}"
         result = _bounded_pattern_search(pattern, context)
         if result is None:
             # Timeout, oversized, or invalid pattern — fail closed (no match)
@@ -1608,6 +1858,62 @@ def is_unc_shape(raw: str) -> bool:
     return len(raw) >= 2 and raw[0] in "\\/" and raw[1] in "\\/"
 
 
+_unc_agents_root_cache: tuple[tuple[object, ...], Path | None] | None = None
+
+
+def _unc_agents_root() -> Path | None:
+    """The kiro agents dir as a UNC-gate trusted root, memoized per configuration.
+
+    ``kiro_agents_dir()`` resolves ``KIRO_HOME`` (``Path.resolve()`` --
+    filesystem I/O, and on a UNC-shaped override an SMB touch), so consulting
+    it per gate check would put blocking I/O -- and exactly the network access
+    this gate promises not to make -- on every validation, including async
+    callers (review finding on #6728). Memoized on the RAW ``KIRO_HOME`` env
+    value plus the accessor and override-hook identities, so the resolution
+    runs once per configuration and a monkeypatched or hot-swapped accessor
+    invalidates naturally. Mirrors how ``data_home()`` keeps its own hot path
+    cheap.
+
+    A computation failure memoizes ``None`` (root absent, gate stays total):
+    deterministic-per-configuration beats self-healing here, because the
+    failure mode being avoided is a per-call resolve that can block on an SMB
+    timeout, and the degraded state -- UNC agent specs refused -- is exactly
+    the pre-#6721 status quo. Recovery is an env change or process restart.
+    Benign write race under threads: last-writer-wins on an idempotent value.
+    """
+    global _unc_agents_root_cache
+    key: tuple[object, ...] = (
+        os.environ.get("KIRO_HOME"),
+        _config_paths.kiro_agents_dir,
+        getattr(_config_paths, "_agents_dir_override", None),
+    )
+    cached = _unc_agents_root_cache
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    try:
+        # Same admission basis as data_home(): the gateway itself writes the
+        # managed agent specs here. The PROJECT-level agents dir is
+        # deliberately NOT admitted -- an arbitrary project directory is not
+        # gateway-written, so admitting it would widen the trust boundary.
+        root: Path | None = _config_paths.kiro_agents_dir()
+    except (ValueError, OSError, RuntimeError):
+        # A broken home resolution must not take the gate down with it: the
+        # two always-computable roots still apply and the function stays
+        # total (True/False, never a propagated error).
+        root = None
+    _unc_agents_root_cache = (key, root)
+    return root
+
+
+# Prime the memo at import time (review finding, #6728 round 3): without this
+# the FIRST gate check after process start -- or after a ``KIRO_HOME`` change --
+# still pays the resolving accessor on whatever thread asked, which on an async
+# validation path is the event loop. Import of this module happens at process
+# start, off the loop, so the one resolution per configuration lands there.
+# Best-effort: a failure here memoizes root-absent exactly as a lazy miss would.
+_unc_agents_root()
+
+
 def unc_probe_allowed(raw: str) -> bool:
     """Whether a UNC-shaped path may touch the filesystem on Windows.
 
@@ -1615,18 +1921,27 @@ def unc_probe_allowed(raw: str) -> bool:
     (``\\\\evil\\share\\x.png`` or ``//evil/share/x.png`` echoed in any message
     or query) makes Windows open an SMB connection to that host -- an outbound
     credential probe the attacker controls. Filesystem access is therefore
-    restricted to UNC paths under directories this gateway itself writes
-    attachments to: the data home (on a roaming profile the home directory is
-    itself a UNC share, the one legitimate source of UNC attachment paths) and
-    the temp directory (channel-side image staging). The comparison is purely
-    lexical (``normpath``/``normcase``), so this check never touches the
-    network itself.
+    restricted to UNC paths under directories this gateway itself writes to:
+    the data home (on a roaming profile the home directory is itself a UNC
+    share, the one legitimate source of UNC attachment paths), the temp
+    directory (channel-side image staging), and the kiro agents directory
+    (``apps.bridges._register_agents`` and ``agent.rebuild_agent_config``
+    write the managed specs there -- see ``kiro_agents_dir()``'s docstring;
+    on a roaming profile it sits on the same UNC share as the data home, and
+    without it every user-level agent spec read was silently refused, #6721).
+    The comparison is purely lexical (``normpath``/``normcase``) and the
+    agents root is memoized per configuration (see ``_unc_agents_root``), so
+    this check never touches the network itself.
     """
     try:
         cand = os.path.normcase(os.path.normpath(raw))
     except (ValueError, OSError):
         return False
-    for root in (_config_paths.data_home(), Path(tempfile.gettempdir())):
+    roots: tuple[Path, ...] = (_config_paths.data_home(), Path(tempfile.gettempdir()))
+    agents_root = _unc_agents_root()
+    if agents_root is not None:
+        roots += (agents_root,)
+    for root in roots:
         rootn = os.path.normcase(os.path.normpath(str(root)))
         if not is_unc_shape(rootn):
             continue
@@ -1670,7 +1985,11 @@ def safe_read_file(path: str) -> str:
     """
     resolved = os.path.realpath(os.path.expanduser(path))
     if is_sensitive_path(resolved):
-        raise PermissionError(f"Blocked: access to sensitive path: {resolved}")
+        # {resolved!r}, not {resolved}: the resolved target is caller/attacker
+        # influenced (a symlink target is chosen by whoever wrote the link) and
+        # this text reaches log records via ``exc_info`` — a raw newline in it
+        # would forge a second record.
+        raise PermissionError(f"Blocked: access to sensitive path: {resolved!r}")
     try:
         fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError as exc:
@@ -1678,7 +1997,7 @@ def safe_read_file(path: str) -> str:
         # swap of the final component into a symlink — refuse it. Any other
         # OSError (ENOENT, EACCES) is a normal read error; re-raise as-is.
         if exc.errno in (errno.ELOOP, getattr(errno, "EMLINK", -1)):
-            raise PermissionError(f"Blocked: refusing to follow symlink at {resolved}") from exc
+            raise PermissionError(f"Blocked: refusing to follow symlink at {resolved!r}") from exc
         raise
     with os.fdopen(fd, "r", encoding="utf-8") as fh:
         return fh.read()
@@ -1749,7 +2068,7 @@ def safe_read_file_bytes_with_identity(
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError as exc:
         if exc.errno in (errno.ELOOP, getattr(errno, "EMLINK", -1)):
-            raise PermissionError(f"Blocked: refusing to follow symlink at {path}") from exc
+            raise PermissionError(f"Blocked: refusing to follow symlink at {path!r}") from exc
         return None
     try:
         st = os.fstat(fd)
@@ -1857,8 +2176,9 @@ def safe_read_file_bytes_nolink(
     ``st_nlink > 1`` or a non-regular file type is rejected.
 
     When ``within_root`` is given, the OPENED descriptor's real path
-    (via ``/proc/self/fd`` on Linux, ``fcntl.F_GETPATH`` on macOS) must resolve
-    inside that root and must not be sensitive. ``O_NOFOLLOW`` only guards the
+    (via ``/proc/self/fd`` on Linux, ``fcntl.F_GETPATH`` on macOS, or
+    ``GetFinalPathNameByHandleW`` on Windows) must resolve inside that root and
+    must not be sensitive. ``O_NOFOLLOW`` only guards the
     FINAL path component — a nested directory swapped for a symlink between
     the tree walk and the open would silently escape the approved tree. The
     fd-path check is pinned to the inode actually opened, so no check-to-use
@@ -1919,28 +2239,6 @@ def safe_read_file_bytes_nolink(
                 os.close(fd)
             except OSError:
                 pass
-
-
-# errnos meaning "this filesystem has no extended attributes", as opposed to "the
-# lookup failed". Only the former is safe to treat as "nothing to carry".
-_XATTR_UNSUPPORTED_ERRNOS = frozenset(
-    e for e in (getattr(errno, n, None) for n in ("ENOTSUP", "EOPNOTSUPP", "ENOSYS"))
-    if e is not None
-)
-
-_ACCESS_CONTROL_XATTR_PREFIXES = (
-    "system.posix_acl_",  # POSIX ACLs: the actual permission set
-    "security.",          # SELinux/SMACK/capabilities labels
-)
-
-
-def _is_access_control_xattr(attr: str) -> bool:
-    """True when losing *attr* would leave the file less protected.
-
-    Only these justify refusing a write. `user.*` is application metadata: worth
-    carrying, not worth failing a save over on a filesystem that cannot store it.
-    """
-    return attr.startswith(_ACCESS_CONTROL_XATTR_PREFIXES)
 
 
 def safe_write_file_nolink(
@@ -2093,10 +2391,18 @@ def safe_write_file_nolink(
     # A filesystem that does not support xattrs at all is NOT an error: there is
     # nothing on the source to lose. Any OTHER failure means we cannot know what
     # we would be dropping, so it refuses.
+    #
+    # `_should_carry_xattr` narrows this to the attributes an inode-replacing
+    # write may reproduce, and it is applied HERE, at the read, so a
+    # privilege-bearing `security.capability` or an integrity signature over the
+    # OLD bytes (`security.ima`/`security.evm`) is never captured to be replayed
+    # onto content the caller supplied. See its allowlist in atomic_write.py.
     src_xattrs: list[tuple[str, bytes]] = []
     if all(hasattr(os, a) for a in ("listxattr", "getxattr", "setxattr")):
         try:
             for _attr in os.listxattr(fd):
+                if not _should_carry_xattr(_attr):
+                    continue
                 src_xattrs.append((_attr, os.getxattr(fd, _attr)))
         except OSError as exc:
             if exc.errno not in _XATTR_UNSUPPORTED_ERRNOS:
@@ -2200,7 +2506,9 @@ def safe_write_file_nolink(
             # a fresh inode starts with none, which silently drops POSIX ACLs
             # (stored as system.posix_acl_access) and any user.* metadata.
             #
-            # Split by what the attribute DOES, rather than one policy for all:
+            # Split by what the attribute DOES, rather than one policy for all.
+            # `src_xattrs` is already narrowed to the carriable allowlist at the
+            # read above, so the split below is only over POSIX ACLs and `user.*`:
             #
             #  * an ACCESS-CONTROL attribute that fails to copy is a security
             #    regression -- the rename would install an inode the owner has
@@ -2649,16 +2957,53 @@ _AUDIT_ONLY_READ_IDS: dict[str, str] = {
     # no value is returned. The audit is owed regardless, because the file holds
     # live credential material whatever this reader touches.
     "kiro_cli.idc_identity_probe": ".local/share/kiro-cli/data.sqlite3",
+    # Same store, read by ``kiro_crew.kiro_prerequisite.identity_fingerprint`` to
+    # answer one question on the turn path: does the account signed in NOW differ
+    # from the one the running kiro-cli children loaded? Only stable account
+    # claims participate (start_url, region, oauth_flow, scopes, client_id) plus
+    # the non-secret ``auth.*`` / ``api.codewhisperer.*`` marker rows; the values
+    # are hashed and only a digest leaves the function. The rotating and secret
+    # fields (access_token, refresh_token, expires_at, client_secret) are excluded
+    # by an ALLOWLIST, so a field added to the blob later cannot join by default.
+    # Audited on the observation a caller acts on rather than per poll -- the
+    # reader holds a short cache -- for the same reason as the mint entry below.
+    "kiro_prerequisite.identity_fingerprint": ".local/share/kiro-cli/data.sqlite3",
     # Class 2. kiro-cli's MCP OAuth artifact cache under ``~/.aws/sso/cache``.
-    # ``kiro_crew.connections.mint.grant_present`` STATS the paired
+    # ``kiro_crew.mcp_grant.grant_present`` STATS the paired
     # ``<sha256(mcp_url)>.token.json`` / ``.registration.json`` artifacts to learn
-    # whether kiro-cli already holds a grant for ONE provider -- the mint's only
-    # consent-completion signal. The files are never opened, so no token material
-    # can enter the process, and the name is a hex digest of a registry-declared
-    # provider URL, so no other path in that directory is expressible. Audited on
-    # the observation a caller acts on, not per poll; see
-    # ``mint._grant_observed`` for why that boundary is not fail-closed.
+    # whether kiro-cli already holds a grant for ONE endpoint. The files are never
+    # opened, so no token material can enter the process.
+    #
+    # TWO callers, and the second is the wider one: the mint's consent-completion
+    # signal (curated registry providers only), and ``mcp_discovery``'s remote
+    # probe, which asks for ANY url the user configured whenever a probe meets an
+    # OAuth challenge. So the reasoning cannot rest on the url being
+    # registry-declared. What keeps it sound for arbitrary input is the key: the
+    # name is a sha256 over the url's normalized origin and path, so no caller can
+    # express a path outside this directory, name a file it did not derive, or
+    # smuggle a credential from the url into the filename. The digest is also why
+    # the widened caller set adds no read surface -- both callers can only ever
+    # probe for the pair belonging to the url they already hold.
+    #
+    # Audited on the observation a caller acts on, not per poll, and the two
+    # callers differ on which observations those are. The mint polls for a grant
+    # to APPEAR, so only its TRUE is acted on and recorded. The probe reads once
+    # and renders either answer -- an absent pair is what produces "Sign-in
+    # required" -- so it opts into recording the negative too, as ``missing``.
+    # See ``mcp_grant.grant_observed`` for why that boundary is not fail-closed,
+    # and note that neither caller logs the url itself (the probe logs the server
+    # name, the mint warning logs the key) because a user-supplied endpoint can
+    # carry a credential in its userinfo or query string.
     "connections_mint.oauth_grant_presence": ".aws/sso/cache/<sha256(mcp_url)>.token.json",
+    # Class 2, same artifacts and same posture as the mint entry above: the
+    # status module (``kiro_crew.connections.status``) STATS the identical
+    # paired grant artifacts to answer the dashboard's authorization question.
+    # A separate id, not a reuse of the mint's, so the SEL trail says which
+    # surface looked. Audited only on the acted-on observation -- the stamping
+    # of a provider's first-connect timestamp -- never per poll sweep; see
+    # ``status.reconcile_connected_since`` for why that boundary is
+    # best-effort rather than fail-closed (stats only, no bytes returned).
+    "connections_status.oauth_grant_presence": ".aws/sso/cache/<sha256(mcp_url)>.token.json",
 }
 
 
@@ -2690,6 +3035,188 @@ def emit_internal_read_audit(read_id: str, outcome: str) -> bool:
 
 # ── Script Hooks ──
 
+# Inclusive bounds for a script hook's subprocess timeout, in seconds. Mirrors
+# the API schema (``validation.HOOK_CREATE_SCHEMA`` min_val=1/max_val=300); kept
+# here so the same bound is enforced at EVERY persistence boundary — create,
+# update, and deserialization — not only when a value arrives over the dashboard
+# API. A 0 (or negative) timeout makes ``asyncio.wait_for`` fire immediately, and
+# an unbounded one lets a hook wedge a turn for as long as it likes; both are
+# outcomes a hand-edited or older ``hooks.json`` could otherwise reintroduce.
+HOOK_TIMEOUT_MIN = 1
+HOOK_TIMEOUT_MAX = 300
+HOOK_TIMEOUT_DEFAULT = 30
+
+# Events on which a standalone skills-only hook (no command) actually fires: only
+# UserPromptSubmit / AgentSpawn synthesize the "Load skills:" directive in
+# ``ScriptHookStore.fire()``. On any other event the directive has no consumer,
+# so pairing skills with one is a config that saves but never fires.
+_SKILLS_ONLY_EVENTS = (HOOK_EVENT_USER_PROMPT_SUBMIT, HOOK_EVENT_AGENT_SPAWN)
+
+# A global Python inline-flag directive at the very start of a pattern. Only this
+# form replaces the matcher-wide case-insensitive default. Scoped forms such as
+# ``(?i:...)`` and ``(?-i:...)`` govern their group only, so the caller still
+# prepends ``(?i)`` for the rest of the expression.
+_GLOBAL_INLINE_FLAGS_RE = re.compile(r"^\(\?[aiLmsux]+\)")
+
+
+def _has_global_inline_flags(pattern: str) -> bool:
+    """True when *pattern* starts with a global Python flag directive."""
+    return _GLOBAL_INLINE_FLAGS_RE.match(pattern) is not None
+
+
+def _normalize_hook_timeout(value: object) -> int:
+    """Coerce a persisted/edited timeout to an int within the allowed bounds.
+
+    ``hooks.json`` is hand-editable and older files predate the 1–300 bound, so a
+    missing / non-int / out-of-range value must degrade to a SAFE in-range value
+    rather than propagate: ``None`` or junk → the default; a numeric value is
+    clamped into ``[HOOK_TIMEOUT_MIN, HOOK_TIMEOUT_MAX]``. Used by ``from_dict``
+    (fail-soft on load); the raising ``validate_hook_fields`` is what rejects a
+    bad value at the create/update API boundary. A bool is rejected (``bool`` is
+    an ``int`` subclass but ``True`` as a timeout is meaningless).
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return HOOK_TIMEOUT_DEFAULT
+    try:
+        ivalue = int(value)
+    except (ValueError, OverflowError):
+        return HOOK_TIMEOUT_DEFAULT
+    return max(HOOK_TIMEOUT_MIN, min(HOOK_TIMEOUT_MAX, ivalue))
+
+
+def validate_hook_fields(
+    *, event: str, timeout: object, command: str, skills: list, matcher: str, matcher_mode: str
+) -> None:
+    """Enforce the script-hook invariants at a WRITE boundary, raising on any breach.
+
+    The single source of truth for what makes a hook well-formed, shared by
+    ``ScriptHookStore.create`` and ``ScriptHookStore.update`` so a hook persisted
+    by EITHER path is held to the same contract — closing the gap where the
+    command+skills invariant, event membership, and timeout bounds were checked
+    only in ``update``. Deserialization (``ScriptHook.from_dict``) does NOT call
+    this: a malformed persisted hook must load fail-soft (normalized), never abort
+    the whole store, so it uses the ``_normalize_hook_*`` helpers instead.
+
+    Raises ``ValueError`` (which the dashboard handler maps to HTTP 400) when:
+
+    * ``event`` is not one of ``HOOK_EVENTS``;
+    * ``timeout`` is not an int in ``[1, 300]``;
+    * neither ``command`` nor ``skills`` is present (an empty hook);
+    * ``skills`` is combined with a ``command`` (the skills would never fire);
+    * ``skills`` is paired with an event other than UserPromptSubmit/AgentSpawn
+      (the "Load skills:" directive has no consumer there);
+    * ``matcher_mode`` is ``regex`` with a syntactically invalid ``matcher``.
+    """
+    if event not in HOOK_EVENTS:
+        raise ValueError(f"invalid event: {event}")
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or not (
+        HOOK_TIMEOUT_MIN <= timeout <= HOOK_TIMEOUT_MAX
+    ):
+        raise ValueError(
+            f"timeout must be an integer between {HOOK_TIMEOUT_MIN} and {HOOK_TIMEOUT_MAX}"
+        )
+    if not command and not skills:
+        raise ValueError("either command or skills must be provided")
+    if skills:
+        if command:
+            raise ValueError(
+                "skills cannot be combined with a command — the skills would "
+                "never fire; use a skills-only hook or drop the skills"
+            )
+        if event not in _SKILLS_ONLY_EVENTS:
+            raise ValueError(
+                f"skills hooks cannot fire on {event} events — "
+                "choose UserPromptSubmit or AgentSpawn"
+            )
+    if matcher_mode == "regex" and matcher:
+        try:
+            re.compile(matcher)
+        except re.error as exc:
+            raise ValueError(f"invalid regex: {exc}") from None
+
+
+# Env keys a script-hook subprocess may inherit from the gateway. A script hook
+# runs an operator/agent-authored command through ``/bin/sh -c`` (POSIX) or
+# ``cmd /c`` (Windows), so it needs only what the shell and an ordinary command
+# require to run — an interpreter/tool on PATH, HOME, locale, TLS trust, and a
+# proxy — plus the two hook-metadata variables injected below. Inheriting the
+# whole gateway environment (``{**os.environ, ...}``) also handed every hook the
+# gateway's AWS keys, model/provider keys, OAuth tokens, and connection strings,
+# which a hostile or careless command could echo straight back through stdout,
+# stderr, or the audit trail. This is the same strict-allowlist boundary the
+# authenticated ``gh``/``glab`` spawns cross (``_PROVIDER_BASE_ENV_KEYS`` in
+# ``dashboard/handlers/source_providers.py``); a variable a hook genuinely needs
+# is added here by name, never by opening the gate to the whole environment. A
+# key absent from the host environment is simply not forwarded — the allowlist
+# is a filter, not a set of required keys — so a minimal container is unaffected.
+_HOOK_BASE_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        # A hook subprocess sees ONLY these ambient keys (plus the two
+        # KIROCREW_HOOK_* metadata vars). A hook that depended on an ambient var
+        # NOT listed here (e.g. VIRTUAL_ENV, PYTHONPATH, JAVA_HOME, AWS_PROFILE,
+        # nvm/pyenv vars) will fail after upgrade with a "works in my terminal,
+        # fails in the hook" symptom — the fix is to add that key here by name.
+        # This fail-closed direction is deliberate: the allowlist is the
+        # secret-egress boundary, so widening it is a per-key security decision.
+        # Shell / command resolution. PATH is what lets ``/bin/sh -c "python …"``
+        # find the interpreter; the Windows spellings mirror it there.
+        "PATH",
+        "PATHEXT",
+        "COMSPEC",
+        "SYSTEMROOT",
+        # Home / user profile — a hook command that reads or writes under ``~``.
+        "HOME",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "XDG_CONFIG_HOME",
+        # Data home — a hook that invokes the ``kirocrew`` CLI (or otherwise
+        # reads the instance's data dir) must resolve the gateway's overridden
+        # home, not the default ``~/.kiro/crew``. It is a path, not a credential,
+        # so preserving it does not widen the secret-egress boundary this env
+        # allowlist exists to close.
+        "KIROCREW_HOME",
+        # Temp dir — a hook that stages a scratch file.
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        # Locale — so a hook's output encoding matches the host.
+        "LANG",
+        "LC_ALL",
+        # TLS trust may be required by network clients. Proxy URLs are omitted:
+        # HTTP(S)_PROXY commonly embeds userinfo credentials, and script hooks
+        # are an untrusted execution boundary. NO_PROXY carries host patterns,
+        # not credentials, and is safe to preserve.
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "NO_PROXY",
+        "no_proxy",
+    }
+)
+
+
+def _hook_subprocess_env(hook: "ScriptHook", context: str) -> dict[str, str]:
+    """Build the environment a script-hook subprocess runs with.
+
+    A strict allowlist over ``os.environ`` (``_HOOK_BASE_ENV_KEYS``) plus the two
+    hook-metadata variables the hook contract exposes — never a copy of the whole
+    gateway environment, which would leak the gateway's credentials to every hook
+    command (see ``_HOOK_BASE_ENV_KEYS``). The metadata variables are set LAST so
+    a same-named ambient variable can never shadow them.
+
+    ``KIROCREW_HOOK_CONTEXT`` is capped for a Stop event only: the env var is
+    bounded by ARG_MAX (~32K on Windows), and a multi-KB Stop segment there can
+    fail subprocess creation. The full context still reaches the hook via the
+    stdin JSON payload (``Stop -> hook_event["assistant_text"]``) and drove
+    matcher evaluation, so the cap loses nothing the hook cannot recover.
+    """
+    env = {k: v for k, v in os.environ.items() if k in _HOOK_BASE_ENV_KEYS}
+    env["KIROCREW_HOOK_EVENT"] = hook.event
+    env["KIROCREW_HOOK_CONTEXT"] = context[:500] if hook.event == HOOK_EVENT_STOP else context
+    return env
+
 
 @dataclass
 class ScriptHook:
@@ -2712,6 +3239,7 @@ class ScriptHook:
     enabled: bool = True
     last_run: float = 0.0
     last_status: str = ""  # "ok", "error", "timeout", "blocked"
+    last_error: str = ""  # human-readable reason for the most recent non-ok status
     run_count: int = 0
 
     def to_dict(self) -> dict:
@@ -2723,6 +3251,27 @@ class ScriptHook:
         matcher = data.get("matcher", data.get("pattern", ""))
         skills_raw = data.get("skills", [])
         skills = skills_raw if isinstance(skills_raw, list) else []
+        # Redact + truncate a persisted last_error on load: hooks.json is
+        # operator-writable and an agent-written (or hand-edited) error can carry
+        # a credential. It flows from_dict() -> /api/hooks -> the dashboard
+        # InfoTip, so it is an output boundary and must be scrubbed here too, not
+        # only at write time. Non-string values default to "".
+        raw_last_error = data.get("last_error", "")
+        last_error = (
+            redact_via_context(raw_last_error)[:500]
+            if isinstance(raw_last_error, str) and raw_last_error
+            else ""
+        )
+        # Normalize the timeout on load. hooks.json is hand-editable and older
+        # files predate the 1–300 bound, so a missing / non-int / out-of-range
+        # value is clamped to a safe in-range value here rather than persisted
+        # verbatim to later fire a 0-second (immediate) or unbounded timeout.
+        # Deserialization is fail-soft on purpose (a malformed hook must load,
+        # not abort the whole store); the raising `validate_hook_fields` is what
+        # rejects a bad value at the create/update boundary. `event` is left as
+        # written so an unknown event is visibly inert rather than silently
+        # remapped, matching how `matcher_mode` junk falls through to glob.
+        timeout = _normalize_hook_timeout(data.get("timeout", HOOK_TIMEOUT_DEFAULT))
         return cls(
             id=data.get("id", str(uuid.uuid4())[:8]),
             name=data.get("name", ""),
@@ -2731,12 +3280,126 @@ class ScriptHook:
             matcher_mode=data.get("matcher_mode", "glob"),
             command=data.get("command", ""),
             skills=[str(s) for s in skills if isinstance(s, str)],
-            timeout=data.get("timeout", 30),
+            timeout=timeout,
             enabled=data.get("enabled", True),
             last_run=data.get("last_run", 0.0),
             last_status=data.get("last_status", ""),
+            last_error=last_error,
             run_count=data.get("run_count", 0),
         )
+
+
+# ── Script hook output caps ──
+#
+# ``run_script_hook`` used to ``await proc.communicate(...)``, which buffers
+# BOTH pipes in memory until EOF: a buggy or hostile hook could emit unbounded
+# stdout/stderr and OOM (or stall) the gateway for every session before the
+# 500-char presentation limit was ever applied (#5442). We now drain each
+# stream incrementally and keep only the first ``_HOOK_STREAM_CAP_BYTES`` bytes,
+# while continuing to read (and discard) the rest so the child can never block
+# on a full pipe. The cap is generously above the 500-char field we surface, so
+# the retained prefix is always enough to decode and truncate for display, yet
+# small enough that a runaway hook cannot exhaust memory.
+_HOOK_STREAM_CAP_BYTES = 64 * 1024
+# Marker appended to a decoded stream when its raw bytes exceeded the cap, so
+# truncation is visible rather than silent.
+_HOOK_TRUNCATION_MARKER = "\n…[output truncated]"
+
+
+async def _read_capped_stream(
+    reader: "asyncio.StreamReader | None", cap: int
+) -> tuple[bytes, bool]:
+    """Drain *reader* fully, retaining at most *cap* bytes.
+
+    Returns ``(retained_bytes, truncated)``. Bytes beyond *cap* are read and
+    discarded so the child never blocks on a full OS pipe buffer (the deadlock
+    ``communicate`` avoided by buffering everything — we avoid it by consuming
+    everything, but only *keeping* a bounded prefix). Chunked reads keep peak
+    memory at roughly ``cap`` regardless of how much the child writes.
+    """
+    if reader is None:
+        return b"", False
+    retained = bytearray()
+    truncated = False
+    while True:
+        # A fixed read size bounds a single chunk; the loop bounds the total.
+        chunk = await reader.read(65536)
+        if not chunk:
+            break
+        if len(retained) < cap:
+            room = cap - len(retained)
+            retained.extend(chunk[:room])
+            if len(chunk) > room:
+                truncated = True
+        else:
+            # Already at cap — keep draining so the pipe drains, drop the bytes.
+            truncated = True
+    return bytes(retained), truncated
+
+
+def _decode_capped(raw: bytes, truncated: bool) -> str:
+    """Decode capped raw bytes, appending the truncation marker when clipped.
+
+    ``errors="replace"`` handles a multibyte sequence severed at the cap
+    boundary: the trailing partial code point becomes U+FFFD rather than raising
+    or silently dropping, so a UTF-8 stream clipped mid-character still decodes
+    to a stable, safe string.
+    """
+    text = raw.decode(errors="replace")
+    if truncated:
+        text += _HOOK_TRUNCATION_MARKER
+    return text
+
+
+async def _communicate_capped(
+    proc: "asyncio.subprocess.Process", stdin_data: bytes, cap: int
+) -> tuple[bytes, bool, bytes, bool]:
+    """Write *stdin_data*, then drain stdout and stderr concurrently under a cap.
+
+    Concurrent draining (vs. sequential) is required for the same reason
+    ``communicate`` reads both pipes at once: a child that fills stderr while we
+    are still reading stdout would deadlock if we did not consume stderr in
+    parallel. Returns ``(stdout, stdout_truncated, stderr, stderr_truncated)``.
+    """
+
+    async def _feed_stdin() -> None:
+        stdin = proc.stdin
+        if stdin is None:
+            return
+        try:
+            stdin.write(stdin_data)
+            await stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            # The hook may exit without reading stdin; that is not our error.
+            pass
+        finally:
+            try:
+                stdin.close()
+            except Exception:
+                pass
+
+    stdin_task = asyncio.ensure_future(_feed_stdin())
+    stdout_task = asyncio.ensure_future(_read_capped_stream(proc.stdout, cap))
+    stderr_task = asyncio.ensure_future(_read_capped_stream(proc.stderr, cap))
+    try:
+        (stdout_b, stdout_trunc), (stderr_b, stderr_trunc) = await asyncio.gather(
+            stdout_task, stderr_task
+        )
+        await stdin_task
+        await proc.wait()
+    except BaseException:
+        # On timeout (CancelledError from wait_for) or any failure, cancel and
+        # OBSERVE every helper before returning control to the reap path. Merely
+        # calling cancel() leaves the StreamReader with an active waiter, so a
+        # cleanup read can raise "read() called while another coroutine is
+        # already waiting" and leak the process.
+        for task in (stdin_task, stdout_task, stderr_task):
+            task.cancel()
+        await asyncio.gather(
+            stdin_task, stdout_task, stderr_task, return_exceptions=True
+        )
+        raise
+    return stdout_b, stdout_trunc, stderr_b, stderr_trunc
 
 
 @dataclass
@@ -2838,6 +3501,7 @@ async def run_script_hook(
     if gov_denied:
         hook.last_run = time.time()
         hook.last_status = "blocked"
+        hook.last_error = f"Blocked by governance: {gov_denied}"
         hook.run_count += 1
         _audit_governance_hook_decision(
             sk, f"run_script_hook:{hook.name or hook.id}", "denied", gov_denied
@@ -2857,18 +3521,17 @@ async def run_script_hook(
 
     try:
         # circular import: sandbox → registry → apps → hooks, so import at call time
-        from kiro_crew.sandbox import cgroup_scope_argv, create_subprocess_limited, wrap_argv
+        from kiro_crew.sandbox import (
+            create_subprocess_limited,
+            sandboxed_spawn_argv,
+            sandboxed_spawn_argv_async,
+        )
 
-        # The env var is bounded by ARG_MAX — a multi-KB Stop segment there can
-        # fail subprocess creation (~32K on Windows). Cap the ENV copy only; the
-        # full context still reaches the hook via the stdin JSON payload
-        # (Stop -> hook_event["assistant_text"]) and drove matcher evaluation.
-        env_context = context[:500] if hook.event == HOOK_EVENT_STOP else context
-        env = {
-            **os.environ,
-            "KIROCREW_HOOK_EVENT": hook.event,
-            "KIROCREW_HOOK_CONTEXT": env_context,
-        }
+        # A script hook inherits only the minimum env its shell + command need
+        # (``_HOOK_BASE_ENV_KEYS``) plus the two hook-metadata variables — NOT a
+        # copy of the whole gateway environment, which would expose the gateway's
+        # AWS/model/OAuth/connection-string credentials to every hook command.
+        env = _hook_subprocess_env(hook, context)
         # Shell per platform: POSIX /bin/sh -c, Windows cmd /c (no /bin/sh there).
         # The argv is what the sandbox/cgroup chokepoints below vet, on BOTH
         # platforms — only the eventual spawn form differs (see the Windows
@@ -2877,8 +3540,16 @@ async def run_script_hook(
             argv = ["cmd", "/c", hook.command]
         else:
             argv = ["/bin/sh", "-c", hook.command]
-        wrapped_argv, cleanup_path = wrap_argv(argv)
-        wrapped_argv = cgroup_scope_argv(wrapped_argv)  # cgroup DoS ceiling
+        # Route argv and the strict hook allowlist through the shared spawn
+        # funnel. Besides filesystem isolation and cgroup limits, this lets an
+        # outer systemd-run wrapper receive its user-bus locators while inserting
+        # an inner `env -u` shim that removes them before the hook command execs.
+        # Calling wrap_argv + cgroup_scope_argv directly would give the wrapper
+        # the child-safe allowlist and make it fail before a PreToolUse policy
+        # hook could run.
+        wrapped_argv, env, cleanup_path = await sandboxed_spawn_argv_async(
+            argv, env=env, _prepare=sandboxed_spawn_argv
+        )
         # Process-group isolation for clean tree-kill on timeout. Pass both flags
         # explicitly (NOT **dict unpack — breaks mypy's Popen overload resolution
         # on the build fleet): start_new_session=True is a no-op on Windows,
@@ -2920,8 +3591,14 @@ async def run_script_hook(
                 creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             )
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(input=stdin_data), timeout=hook.timeout
+            (
+                stdout_b,
+                stdout_trunc,
+                stderr_b,
+                stderr_trunc,
+            ) = await asyncio.wait_for(
+                _communicate_capped(proc, stdin_data, _HOOK_STREAM_CAP_BYTES),
+                timeout=hook.timeout,
             )
         finally:
             if cleanup_path:
@@ -2931,20 +3608,36 @@ async def run_script_hook(
                     pass
         elapsed = int((time.monotonic() - start) * 1000)
         exit_code = proc.returncode or 0
+        # Decode with the upstream byte cap (#5442) so redaction never sees an
+        # unbounded string, THEN redact the full capped streams through the
+        # canonical companion-aware shim before any truncation or return
+        # (#5441). Both fields are returned by the test API, and stdout can also
+        # become model context for prompt/spawn hooks; redacting the capped text
+        # first prevents a credential that straddles a presentation boundary
+        # (e.g. the 500-char stderr cut for last_error, #4708) from leaking as
+        # an unredacted fragment.
+        stdout_text = _decode_capped(stdout_b, stdout_trunc).strip()
+        stderr_text = _decode_capped(stderr_b, stderr_trunc).strip()
+        stdout_safe = redact_via_context(stdout_text) if stdout_text else ""
+        stderr_safe_full = redact_via_context(stderr_text) if stderr_text else ""
+        stderr_safe = stderr_safe_full[:500]
         hook.last_run = time.time()
         if exit_code == 2:
             hook.last_status = "blocked"
+            hook.last_error = stderr_safe or "Blocked (exit 2)"
         elif exit_code == 0:
             hook.last_status = "ok"
+            hook.last_error = ""
         else:
             hook.last_status = "error"
+            hook.last_error = stderr_safe or f"Exited with code {exit_code}"
         hook.run_count += 1
         return ScriptHookResult(
             hook_id=hook.id,
             hook_name=hook.name,
             event=hook.event,
-            stdout=stdout_b.decode(errors="replace").strip(),
-            stderr=stderr_b.decode(errors="replace").strip(),
+            stdout=stdout_safe,
+            stderr=stderr_safe_full,
             exit_code=exit_code,
             duration_ms=elapsed,
         )
@@ -2958,12 +3651,22 @@ async def run_script_hook(
                 # timeout path already runs on the event loop, so we never want
                 # to stall it further while taskkill.exe walks the tree
                 await platform_compat.kill_process_tree_async(proc.pid, platform_compat.SIGKILL)
-                await proc.communicate()
+                # Reap the killed tree WITHOUT re-buffering: a hook that timed
+                # out having already flooded its pipes must not be able to OOM
+                # us during cleanup (#5442). Drain both pipes concurrently under
+                # the same cap and discard; sequential reads can deadlock when
+                # residual data fills the other pipe.
+                await asyncio.gather(
+                    _read_capped_stream(proc.stdout, _HOOK_STREAM_CAP_BYTES),
+                    _read_capped_stream(proc.stderr, _HOOK_STREAM_CAP_BYTES),
+                )
+                await proc.wait()
         except Exception:
             pass
         elapsed = int((time.monotonic() - start) * 1000)
         hook.last_run = time.time()
         hook.last_status = "timeout"
+        hook.last_error = f"Timed out after {hook.timeout}s"
         hook.run_count += 1
         return ScriptHookResult(
             hook_id=hook.id,
@@ -2974,14 +3677,16 @@ async def run_script_hook(
         )
     except Exception as exc:
         elapsed = int((time.monotonic() - start) * 1000)
+        safe_error = redact_via_context(str(exc))
         hook.last_run = time.time()
         hook.last_status = "error"
+        hook.last_error = safe_error[:500]
         hook.run_count += 1
         return ScriptHookResult(
             hook_id=hook.id,
             hook_name=hook.name,
             event=hook.event,
-            error=str(exc),
+            error=safe_error,
             duration_ms=elapsed,
         )
 
@@ -3000,6 +3705,10 @@ class ScriptHookStore:
         self._dir = config_dir or _cfg_dir()
         self._path = self._dir / _HOOKS_FILE
         self._hooks: dict[str, ScriptHook] = {}
+        # Entries that cannot be deserialized must remain inert, but they still
+        # belong to the user. Preserve their raw JSON values across later status
+        # and CRUD writes so fail-soft loading does not become silent data loss.
+        self._unparsed_hook_entries: list[object] = []
         # Mutations used to be implicitly serialised by running on the single
         # event-loop thread. They are now offloaded with asyncio.to_thread (the
         # persistence takes a file lock and fsyncs, which must not block the
@@ -3015,16 +3724,52 @@ class ScriptHookStore:
             return
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
-            for h in data.get("hooks", []):
-                hook = ScriptHook.from_dict(h)
-                self._hooks[hook.id] = hook
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Failed to load hooks: %s", exc)
+            return
+        # Deserialize each hook independently: a single malformed entry (a
+        # non-dict, or a dict `from_dict` cannot coerce) must not take down the
+        # whole store and drop every OTHER hook the user has. `from_dict` is
+        # already fail-soft (it normalizes junk fields), so a raise here would be
+        # unexpected — but a foreign / hand-corrupted entry is possible, so keep
+        # it inert and preserve its raw value for future rewrites.
+        #
+        # A malformed root or `hooks` collection cannot be represented by the
+        # list-shaped store. Keep it inert so gateway startup remains available;
+        # `_write_hooks_file` validates the locked, current bytes and refuses any
+        # mutation rather than overwriting data the store cannot preserve.
+        if not isinstance(data, dict):
+            logger.warning("Failed to load hooks: root is not an object")
+            return
+        hooks_data = data.get("hooks", [])
+        if not isinstance(hooks_data, list):
+            logger.warning("Failed to load hooks: hooks collection is not a list")
+            return
+
+        for h in hooks_data:
+            try:
+                if not isinstance(h, dict):
+                    raise TypeError("hook entry is not an object")
+                if h.get("event", HOOK_EVENT_USER_PROMPT_SUBMIT) not in HOOK_EVENTS:
+                    raise ValueError("hook entry has an invalid event")
+                hook = ScriptHook.from_dict(h)
+                # Keep insertion inside the per-entry guard: a hand-edited ID
+                # can be an unhashable list/dict even when from_dict succeeds.
+                self._hooks[hook.id] = hook
+            except Exception:
+                logger.warning("Skipping unparseable hook entry", exc_info=True)
+                self._unparsed_hook_entries.append(h)
+                continue
 
     def _save(self) -> None:
-        self._write_hooks_file([h.to_dict() for h in self._hooks.values()])
+        self._write_hooks_file(
+            [
+                *(h.to_dict() for h in self._hooks.values()),
+                *self._unparsed_hook_entries,
+            ]
+        )
 
-    def _write_hooks_file(self, hooks_data: list[dict]) -> None:
+    def _write_hooks_file(self, hooks_data: Sequence[object]) -> None:
         """Write the ``hooks`` list while PRESERVING every other top-level key.
 
         ``hooks.json`` is shared: this store owns the ``hooks`` key, but the
@@ -3055,8 +3800,18 @@ class ScriptHookStore:
             if self._path.exists():
                 try:
                     loaded = json.loads(self._path.read_text(encoding="utf-8"))
-                    if isinstance(loaded, dict):
-                        data = {k: v for k, v in loaded.items() if k != "hooks"}
+                    if not isinstance(loaded, dict):
+                        raise webhooks.WebhookStoreUnreadable(
+                            f"{self._path.name} root is not an object; refusing to overwrite it"
+                        )
+                    if "hooks" in loaded and not isinstance(loaded["hooks"], list):
+                        raise webhooks.WebhookStoreUnreadable(
+                            f"{self._path.name} hooks collection is not a list; "
+                            "refusing to overwrite it"
+                        )
+                    data = {k: v for k, v in loaded.items() if k != "hooks"}
+                except webhooks.WebhookStoreUnreadable:
+                    raise
                 except (json.JSONDecodeError, OSError) as exc:
                     logger.warning(
                         "hooks.json unreadable, refusing to overwrite it: %s", exc
@@ -3101,6 +3856,23 @@ class ScriptHookStore:
         hook = ScriptHook.from_dict(data)
         if not hook.id:
             hook.id = str(uuid.uuid4())[:8]
+        # Enforce the SAME invariants `update` does, via the shared validator:
+        # a direct/internal caller of `create` used to bypass the command+skills
+        # invariant, event membership, and timeout bounds (only `update` checked
+        # them), so it could persist a hook the update path would reject and that
+        # later silently fails to fire. `from_dict` clamps the timeout on the way
+        # in, but validate against the ORIGINAL `data` so a caller that passed an
+        # out-of-range timeout is told rather than having it silently clamped —
+        # matching the API schema's reject-don't-clamp behavior. Raises
+        # ValueError (mapped to HTTP 400 by the dashboard handler).
+        validate_hook_fields(
+            event=hook.event,
+            timeout=data.get("timeout", hook.timeout),
+            command=hook.command,
+            skills=hook.skills,
+            matcher=hook.matcher,
+            matcher_mode=hook.matcher_mode,
+        )
         with self._mutex, self._atomic_mutation():
             self._hooks[hook.id] = hook
             self._save()
@@ -3111,44 +3883,28 @@ class ScriptHookStore:
             hook = self._hooks.get(hook_id)
             if not hook:
                 return None
-            if "event" in data and data["event"] not in HOOK_EVENTS:
-                raise ValueError(f"invalid event: {data['event']}")
-            if "timeout" in data:
-                t = data["timeout"]
-                if not isinstance(t, int) or not (1 <= t <= 300):
-                    raise ValueError("timeout must be an integer between 1 and 300")
             for k in ("name", "event", "matcher", "matcher_mode", "command", "timeout", "enabled"):
                 if k in data:
                     setattr(hook, k, data[k])
             if "skills" in data:
                 skills_raw = data["skills"]
                 hook.skills = [str(s) for s in skills_raw if isinstance(s, str)] if isinstance(skills_raw, list) else []
-            # Post-merge validation on the merged hook: skills injection only
-            # fires for a standalone skills hook (no command) on
-            # UserPromptSubmit/AgentSpawn (see fire()). Reject any other pairing
-            # so a partial update can't leave a config that saves but never fires.
-            if hook.skills:
-                if hook.command:
-                    raise ValueError(
-                        "skills cannot be combined with a command — the skills "
-                        "would never fire; use a skills-only hook or drop the skills"
-                    )
-                if hook.event in (
-                    HOOK_EVENT_PRE_TOOL_USE, HOOK_EVENT_POST_TOOL_USE, HOOK_EVENT_STOP,
-                ):
-                    raise ValueError(
-                        f"skills hooks cannot fire on {hook.event} events — "
-                        "choose UserPromptSubmit or AgentSpawn"
-                    )
-            # Post-merge validation: reject invalid regex on the merged state
-            # (a partial update sending only matcher without matcher_mode would
-            # bypass the schema-level regex check which sees the request, not
-            # the merged hook).
-            if hook.matcher_mode == "regex" and hook.matcher:
-                try:
-                    re.compile(hook.matcher)
-                except re.error as exc:
-                    raise ValueError(f"invalid regex: {exc}") from None
+            # Validate the MERGED hook through the shared validator — the same
+            # one `create` uses — so both write paths enforce one contract:
+            # event membership, timeout bounds, the command+skills invariant and
+            # its event pairing, and regex syntax. Validating post-merge (not the
+            # request dict) is what catches a partial update that would otherwise
+            # bypass a schema check keyed on the request — e.g. a matcher sent
+            # without its matcher_mode, or skills added to a hook already on a
+            # tool event. Raises ValueError (mapped to HTTP 400 by the handler).
+            validate_hook_fields(
+                event=hook.event,
+                timeout=hook.timeout,
+                command=hook.command,
+                skills=hook.skills,
+                matcher=hook.matcher,
+                matcher_mode=hook.matcher_mode,
+            )
             self._save()
         return hook
 
@@ -3261,6 +4017,7 @@ class ScriptHookStore:
                 if gov_denied:
                     hook.last_run = time.time()
                     hook.last_status = "blocked"
+                    hook.last_error = f"Blocked by governance: {gov_denied}"
                     hook.run_count += 1
                     _audit_governance_hook_decision(
                         sk, f"skills_only_hook:{hook.name or hook.id}", "denied", gov_denied
@@ -3278,6 +4035,7 @@ class ScriptHookStore:
                 skills_directive = " ".join(f"${s.split('/')[-1]}" for s in hook.skills)
                 hook.last_run = time.time()
                 hook.last_status = "ok"
+                hook.last_error = ""
                 hook.run_count += 1
                 result = ScriptHookResult(
                     hook_id=hook.id,
@@ -3338,7 +4096,7 @@ class ScriptHookStore:
     def _save_snapshot(self, hooks_data: list[dict]) -> None:
         """Thread-safe save using pre-captured hook snapshot."""
         with self._mutex:
-            self._write_hooks_file(hooks_data)
+            self._write_hooks_file([*hooks_data, *self._unparsed_hook_entries])
 
 
 # -- Global script hook store accessor --

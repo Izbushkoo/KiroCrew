@@ -7,7 +7,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import time as _time
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -15,6 +14,7 @@ from pathlib import Path
 from typing import TypeVar
 from uuid import uuid4
 
+from kiro_crew.llm_helpers import _extract_json_of_type
 from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 CODE_EXTS = {
     '.py', '.java', '.ts', '.js', '.rs', '.go', '.rb', '.c', '.cpp', '.h',
-    '.sh', '.cs', '.kt', '.swift', '.scala',
+    '.sh', '.ps1', '.psm1', '.cs', '.kt', '.swift', '.scala',
 }
 
 MARKDOWN_EXTS = {'.md', '.docx'}
@@ -236,6 +236,19 @@ def _first_line_title(content: str) -> str:
     return ""
 
 
+_SUMMARY_PAYLOAD_KEYS = frozenset({"topic", "themes"})
+
+
+def _summary_shaped(value: object) -> bool:
+    """Prefer predicate: a dict carrying at least one source-summary field.
+
+    Disambiguates the payload from stray braced JSON in the surrounding prose
+    or in the untrusted section summaries echoed back by the model -- those
+    parse as dicts but never carry the ``topic``/``themes`` fields this
+    caller consumes."""
+    return isinstance(value, dict) and not _SUMMARY_PAYLOAD_KEYS.isdisjoint(value)
+
+
 class IngestionPipeline:
     """Orchestrates: read file -> chunk -> extract entities -> store."""
 
@@ -249,9 +262,22 @@ class IngestionPipeline:
         self.embedder = embedder
         self._dedup_enabled = dedup_enabled
 
+    def _resolve_old_item_ids(self, source_id: str | None) -> list[str]:
+        """The source's full pre-existing item group: the ids a replace-all
+        ingest supersedes and must delete.
+
+        Materializes one row per item in the source -- tens of thousands on a
+        large library, over a second of blocking SQLite -- so callers MUST run
+        it on a worker thread (``store.db`` is thread-local), never on the
+        event loop. The ingest paths fold it into the duplicate-gate hop, just
+        ahead of the gate's own transaction.
+        """
+        return [row['id'] for row in self.store.db.execute(
+            "SELECT id FROM items WHERE source_id = ?", (source_id,)).fetchall()]
+
     def _skip_as_duplicate(self, content_hash: str, source_id: str | None,
                            old_item_ids: list[str] | None = None,
-                           on_duplicate: Callable[[], None] | None = None) -> str | None:
+                           on_duplicate: Callable[[str], None] | None = None) -> str | None:
         """Terminal job id when this exact document is already in the Library.
 
         Returns ``None`` when the write should proceed.
@@ -347,7 +373,11 @@ class IngestionPipeline:
             # rolls the gate back too, which is the correct pairing: the delete,
             # the claim and the record land together or not at all.
             if on_duplicate is not None:
-                on_duplicate()
+                # The caller may track file identity in a different hash domain
+                # (folder rows use raw bytes while items use extracted text).
+                # Hand it the exact text hash the gate matched so transformed
+                # documents can remain adoptable after this transaction commits.
+                on_duplicate(content_hash)
             self.store.db.execute("COMMIT")
         except Exception:
             self.store.db.execute("ROLLBACK")
@@ -424,7 +454,7 @@ class IngestionPipeline:
         except Exception:
             logger.debug("Post-ingest dedup skipped", exc_info=True)
 
-    async def ingest_file(self, path: str, on_progress=None, original_name: str = "", namespace: str = "default", source_id: str = "", old_item_ids: list[str] | None = None, on_committed: Callable[[list[str]], None] | None = None, on_duplicate: Callable[[], None] | None = None) -> str | None:
+    async def ingest_file(self, path: str, on_progress=None, original_name: str = "", namespace: str = "default", source_id: str = "", old_item_ids: list[str] | None = None, on_committed: Callable[[list[str]], None] | None = None, on_duplicate: Callable[[str], None] | None = None) -> str | None:
         """Full pipeline. Returns job_id, or None if content hash unchanged.
 
         If source_id is provided, ingests into that existing source instead of
@@ -444,9 +474,9 @@ class IngestionPipeline:
         the same run-to-completion guarantee as the delete it belongs with.
 
         ``on_duplicate`` is that same bargain for the branch where the pre-ingest
-        gate REFUSES the write. It runs inside the gate's own hop, after its
-        transaction commits, and records whatever terminal state the caller keys by
-        document. Leaving it to the caller is not merely riskier here than on the
+        gate REFUSES the write. It receives the extracted-text hash matched by the
+        gate and runs inside the gate's transaction, recording whatever terminal
+        state the caller keys by document. Leaving it to the caller is not merely riskier here than on the
         success branch, it is unsound: ``run_to_completion`` guarantees the gate
         finishes and then re-raises the cancellation, so a shutdown lands with the
         deletion and the location claim durable and the caller's write never
@@ -533,12 +563,15 @@ class IngestionPipeline:
         # 2. Hash check + source resolution
         content_hash = hashlib.sha256(text.encode()).hexdigest()
         _old_item_ids: list[str] = old_item_ids if old_item_ids is not None else []
+        # Replace-all paths defer the full-source _old_item_ids read into the
+        # off-loop gate hop below: it materializes the source's whole item-id
+        # set, which is seconds of blocking SQLite on a large library.
+        resolve_old_group = False
         if source_id:
             # Ingest into existing source (remote sync path)
             if old_item_ids is None:
                 # Single-file/remote source: replace all items for this source
-                _old_item_ids = [row['id'] for row in self.store.db.execute(
-                    "SELECT id FROM items WHERE source_id = ?", (source_id,)).fetchall()]
+                resolve_old_group = True
             props: dict[str, object] = {}
             existing: dict | None = {"id": source_id}  # sentinel — source already exists
             src_row = self.store.db.execute(
@@ -554,8 +587,7 @@ class IngestionPipeline:
                 if props.get('content_hash') == content_hash:
                     return None
                 source_id = existing['id']
-                _old_item_ids = [row['id'] for row in self.store.db.execute(
-                    "SELECT id FROM items WHERE source_id = ?", (source_id,)).fetchall()]
+                resolve_old_group = True
             else:
                 props = {}
                 source_id = self.store.add_source(
@@ -564,12 +596,17 @@ class IngestionPipeline:
                 )
 
         # 3. Job record
-        # One hop for the whole gate: it deletes the superseded items, attaches
-        # the location and writes the terminal job row, and its delete rebuilds
-        # the entity graph — seconds of blocking SQLite on a large library.
-        dupe_job = await run_to_completion(
-            lambda: self._skip_as_duplicate(
-                            content_hash, source_id, _old_item_ids, on_duplicate=on_duplicate))
+        # One hop for the whole gate: it resolves the pre-existing item group
+        # (a full-source read, just ahead of the gate's own transaction),
+        # deletes the superseded items, attaches the location and writes the
+        # terminal job row, and its delete rebuilds the entity graph — seconds
+        # of blocking SQLite on a large library.
+        def _gate() -> tuple[str | None, list[str]]:
+            ids = self._resolve_old_item_ids(source_id) if resolve_old_group else _old_item_ids
+            return self._skip_as_duplicate(
+                content_hash, source_id, ids, on_duplicate=on_duplicate), ids
+
+        dupe_job, _old_item_ids = await run_to_completion(_gate)
         if dupe_job:
             return dupe_job
         job_id = uuid4().hex[:12]
@@ -750,7 +787,7 @@ class IngestionPipeline:
     async def ingest_text(self, text: str, title: str, source_type: str = 'manual',
                           source_id: str | None = None,
                           old_item_ids: list[str] | None = None,
-                          on_duplicate: Callable[[], None] | None = None) -> str | None:
+                          on_duplicate: Callable[[str], None] | None = None) -> str | None:
         """Ingest raw text (dashboard drop, chat, or a shared aggregate source).
 
         Without ``source_id`` the source is found-or-created by a
@@ -770,6 +807,10 @@ class IngestionPipeline:
 
         # Resolve the source and the prior item ids this call should replace.
         _old_item_ids: list[str] = old_item_ids if old_item_ids is not None else []
+        # Replace-all paths defer the full-source _old_item_ids read into the
+        # off-loop gate hop below: it materializes the source's whole item-id
+        # set, which is seconds of blocking SQLite on a large library.
+        resolve_old_group = False
         if source_id is None:
             uri = f"{source_type}://{content_hash[:16]}"
             existing = self.store.get_source_by_uri(uri)
@@ -778,8 +819,7 @@ class IngestionPipeline:
                 if props.get('content_hash') == content_hash:
                     return None  # unchanged
                 source_id = existing['id']
-                _old_item_ids = [row['id'] for row in self.store.db.execute(
-                    "SELECT id FROM items WHERE source_id = ?", (source_id,)).fetchall()]
+                resolve_old_group = True
             else:
                 source_id = self.store.add_source(
                     name=title, source_type=source_type, uri=uri,
@@ -787,15 +827,19 @@ class IngestionPipeline:
                 )
         elif old_item_ids is None:
             # Existing source, replace-all (single-text / remote-sync source).
-            _old_item_ids = [row['id'] for row in self.store.db.execute(
-                "SELECT id FROM items WHERE source_id = ?", (source_id,)).fetchall()]
+            resolve_old_group = True
 
-        # One hop for the whole gate: it deletes the superseded items, attaches
-        # the location and writes the terminal job row, and its delete rebuilds
-        # the entity graph — seconds of blocking SQLite on a large library.
-        dupe_job = await run_to_completion(
-            lambda: self._skip_as_duplicate(
-                            content_hash, source_id, _old_item_ids, on_duplicate=on_duplicate))
+        # One hop for the whole gate: it resolves the pre-existing item group
+        # (a full-source read, just ahead of the gate's own transaction),
+        # deletes the superseded items, attaches the location and writes the
+        # terminal job row, and its delete rebuilds the entity graph — seconds
+        # of blocking SQLite on a large library.
+        def _gate() -> tuple[str | None, list[str]]:
+            ids = self._resolve_old_item_ids(source_id) if resolve_old_group else _old_item_ids
+            return self._skip_as_duplicate(
+                content_hash, source_id, ids, on_duplicate=on_duplicate), ids
+
+        dupe_job, _old_item_ids = await run_to_completion(_gate)
         if dupe_job:
             return dupe_job
 
@@ -1012,10 +1056,12 @@ class IngestionPipeline:
         )
         try:
             response = await self.extractor._pool.send(prompt, timeout=30.0)
-            # Parse JSON from response
-            m = re.search(r'\{[\s\S]*\}', response)
-            if m:
-                data = json.loads(m.group())
+            data = _extract_json_of_type(response, dict, prefer=_summary_shaped)
+            # The shape check guards the WRITE, not just the preference: the
+            # scanner falls back to the first dict when nothing is
+            # payload-shaped (e.g. a bare "{}" echo), and storing that would
+            # overwrite an existing summary with empty values.
+            if isinstance(data, dict) and _summary_shaped(data):
                 topic = _redact(data.get("topic", ""))
                 themes = json.dumps([r for t in data.get("themes", [])[:5] if (r := _redact(t))])
                 self.store.db.execute(

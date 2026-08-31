@@ -379,7 +379,22 @@ class TestPutRegistriesValidation:
                 json={"registries": [{"repo": "../evil"}]},
             )
             assert resp.status == 400
-            assert "invalid repo name" in (await resp.json())["error"]
+            # The rejection covers full ssh/https URLs too, so the wording says
+            # "URL or name" rather than the misleading name-only phrasing.
+            assert "invalid repo URL or name" in (await resp.json())["error"]
+
+    @pytest.mark.asyncio
+    async def test_rejects_invalid_repo_url(self, tmp_path, monkeypatch):
+        """A malformed full URL is rejected with the URL-or-name wording (the
+        input is a URL, so a bare "invalid repo name" banner would read wrong)."""
+        _setup_env(tmp_path, monkeypatch)
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.put(
+                "/api/apps/registries",
+                json={"registries": [{"repo": "ssh://git@evil host/repo.git"}]},
+            )
+            assert resp.status == 400
+            assert "invalid repo URL or name" in (await resp.json())["error"]
 
     @pytest.mark.asyncio
     async def test_rejects_repo_with_spaces(self, tmp_path, monkeypatch):
@@ -564,7 +579,7 @@ class TestPutRegistriesUrls:
                 json={"registries": [{"repo": "acme/apps"}]},
             )
             assert resp.status == 400
-            assert "invalid repo name" in (await resp.json())["error"]
+            assert "invalid repo URL or name" in (await resp.json())["error"]
 
     @pytest.mark.asyncio
     async def test_rejects_shell_metachar_junk(self, tmp_path, monkeypatch):
@@ -575,7 +590,7 @@ class TestPutRegistriesUrls:
                 json={"registries": [{"repo": "https://github.com/a/b;rm -rf /"}]},
             )
             assert resp.status == 400
-            assert "invalid repo name" in (await resp.json())["error"]
+            assert "invalid repo URL or name" in (await resp.json())["error"]
 
     @pytest.mark.asyncio
     async def test_rejects_plaintext_http_url(self, tmp_path, monkeypatch):
@@ -589,7 +604,7 @@ class TestPutRegistriesUrls:
                 json={"registries": [{"repo": "http://github.com/acme/apps"}]},
             )
             assert resp.status == 400
-            assert "invalid repo name" in (await resp.json())["error"]
+            assert "invalid repo URL or name" in (await resp.json())["error"]
 
     @pytest.mark.asyncio
     async def test_blocked_repo_still_blocked(self, tmp_path, monkeypatch):
@@ -853,6 +868,23 @@ class TestSshUrlParity:
             data = await resp.json()
             assert data["ok"] is True
             assert data["registries"][0]["repo"] == "ssh://dev@git.example.com/team/MyApps"
+
+    @pytest.mark.asyncio
+    async def test_colon_bearing_ssh_userinfo_is_never_returned_or_persisted(
+        self, tmp_path, monkeypatch
+    ):
+        """Ambiguous SSH routing input fails safely without echoing its suffix."""
+        _setup_env(tmp_path, monkeypatch)
+        secret = "ssh-password-secret"
+        raw = f"ssh://dev:{secret}@git.example.com/team/MyApps"
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.put("/api/apps/registries", json={"registries": [{"repo": raw}]})
+            body = await resp.text()
+
+        assert resp.status == 400
+        assert secret not in body
+        assert raw not in body
+        assert "ssh://dev@git.example.com/team/MyApps" in body
 
     @pytest.mark.asyncio
     async def test_accepts_ssh_url_with_port(self, tmp_path, monkeypatch):

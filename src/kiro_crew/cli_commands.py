@@ -21,10 +21,11 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from kiro_crew import __version__, beacon, platform_compat
+from kiro_crew.agent import reset_agent_model
 from kiro_crew.apps.bridges import (
     deregister_app,
     deregister_app_crons_from_service,
@@ -52,20 +53,27 @@ from kiro_crew.config.loader import (
     config_local_path,
     config_path,
     read_config_for_update,
+    read_local_secret,
     update_config_locked,
 )
-from kiro_crew.cron import CronSchedule, CronService, format_schedule
+from kiro_crew.cron import CronSchedule, CronService, CronStoreUnreadable, format_schedule
 from kiro_crew.cron_trigger import trigger_cron_job
 from kiro_crew.dashboard import tailnet, tailnet_serve
 from kiro_crew.dashboard.origin import parse_dashboard_url
 from kiro_crew.eval.judge import LLMJudge
 from kiro_crew.eval.runner import EvalRunner, format_results, score_by_dimension
 from kiro_crew.eval.scenario import AssertionType, load_scenario, load_scenarios
+from kiro_crew.history import ConversationLog
 from kiro_crew.hooks import safe_read_file
-from kiro_crew.learn import Lesson, LessonStore
+from kiro_crew.learn import LessonStore
 from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.memory import MemoryStore
 from kiro_crew.port_resolution import resolve_client_port_ex
+from kiro_crew.secrets.migrate import (
+    MigrationConflictError,
+    format_report,
+    migrate_env_secrets,
+)
 from kiro_crew.security import (
     BUILTIN_DENIED_RULES,
     BUILTIN_DENY_PATTERNS,
@@ -84,7 +92,7 @@ from kiro_crew.validation import (
     WORKSPACE_NAME_RE,
     normalize_lesson_category,
 )
-from kiro_crew.vector_memory import VectorMemoryStore, _lesson_display_text
+from kiro_crew.vector_memory import LessonWriteOutcome, VectorMemoryStore, _lesson_display_text
 
 # Workspace dirs are confined to the data home: a workspace is agent-writable
 # working state, so letting --dir escape would let it be pointed at ~/.ssh or the
@@ -170,7 +178,7 @@ def _format_schedule(schedule: object) -> str:
     return format_schedule(schedule)
 
 
-def _internal_secret() -> str:
+def _internal_secret(port: int) -> str:
     """Read the per-session IPC secret written by the gateway.
 
     The gateway writes ``~/.kiro/crew/.local_secret`` (mode 0600) after a
@@ -183,10 +191,7 @@ def _internal_secret() -> str:
     server then rejects the request with 403, which is the correct
     failure mode.
     """
-    try:
-        return (config_dir() / ".local_secret").read_text().strip()
-    except Exception:
-        return ""
+    return read_local_secret(port)
 
 
 def _spawn(args: argparse.Namespace) -> None:
@@ -197,7 +202,7 @@ def _spawn(args: argparse.Namespace) -> None:
     if action == "list":
         req = urllib.request.Request(
             f"{base}/api/spawn",
-            headers={"X-Internal-Secret": _internal_secret()},
+            headers={"X-Internal-Secret": _internal_secret(args.port)},
         )
         try:
             with loopback_urlopen(req, timeout=5) as resp:
@@ -236,7 +241,7 @@ def _spawn_run(args: argparse.Namespace, base: str) -> None:
         data=data,
         headers={
             "Content-Type": "application/json",
-            "X-Internal-Secret": _internal_secret(),
+            "X-Internal-Secret": _internal_secret(args.port),
         },
     )
     try:
@@ -263,7 +268,7 @@ def _spawn_run(args: argparse.Namespace, base: str) -> None:
 
     print(f"Spawned subagent {agent_id}, waiting for result...", file=sys.stderr)
     poll_url = f"{base}/api/spawn/{agent_id}"
-    secret = _internal_secret()
+    secret = _internal_secret(args.port)
     while True:
         _time.sleep(2)
         poll_req = urllib.request.Request(poll_url, headers={"X-Internal-Secret": secret})
@@ -602,9 +607,15 @@ def _run_app_mcp_server(app_name: str) -> None:
     module_name = f"kiro_crew.apps.builtins.{app_name.replace('-', '_')}.mcp_server"
     try:
         mod = importlib.import_module(module_name)
-    except ImportError as exc:
-        print(f"App {app_name!r} has no MCP server ({module_name}): {exc}", file=sys.stderr)
-        sys.exit(1)
+    except ModuleNotFoundError as exc:
+        # Only the TARGET module (or one of its parent packages) missing means
+        # "this app has no MCP server". A missing dependency imported INSIDE
+        # mcp_server.py — or any other ImportError — is a real defect and must
+        # keep its traceback rather than exit with a misleading diagnosis.
+        if exc.name and (exc.name == module_name or module_name.startswith(exc.name + ".")):
+            print(f"App {app_name!r} has no MCP server ({module_name}): {exc}", file=sys.stderr)
+            sys.exit(1)
+        raise
     runner = getattr(mod, "run_mcp_server", None)
     if runner is None:
         print(f"{module_name} defines no run_mcp_server()", file=sys.stderr)
@@ -671,8 +682,22 @@ def _handle_app(args: argparse.Namespace) -> None:
 
     elif action == "disable":
         _cleanup_app_crons_from_scheduler(args.name)
-        deregister_app(args.name)
+        # Flip the authoritative flag BEFORE tearing resources down. A running gateway
+        # is a DIFFERENT process: it watches this app's backend and re-registers its MCP
+        # servers and agents on a health recovery, gated on the enabled flag it reads
+        # from installed.json. Deregistering first leaves a window where that flag still
+        # says enabled and the resources are already gone — and a recovery landing there
+        # puts them back for an app the operator is disabling. The gateway's own disable
+        # path has no such window because it stops the backend first, which ends the
+        # watch; the CLI cannot do that from out here, so it closes the window by
+        # ordering instead.
+        #
+        # If the deregistration below then fails, the app is still correctly marked
+        # disabled and the failure is reported to an operator already at the terminal —
+        # which is the better of the two error shapes, because the alternative is a
+        # silent re-registration nobody sees.
         result = disable_app(args.name)
+        deregister_app(args.name)
         if result.ok:
             print(f"✅ {result.message}")
         else:
@@ -819,11 +844,74 @@ def _handle_agent(args: argparse.Namespace) -> None:
         cfg.save()
         print(f"Deleted agent: {args.name}")
 
+    elif action == "reset-model":
+        _agent_reset_model(args)
+
     else:
-        print("Usage: kirocrew agent {list|create|update|delete}")
+        print("Usage: kirocrew agent {list|create|update|delete|reset-model}")
+
+
+def _agent_reset_model(args: argparse.Namespace) -> None:
+    """Clear an agent spec's pinned model (``kirocrew agent reset-model``).
+
+    The explicit, narrow way back to the shipped default model. It exists
+    because ownership of a spec's ``model`` cannot be inferred: a value an older
+    build's propagation wrote and one the user typed in by hand are
+    byte-identical on disk, so nothing may reclassify a pin behind the user's
+    back. Before this, the only ways out were the dashboard's Agent Templates
+    editor (clear the model) and ``kirocrew setup --clean``, which also
+    regenerates the whole spec and discards every other customization with it.
+    """
+    name = getattr(args, "agent", None) or "kirocrew"
+    try:
+        spec_path, previous = reset_agent_model(name)
+    except FileNotFoundError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        sys.exit(1)
+    except ValueError as exc:
+        # Ambiguous: two specs claim the name and the runtime's choice between
+        # them is undefined, so resetting either could strip the wrong one.
+        print(f"❌ {exc}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as exc:
+        print(f"❌ Could not write the agent spec: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if previous:
+        # repr on BOTH the model and the path. Neither is trusted input: an
+        # installed app writes specs into the agents directory and a cloned
+        # repository can ship one, so an OSC/ANSI sequence can arrive in the
+        # `model` value AND in the FILENAME -- the declared-name scan returns
+        # whichever file declares the requested name, so its path is attacker-
+        # shaped even though *name* itself is grammar-validated.
+        print(f"✅ Cleared {name}'s pinned model ({previous!r}) in {str(spec_path)!r}")
+    else:
+        print(f"✅ {name} had no pinned model in {str(spec_path)!r}")
+    print("   It now tracks the shipped default; restart the gateway to apply.")
 
 
 def _cron(args: argparse.Namespace) -> None:
+    """Dispatch cron subcommands, translating a refused write into an error.
+
+    ``CronService._save`` raises ``CronStoreUnreadable`` rather than silently
+    skipping the write when the last load failed, so every mutating verb here can
+    fail that way. Untranslated it reached the user as a stack trace, which names
+    the raise site but not the one action that fixes it. The exception's own
+    message carries that remediation, so it is surfaced verbatim.
+
+    One wrapper rather than a handler per verb: `add`, `update`, `remove`,
+    `pause`, `resume` and `adopt` all persist through the same ``_save``, so
+    catching at the dispatch boundary covers them without eight duplicated
+    blocks, and any verb added later is covered by construction.
+    """
+    try:
+        _cron_dispatch(args)
+    except CronStoreUnreadable as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _cron_dispatch(args: argparse.Namespace) -> None:
     """Dispatch cron subcommands: list, add, remove, pause, resume."""
 
     svc = CronService(base_dir=config_dir())
@@ -838,6 +926,97 @@ def _cron(args: argparse.Namespace) -> None:
             status = "✅" if j.enabled else "⏸️"
             sched = _format_schedule(j.schedule)
             print(f"  {status} {j.id}  {j.name}  ({sched})  {j.message[:60]}")
+            # Ownership is printed because it decides which surfaces can manage
+            # the job at all: a job with no owning session is outside every chat
+            # session's scope, so `cron_list` from chat does not list it and the
+            # mutating tools answer a deliberately vague "job not found". That is
+            # the intended boundary, but with the field invisible here the CLI
+            # was the only place the state existed and nothing showed it -- which
+            # is what made a normal, correct state read as a job that had
+            # vanished. `cron adopt` is the way back.
+            owner = j.session_key or ""
+            provenance = j.created_by or ""
+            if owner:
+                detail = f"owner: {owner}"
+            else:
+                detail = "owner: none (manage from CLI or the dashboard Schedule page)"
+            if provenance:
+                detail += f"  created by: {provenance}"
+            print(f"      {detail}")
+
+    elif action == "adopt":
+        job_id = args.job_id
+        if getattr(args, "release", False):
+            session_key = ""
+        else:
+            # One flag, two accepted spellings of the same target. A bare slot
+            # name gets the `dashboard:` namespace the delivery consumers strip
+            # back off (messaging.py / the Slack gateway both
+            # removeprefix("dashboard:")), so adding it here is their exact
+            # inverse and needs no lookup. An already-namespaced key passes
+            # through untouched -- there is no second flag for that case,
+            # because a key with no namespace at all could never equal any
+            # caller's session key and so could only ever produce a row nobody
+            # can own.
+            target = (getattr(args, "session_of", None) or "").strip()
+            if not target:
+                print("Error: --session-of requires a session", file=sys.stderr)
+                sys.exit(1)
+            session_key = target if ":" in target else f"dashboard:{target}"
+        if not svc.adopt_job(job_id, session_key):
+            print(f"Error: job not found: {job_id}", file=sys.stderr)
+            sys.exit(1)
+        sel().log_api_access(
+            caller="cli",
+            operation="cron.adopt",
+            outcome="allowed",
+            source="cli",
+            resources=f"job_id={job_id} session_key={session_key or '(released)'}",
+        )
+        if session_key:
+            # Ownership and delivery do not have the same reach. `_owned_by`
+            # matches any namespace, so a Slack or Telegram session can own and
+            # manage a job -- but only a `dashboard:` key resolves to a slot the
+            # delivery path can inject into (both consumers reach a slot with
+            # removeprefix("dashboard:")). Saying "results are delivered there"
+            # for a `slack:` key would be a promise the code does not keep.
+            if session_key.startswith("dashboard:"):
+                print(
+                    f"Job {job_id} now belongs to {session_key}: that session can manage it "
+                    f"and its results are delivered there."
+                )
+                # A typo'd key is accepted by the store but resolves to no slot,
+                # so the job's output would go nowhere -- the same
+                # invisible-delivery state this command exists to recover from.
+                # Warn rather than refuse: the delivery path resolves a live slot
+                # first and only falls back to rehydrating from history, so a
+                # brand-new tab that has not logged anything yet is a legitimate
+                # target and absence of a log does not prove the key is wrong.
+                slot = session_key.removeprefix("dashboard:")
+                try:
+                    known = ConversationLog().has_log(slot)
+                except Exception:
+                    known = True  # cannot tell -> stay quiet rather than cry wolf
+                if not known:
+                    print(
+                        f"Warning: no recorded session named {slot!r}. If that is a typo, "
+                        f"the job's results will not reach anyone -- re-run with the right "
+                        f"key, or `--release` to undo.",
+                        file=sys.stderr,
+                    )
+            else:
+                print(f"Job {job_id} now belongs to {session_key}: that session can manage it.")
+                print(
+                    f"Note: results are not injected into a chat for a "
+                    f"{session_key.split(':', 1)[0]!r} owner -- only a dashboard session is "
+                    f"resolved as a delivery target. Ownership transferred; delivery did not.",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                f"Job {job_id} released: no owning session, so manage it from the CLI or "
+                f"the dashboard Schedule page."
+            )
 
     elif action == "add":
         every = getattr(args, "every", None)
@@ -964,7 +1143,8 @@ def _cron(args: argparse.Namespace) -> None:
             print(f"Job not found: {args.job_id}")
 
     elif action == "remove":
-        if svc.remove_job(args.job_id):
+        removed = svc.remove_job(args.job_id, actor="cli", source="cli")
+        if removed:
             print(f"Removed job: {args.job_id}")
         else:
             print(f"Job not found: {args.job_id}")
@@ -1085,8 +1265,18 @@ def _cron_preview(args: argparse.Namespace) -> None:
                 )
             return result
 
-        def notify(self, message: str) -> None:
-            print(f"[notify suppressed]: {message}")
+        def notify(self, text: str, **kwargs: object) -> dict:
+            # Signature mirrors production ScriptContext.notify: scripts pass routing
+            # kwargs (session="origin" is the documented way for a cron to reach the
+            # chat that created it), so a positional-only stub made preview crash on
+            # the one branch a monitor cron exists for. Redaction mirrors production
+            # too -- this prints to the user's terminal, and kwargs values are
+            # script-supplied. Returns an empty dict: nothing was delivered.
+            safe_text = redact(text)
+            safe_kwargs = json.loads(redact(json.dumps(kwargs))) if kwargs else {}
+            routing = f" (kwargs: {safe_kwargs})" if safe_kwargs else ""
+            print(f"[notify suppressed]: {safe_text}{routing}")
+            return {}
 
         def close(self):
             pass
@@ -1117,6 +1307,60 @@ def _cron_preview(args: argparse.Namespace) -> None:
         )
     if outcome == "error":
         sys.exit(1)
+
+
+_TIME_SELECTOR_RE = re.compile(r"(?i)\A(?P<value>\d+)(?P<unit>[smhdw])\Z")
+_TIME_SELECTOR_UNITS = {
+    "s": 1,
+    "m": 60,
+    "h": 3600,
+    "d": 86400,
+    "w": 604800,
+}
+
+
+def parse_time_selector(raw: str, *, now: datetime | None = None) -> datetime | None:
+    """Resolve a ``--since``/``--until`` selector to an aware UTC datetime.
+
+    Accepts a relative AGE (``30m``, ``2h``, ``7d``, ``1w``) meaning "that long
+    ago", or an absolute ISO 8601 instant (``2026-08-21``,
+    ``2026-08-21T04:00:00Z``). Empty input means "no bound" and returns ``None``.
+
+    A bare ISO date/time with no offset is read as UTC — the audit log is written
+    in UTC, so interpreting it as local time would silently shift the window by
+    the host's offset. ``Z`` is normalized because ``fromisoformat`` only accepts
+    it from Python 3.11 and this package supports 3.10.
+
+    Raises ``ValueError`` with the accepted forms spelled out, so a typo gets a
+    usable message instead of an empty result the caller reads as "no events".
+    An absurd but well-formed age (``999999999999999999w``) overflows
+    ``timedelta``; that surfaces as the same ``ValueError`` rather than an
+    uncaught ``OverflowError`` traceback, so the CLI still exits 2 with guidance.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    match = _TIME_SELECTOR_RE.match(text)
+    if match:
+        seconds = int(match.group("value")) * _TIME_SELECTOR_UNITS[match.group("unit").lower()]
+        try:
+            return (now or datetime.now(tz=timezone.utc)) - timedelta(seconds=seconds)
+        except (OverflowError, OSError):
+            raise ValueError(
+                f"{raw!r} is too far in the past to represent. Use a smaller age "
+                "(30m, 2h, 7d, 1w) or an ISO 8601 instant."
+            ) from None
+    iso = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        parsed = datetime.fromisoformat(iso)
+    except ValueError:
+        raise ValueError(
+            f"cannot read {raw!r} as a time. Use a relative age (30m, 2h, 7d, 1w) "
+            "or an ISO 8601 instant (2026-08-21, 2026-08-21T04:00:00Z)."
+        ) from None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _security(args: argparse.Namespace) -> None:
@@ -1160,11 +1404,26 @@ def _security(args: argparse.Namespace) -> None:
     elif action == "events":
 
         limit = getattr(args, "limit", 20)
-        events = sel().recent(limit=limit)
+        try:
+            since = parse_time_selector(getattr(args, "since", "") or "")
+            until = parse_time_selector(getattr(args, "until", "") or "")
+        except ValueError as exc:
+            print(f"❌ {exc}")
+            sys.exit(2)
+        if since and until and since >= until:
+            print("❌ --since must be earlier than --until")
+            sys.exit(2)
+        events = sel().recent(limit=limit, since=since, until=until)
+        window = ""
+        if since or until:
+            window = (
+                f" in [{since.isoformat() if since else '-'}, "
+                f"{until.isoformat() if until else 'now'})"
+            )
         if not events:
-            print("No security events recorded.")
+            print(f"No security events recorded{window}.")
             return
-        print(f"📋 Last {len(events)} security event(s):\n")
+        print(f"📋 Last {len(events)} security event(s){window}:\n")
         for e in events:
             ts = e.get("timestamp", "?")[:19]
             etype = e.get("event_type", "?")
@@ -1179,14 +1438,35 @@ def _security(args: argparse.Namespace) -> None:
                 print(f"    downstream: {e['downstream_service']}")
     elif action == "verify":
 
-        total, valid = sel().verify_integrity()
-        if total == 0:
+        # detailed=True: a segment dir that refused to pin (or was swapped
+        # mid-verification) leaves the ROTATED segments unchecked, and the
+        # command whose job is to surface tampering must not call that run
+        # "intact" over the live log alone (#5051 review).
+        result = sel().verify_integrity(detailed=True)
+        if not result.history_verifiable:
+            # The live-log clause is derived from the SAME pass's counts, so
+            # it can never claim "intact" over entries that did not verify.
+            if result.total and result.total != result.valid:
+                live = (
+                    f"the live log shows tampered entries: "
+                    f"{result.valid}/{result.total} entries valid"
+                )
+            elif result.total:
+                live = f"the live log verified intact: {result.valid}/{result.total} entries"
+            else:
+                live = "no events to verify"
+            print(
+                f"⚠️  Audit history UNVERIFIABLE: {result.reason}. "
+                f"Rotated segments were not checked — {live}."
+            )
+        elif result.total == 0:
             print("No security events to verify.")
-        elif total == valid:
-            print(f"✅ HMAC chain intact: {total} entries verified.")
+        elif result.total == result.valid:
+            print(f"✅ HMAC chain intact: {result.total} entries verified.")
         else:
             print(
-                f"⚠️  HMAC chain COMPROMISED: {valid}/{total} entries valid, {total - valid} tampered."
+                f"⚠️  HMAC chain COMPROMISED: {result.valid}/{result.total} entries "
+                f"valid, {result.total - result.valid} tampered."
             )
     else:
         print("Usage: kirocrew security {audit|deny-list|events|verify}")
@@ -1344,8 +1624,127 @@ def _policy(args: argparse.Namespace) -> None:
         for scope in sorted(prof.controls):
             print(f"   • {scope}: {prof.controls[scope]}")
 
+    elif action == "source":
+        _print_policy_source()
+
+    elif action == "fetch":
+        _policy_fetch(force=getattr(args, "force", False))
+
     else:
-        print("Usage: kirocrew policy {show|validate|explain <scope> <item>|profile <name>}")
+        print(
+            "Usage: kirocrew policy {show|validate|explain <scope> <item>|"
+            "profile <name>|source|fetch}"
+        )
+
+
+def _print_policy_source() -> None:
+    """Report whether this host follows a centrally distributed ceiling.
+
+    Prints the source's SCHEME rather than its URL, matching what the dashboard
+    viewer exposes: this command is reachable from a shell the agent may drive, and
+    the endpoint is the fleet's control plane. An operator who needs the URL reads
+    it from the policy file or the environment, out of band.
+    """
+    from kiro_crew.platform.policy_distribution import (
+        POLICY_URL_ENV,
+        distribution_posture,
+        registered_policy_schemes,
+    )
+
+    posture = distribution_posture()
+    if posture.get("error_code"):
+        print(
+            "⚠️  Central policy distribution is misconfigured; see the gateway log "
+            "for the reason and check the 'distribution' block in your policy."
+        )
+        return
+    if not posture.get("configured"):
+        print("Central policy distribution: not configured (this host uses a local policy).")
+        print(
+            f"   Set {POLICY_URL_ENV}, or add a 'distribution' block to the policy, to enable it."
+        )
+        print(f"   Transports available: {', '.join(registered_policy_schemes())}")
+        return
+
+    interval = posture.get("refresh_interval_seconds") or 0
+    print("🌐 Central policy distribution: ACTIVE")
+    print(f"   transport        : {posture.get('source_scheme') or '—'}")
+    print(f"   refresh          : {f'every {interval}s' if interval else 'at boot only'}")
+    print(f"   polling now      : {'yes' if posture.get('refresher_running') else 'no'}")
+    max_age = posture.get("max_cache_age_seconds") or 0
+    print(f"   staleness bound  : {f'{max_age}s' if max_age else 'none'}")
+    print(f"   if unavailable   : {posture.get('on_unavailable')}")
+    if posture.get("cache_present"):
+        print(f"   cached copy      : {posture.get('cache_age_seconds')}s old")
+    else:
+        print("   cached copy      : none (an outage would leave this host with no ceiling)")
+    if posture.get("last_refresh_status"):
+        print(
+            f"   last refresh     : {posture['last_refresh_status']} "
+            f"({posture.get('last_refresh_age_seconds')}s ago)"
+        )
+
+
+def _policy_fetch(*, force: bool) -> None:
+    """Fetch the central policy now, applying it when it is usable.
+
+    Exits non-zero on a refusal or an unreachable source so this is usable as a
+    fleet-verification step in a config-management run: an admin rolling a change
+    needs a check that FAILS on the host that did not take it, not one that prints
+    a warning into a log nobody reads.
+
+    **What it can and cannot claim.** ``refresh_now`` installs the ceiling in the calling
+    process, and this process exits immediately — so a bare "applied" would overclaim: a
+    running gateway is a different process and keeps its own ceiling until its refresher
+    polls. What this command really establishes is that the endpoint serves a document
+    this host accepts, and that the document is now the host's last-known-good. The
+    message says which of those happened and when a running gateway takes it, because a
+    boot-only source (no ``refresh_interval_secs``) has no next cycle to take it on.
+    """
+    from kiro_crew.platform.policy_distribution import (
+        REFRESH_APPLIED,
+        REFRESH_NOT_CONFIGURED,
+        REFRESH_REJECTED,
+        REFRESH_UNCHANGED,
+        effective_refresh_interval,
+        refresh_now,
+    )
+
+    outcome = refresh_now(force=force)
+    if outcome.status == REFRESH_NOT_CONFIGURED:
+        print("Central policy distribution is not configured; nothing to fetch.")
+        return
+    if outcome.status == REFRESH_UNCHANGED:
+        print("✅ The central policy is unchanged; this host is current.")
+        if outcome.detail:
+            print(f"   {outcome.detail}")
+        return
+    if outcome.status == REFRESH_APPLIED:
+        print("✅ Fetched a valid governance ceiling and cached it as this host's own.")
+        if outcome.signature_state:
+            print(f"   provenance: {outcome.signature_state}")
+        interval = effective_refresh_interval()
+        if interval:
+            print(
+                f"   A running gateway adopts it within {interval}s, on its next refresh; "
+                "a newly started one adopts it immediately."
+            )
+        else:
+            print(
+                "   This source is boot-only (no refresh_interval_secs), so a gateway "
+                "already running keeps its current ceiling until it is restarted. Set a "
+                "refresh interval if a push should bind without one."
+            )
+        return
+    # Rejected or unreachable. The running ceiling is untouched either way, which
+    # is worth saying: an operator reading a failure needs to know whether the host
+    # is now ungoverned (it is not).
+    # "was refused", not "refused": the policy is the object of the refusal, not the
+    # thing doing it.
+    label = "was refused" if outcome.status == REFRESH_REJECTED else "could not be reached"
+    print(f"❌ The central policy {label}: {outcome.detail}")
+    print("   The ceiling already in effect is unchanged.")
+    raise SystemExit(1)
 
 
 async def _run_eval(args: argparse.Namespace) -> None:
@@ -1454,6 +1853,33 @@ async def _run_eval(args: argparse.Namespace) -> None:
     print(f"\nResults saved to:\n  {report_path}\n  {json_path}")
 
 
+# Appended to every `learn add` output that wrote something. This command builds
+# its store with no embed_fn (loading the embedding model would add its startup
+# cost to every CLI invocation), so an insert lands with a NULL vector and an
+# enrichment CLEARS the stored one (the upsert keeps a vector only when the value
+# is unchanged). Either way the row is repaired by the gateway's boot-time
+# re-embed sweep, not by this process — an unqualified success message would
+# overstate what happened, and a user searching semantically before the next
+# gateway start would not find the lesson they were just told was saved.
+# "once its embedding backend is ready" is the sweep's own guarantee, not
+# hedging: _wait_then_backfill defers the sweep to a later boot when the
+# embedding model has not landed, so "on its next start" would over-promise.
+_LEARN_EMBED_NOTE = (
+    "  Stored and keyword-searchable now; the embedding vector is filled by the\n"
+    "  gateway's re-embed sweep after it next starts, once its embedding backend\n"
+    "  is ready."
+)
+
+# INSERTED only. An enrichment resolves against the ONE existing row it rewrites
+# (write_lesson pass 1 sets ``matched`` and pass 2's generic scan runs over
+# ``[] if matched else lesson_rows``), so the substring/topic-overlap claim is
+# true only for an insert — printing it on ENRICHED would report checks that
+# never ran, the same defect this change fixes.
+_LEARN_DEDUP_NOTE = (
+    "  (Semantic dedup did not run at write time; substring/topic-overlap dedup\n" "  still did.)"
+)
+
+
 def _learn(args: argparse.Namespace) -> None:
     """Save, list, or remove learned corrections."""
 
@@ -1468,23 +1894,62 @@ def _learn(args: argparse.Namespace) -> None:
             rule = args.rule
             category = args.category
             negative = getattr(args, "negative", None)
-            if vs.write_lesson(rule, category, negative):
-                neg = f" ({negative})" if negative else ""
-                print(f"Saved: {rule}{neg} [{category}]")
-            else:
-                lesson = Lesson(
-                    ts=datetime.now(timezone.utc).isoformat(),
-                    rule=rule,
-                    category=category,
-                    negative=negative,
+            # The reporting form, not the bool. This command used to read EVERY falsy
+            # return as "the vector store did not take it" and write a second record
+            # into lessons.jsonl. Most of those returns mean the opposite -- the
+            # lesson is already stored exactly as submitted -- so the fallback wrote a
+            # redundant record for a lesson that was fine, and printed "Saved:" when
+            # nothing needed saving.
+            #
+            # The one return that really does mean "nothing was stored" is a REFUSAL,
+            # and routing that into the JSONL store was worse than redundant: that
+            # store validates no content at all, so a value this store rejected (an
+            # injection-pattern clause) landed there anyway, and the context builder
+            # reads lessons.jsonl whenever the vector store holds no lessons.
+            #
+            # So the fallback is REMOVED, not narrowed. There is no "vector store
+            # unavailable" state to fall back from here: ``vs`` is constructed and
+            # ``init()``-ed unconditionally above, which means a falsy return was the
+            # only way into that branch.
+            result = vs.write_lesson(rule, category, negative)
+            neg = f" ({negative})" if negative else ""
+            # The category is echoed ONLY where the store adopted the submitted one.
+            # It is write-once (vector_memory.py builds an enrichment with the STORED
+            # category, falling back to the submitted one only when the row has none),
+            # so an insert is the single outcome where what was typed is what is held.
+            # Anything else printing it would show a value the store may not have --
+            # the same defect this PR fixes on the reporting side. `learn list` is
+            # where stored values belong.
+            if result.outcome is LessonWriteOutcome.INSERTED:
+                print(f"Saved: {rule}{neg} [{category}]\n{_LEARN_EMBED_NOTE}\n{_LEARN_DEDUP_NOTE}")
+            elif result.outcome is LessonWriteOutcome.ENRICHED:
+                # No _LEARN_DEDUP_NOTE here: an enrichment matched its existing row in
+                # pass 1, which SKIPS the generic dedup scan. Instead say what the
+                # rewrite cost — the upsert cleared the vector the row already had.
+                print(
+                    f"Updated the stored lesson with this clause: {rule}{neg}\n"
+                    "  The stored category is kept; `learn list` shows it.\n"
+                    "  This rewrite cleared the row's existing embedding vector.\n"
+                    + _LEARN_EMBED_NOTE
                 )
-                # save_or_enrich, not save: `learn add --negative` is explicit user
-                # intent, so a re-submitted rule should get the clause attached
-                # rather than be skipped as a duplicate. save() keeps the skip
-                # semantics for automatic writers.
-                jsonl_store.save_or_enrich(lesson)
-                neg = f" ({lesson.negative})" if lesson.negative else ""
-                print(f"Saved: {lesson.rule}{neg} [{lesson.category}]")
+            elif result.outcome is LessonWriteOutcome.UNCHANGED:
+                # Nothing was written, and the store keeps the stored category and
+                # NOT-clause rather than rewriting them on a re-submit.
+                print(
+                    f"Already stored, nothing written: {rule}\n"
+                    "  A re-submit keeps the stored category and NOT-clause; "
+                    "changing one means `learn remove` then `learn add`."
+                )
+            elif result.outcome is LessonWriteOutcome.DEDUPED:
+                print(f"Not saved: an existing lesson already covers this ({result.reason})")
+            else:
+                # REFUSED -- and any outcome a later change adds, which is deliberate:
+                # every branch above names ONE outcome, so a new one lands here and
+                # exits non-zero rather than being silently reported as a success. A
+                # non-zero exit so a script driving this command sees the failure.
+                reason = f" ({result.reason})" if result.reason else ""
+                print(f"NOT saved: the memory store refused this lesson{reason}", file=sys.stderr)
+                sys.exit(1)
 
         elif action == "list":
             vs_lessons = vs.get_lessons()
@@ -1548,6 +2013,39 @@ def _markdown_memory_store() -> MemoryStore:
     return MemoryStore()
 
 
+def _memory_search_history(args: argparse.Namespace) -> None:
+    """Print FTS5 hits from the markdown memory layer.
+
+    Reads the same index the heartbeat and gateway keep current, so this needs
+    no embedder and no vector store — it answers "where did I write this word"
+    against preferences, projects and the dated daily-history files.
+
+    Resolves the store through ``_markdown_memory_store`` for the reason spelled
+    out there: the reader must anchor exactly where the gateway's consolidator
+    writes, or a config that remaps the default workspace searches a tree
+    nothing writes to.
+    """
+    store = _markdown_memory_store()
+    results = store.search(args.query, limit=10)
+    if not results:
+        # An empty index is not the same statement as an absent word, so the two
+        # are reported differently.
+        if not store.index_row_count():
+            print("Memory history index is empty or unavailable; nothing was searched.")
+        else:
+            print("No memory-history matches.")
+        return
+    print("  Daily history / preferences / projects:")
+    for r in results:
+        # Strip terminal control sequences for the same reason the semantic
+        # listing does: memory holds whatever the user pasted into a session.
+        path = _TERMINAL_CTRL_RE.sub("", str(r.get("path", "?")))
+        snippet = _TERMINAL_CTRL_RE.sub("", str(r.get("snippet", ""))).strip()
+        print(f"    {path}")
+        if snippet:
+            print(f"        {snippet}")
+
+
 def _memory_show(args: argparse.Namespace) -> None:
     """Read-only view of the markdown memory layer (preferences/projects/history).
 
@@ -1595,6 +2093,11 @@ def _memory_cmd(args: argparse.Namespace) -> None:
     if action == "show":
         _memory_show(args)
         return
+    # "search --layer history" reads only the markdown FTS index, so don't open
+    # (or create) the vector store for it — same reason as "show" above.
+    if action == "search" and getattr(args, "layer", "all") == "history":
+        _memory_search_history(args)
+        return
     cfg = KiroCrewConfig.load()
     store = VectorMemoryStore(embedding_dim=cfg.memory.embedding_dim)
     store.init()
@@ -1620,19 +2123,31 @@ def _memory_cmd(args: argparse.Namespace) -> None:
                 )
 
         elif action == "search":
-            results = store.search_episodic(query_text=args.query, limit=10)
-            if not results:
-                print("No episodic memories found.")
-                return
-            for r in results:
-                tags = (
-                    json.loads(r.get("tags", "[]"))
-                    if isinstance(r.get("tags"), str)
-                    else r.get("tags", [])
-                )
-                print(f"  [{r.get('importance', 0):.1f}] {r['text'][:120]}")
-                if tags:
-                    print(f"        tags: {', '.join(tags)}")
+            layer = getattr(args, "layer", "all")
+            if layer in ("vector", "all"):
+                results = store.search_episodic(query_text=args.query, limit=10)
+                if not results:
+                    print("No episodic memories found.")
+                    # Under "all" the markdown layer is still to come: an empty
+                    # vector result is not an empty answer.
+                    if layer == "vector":
+                        return
+                elif layer == "all":
+                    # Both sections are printed, so both are named. Unlabelled,
+                    # the first block of hits reads as the whole answer. Held
+                    # back under "vector", whose output shape is a promise.
+                    print("  Episodic recall:")
+                for r in results:
+                    tags = (
+                        json.loads(r.get("tags", "[]"))
+                        if isinstance(r.get("tags"), str)
+                        else r.get("tags", [])
+                    )
+                    print(f"  [{r.get('importance', 0):.1f}] {r['text'][:120]}")
+                    if tags:
+                        print(f"        tags: {', '.join(tags)}")
+            if layer == "all":
+                _memory_search_history(args)
 
         elif action == "stats":
             stats = store.memory_stats()
@@ -1722,7 +2237,7 @@ def _artifact(args: argparse.Namespace) -> None:
 
     action = getattr(args, "artifact_action", None) or "list"
 
-    headers: dict[str, str] = {"X-Internal-Secret": _internal_secret()}
+    headers: dict[str, str] = {"X-Internal-Secret": _internal_secret(port)}
 
     def _request(method: str, path: str, body: dict | None = None) -> dict:
         data = json.dumps(body).encode() if body is not None else None
@@ -1822,7 +2337,23 @@ def _artifact(args: argparse.Namespace) -> None:
         if d.get("error"):
             print(f"Error: {d['error']}", file=sys.stderr)
             sys.exit(1)
-        print(f"Saved: slug={d.get('slug', '?')} version={d.get('version', 1)}")
+        slug = d.get("slug", "?")
+        print(f"Saved: slug={slug} version={d.get('version', 1)}")
+        # `save` has no --slug, so the slug is always derived from --name and a
+        # name collision can only ever be resolved by suffixing. That reads as
+        # success (exit 0, "version=1"), which is how a re-save of corrected
+        # content ends up published at a slug nobody looks at while the
+        # original keeps serving the old text. Name the slug that was taken and
+        # the verb that versions in place.
+        taken = d.get("slug_collided_with")
+        if taken:
+            print(
+                f"Warning: slug '{taken}' is already taken, so this created a NEW "
+                f"artifact at '{slug}' rather than a new version of '{taken}'. "
+                f"To version the existing artifact in place, use: "
+                f"kirocrew artifact update {taken}",
+                file=sys.stderr,
+            )
         return
 
     if action == "update":
@@ -2323,3 +2854,42 @@ def _telemetry(args: argparse.Namespace) -> None:
     else:
         print("✅ Anonymous usage beacon DISABLED. Nothing will be sent.")
         print(f"   You can also delete {beacon.INSTALL_ID_FILE} from the data home.")
+
+
+def _handle_secrets(args: argparse.Namespace) -> None:
+    """Dispatch secrets subcommands. Currently only ``import`` (migration)."""
+
+    action = getattr(args, "secrets_action", None)
+
+    if action == "import":
+        # Import ONLY from the fixed data-home .env — never an arbitrary path.
+        # A caller-supplied file would let a sandbox-off agent import attacker
+        # Jira values into the vault and have the vault-first consumer trust
+        # them, so there is deliberately no --file option.
+        # A concurrent .env change or an undecryptable pre-existing vault entry
+        # aborts the migration with MigrationConflictError. That is an expected
+        # operational condition (retry after the concurrent write settles, or
+        # repair the vault entry), so surface it as a clean CLI error with a
+        # nonzero exit — never an uncaught traceback.
+        try:
+            report = migrate_env_secrets(dry_run=not args.apply)
+        except MigrationConflictError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        except (OSError, ValueError) as exc:
+            # A truncated/corrupt `secrets.enc` makes the vault's `list_names()`
+            # (or a decrypt) raise `ValueError`/`OSError` rather than
+            # `MigrationConflictError`. Surface it as the same concise CLI error
+            # with a nonzero exit instead of an uncaught traceback — the store is
+            # unreadable, which the operator must repair before importing.
+            print(
+                f"error: could not read the secrets vault "
+                f"({exc.__class__.__name__}: {exc}); repair or remove the vault "
+                f"store, then re-run `kirocrew secrets import --apply`.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(format_report(report))
+    else:
+        print("Usage: kirocrew secrets import [--apply]", file=sys.stderr)
+        sys.exit(1)

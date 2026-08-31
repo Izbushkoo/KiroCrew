@@ -43,6 +43,7 @@ from kiro_crew.dashboard.chat_utils import (
 )
 from kiro_crew.history import on_loop_persist_strict
 from kiro_crew.knowledge.llm_pool import LLMPool
+from kiro_crew.llm_helpers import _extract_json_of_type
 from kiro_crew.platform_compat import is_link_or_junction, unlink_link_or_junction
 
 try:
@@ -1756,6 +1757,7 @@ async def _launch_loop(request: web.Request, cid: str, *, prepared: bool = False
         idle_secs=int(row["idle_secs"] or DEFAULT_IDLE_SECS),
         max_cycles=int(row["max_cycles"] or 0),
         stop_sentinel_path=str(_campaign_dir(cid) / "STOP"),
+        admission_check=lambda: state.get_slot(slot.key) is slot,
     )
 
 
@@ -2176,7 +2178,7 @@ def _read_workflow_cycle_offset(campaign_id: str) -> int:
         return 0
     try:
         return int(json.loads(p.read_text()).get("cycle_offset", 0) or 0)
-    except (json.JSONDecodeError, OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError):
         return 0
 
 
@@ -2319,7 +2321,7 @@ async def _poll_workflow_campaign(
                             ),
                             error_message="Workflow run snapshot lost after 1h — run likely evicted or crashed.",
                         )
-                except (json.JSONDecodeError, OSError, ValueError, TypeError):
+                except (OSError, ValueError, TypeError):
                     pass
             return
         # ALL snapshot processing runs under the campaign's transition lock:
@@ -2546,14 +2548,36 @@ def _compact_tree(tree: list[dict]) -> str:
     return "\n".join(lines) if lines else "(empty — this is the first round)"
 
 
+def _grill_node_shaped(value: object) -> bool:
+    """Prefer predicate: an array carrying at least one node-shaped record.
+
+    Disambiguates the payload from stray bracketed PROSE that also parses as
+    an array (a "see item [1]:" marker, a trailing "[12]." citation) — those
+    decode to arrays of scalars and are never preferred."""
+    return isinstance(value, list) and any(
+        isinstance(item, dict) and "kind" in item and "text" in item for item in value
+    )
+
+
 def _parse_grill_nodes(raw: str) -> list[dict]:
-    """Extract child node dicts {kind, text, recommended?} from an LLM reply."""
-    start, end = raw.find("["), raw.rfind("]")
-    if start < 0 or end <= start:
-        return []
+    """Extract child node dicts {kind, text, recommended?} from an LLM reply.
+
+    Extraction delegates to the shared ``llm_helpers._extract_json_of_type``
+    scanner, so a stray bracket in surrounding prose no longer corrupts the
+    span the way the old outermost ``find('[') .. rfind(']')`` slice did.
+    Returns [] on any parse failure, or when two DIFFERENT node-shaped arrays
+    make the choice ambiguous (the shared contract refuses to guess)."""
     try:
-        items = json.loads(raw[start : end + 1])
-    except (json.JSONDecodeError, ValueError):
+        items = _extract_json_of_type(raw, list, prefer=_grill_node_shaped)
+    except RecursionError:
+        # The stdlib decoder recurses per nesting level, so a nesting bomb in
+        # the untrusted reply overflows long before any structural bound. This
+        # parser's callers are outside any exception envelope (the grill-expand
+        # handler would surface it as HTTP 500), so degrade to no-nodes here.
+        # PR #5066 makes the shared scanner fail closed on this centrally;
+        # this guard becomes redundant-but-harmless once that lands.
+        return []
+    if not isinstance(items, list):
         return []
     out = []
     for it in items:
@@ -3159,7 +3183,7 @@ async def _handle_knowledge_status(request: web.Request) -> web.Response:
     # (it has not, until the user adds it), so no filesystem side effects here.
     uri = str((d / "findings_for_knowledge.md").resolve())
     try:
-        existing = store.get_source_by_uri(uri)
+        existing = await asyncio.to_thread(store.get_source_by_uri, uri)
     except Exception:
         logger.exception("knowledge-status lookup failed for %s", cid)
         return web.json_response({"in_library": False})
@@ -3198,7 +3222,7 @@ async def _handle_to_knowledge(request: web.Request) -> web.Response:
     sanitized_path.write_text(redacted)
     uri = str(sanitized_path.resolve())
     # Dedup check
-    existing = store.get_source_by_uri(uri)
+    existing = await asyncio.to_thread(store.get_source_by_uri, uri)
     if existing:
         return web.json_response(
             {"error": "Already in Knowledge Library", "id": existing["id"]}, status=409
@@ -3221,19 +3245,35 @@ async def _handle_to_knowledge(request: web.Request) -> web.Response:
         if row
         else f"Research: {cid}"
     )
-    sid = store.add_source(name=name, source_type="local_file", uri=uri, properties={})
-    store.db.execute("UPDATE sources SET sync_status = 'syncing' WHERE id = ?", (sid,))
-    store.db.commit()
+
+    # The store hands out one connection per thread, so all statement work for
+    # this request runs off-loop in a single worker: a lock wait on the store's
+    # busy timeout must stall a thread, never the event loop (issue #7020's
+    # loop-stall class). ``add_source`` rides in the same closure because the
+    # status UPDATE needs its ``sid`` on the same per-thread connection.
+    def _add_source_marked_syncing() -> str:
+        new_sid = store.add_source(name=name, source_type="local_file", uri=uri, properties={})
+        store.db.execute("UPDATE sources SET sync_status = 'syncing' WHERE id = ?", (new_sid,))
+        store.db.commit()
+        return new_sid
+
+    sid = await asyncio.to_thread(_add_source_marked_syncing)
 
     async def _bg_ingest() -> None:
-        try:
-            await pipeline.ingest_file(uri, source_id=sid)
+        def _mark_synced() -> None:
             store.db.execute("UPDATE sources SET sync_status = 'synced' WHERE id = ?", (sid,))
             store.db.commit()
-        except Exception:
-            logger.exception("Research findings ingestion failed for %s", cid)
+
+        def _mark_error() -> None:
             store.db.execute("UPDATE sources SET sync_status = 'error' WHERE id = ?", (sid,))
             store.db.commit()
+
+        try:
+            await pipeline.ingest_file(uri, source_id=sid)
+            await asyncio.to_thread(_mark_synced)
+        except Exception:
+            logger.exception("Research findings ingestion failed for %s", cid)
+            await asyncio.to_thread(_mark_error)
 
     task = asyncio.create_task(_bg_ingest())
     app_tasks = request.app.setdefault("_bg_tasks", set())

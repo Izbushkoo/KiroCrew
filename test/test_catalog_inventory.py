@@ -277,7 +277,10 @@ class TestPinnedFetchNeverEatsUserData:
             "https://example.com/a.git", SHA, dest, log,
             clone_env={}, sandbox_mode="standard",
         )
-        assert result is not None and result["error"] == "destination_not_a_checkout"
+        # Machine slug lives in `code`; `error` carries the human sentence the
+        # install banner renders verbatim.
+        assert result is not None and result["code"] == "destination_not_a_checkout"
+        assert result["error"] and result["error"] != "destination_not_a_checkout"
         assert (dest / "important.txt").read_text(encoding="utf-8") == "user data"
 
     @pytest.mark.asyncio
@@ -293,7 +296,8 @@ class TestPinnedFetchNeverEatsUserData:
             "https://example.com/a.git", SHA, dest, log,
             clone_env={}, sandbox_mode="standard",
         )
-        assert result is not None and result["error"] == "destination_not_a_checkout"
+        assert result is not None and result["code"] == "destination_not_a_checkout"
+        assert result["error"] and result["error"] != "destination_not_a_checkout"
         assert (dest / ".git").is_file(), "the link was left alone"
 
     @pytest.mark.asyncio
@@ -592,7 +596,8 @@ class TestPinnedInstallNeverReusesAnExistingTree:
 
         result = await reg._git_clone_or_pull(URL, "main", dest, [], commit=SHA)
         assert result is not None
-        assert result["error"] == "existing_checkout_not_moved_aside"
+        assert result["code"] == "existing_checkout_not_moved_aside"
+        assert result["error"] and result["error"] != "existing_checkout_not_moved_aside"
         assert dest.exists(), "a checkout we could not move is left untouched"
 
     @pytest.mark.asyncio
@@ -658,6 +663,31 @@ class TestCatalogFailureNeverDowngradesToAnUnpinnedSeed:
         row, reason = reg._resolve_registry_row("dup")
         assert row is None, "an unpinned seed must not stand in for an unknown pin"
         assert "could not be reached" in reason
+
+    def test_failure_log_and_reason_omit_name_and_exception_text(
+        self, monkeypatch, caplog
+    ):
+        secret_shaped_name = "secrettoken123"
+        monkeypatch.setattr(reg, "_load_registry_file", lambda: [])
+
+        def _unavailable(name):
+            raise reg.official_catalog.CatalogUnavailable(
+                f"catalog rejected {name} with embedded-secret"
+            )
+
+        monkeypatch.setattr(
+            reg.official_catalog,
+            "inventory_for_install",
+            _unavailable,
+        )
+
+        row, reason = reg._resolve_registry_row(secret_shaped_name)
+
+        assert row is None
+        assert secret_shaped_name not in reason
+        assert "embedded-secret" not in reason
+        assert secret_shaped_name not in caplog.text
+        assert "embedded-secret" not in caplog.text
 
     def test_an_authoritative_no_catalog_row_still_uses_the_seed(self, monkeypatch):
         """The other half: refusing on a successful "no row" would break every

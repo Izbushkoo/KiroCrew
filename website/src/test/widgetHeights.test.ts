@@ -122,17 +122,69 @@ describe('widgetHeights', () => {
     const util = read('utils', 'widgetHeights.ts')
     const frame = read('components', 'WidgetFrame.tsx')
     const page = read('pages', 'ArtifactsPage.tsx')
+    // WidgetThumb -- the gallery's consumer of this cache -- was extracted out of
+    // ArtifactsPage into this shared module so a second page (the Drive library
+    // gallery) renders identical previews. So the CONSUMER moved; the invariant
+    // did not. The page is still held to "must not contain the key", and the
+    // import/no-private-map assertions now follow WidgetThumb to where it lives.
+    const thumbs = read('components', 'library', 'ArtifactThumbs.tsx')
     // The key, the map, the debounce and the persist live in exactly one file.
     expect(util).toContain("'mc-widget-heights'")
     expect(frame).not.toContain('mc-widget-heights')
     expect(page).not.toContain('mc-widget-heights')
-    // ...and both consumers go through it rather than keeping a private copy.
-    for (const [name, text] of [['WidgetFrame', frame], ['ArtifactsPage', page]] as const) {
-      expect(text, `${name} must import the shared cache`).toMatch(/from '\.\.\/utils\/widgetHeights'/)
+    expect(thumbs).not.toContain('mc-widget-heights')
+    // ...and every consumer goes through it rather than keeping a private copy.
+    for (const [name, text] of [['WidgetFrame', frame], ['ArtifactThumbs', thumbs]] as const) {
+      expect(text, `${name} must import the shared cache`).toMatch(/from '(\.\.\/)+utils\/widgetHeights'/)
       expect(text, `${name} must not hold its own map`).not.toMatch(/const heightCache/)
     }
+    // The page must not have quietly grown a replacement on its way out.
+    expect(page, 'ArtifactsPage must not hold its own map').not.toMatch(/const heightCache/)
     // The frame takes the DEFAULT key space, which is what keeps the entries it
     // already persisted resolvable across the extraction.
     expect(frame).toMatch(/widgetHeightKey\(html\)/)
+  })
+})
+
+// A frame that sizes itself from its document's report feeds its own measurement,
+// because ordinary CSS lets a document's height depend on the frame's viewport.
+// This is not a threat model — the documents are agent-authored. It is that
+// `min-height:100vh` is the commonest idiom there is, and a multiplier above 1
+// diverges (measured in Chromium: 690 → 3838 → 21341 → 100000px in four reports).
+// clampFrameHeight is the single place both readers of the protocol go through, on
+// the way in from a report and on the way out of the cache.
+describe('clampFrameHeight', () => {
+  it('keeps a legitimate height untouched', async () => {
+    const { clampFrameHeight } = await loadModule()
+    expect(clampFrameHeight(343)).toBe(343)
+    expect(clampFrameHeight(20_000)).toBe(20_000)
+  })
+
+  it('refuses to collapse the frame', async () => {
+    // A zero-height frame is unrecoverable from the reader's side.
+    const { clampFrameHeight, MIN_REPORTED_FRAME_HEIGHT } = await loadModule()
+    expect(clampFrameHeight(0)).toBe(MIN_REPORTED_FRAME_HEIGHT)
+    expect(clampFrameHeight(-5000)).toBe(MIN_REPORTED_FRAME_HEIGHT)
+  })
+
+  it('refuses to expand the page without bound', async () => {
+    const { clampFrameHeight, MAX_REPORTED_FRAME_HEIGHT } = await loadModule()
+    expect(clampFrameHeight(1e9)).toBe(MAX_REPORTED_FRAME_HEIGHT)
+    expect(clampFrameHeight(Number.MAX_SAFE_INTEGER)).toBe(MAX_REPORTED_FRAME_HEIGHT)
+  })
+
+  it('treats a non-finite report as no information rather than a size', async () => {
+    const { clampFrameHeight, MIN_REPORTED_FRAME_HEIGHT } = await loadModule()
+    expect(clampFrameHeight(Number.NaN)).toBe(MIN_REPORTED_FRAME_HEIGHT)
+    expect(clampFrameHeight(Number.POSITIVE_INFINITY)).toBe(MIN_REPORTED_FRAME_HEIGHT)
+  })
+
+  it('bounds a value that was already cached before the bound existed', async () => {
+    // The read path needs the clamp as much as the write path: an entry persisted
+    // by an earlier build is restored on the next open with no script involved.
+    const { clampFrameHeight, getWidgetHeight, MAX_REPORTED_FRAME_HEIGHT } =
+      await loadModule([['poisoned', 99_999_999]])
+    expect(getWidgetHeight('poisoned')).toBe(99_999_999)
+    expect(clampFrameHeight(getWidgetHeight('poisoned')!)).toBe(MAX_REPORTED_FRAME_HEIGHT)
   })
 })

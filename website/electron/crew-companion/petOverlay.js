@@ -15,7 +15,7 @@
  */
 
 const path = require("path");
-const { BrowserWindow, screen, ipcMain } = require("electron");
+const { app, BrowserWindow, screen, ipcMain } = require("electron");
 const { companionPageUrl } = require("./pageUrl");
 
 /** @type {Map<number, Electron.BrowserWindow>} display id -> overlay */
@@ -51,6 +51,26 @@ function setOverlayTarget(url, token) {
   credential = token || "";
 }
 
+/**
+ * Keep the HOST app in the Dock (macOS).
+ *
+ * macOS flips a window-owning app to the accessory activation policy — which drops
+ * its Dock icon — when it shows a window shaped like this overlay (frameless,
+ * transparent, always-on-top). Re-assert "regular" and the Dock icon right after
+ * showing, so opening the companion never makes Kiro Crew vanish from the Dock.
+ * Mirrors Mochi's assertHostStaysInDock (mochi/petOverlays.js), which carries the
+ * same note; the crew-companion overlay was missing it.
+ */
+function assertHostStaysInDock() {
+  if (process.platform !== "darwin") return;
+  try {
+    app.setActivationPolicy?.("regular");
+    app.dock?.show?.();
+  } catch {
+    /* older Electron / already regular */
+  }
+}
+
 function createOverlayFor(display) {
   const win = new BrowserWindow({
     x: display.bounds.x,
@@ -65,6 +85,24 @@ function createOverlayFor(display) {
     hasShadow: false,
     enableLargerThanScreen: true,
     show: false,
+    /*
+     * Deliver the FIRST click to the page — a constructor option, the only place
+     * this can be set.
+     *
+     * On macOS a click into an inactive window is consumed to activate it, and this
+     * overlay is `setFocusable(false)` + `showInactive()`, so it never becomes the
+     * active window: EVERY click is a first-mouse click. Without this the window
+     * accepted `mousemove` (ignore-mouse is set with `forward: true`) but never the
+     * `mousedown` behind it — so the bubble's hover-revealed ✕ appeared under the
+     * cursor and did nothing when clicked, and the notification could not be
+     * dismissed at all.
+     *
+     * It used to be attempted as `win.setAcceptFirstMouse?.(true)` after
+     * construction. No such method exists on BrowserWindow — `acceptFirstMouse` is
+     * a BaseWindow CONSTRUCTOR option only — and the optional call swallowed the
+     * miss silently, which is why it read as done for so long.
+     */
+    acceptFirstMouse: true,
     webPreferences: {
       preload: path.join(__dirname, "pet-preload.js"),
       contextIsolation: true,
@@ -76,7 +114,6 @@ function createOverlayFor(display) {
   });
 
   win.setFocusable(false);
-  win.setAcceptFirstMouse?.(true);
   // Refuse input by default; the renderer re-enables it over the sprite alone.
   win.setIgnoreMouseEvents(true, { forward: true });
   // INVISIBLE TO SCREEN CAPTURE (macOS NSWindowSharingNone, Windows
@@ -94,7 +131,11 @@ function createOverlayFor(display) {
 
   win.loadURL(companionPageUrl(baseUrl, "pet.html", credential));
   win.once("ready-to-show", () => {
-    if (!win.isDestroyed()) win.showInactive();
+    if (win.isDestroyed()) return;
+    win.showInactive();
+    // Showing this accessory-shaped window demotes the app to a Dock-less accessory
+    // on macOS; put the host back in the Dock (see assertHostStaysInDock).
+    assertHostStaysInDock();
   });
   win.on("closed", () => {
     for (const [id, w] of overlays) if (w === win) overlays.delete(id);
@@ -279,6 +320,7 @@ function registerOverlayIpc() {
 }
 
 module.exports = {
+  assertHostStaysInDock,
   broadcastToPets,
   isPetWindow,
   openPetWindow,

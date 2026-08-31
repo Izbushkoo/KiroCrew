@@ -553,6 +553,15 @@ export default [
               // a closed DOM set cannot match prose — no English phrase is
               // `AltRight` — and a new key code has to be added here on purpose.
               '^(?:Alt|Control|Meta|Shift)(?:Left|Right)$',
+              // The TWO provider-CLI LOGIN COMMANDS the pull-request panel offers
+              // as copyable recovery text (`pullRequestErrorDetails` returns one
+              // verbatim and the panel renders it in a <code> block). A command
+              // typed into a terminal is a wire string: translating it breaks
+              // it. Enumerated rather than shaped, like the key codes above — a
+              // "lowercase words" shape would exempt exactly the prose this
+              // config fights hardest, and this is a closed two-member set that
+              // grows only when a new provider CLI is wired in on purpose.
+              '^(?:gh|glab) auth login$',
               // A `mc:`-NAMESPACED BROWSER-STORAGE KEY, e.g.
               // `mc:notif:activeKinds:v2`, `mc:notif:seenChannels`. The dashboard
               // namespaces every localStorage key it owns under `mc:`, and such
@@ -606,6 +615,23 @@ export default [
               // slash-prefixed string (`'/Delete'`) is exempt.
               '^https?://\\S*$',
               '^[.~]?/\\S*$',
+              // URL-GRAMMAR FRAGMENTS of the Issue Radar provider table
+              // (`apps/issue-radar/lib/links.ts`): the repository-path templates, the
+              // two placeholders `String.replace` substitutes into them, and Azure
+              // DevOps' `_`-prefixed route segment. Same category as the path and
+              // query entries above — a forge's route is that forge's contract, and a
+              // translated `_workitems` is a 404, not a localized page.
+              //
+              // The slash-bearing entry above cannot cover these: `{owner}/{repo}`
+              // carries braces, which its `[\w./-]` class excludes, and `_workitems`
+              // has no slash at all — the very requirement that stops that entry from
+              // exempting single prose words. So this is ENUMERATED rather than a
+              // shape: the literals the table actually holds, whole-value anchored,
+              // which no sentence of copy can match. A general "token with braces or a
+              // leading underscore" shape was rejected for the reason stated for `mc:`
+              // above — it would start releasing real copy the moment a label
+              // interpolated a placeholder.
+              String.raw`^(?:\{owner\}(?:/_git)?/\{repo\}|\{owner\}|\{repo\}|_workitems)$`,
               // A FILE-PICKER `accept` EXTENSION LIST, e.g.
               // `,.txt,.md,.json,.har,.yaml` — the comma-joined dot-extension
               // string handed to `<input type="file" accept=…>`. These live at
@@ -730,7 +756,18 @@ export default [
               // per-channel settings panels. Enumerated and whole-value-anchored,
               // so a sentence merely mentioning a channel is still reported —
               // only the bare name is exempt.
-              '^(Slack|Discord|Telegram|Teams|Webex|WeCom|WeChat)$',
+              '^(Slack|Discord|Telegram|Teams|Webex|WeCom|WeChat|WhatsApp)$',
+              // The code-forge product brands, in the do-not-translate glossary for
+              // the same reason and enforced there by `glossary.test.ts`: "GitLab" is
+              // "GitLab" in every language, and a localized spelling would name a
+              // product that does not exist. They reach the UI as the provider name in
+              // Issue Radar's connect picker and as the `{{provider}}` value
+              // interpolated into its refresh tooltips, so the bare brand is the whole
+              // literal. Whole-value-anchored like the entry above, so a sentence that
+              // merely mentions a forge is still reported — only the bare name is
+              // exempt, and the sentences AROUND it stayed in the catalog (that is
+              // what `{{provider}}` is for).
+              '^(GitHub|GitLab|Azure DevOps)$',
               // The PPTX Maker chat-token KEYWORDS (`[Style: name]`,
               // `[Template: name]`). Enumerated and whole-value-anchored, exactly like
               // the modifier-key caps below: the agent prompts parse this literal
@@ -825,7 +862,10 @@ export default [
               // fixed vocabulary (`message_sent`, `tool_call`, `approval_required`), read
               // by the behaviour state machine, never rendered.
               '^report[A-Z]\\w*$', '^pickFile$',
-              'querySelector(All)?', 'getElementById', 'createElement',
+              // `closest` takes the same CSS-selector contract as querySelector:
+              // its argument is an attribute/type selector walked up the tree,
+              // never rendered copy.
+              'querySelector(All)?', 'closest', 'getElementById', 'createElement',
               'addEventListener', 'removeEventListener', 'matchMedia',
               // WebGL/DOM capability lookups take registry identifiers
               // (`WEBGL_lose_context`), which are mixed-case and so escape the
@@ -1021,7 +1061,13 @@ export default [
   // this module", and any copy later added to this file belongs in the catalog,
   // not here — keep this module CSS-only.
   {
-    files: ['src/apps/md-notebook/styles.ts'],
+    files: [
+      'src/apps/md-notebook/styles.ts',
+      // Same class as Notes: a CSS-in-TS string injected via <style>, never copy.
+      // Editing a selector inside CC_CSS otherwise fails [added-lines] because the
+      // whole template sits under an ALL-CAPS declarator.
+      'src/apps/crew-companion/styles.ts',
+    ],
     rules: {
       'i18next/no-literal-string': 'off',
     },
@@ -1148,6 +1194,45 @@ export default [
   // and any real copy later added elsewhere still belongs in the catalog.
   {
     files: ['src/components/commandPalette/settingsKeywords.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // FONT FAMILY NAMES ONLY: the candidate names the terminal font picker probes
+  // the viewing machine's font book for, plus the probe and preview sample text.
+  // Every name is matched BY VALUE against that font book — a translated
+  // `JetBrains Mono` resolves to nothing and the terminal silently falls back to
+  // the generic monospace, so translating one breaks the feature in that locale
+  // while adding a catalog entry no one can act on. The names do reach the screen
+  // as picker rows, which is the point: a font is chosen by the name it is
+  // installed under, the way a person is addressed by their own name.
+  //
+  // Scoped to this one file for the same reason as the modules above: a shape rule
+  // cannot express "font family names, but only in this module". Title-case
+  // multi-word names are exactly the shape the gate exists to catch, and the
+  // ` Mono` / ` Nerd Font` suffixes are far too generic to anchor an exclusion on.
+  // Keep this module names-only — the picker's own copy (its label, description,
+  // and the free-text row) lives in the catalog, not behind this exemption.
+  {
+    files: ['src/utils/monoFontCandidates.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // FONT FAMILY PICKER ROWS + BUNDLED FONT NAME LITERALS: the Settings →
+  // Display Font Family picker's option labels ('Sans' / 'Mono' / 'System' /
+  // 'OpenDyslexic') are proper nouns and internal identifiers, not user copy.
+  // The module also holds the CSS font-family stack strings for the bundled
+  // OpenDyslexic face (OPENDYSLEXIC_BODY_STACK / OPENDYSLEXIC_MONO_STACK) and
+  // the bundled-mono family-name list (BUNDLED_MONO_FONTS). All are matched by
+  // exact value against @font-face declarations and CSS lookups; translating
+  // any of them would break the resolution. Same names-only rationale as
+  // monoFontCandidates.ts above — kept in its own module so the exemption is
+  // tight.
+  {
+    files: ['src/utils/fontFamilyOptions.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },

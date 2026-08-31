@@ -28,7 +28,7 @@ from kiro_crew.config.loader import (
     config_path,
     update_config_locked,
 )
-from kiro_crew.cron import CronStoreBusy
+from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable
 from kiro_crew.dashboard.chat_utils import (
     forget_slack_options_for_thread,
     options_control_is_stale,
@@ -36,6 +36,7 @@ from kiro_crew.dashboard.chat_utils import (
     slack_options_owner_keys_snapshot,
     slack_options_slot,
 )
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.identity import channel_inbound_permitted
 from kiro_crew.security import redact_and_truncate, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -450,7 +451,7 @@ async def _handle_shortcut_submission(payload: dict) -> None:
 
     try:
         meta = json.loads(view.get("private_metadata", "{}"))
-    except (ValueError, json.JSONDecodeError):
+    except ValueError:
         meta = {}
 
     orig_channel = meta.get("channel", "")
@@ -2058,10 +2059,14 @@ async def _handle_cron_ack(payload: dict, action: dict, channel: str, msg_ts: st
     msg_text = payload.get("message", {}).get("text", "")[:200]
     try:
         await _orch.cron_svc.ack_job_async(job_id, msg_text)
-    except CronStoreBusy:
-        # Ack is best-effort context bookkeeping; a transiently-contended store
-        # must not fail the Slack interaction. The button already acked visually.
-        logger.warning("cron ack skipped: store busy (job %s)", job_id)
+    except (CronStoreBusy, CronStoreUnreadable) as exc:
+        # Ack is best-effort context bookkeeping; neither a transiently-contended
+        # store nor an unreadable one must fail the Slack interaction. The button
+        # already acked visually. Unreadable degrades here rather than surfacing
+        # to the user because nothing was requested of the store by the person
+        # clicking -- this is the same class as the background writers in
+        # CronService, not a user-initiated mutation.
+        logger.warning("cron ack skipped: %s (job %s)", type(exc).__name__, job_id)
     if _orch.dashboard_state:
         for n in _orch.dashboard_state._notification_log:
             if n.get("job_id") == job_id and not n.get("acked"):
@@ -2653,7 +2658,7 @@ async def _handle_session_resume(
 
     try:
         val = json.loads(action.get("value", "{}"))
-    except (ValueError, json.JSONDecodeError):
+    except ValueError:
         val = {"key": action.get("value", "")}
 
     session_key = val.get("key", "")
@@ -2753,7 +2758,7 @@ async def _handle_session_resume(
         )
 
 
-_resume_locks: dict[str, asyncio.Lock] = {}
+_resume_locks: dict[str, LoopBoundLock] = {}
 
 
 async def _handle_resume_choice(
@@ -2779,7 +2784,7 @@ async def _handle_resume_choice(
 
     try:
         val = json.loads(action.get("value", "{}"))
-    except (ValueError, json.JSONDecodeError):
+    except ValueError:
         return
 
     session_key = val.get("key", "")
@@ -2801,7 +2806,7 @@ async def _handle_resume_choice(
                 _resume_locks.pop(k, None)
                 evicted += 1
 
-    lock = _resume_locks.setdefault(session_key, asyncio.Lock())
+    lock = _resume_locks.setdefault(session_key, LoopBoundLock())
     async with lock:
         # Re-check: session may have been linked while user was choosing
         existing_thread, existing_channel = _orch.sessions.get_slack_link(session_key)
@@ -2902,7 +2907,7 @@ async def _handle_resume_choice(
                 for ln in lines:
                     try:
                         d = json.loads(ln.strip())
-                    except (ValueError, json.JSONDecodeError):
+                    except ValueError:
                         continue
                     if d.get("_type"):
                         continue

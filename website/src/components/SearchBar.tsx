@@ -5,6 +5,7 @@ import { platformShortcut } from '../utils/platform'
 import { SEARCH_LISTBOX_ID, searchOptionId } from './SearchResultsList'
 
 import { i18nT } from '../i18n/t'
+import { useImeGuard } from '../hooks/useImeGuard'
 interface SearchBarProps {
   term: string
   setTerm: (t: string) => void
@@ -20,9 +21,12 @@ interface SearchBarProps {
   goTo?: (i: number) => void
   /** Render inline (fills width, no floating chrome) for use inside the search pane header. */
   docked?: boolean
+  /** True when older history is unloaded, so results cover only the loaded window. */
+  scopeLimited?: boolean
 }
 
-export default function SearchBar({ term, setTerm, matches, currentIdx, next, prev, close, caseSensitive, toggleCaseSensitive, focusNonce, goTo, docked }: SearchBarProps) {
+export default function SearchBar({ term, setTerm, matches, currentIdx, next, prev, close, caseSensitive, toggleCaseSensitive, focusNonce, goTo, docked, scopeLimited }: SearchBarProps) {
+  const ime = useImeGuard()
   const inputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => { inputRef.current?.focus() }, [])
@@ -38,7 +42,8 @@ export default function SearchBar({ term, setTerm, matches, currentIdx, next, pr
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter') {
-      e.preventDefault()
+      // Only the Enter path is claimed — arrow/Home/End navigation stays untouched.
+      if (!ime.claimEnter(e)) return
       if (e.shiftKey) prev()
       else next()
     }
@@ -93,9 +98,18 @@ export default function SearchBar({ term, setTerm, matches, currentIdx, next, pr
         aria-activedescendant={matches.length > 0 ? searchOptionId(currentIdx) : undefined}
         value={term}
         onChange={e => setTerm(e.target.value)}
+        {...ime.bindComposition()}
         onKeyDown={handleKeyDown}
         aria-label={i18nT('components.searchBar.find_in_chat')}
         placeholder={i18nT('components.searchBar.find_in_chat_2')}
+        /* focus-cue-ok: undocked, the cue is on the WRAPPER — the pill above
+           carries `focus-within:border-accent` (same structure as IssueList's
+           search box), and a ring on the bare input would nest two outlines.
+           Docked, the bar is the search panel's title, summoned by the user and
+           autofocused, with the caret as the in-place cue; it has carried no
+           outline since it shipped, and this change only rewired the
+           composition/Enter handling, so restyling the docked header is out of
+           its scope. */
         className={`bg-transparent border-none outline-none text-text placeholder:text-muted text-[13px] ${docked ? 'flex-1 min-w-0' : 'w-[180px]'}`}
       />
       <button
@@ -106,11 +120,24 @@ export default function SearchBar({ term, setTerm, matches, currentIdx, next, pr
       >
         <CaseSensitive size={15} />
       </button>
-      {term && (
-        <span className="text-muted text-[12px] whitespace-nowrap tabular-nums">
-          {matches.length > 0 ? `${currentIdx + 1} of ${matches.length} results` : i18nT('components.searchBar.no_results')}
-        </span>
-      )}
+      {term && (() => {
+        const count = matches.length > 0
+          ? (scopeLimited
+              ? i18nT('components.searchBar.results_loaded_only', { current: currentIdx + 1, total: matches.length })
+              : `${currentIdx + 1} of ${matches.length} results`)
+          : (scopeLimited
+              ? i18nT('components.searchBar.no_results_loaded_only')
+              : i18nT('components.searchBar.no_results'))
+        return (
+          <>
+            {/* Wraps rather than clips: the tail carries the "in loaded history"
+                qualifier, so a clipped count reads as a complete one. */}
+            <span className="text-muted text-[12px] min-w-0 tabular-nums" title={count}>
+              {count}
+            </span>
+          </>
+        )
+      })()}
       <button onClick={prev} className="p-0.5 rounded text-muted hover:text-text cursor-pointer border-none bg-transparent" title={i18nT('components.searchBar.previous', { mod: platformShortcut('Shift+Enter') })} aria-label={i18nT('components.searchBar.previous_match')}>
         <ChevronUp size={15} />
       </button>

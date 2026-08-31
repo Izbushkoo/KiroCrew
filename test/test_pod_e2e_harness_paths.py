@@ -56,7 +56,8 @@ def _bash_works() -> bool:
 
 
 pytestmark = pytest.mark.skipif(
-    not _bash_works(), reason="harness fragments need a working bash (not the WSL stub)"
+    os.name == "nt" or not _bash_works(),
+    reason="harness fragments require POSIX path and process semantics plus bash",
 )
 
 
@@ -101,16 +102,12 @@ def gnu_readlink(tmp_path: Path) -> str:
     bindir = tmp_path / "shim"
     bindir.mkdir()
     shim = bindir / "readlink"
-    shim.write_text(
-        textwrap.dedent(
-            """\
+    shim.write_text(textwrap.dedent("""\
             #!/usr/bin/env python3
             import os, sys
             args = [a for a in sys.argv[1:] if a not in ("-f", "--")]
             print(os.path.realpath(args[0]))
-            """
-        )
-    )
+            """))
     shim.chmod(0o755)
     return str(bindir)
 
@@ -149,7 +146,7 @@ def test_guard_works_without_any_readlink_at_all(symlinked_home, tmp_path):
     empty = tmp_path / "no-readlink"
     empty.mkdir()
     res = subprocess.run(
-        ["bash", "-c", f'NAME=smoke\n{GUARD}\necho OK'],
+        ["bash", "-c", f"NAME=smoke\n{GUARD}\necho OK"],
         env={"HOME": symlinked_home, "PATH": f"{empty}:/usr/bin:/bin"},
         capture_output=True,
         text=True,
@@ -161,7 +158,7 @@ def test_guard_works_without_any_readlink_at_all(symlinked_home, tmp_path):
 
 def test_guard_still_rejects_an_escaping_name(symlinked_home, gnu_readlink):
     """The guard's actual purpose must survive the fix."""
-    res = _run(f'NAME=../../escape\n{GUARD}\necho SHOULD_NOT_REACH', symlinked_home, gnu_readlink)
+    res = _run(f"NAME=../../escape\n{GUARD}\necho SHOULD_NOT_REACH", symlinked_home, gnu_readlink)
     assert res.returncode == 65, res.stdout + res.stderr
     assert "escapes .e2e-artifacts" in res.stderr
     assert "SHOULD_NOT_REACH" not in res.stdout
@@ -218,7 +215,7 @@ def _resolve(name: str, home: str, porcelain: str = PORCELAIN, tmp: Path | None 
     fake = bindir / "git"
     fake.write_text("#!/bin/sh\ncat <<'PORC'\n" + porcelain + "PORC\n")
     fake.chmod(0o755)
-    snippet = f'HERE=/repo\n{RESOLVER}\n_resolve_checkout {name!r}'
+    snippet = f"HERE=/repo\n{RESOLVER}\n_resolve_checkout {name!r}"
     return _run(snippet, home, extra_path=str(bindir)).stdout.strip()
 
 
@@ -251,3 +248,136 @@ def test_resolver_prefers_feat_over_another_branch_with_the_same_leaf(tmp_path):
 
 def test_resolver_reports_nothing_for_an_unknown_name(tmp_path):
     assert _resolve("nosuchpod", str(tmp_path), tmp=tmp_path) == ""
+
+
+# ---------------------------------------------------------------------------
+# Health phase: identity, not reachability.
+#
+# The phase used to bare-curl base_url/api/health and accept any 200/401/403. A
+# pod's port is derived from its name across 199 slots and can be pinned by hand,
+# so it is routinely held by another pod or by the live gateway, and every
+# gateway answers that path identically -- so the poll could hand every later
+# phase a pod this run never booted. It now reads the identity-gated verdict from
+# `pod status --json`. These drive the real fragment out of the shipped script.
+# ---------------------------------------------------------------------------
+HEALTH_FRAGMENT_START = (
+    "# ---------------------------------------------------------------- health --"
+)
+HEALTH_FRAGMENT_END = 'fail "health — pod never became healthy'
+
+
+def _health_snippet(stub_bin: str, timeout: str = "1") -> str:
+    """The shipped health fragment plus the minimum preamble it reads."""
+    body = _fragment(HEALTH_FRAGMENT_START, HEALTH_FRAGMENT_END) + '"\n  fi\nfi\n'
+    preamble = textwrap.dedent(f"""
+        set -uo pipefail
+        export POD_E2E_HEALTH_TIMEOUT='{timeout}'
+        KIROCREW_CLI="{stub_bin}"
+        NAME=demo
+        BASE_URL=http://127.0.0.1:7811
+        PORT=7811
+        # Under the supplied HOME (pytest's tmp_path), never `mktemp -d`: `_run`
+        # passes only HOME and PATH, so a bare mktemp would land in the host temp
+        # root and stay there after the test.
+        ARTIFACT_DIR="$HOME/artifacts"
+        mkdir -p "$ARTIFACT_DIR"
+        log() {{ :; }}
+        fail() {{ echo "FAIL:$1"; }}
+        """)
+    return preamble + body + '\necho "HEALTHY=$HEALTHY FOREIGN=$FOREIGN"\n'
+
+
+@pytest.fixture()
+def stub_cli(tmp_path: Path):
+    """A fake `kirocrew` whose `pod status --json` health value is injectable."""
+
+    def _make(health: str) -> str:
+        path = tmp_path / "kirocrew-stub"
+        path.write_text(
+            textwrap.dedent(f"""
+                #!/usr/bin/env bash
+                if [ "$1" = "pod" ] && [ "$2" = "status" ]; then
+                  printf '{{"name":"demo","status":"up","port":7811,"health":%s}}\\n' '{health}'
+                  exit 0
+                fi
+                exit 0
+                """).lstrip(),
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+        return str(path)
+
+    return _make
+
+
+def test_health_accepts_the_pods_own_serving_codes(stub_cli, tmp_path):
+    for code in ("200", "401", "403"):
+        res = _run(_health_snippet(stub_cli(code)), str(tmp_path))
+        assert res.returncode == 0, res.stdout + res.stderr
+        assert "HEALTHY=1" in res.stdout, f"code {code}: {res.stdout}"
+        assert "FAIL:" not in res.stdout, f"code {code} must not fail: {res.stdout}"
+
+
+def test_health_refuses_a_foreign_port_holder_and_names_the_conflict(stub_cli, tmp_path):
+    """-2 is a squatter, so the phase must NOT proceed, and must say why.
+
+    Blaming the worktree build here is what sent an operator to read a journal
+    that only says "address already in use"; the remedy is a free PORT=.
+    """
+    res = _run(_health_snippet(stub_cli("-2")), str(tmp_path))
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "HEALTHY=0 FOREIGN=1" in res.stdout, res.stdout
+    assert "FAIL:" in res.stdout, res.stdout
+    assert "held by another process" in res.stdout, res.stdout
+    assert "PORT=" in res.stdout, res.stdout
+
+
+def test_health_reports_a_plain_timeout_when_nothing_answers(stub_cli, tmp_path):
+    res = _run(_health_snippet(stub_cli("0")), str(tmp_path))
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "HEALTHY=0 FOREIGN=0" in res.stdout, res.stdout
+    assert "never became healthy" in res.stdout, res.stdout
+    assert "held by another process" not in res.stdout, res.stdout
+
+
+@pytest.mark.parametrize(
+    "bad,why",
+    [
+        ("abc", "read as a variable NAME inside $(( )); set -u kills the run"),
+        ("-5", "leading '-' is a non-digit, and a past deadline fakes a timeout"),
+        ("999999999999999999999999", "no error, but the deadline lands centuries out"),
+        ("6 0", "whitespace is not a digit"),
+    ],
+)
+def test_health_survives_every_bad_timeout_override(stub_cli, tmp_path, bad, why):
+    """A typo in one env var must cost a warning, never the run.
+
+    Each of these was verified to abort or hang the unvalidated form directly --
+    `abc` exits 127 with "unbound variable", and a 24-digit value does not error at
+    all but sets a deadline centuries out, so the poll never gives up. For an
+    unattended harness that silent hang is worse than the crashes. Validation
+    therefore happens once, before the value reaches arithmetic.
+    """
+    res = _run(_health_snippet(stub_cli("200"), timeout=bad), str(tmp_path))
+    assert res.returncode == 0, f"{why}: {res.stdout + res.stderr}"
+    # Fell back to the default and still reached a real verdict.
+    assert "HEALTHY=1" in res.stdout, f"{why}: {res.stdout}"
+    assert "ignoring POD_E2E_HEALTH_TIMEOUT" in res.stderr, f"{why}: {res.stderr}"
+    for boom in ("unbound variable", "value too great for base"):
+        assert boom not in res.stderr, f"{why}: {res.stderr}"
+
+
+@pytest.mark.parametrize("good", ["5", "08", "60", "999999"])
+def test_health_accepts_a_valid_timeout_override(stub_cli, tmp_path, good):
+    """The knob must still work -- validation that rejects everything is useless.
+
+    `08` is deliberately in the accepted set, not the rejected one: a leading zero
+    is a normal way to write a number, and it only broke because bash read it as
+    octal ("value too great for base", exit 1). The explicit `10#` base makes it
+    mean 8 seconds, so it is interpreted rather than refused.
+    """
+    res = _run(_health_snippet(stub_cli("200"), timeout=good), str(tmp_path))
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "HEALTHY=1" in res.stdout, res.stdout
+    assert "ignoring POD_E2E_HEALTH_TIMEOUT" not in res.stderr, res.stderr
+    assert "value too great for base" not in res.stderr, res.stderr

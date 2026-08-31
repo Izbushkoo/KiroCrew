@@ -12,7 +12,7 @@
  * QueryClientProvider wrapper, an `api` module mock, small fixture makers).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, act } from '@testing-library/react'
+import { render, screen, waitFor, act, fireEvent } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 
@@ -28,6 +28,7 @@ vi.mock('../api/client', () => ({
 import { PierreWorkspaceTreeImpl } from '../pierre/PierreWorkspaceTreeImpl'
 import { api } from '../api/client'
 import { treeMock } from './__mocks__/pierreTreesReact'
+import type { MenuItem, MenuContext } from './__mocks__/pierreTreesReact'
 
 const ROOT = '/repo/project'
 const PATHS = ['README.md', 'src/a/b.ts']
@@ -430,5 +431,199 @@ describe('PierreWorkspaceTreeImpl — search forwarding', () => {
 
     // '' and null both mean "no search"; the model only accepts null for that.
     expect(treeMock.last().calls.search).toEqual([null, 'rail', null, null])
+  })
+})
+
+describe('PierreWorkspaceTreeImpl — row context menu', () => {
+  // Baseline composition the wrapper hands `useFileTree`: the `<FileTree>`
+  // renderContextMenu wiring forces `enabled: true` on top of this, but the
+  // trigger config here is what survives.
+  it('enables both right-click and the hover button as context-menu triggers', async () => {
+    renderTree()
+    await waitForTree()
+    expect(treeMock.last().options).toMatchObject({
+      composition: { contextMenu: { triggerMode: 'both', buttonVisibility: 'when-needed' } },
+    })
+  })
+
+  it('wires renderContextMenu only when a host is present to hand the row to', async () => {
+    // `<FileTree>`'s own `renderContextMenu != null` check forces the menu
+    // enabled unconditionally, so passing it with no `onAddToContext` would
+    // open a menu whose only action closes itself and does nothing.
+    const { update } = renderTree()
+    await waitForTree()
+    expect(treeMock.fileTreeProps.at(-1)!.renderContextMenu).toBeUndefined()
+
+    update({ onAddToContext: vi.fn() })
+    expect(typeof treeMock.fileTreeProps.at(-1)!.renderContextMenu).toBe('function')
+  })
+
+  const openMenu = (item: MenuItem) => {
+    const close = vi.fn()
+    const context: MenuContext = {
+      anchorElement: document.createElement('div'),
+      anchorRect: document.createElement('div').getBoundingClientRect(),
+      close,
+      restoreFocus: vi.fn(),
+    }
+    const node = treeMock.fileTreeProps.at(-1)!.renderContextMenu!(item, context)
+    return { close, ...render(<>{node}</>) }
+  }
+
+  it('offers a single Add to chat action on a file, wired to the absolute path', async () => {
+    const onAddToContext = vi.fn()
+    renderTree({ onAddToContext })
+    await waitForTree()
+
+    const { close } = openMenu({ kind: 'file', name: 'b.ts', path: 'src/a/b.ts' })
+
+    // Row click already opens a file, so the menu carries no Open duplicate.
+    expect(screen.queryByRole('menuitem', { name: 'Open' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Add to chat' }))
+    expect(onAddToContext).toHaveBeenCalledWith(`${ROOT}/src/a/b.ts`, 'file')
+    expect(close).toHaveBeenCalledTimes(1)
+  })
+
+  it('focuses the first item on open so the keyboard path can activate it', async () => {
+    // Pierre focuses the tree ROW when it opens the menu, never this slotted
+    // content, so without an explicit focus a Shift+F10 user would sit on the
+    // row: the item's own Enter/Space handler could never fire.
+    const onAddToContext = vi.fn()
+    renderTree({ onAddToContext })
+    await waitForTree()
+
+    openMenu({ kind: 'file', name: 'b.ts', path: 'src/a/b.ts' })
+    const menuitem = screen.getByRole('menuitem', { name: 'Add to chat' })
+    expect(menuitem).toHaveFocus()
+
+    // And the focused item actually activates on Enter.
+    fireEvent.keyDown(menuitem, { key: 'Enter' })
+    expect(onAddToContext).toHaveBeenCalledWith(`${ROOT}/src/a/b.ts`, 'file')
+  })
+
+  it('reports a directory as a dir add', async () => {
+    const onAddToContext = vi.fn()
+    renderTree({ onAddToContext })
+    await waitForTree()
+
+    const { close } = openMenu({ kind: 'directory', name: 'a', path: 'src/a' })
+
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Add to chat' }))
+    expect(onAddToContext).toHaveBeenCalledWith(`${ROOT}/src/a`, 'dir')
+    expect(close).toHaveBeenCalledTimes(1)
+  })
+
+  it('normalizes a native-Windows mixed-separator path to forward slashes', async () => {
+    // On native Windows the tree root is backslash-separated while Pierre paths
+    // are POSIX, so a raw join is `C:\repo\project/src/a/b.ts`. Left mixed, the
+    // mention host's makeRelative cannot relativize it (absolute token +
+    // duplicate attachment); the reported path must be forward-slash throughout.
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({ root: 'C:\\repo\\project' }))
+    const onAddToContext = vi.fn()
+    renderTree({ onAddToContext })
+    await waitForTree()
+
+    openMenu({ kind: 'file', name: 'b.ts', path: 'src/a/b.ts' })
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Add to chat' }))
+    expect(onAddToContext).toHaveBeenCalledWith('C:/repo/project/src/a/b.ts', 'file')
+  })
+
+  it('does not double a separator when the project root is a Windows drive root', async () => {
+    // A drive-root project (`D:\`) normalizes to `D:/`, which ALREADY ends in
+    // a separator. Left un-stripped, the join produces `D://item.path` -- a
+    // double slash the mention host's makeRelative prefix-strip then consumes
+    // only ONE of, leaving a stray leading `/` on the relativized result.
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({ root: 'D:\\' }))
+    const onAddToContext = vi.fn()
+    renderTree({ onAddToContext })
+    await waitForTree()
+
+    openMenu({ kind: 'file', name: 'b.ts', path: 'src/a/b.ts' })
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Add to chat' }))
+    expect(onAddToContext).toHaveBeenCalledWith('D:/src/a/b.ts', 'file')
+  })
+
+  it('leaves a POSIX filename containing a backslash untouched', async () => {
+    // `\` is a legal character in a POSIX filename. Only a Windows-shaped ROOT
+    // is separator-normalized; the row's own path must pass through verbatim,
+    // or the staged mention would point at a nonexistent nested path.
+    const onAddToContext = vi.fn()
+    renderTree({ onAddToContext })
+    await waitForTree()
+
+    openMenu({ kind: 'file', name: 'weird\\name.txt', path: 'src/weird\\name.txt' })
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Add to chat' }))
+    expect(onAddToContext).toHaveBeenCalledWith(`${ROOT}/src/weird\\name.txt`, 'file')
+  })
+})
+
+describe('PierreWorkspaceTreeImpl — row context menu keyboard contract (#6231)', () => {
+  // The DEGENERATE case of the shared `role="menu"` contract: this menu hosts
+  // exactly ONE menuitem, so every focus-move assertion is vacuously true —
+  // "focus lands on the next item" and "focus does not move" are the same
+  // observation. What the contract still owes a keyboard user is CONSUMPTION:
+  // an arrow inside an open menu must not scroll the page behind it, and a Tab
+  // must not drop the user out of a menu they were just told is open (#2533).
+  // These tests therefore assert on `fireEvent`'s return value — false means
+  // `preventDefault()` was called, i.e. the contract claimed the key — which is
+  // the only signal that distinguishes wired from unwired on a one-item menu.
+  const openMenu = (item: MenuItem) => {
+    const context: MenuContext = {
+      anchorElement: document.createElement('div'),
+      anchorRect: document.createElement('div').getBoundingClientRect(),
+      close: vi.fn(),
+      restoreFocus: vi.fn(),
+    }
+    const node = treeMock.fileTreeProps.at(-1)!.renderContextMenu!(item, context)
+    return render(<>{node}</>)
+  }
+
+  /** Open the row menu and hand back its single item, focused (the
+   *  component's own firstItemRef effect owns that focus entry). */
+  const openSingleItemMenu = async () => {
+    renderTree({ onAddToContext: vi.fn() })
+    await waitForTree()
+    openMenu({ kind: 'file', name: 'b.ts', path: 'src/a/b.ts' })
+    const menuitem = screen.getByRole('menuitem', { name: 'Add to chat' })
+    expect(menuitem).toHaveFocus()
+    return menuitem
+  }
+
+  it.each(['ArrowDown', 'ArrowUp', 'Home', 'End'])(
+    'consumes %s rather than letting it scroll the page behind the open menu',
+    async key => {
+      const menuitem = await openSingleItemMenu()
+
+      // false = preventDefault() was called: the menu contract claimed the key.
+      expect(fireEvent.keyDown(menuitem, { key })).toBe(false)
+      // One item, so navigation is a no-op — but it is a no-op that STAYS
+      // inside the menu rather than moving focus nowhere useful.
+      expect(menuitem).toHaveFocus()
+    },
+  )
+
+  it.each([
+    ['Tab', false],
+    ['Shift+Tab', true],
+  ] as const)('contains %s within the menu instead of dropping focus behind it', async (_label, shiftKey) => {
+    const menuitem = await openSingleItemMenu()
+
+    // The single item is simultaneously the first and the last item, so both
+    // Tab directions sit on a containment boundary and must wrap onto it.
+    expect(fireEvent.keyDown(menuitem, { key: 'Tab', shiftKey })).toBe(false)
+    expect(menuitem).toHaveFocus()
+  })
+
+  it('leaves a key the menu contract does not own alone', async () => {
+    // Regression PIN, not new behaviour: Enter still belongs to the item's own
+    // activation handler, and the contract must not swallow it on the way.
+    const onAddToContext = vi.fn()
+    renderTree({ onAddToContext })
+    await waitForTree()
+    openMenu({ kind: 'file', name: 'b.ts', path: 'src/a/b.ts' })
+    const menuitem = screen.getByRole('menuitem', { name: 'Add to chat' })
+
+    fireEvent.keyDown(menuitem, { key: 'Enter' })
+    expect(onAddToContext).toHaveBeenCalledWith(`${ROOT}/src/a/b.ts`, 'file')
   })
 })

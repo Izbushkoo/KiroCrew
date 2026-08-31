@@ -91,18 +91,6 @@ class TestConversationLog:
         log = ConversationLog(base_dir=tmp_path)
         log.mark_consolidated("nonexistent", 5)  # should not raise
 
-    def test_load_transcript(self, tmp_path):
-        log = ConversationLog(base_dir=tmp_path)
-        log.append("t1", "user", "what is 2+2?")
-        log.append("t1", "assistant", "4")
-        transcript = log.load_transcript("t1")
-        assert "User: what is 2+2?" in transcript
-        assert "Assistant: 4" in transcript
-
-    def test_load_transcript_empty(self, tmp_path):
-        log = ConversationLog(base_dir=tmp_path)
-        assert log.load_transcript("nonexistent") == ""
-
     def test_safe_key_sanitizes(self, tmp_path):
         log = ConversationLog(base_dir=tmp_path)
         log.append("thread:with/special chars!", "user", "hi")
@@ -2567,6 +2555,48 @@ class TestStopEventContextInjection:
         assert result == ""
 
 
+class TestCancelledTurnPreambleInstruction:
+    """The restore block must not invite a standalone cancellation ack.
+
+    The model reads the cancelled-turn preamble verbatim; an instruction that
+    permits acknowledging the cancellation makes it emit a synthetic
+    "Response was interrupted" message styled like a real response. The
+    wording must forbid any standalone acknowledgment, and the bracket
+    markers must stay byte-identical because context_blocks.py parses them.
+    """
+
+    def test_preamble_forbids_standalone_acknowledgment(self, tmp_path):
+        import json
+
+        from kiro_crew.context import build_cancelled_turn_preamble
+
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("sess1", "user", "please refactor the parser")
+        log.append("sess1", "assistant", "Starting on the parser")
+        log.append("sess1", "system", json.dumps({
+            "kind": "stop_event",
+            "id": "stop-abc",
+            "state": "stopped",
+            "outcome": "soft",
+        }))
+
+        result = build_cancelled_turn_preamble(log, "sess1")
+        # Markers parsed by context_blocks.py stay byte-identical.
+        assert result.startswith(
+            "[PREVIOUS TURN WAS CANCELLED BY THE USER \u2014 context restore]"
+        )
+        assert result.endswith("[END PREVIOUS TURN]")
+        # The instruction forbids a standalone acknowledgment and directs
+        # the model to the current request instead.
+        assert "Do not emit any standalone acknowledgment" in result
+        assert "respond only to the current user request" in result
+        # No wording that invites acknowledging the cancellation.
+        assert "Acknowledge it" not in result
+        # Restored context is still carried.
+        assert "please refactor the parser" in result
+        assert "Starting on the parser" in result
+
+
 class TestAutoSkillHelpers:
     """Module-level helpers for auto-skill eligibility."""
 
@@ -4035,7 +4065,7 @@ class TestTailReads:
         log._msg_cache.clear()
         log.recent("t1", max_messages=3)
         # Tail path returned a partial view — the full cache must stay empty
-        # so load_transcript()/search still parse the whole file.
+        # so search still parses the whole file.
         assert "t1" not in log._msg_cache
 
     def test_tail_window_grows_when_insufficient(self, tmp_path):
@@ -4473,6 +4503,89 @@ class TestDeleteSessionSummarySidecar:
         assert log.delete_session("thread-nosum") is True
         assert not log._summary_cache_path("thread-nosum").exists()
 
+    def test_delete_session_skip_pinned_protects_pinned_sessions(self, tmp_path):
+        """skip_pinned=True returns None for pinned sessions under the REAL lock.
+
+        Regression test for the layering fix: the pin-check-and-delete invariant
+        now lives in ConversationLog.delete_session rather than in a handler closure.
+        This test exercises the real _locked codepath, NOT a mocked context manager,
+        so a regression that breaks lock reentrancy will actually fail.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("sess-pinned", "user", "important")
+        log.update_metadata("sess-pinned", {"pinned": True})
+        log.append("sess-unpinned", "user", "ephemeral")
+
+        # Pinned session: skip_pinned=True returns None, file survives
+        assert log.delete_session("sess-pinned", skip_pinned=True) is None
+        assert log._path("sess-pinned").exists()
+
+        # Unpinned session: skip_pinned=True returns True, file is deleted
+        assert log.delete_session("sess-unpinned", skip_pinned=True) is True
+        assert not log._path("sess-unpinned").exists()
+
+    def test_delete_session_skip_pinned_skips_unreadable_metadata(self, tmp_path):
+        """skip_pinned=True returns None when get_metadata_status returns unreadable.
+
+        Simulates a Windows indexer/AV hold that makes the metadata transiently
+        unreadable. The session is skipped (not deleted blind) and can be retried.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("sess-transient", "user", "might be locked")
+
+        # Patch get_metadata_status to simulate transient unreadability
+        original = log.get_metadata_status
+
+        def _unreadable(key):
+            if key == "sess-transient":
+                return {}, False  # readable=False
+            return original(key)
+
+        log.get_metadata_status = _unreadable
+
+        # skip_pinned=True returns None, file survives
+        assert log.delete_session("sess-transient", skip_pinned=True) is None
+        assert log._path("sess-transient").exists()
+
+    def test_delete_session_skip_pinned_logs_on_exception(self, tmp_path, caplog):
+        """skip_pinned=True logs and returns None when get_metadata_status raises.
+
+        Corrupt metadata or permanent I/O failure should be diagnosable via logs.
+        """
+        import logging
+
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("sess-corrupt", "user", "bad metadata")
+
+        # Patch to simulate corrupt metadata raising
+        def _corrupt_meta(key):
+            if key == "sess-corrupt":
+                raise ValueError("corrupt JSON")
+            return log.get_metadata(key), True
+
+        log.get_metadata_status = _corrupt_meta
+
+        with caplog.at_level(logging.WARNING):
+            result = log.delete_session("sess-corrupt", skip_pinned=True)
+
+        assert result is None
+        assert log._path("sess-corrupt").exists()
+        assert "unexpected error reading metadata" in caplog.text
+        assert "sess-corrupt" in caplog.text
+
+    def test_delete_session_skip_pinned_false_deletes_pinned(self, tmp_path):
+        """skip_pinned=False (default) deletes even pinned sessions.
+
+        Ensures the default behavior is unchanged for callers that don't use skip_pinned.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("sess-pinned-force", "user", "pinned but forced")
+        log.update_metadata("sess-pinned-force", {"pinned": True})
+
+        # Without skip_pinned, pinned sessions ARE deleted
+        assert log.delete_session("sess-pinned-force") is True
+        assert not log._path("sess-pinned-force").exists()
+
 
 @pytest.mark.asyncio
 async def test_dedupe_candidate_falls_back_to_lexical_without_judge_model(tmp_path):
@@ -4695,6 +4808,107 @@ class TestAppendIfAbsentOffLoop:
             log, "dashboard:s1", "assistant", "body"
         ) is None
         log.append_if_absent.assert_called_once()
+
+
+class TestAppendMid:
+    """The append path can persist the window row's delivery identity.
+
+    A durable injector writes one logical message twice — the window copy through
+    ``_ChatSlot.append``, which mints ``meta.mid``, and the durable copy through
+    this path. Passing that minted id here stores it in the SAME ``meta.mid``
+    field shape the dashboard slot save writes, so the bounded-read identity walk
+    (``_append_unflushed_tail``) recognises the durable copy as the window row's
+    persisted form; a read cannot recover an identity the write never stored.
+    """
+
+    def test_append_persists_mid_in_the_save_paths_field_shape(self, tmp_path) -> None:
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("t1", "assistant", "result", mid="m-feedfacefeedface")
+        raw = (tmp_path / "t1.jsonl").read_text(encoding="utf-8").splitlines()
+        row = json.loads(raw[1])
+        assert row["meta"] == {"mid": "m-feedfacefeedface"}, (
+            "the id must land exactly where the slot save writes it (meta.mid); "
+            "any other spelling is invisible to the identity walk"
+        )
+
+    def test_id_less_legacy_append_still_round_trips_without_meta(self, tmp_path) -> None:
+        # Pre-id transcripts hold rows with no ``meta`` at all. An append that
+        # passes no id must keep producing that exact shape — readers keep an
+        # id-less fallback for those rows, and nothing migrates old sessions.
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("t1", "assistant", "legacy row")
+        raw = (tmp_path / "t1.jsonl").read_text(encoding="utf-8").splitlines()
+        row = json.loads(raw[1])
+        assert "meta" not in row, "an id-less append must not grow a meta field"
+        assert log.recent("t1", 5) == [{"role": "assistant", "content": "legacy row"}]
+
+    def test_append_if_absent_writes_the_id_with_the_row(self, tmp_path) -> None:
+        log = ConversationLog(base_dir=tmp_path)
+        assert log.append_if_absent("t1", "assistant", "result", mid="m-0123456789abcdef") is True
+        raw = (tmp_path / "t1.jsonl").read_text(encoding="utf-8").splitlines()
+        row = json.loads(raw[1])
+        assert row["meta"] == {"mid": "m-0123456789abcdef"}
+
+    def test_append_if_absent_skips_only_its_own_persisted_copy(self, tmp_path) -> None:
+        # Same body AND same id: this very message is already on disk (the slot
+        # save or an earlier attempt of this write landed it) — skip, leaving
+        # the persisted row byte-identical (an id is never retrofitted).
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("t1", "assistant", "result", mid="m-0123456789abcdef")
+        before = (tmp_path / "t1.jsonl").read_text(encoding="utf-8")
+        assert log.append_if_absent("t1", "assistant", "result", mid="m-0123456789abcdef") is False
+        assert (tmp_path / "t1.jsonl").read_text(encoding="utf-8") == before
+
+    def test_append_if_absent_writes_a_new_occurrence_under_its_own_id(self, tmp_path) -> None:
+        # Same body under ANOTHER id is a different occurrence that repeats the
+        # text (an earlier injection's twin). Skipping on body alone would drop
+        # this occurrence's only durable copy — the window is lost on restart —
+        # so the write must land, carrying its own id.
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("t1", "assistant", "result", mid="m-earlier0000000001")
+        assert log.append_if_absent("t1", "assistant", "result", mid="m-newer000000000002") is True
+        rows = [
+            json.loads(line)
+            for line in (tmp_path / "t1.jsonl").read_text(encoding="utf-8").splitlines()[1:]
+        ]
+        assert [r["meta"]["mid"] for r in rows] == [
+            "m-earlier0000000001",
+            "m-newer000000000002",
+        ]
+
+    def test_append_if_absent_treats_an_id_less_twin_as_another_occurrence(self, tmp_path) -> None:
+        # A body-equal row with NO id is a pre-id legacy row; with an identity
+        # in hand the caller cannot prove it is this message, and skipping
+        # would silently lose the new occurrence. The legacy row itself stays
+        # untouched (no migration).
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("t1", "assistant", "result")
+        assert log.append_if_absent("t1", "assistant", "result", mid="m-0123456789abcdef") is True
+        rows = [
+            json.loads(line)
+            for line in (tmp_path / "t1.jsonl").read_text(encoding="utf-8").splitlines()[1:]
+        ]
+        assert "meta" not in rows[0], "the legacy row must not be migrated"
+        assert rows[1]["meta"] == {"mid": "m-0123456789abcdef"}
+
+    def test_append_if_absent_without_mid_keeps_body_only_matching(self, tmp_path) -> None:
+        # An id-less caller keeps the body-equality regime: it holds no
+        # identity, so body equality is all it can check — unchanged for every
+        # existing caller that passes no mid.
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("t1", "assistant", "result", mid="m-0123456789abcdef")
+        before = (tmp_path / "t1.jsonl").read_text(encoding="utf-8")
+        assert log.append_if_absent("t1", "assistant", "result") is False
+        assert (tmp_path / "t1.jsonl").read_text(encoding="utf-8") == before
+
+    def test_append_if_absent_off_loop_threads_the_id_through(self) -> None:
+        # No running loop, so the wrapper takes the inline path; the contract
+        # under test is only that *mid* survives the hop to the log method.
+        # ``append_off_loop`` deliberately has no mid parameter: it has no
+        # dual-write caller, and a parameter nothing consumes is surface.
+        log = MagicMock()
+        history.append_if_absent_off_loop(log, "k", "assistant", "body", mid="m-2")
+        assert log.append_if_absent.call_args.kwargs["mid"] == "m-2"
 
 
 class TestConsolidationValueGuard:

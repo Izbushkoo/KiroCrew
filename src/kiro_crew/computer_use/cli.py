@@ -24,18 +24,18 @@ its MCP twin (``computer_list_apps``), so neither brushes the rule.
 capability and it adds no tool: it is a *harness* over the existing ten, for a
 human reproducing a failure at a terminal. The rule exists so the model gets a
 structured tool rather than being told to shell out — and the model already has
-all ten as MCP tools. ``call`` deliberately has no MCP twin, because a tool that
+all eleven as MCP tools. ``call`` deliberately has no MCP twin, because a tool that
 runs other tools would let a model launder a per-call gate decision through one
 approved invocation.
 
 **``call`` is fully gated, and that is the point of routing it through
 ``tools.dispatch_tool`` rather than reaching into ``service``.** Every call goes
-through the same ordered chokepoint as an agent call: the keystone primary enable,
-the fail-closed ``gate.require_computer_use``, the built-in app denylist, index
-freshness, the secure-target refusals, and the observation ceiling. So this
-command cannot be used to see or do anything the agent could not, which is
-exactly what makes it a faithful reproduction tool. Two consequences worth
-stating rather than discovering:
+through the same ordered chokepoint as an agent call: the fail-closed keystone
+primary enable, the audit-only ``gate.require_computer_use``, the built-in app
+denylist, index freshness, the secure-target refusals, and the observation
+ceiling. So this command cannot be used to see or do anything the agent could
+not, which is exactly what makes it a faithful reproduction tool. Two
+consequences worth stating rather than discovering:
 
 * the session key is the attended CLI surface (:data:`_CLI_SESSION_KEY`) — a real
   surface the gate accepts, not a bypass sentinel;
@@ -465,7 +465,7 @@ def _coerce(raw: str) -> Any:
     """
     try:
         value = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         return raw
     if isinstance(value, (bool, int, float)) and not isinstance(value, str):
         return value

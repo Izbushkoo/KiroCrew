@@ -125,8 +125,9 @@ describe('client transport', () => {
   })
 
   it('POST/PUT/PATCH send a JSON content type alongside the placeholder key', async () => {
-    await api.trustApp('demo')
+    await api.trustApp('demo', 'https://example.test/owner/demo')
     expect(call().headers).toMatchObject({ 'Content-Type': 'application/json', 'X-Session-Key': 'dashboard:ui' })
+    expect(call().body).toEqual({ repository: 'https://example.test/owner/demo' })
     await api.setTrustAllApps(true)
     expect(call(1).method).toBe('PUT')
     expect(call(1).headers['Content-Type']).toBe('application/json')
@@ -928,11 +929,11 @@ describe('request bodies with conditionally-omitted keys', () => {
     expect(call(3).body).toEqual({ steps: [{ title: 'a' }], task_id: '', original_input: '' })
   })
 
-  it('createWebhookToken requires a signature by default', async () => {
-    await api.createWebhookToken('ci')
-    expect(call().body).toEqual({ label: 'ci', require_signature: true })
+  it('createWebhookToken requires a signature by default and carries the destination', async () => {
+    await api.createWebhookToken('ci', undefined, 'code-reviewer')
+    expect(call().body).toEqual({ agent: 'code-reviewer', label: 'ci', require_signature: true })
     await api.createWebhookToken('legacy', false)
-    expect(call(1).body).toEqual({ label: 'legacy', require_signature: false })
+    expect(call(1).body).toEqual({ agent: '', label: 'legacy', require_signature: false })
   })
 
   it('addUserDeniedCommand defaults the operator note to empty', async () => {

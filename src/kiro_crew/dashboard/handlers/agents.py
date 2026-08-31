@@ -17,8 +17,17 @@ from aiohttp import web
 
 from kiro_crew import agent_state, model_registry
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
-from kiro_crew.agent import AGENT_FILENAME, get_shipped_tools, install_agent, kiro_agents_dir_path
+from kiro_crew.acp_backends import selectable_backend_values
+from kiro_crew.agent import (
+    AGENT_FILENAME,
+    _spec_path_is_safe,
+    clear_model_pin,
+    get_shipped_tools,
+    install_agent,
+    kiro_agents_dir_path,
+)
 from kiro_crew.agent_discovery import (
+    _read_agent_spec,
     clear_list_agents_cache,
     list_agents,
     project_agent_names,
@@ -29,6 +38,7 @@ from kiro_crew.config.loader import (
     ConfigReadError,
     KiroCrewAgentConfig,
     KiroCrewConfig,
+    _safe_color,
     normalize_agent_model,
     read_config_for_update,
     resolve_agent_bindings,
@@ -53,16 +63,19 @@ from kiro_crew.dashboard.handlers._shared import (
     agent_skill_keys,
     agent_skill_views,
     apply_skill_mapping,
+    read_bounded_json,
 )
 from kiro_crew.dashboard.handlers.discover import _redact_external
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.executors import discovery_executor, maintenance_executor, subprocess_executor
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
     cgroup_scope_argv,
     configured_sandbox_mode,
     create_subprocess_limited,
+    scrub_agent_subprocess_env,
     wrap_argv,
 )
 from kiro_crew.validation import _AGENT_NAME_RE
@@ -86,11 +99,14 @@ def _namespaced_agent_file_exists(agent_name: str) -> bool:
     # glob the real ~/.kiro from an isolated run.
     try:
         for path in kiro_agents_dir_path().glob(f"*--{agent_name}.json"):
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
+            data = _read_agent_spec(
+                path,
+                operation="api_agents_sync",
+                source="dashboard",
+            )
+            if data is None:
                 continue
-            if isinstance(data, dict) and data.get("name") == agent_name:
+            if data.get("name") == agent_name:
                 return True
     except OSError:
         return False
@@ -116,16 +132,23 @@ def _sel():
     return _pkg.sel()
 
 
+async def _require_owner(request: web.Request, operation: str) -> web.Response | None:
+    """Owner gate shared by every mutating handler in this module.
+
+    ``~/.kiro/agents`` and ``cfg.agents`` are machine-global: a write there
+    installs tool grants and MCP server commands that later sessions execute,
+    so mutations are owner-only — the same server-side boundary
+    ``mcp_apps.api_mcp_apps_call`` enforces. The caller identity comes from
+    the token-auth middleware (``request["user"]`` / ``request["app"]``),
+    never from a client-set header. Returns the 403 to send, or ``None`` when
+    the caller is the owner.
+    """
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    return await require_owner_dashboard_request(request, operation)
+
+
 # ── Agent Config ──
-
-
-def _auto_install_agent() -> None:
-    """Re-install agent config to kiro-cli so changes take effect immediately."""
-    try:
-        install_agent()
-        logger.info("Auto-applied agent config via dashboard")
-    except Exception:
-        logger.debug("Auto-apply agent config failed", exc_info=True)
 
 
 def _find_agent_config() -> Path:
@@ -140,6 +163,132 @@ def _installed_agent_config() -> Path:
     and sync operations write here — NOT to agents/defaults.json.
     """
     return kiro_agents_dir_path() / AGENT_FILENAME
+
+
+def _write_installed_config_locked(path: Path, config: dict[str, Any]) -> None:
+    """Write the installed agent spec while holding bridges' file lock.
+
+    Runs in a worker thread (see :func:`_commit_agent_config`, dispatched
+    through ``_offload_config_write``), which is what makes taking a synchronous
+    flock here legal — on the event loop it would stall the gateway whenever app
+    registration held the lock.
+
+    ``bridges._mcp_lock`` is imported lazily: ``apps.bridges`` imports back into
+    the dashboard handlers, so a module-level import is circular.
+    """
+    from kiro_crew.apps.bridges import _mcp_lock as _agent_file_lock
+
+    with _agent_file_lock(target=path):
+        write_config_atomically(path, config)
+
+
+def _commit_agent_config(
+    *,
+    config: dict[str, Any],
+    name: str,
+    mc_cfg_path: Path,
+    removed_per_key: dict[str, list[str]],
+    installed_path: Path,
+) -> bool:
+    """Perform the one fallible read and EVERY durable write of one PUT, as one unit.
+
+    This function is the commit half of the invariant stated at the
+    :func:`api_agent_config` PUT branch: it is the ONLY place that branch
+    persists application state, it is purely synchronous, and it is dispatched
+    exactly once through the shielded ``_offload_config_write``. Those three
+    properties make a PUT **non-cancellable but not rollback-atomic**:
+
+    * Purely synchronous — there is no await between two writes, so no
+      cancellation and no other task can be interleaved into the sequence. A
+      worker thread cannot be cancelled at all, so once this starts it runs to
+      completion.
+    * Dispatched once, shielded — the caller cannot unwind (and so cannot
+      release the transaction lock) until this has returned. The alternative
+      shape, awaiting each write separately under the lock, puts a cancellation
+      point between writes however wide the lock is.
+    * The only writer — nothing durable happens before the call, so every
+      failure earlier in the handler leaves the three targets byte-identical.
+
+    What that does NOT buy is rollback: an I/O failure (permission, quota, disk
+    full, lock-open, a failed atomic rename) stops the sequence where it is, and
+    the writes already committed stay committed. The honest failure prefixes, in
+    order, are:
+
+    0. the governance filter raises — nothing durable, and the caller's 500 is
+       exact (it fails closed, so a raise withholds rather than grants);
+    1. the ``config.json`` read raises :class:`ConfigReadError` — nothing
+       durable, and the caller's 500 is exact;
+    2. the ``config.json`` write fails — nothing durable;
+    3. the first bookkeeping write fails — ``config.json`` updated;
+    4. the second bookkeeping write fails (the lift can write twice, once per
+       key) — ``config.json`` updated plus one bookkeeping key;
+    5. the installed-spec write fails — ``config.json`` and bookkeeping
+       updated, the spec unchanged.
+
+    Order inside the unit is chosen to make the *earliest* prefixes the *least*
+    harmful, and three steps are load-bearing rather than incidental:
+
+    * The governance filter is FIRST, and it is in here at all so that the grant
+      decision cannot be made against a ceiling that changes before the write
+      publishes it — see step (0). First because it persists nothing, so its own
+      fail-closed raise costs no partial write.
+    * The read is FIRST among the writes' own inputs. It is the only
+      fallible-by-decision I/O step, and running it here — immediately adjacent
+      to the write it feeds — is what closes the lost-update window: on the
+      previous shape the caller read the baseline and the worker wrote it back
+      one executor hop later, so a concurrent writer landing in that gap had its
+      unrelated fields silently reverted.
+    * The bookkeeping lift runs AFTER the ``config.json`` write (so prefix 2
+      leaves the sidecar untouched, restoring the pre-lock ordering) but BEFORE
+      the spec write, because it STRIPS Kiro Crew keys (``model_managed`` /
+      ``cc_model``) out of the same *config* dict the spec write then persists —
+      reverse the two and the spec lands with fields kiro-cli's
+      ``deny_unknown_fields`` rejects (#2570).
+
+    Everything else fallible has already been decided by the caller: *config* is
+    parsed and validated, *removed_per_key* is the computed ``removedTools`` map,
+    and both paths are resolved.
+
+    Returns whatever the bookkeeping lift returns (True when it stripped a
+    key), so the caller can log it after the lock is released — logging is not
+    durable state and has no business inside the unit.
+    """
+    # (0) Governance floor, immediately before the writes it governs and inside
+    # the same synchronous unit, which is what its own contract asks for
+    # ("every whole-config writer MUST call this immediately before it
+    # persists"). It ran in phase 1 until R7: there it decided against a profile
+    # snapshot taken BEFORE two lock acquisitions, so a contended transaction
+    # flock — unbounded, cross-process — let the ceiling change during the wait
+    # and the PUT persisted a grant governance had since withheld. Here no
+    # await, no lock release and no other task can land between the decision and
+    # the write that publishes it. Same reasoning that put the read at (1).
+    #
+    # First in the unit, so a raise from the filter (``may_skip_gate_now`` fails
+    # closed) leaves all three targets byte-identical, exactly as a phase-1
+    # failure did. Its SEL withhold record is infrastructure, not payload, and
+    # is best-effort inside the filter — it cannot fail this unit.
+    #
+    # Imported lazily: platform.governance is not a module-level dependency of
+    # the dashboard handlers.
+    from kiro_crew.platform.governance import sanitize_agent_config_governance
+
+    sanitize_agent_config_governance(config)
+    # (1) The one fallible READ, and it precedes every write.
+    #
+    # Fail closed: writing back a {} baseline would drop every other setting
+    # just to record removedTools (see read_config_for_update).
+    mc_cfg = read_config_for_update(mc_cfg_path)
+    if removed_per_key:
+        mc_cfg["removedTools"] = removed_per_key
+    else:
+        mc_cfg.pop("removedTools", None)
+    # (2) config.json — the snapshot the read above produced, still current.
+    write_config_atomically(mc_cfg_path, mc_cfg)
+    # (3) agent_model_state.json bookkeeping — after (2), before (4).
+    changed = agent_state.lift_and_strip_bookkeeping(config, name)
+    # (4) the installed spec, under bridges' file lock.
+    _write_installed_config_locked(installed_path, config)
+    return changed
 
 
 async def api_agent_config(request: web.Request) -> web.Response:
@@ -157,18 +306,120 @@ async def api_agent_config(request: web.Request) -> web.Response:
     agent_config_path = installed_path if installed_path.is_file() else defaults_path
 
     if request.method == "PUT":
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"error": "invalid JSON"}, status=400)
+        denied = await _require_owner(request, "agent_config.write")
+        if denied is not None:
+            return denied
+        body, body_err = await read_bounded_json(request, max_bytes=None)
+        if body_err is not None:
+            return body_err
+        assert body is not None  # read_bounded_json returns (dict, None) on success
         config = body.get("config")
         if not isinstance(config, dict):
             return web.json_response({"error": "config must be an object"}, status=400)
         try:
+            # ── THE INVARIANT THIS BRANCH ENFORCES ────────────────────────────
+            # Every validation completes BEFORE the first durable write, and the
+            # one fallible read plus all durable APPLICATION/CONFIG writes of one
+            # PUT execute as a single non-cancellable unit that the transaction
+            # lock strictly contains — the lock cannot release while any write of
+            # the unit is in flight.
+            #
+            # "Application/config writes" is the exact scope, and deliberately so:
+            # the transaction lock's own sidecar (``_McpFileLock.__aenter__``
+            # creates ~/.kiro/settings/mcp.lock) and the SEL audit record on the
+            # owner-denial path above are INFRASTRUCTURE, not payload. Both can
+            # become durable outside the unit, and neither is a half-applied PUT:
+            # a lock file records no user setting and the audit log is required to
+            # outlive the request it describes.
+            #
+            # The unit is non-cancellable but NOT rollback-atomic: an I/O failure
+            # part-way through leaves the earlier writes committed. The prefixes
+            # are enumerated in :func:`_commit_agent_config`, which also explains
+            # why the order makes the earliest prefix the least harmful.
+            #
+            # Structurally that is two phases with nothing in between:
+            #
+            #   PHASE 1 (below, off the locks) — GATHER AND DECIDE. Parse, diff,
+            #   resolve every path. Persists nothing, so any failure or
+            #   cancellation here leaves all three target files byte-identical
+            #   and the 4xx/5xx it returns is honest.
+            #
+            #   PHASE 2 — COMMIT. Take the transaction lock, then the config
+            #   lock, then hand the GOVERNANCE FILTER, the ``config.json`` READ
+            #   and ALL THREE durable writes to :func:`_commit_agent_config`
+            #   through the shielded ``_offload_config_write``, exactly once.
+            #   The read is inside the unit rather than in front of it: adjacent
+            #   to the write it feeds, it cannot capture a baseline that a
+            #   concurrent writer then updates before the worker publishes it
+            #   back. The filter is inside for the same reason in the other
+            #   direction: in front of the locks its verdict could go stale
+            #   during a contended, unbounded flock wait, and the write would
+            #   publish a grant governance had already withheld.
+            #
+            # Why this shape and not "the lock covers more": three prior fixes
+            # widened the lock and each time the next defect was a SEQUENCING or
+            # CANCELLATION fault inside the widened span — a fallible read placed
+            # after a write, an await between two writes, a worker outliving the
+            # await that dispatched it. Widening a span cannot fix those, because
+            # they are properties of what happens INSIDE it. Collapsing the writes
+            # to a single synchronous unit removes the interleaving points instead
+            # of trying to cover them: there is no "between two writes" to land in.
+            #
+            # The three lock layers, transaction lock outermost:
+            #
+            # 1. ``_get_mcp_lock`` (~/.kiro/settings/mcp.lock) is the MCP
+            #    TRANSACTION lock. Agent spec files are a census source for the
+            #    MCP config transactions in handlers/mcp.py, which read the
+            #    current state and then act on it while holding this lock. An
+            #    unlocked write can land inside that read-then-act window, so the
+            #    transaction commits a decision about spec contents that changed
+            #    underneath it.
+            # 2. ``_get_config_lock`` is the in-process lock every other
+            #    ``config.json`` read-modify-writer in the dashboard takes
+            #    (messaging channel savers, security, the MCP handlers, agent
+            #    create/update/delete). This PUT's own RMW now spans an executor
+            #    hop, so the event loop no longer serializes it for free: without
+            #    this lock a sibling RMW can read the same baseline and the last
+            #    atomic rename silently reverts the other side's unrelated
+            #    settings. Held ACROSS the offload for exactly the reason
+            #    api_mcp_gateway_set_stub holds it across its own offload.
+            # 3. ``bridges._mcp_lock(target=installed_path)``
+            #    (~/.kiro/agents/kirocrew.lock) is the FILE lock. The transaction
+            #    lock does not cover it: apps/bridges.py does whole-file
+            #    read-modify-writes of THIS SAME file under that separate flock
+            #    (app enable/disable, MCP (de)registration). Holding only the
+            #    transaction lock leaves a concurrent app enable and this PUT
+            #    each writing the whole file, and the last atomic rename silently
+            #    discards the other side's changes.
+            #
+            # Order is transaction → config → file and must stay that way. Each
+            # edge already exists in the tree and none is inverted anywhere:
+            # transaction→config at api_mcp_toggle / api_mcp_toggle_all /
+            # api_mcp_remove in handlers/mcp.py, config→file wherever
+            # ``_sync_mcp_to_agent`` runs under the config lock (api_mcp_remove,
+            # api_mcp_server_detail, mcp_discover, api_capability_mcp_install),
+            # and no config-lock or file-lock holder in the tree acquires the
+            # transaction lock inside, so there is no ABBA cycle. The file lock is
+            # taken inside the worker thread (by _write_installed_config_locked,
+            # reached from _commit_agent_config) — a blocking flock on the event
+            # loop would freeze the gateway while app registration holds it.
+            # Nothing else in this branch takes a cross-process lock: governance +
+            # SEL and agent_state take none, so running the filter inside the
+            # worker adds no lock edge to the transaction → config → file order.
+            #
+            # PHASE 1 ── gather and decide. Nothing below is durable.
+            #
             # Track tools the user intentionally removed from shipped defaults
             # so they don't reappear on upgrade.  Stored in ~/.kiro/crew/config.json
             # (NOT kirocrew.json — kiro-cli rejects unknown fields).
             # Per-key dict so removing from allowedTools only doesn't affect tools.
+            #
+            # Computed HERE, from the SUBMITTED config, because the governance
+            # filter has not run yet: it now runs in the commit unit (step 0), so
+            # this diff still sees the pre-governance map. A ceiling-withheld
+            # allowedTools ref is not a user removal, and diffing after the
+            # filter would record it as one and suppress that tool on every
+            # future upgrade. Keep this before the offload.
             shipped = get_shipped_tools()
             removed_per_key: dict[str, list[str]] = {}
             for key in ("tools", "allowedTools"):
@@ -176,49 +427,79 @@ async def api_agent_config(request: web.Request) -> web.Response:
                 if diff:
                     removed_per_key[key] = diff
             mc_cfg_path = _h.config_path()  # type: ignore[operator]
-            # Fail closed: writing back a {} baseline would drop every other
-            # setting just to record removedTools. See read_config_for_update.
-            try:
-                mc_cfg = read_config_for_update(mc_cfg_path)
-            except ConfigReadError:
-                logger.exception("Refusing to record removedTools: config unreadable")
-                return web.json_response(
-                    {"error": "failed to read config file", "code": "config_unreadable"},
-                    status=500,
-                )
-            if removed_per_key:
-                mc_cfg["removedTools"] = removed_per_key
-            else:
-                mc_cfg.pop("removedTools", None)
-            write_config_atomically(mc_cfg_path, mc_cfg)
-            # Governance floor on the WHOLE-object write path: this handler
-            # persists the request's config verbatim, so a dashboard PUT could
-            # otherwise restore a ceiling-governed @denied grant or a governed
-            # server's autoApprove that the per-ref writers strip. Filter the map
-            # here too (no-op on an ungoverned host).
-            from kiro_crew.platform.governance import sanitize_agent_config_governance
-
-            # Offloaded: the filter resolves the ceiling AND scans the profile
-            # directory per ref, which is synchronous filesystem work — running it
-            # inline would stall the aiohttp event loop for the duration.
-            await asyncio.to_thread(sanitize_agent_config_governance, config)
-            # Never persist Kiro Crew bookkeeping into the kiro spec —
-            # kiro-cli rejects unknown fields and drops the agent (#2570).
-            # Offloaded like the governance filter above: this reads/writes the
-            # agent_model_state.json sidecar, the same class of synchronous
-            # filesystem work that would otherwise stall the event loop.
             # Only trust a submitted name when it is a non-empty string — any
             # other JSON type (list, dict, number) would flow into the sidecar
             # helper as a dict key and crash the endpoint with a 500.
             raw_name = config.get("name")
-            name = raw_name if isinstance(raw_name, str) and raw_name.strip() else installed_path.stem
-            changed = await asyncio.to_thread(agent_state.lift_and_strip_bookkeeping, config, name)
+            name = (
+                raw_name if isinstance(raw_name, str) and raw_name.strip() else installed_path.stem
+            )
+
+            # Governance floor on the WHOLE-object write path: this handler
+            # persists the request's config verbatim, so a dashboard PUT could
+            # otherwise restore a ceiling-governed @denied grant or a governed
+            # server's autoApprove that the per-ref writers strip.
+            #
+            # NOT in phase 1. The filter used to run here, and that placed the
+            # grant decision BEFORE both lock acquisitions: the transaction flock
+            # is cross-process and its wait is unbounded, so a ceiling revoked
+            # during a contended wait was already stale by the time the write
+            # landed, and the PUT restored a grant governance had withheld.
+            # ``_commit_agent_config`` step (0) now runs it synchronously
+            # adjacent to the writes it governs — see that docstring. It costs a
+            # per-ref directory scan inside the locks, which is the price of the
+            # decision being current; and one call, not two, so the filter is
+            # never applied to a config it already filtered.
+
+            from kiro_crew.dashboard.handlers.mcp import (
+                _get_mcp_lock,
+                _offload_config_write,
+            )
+
+            # PHASE 2 ── commit. Both locks are acquired ahead of every durable
+            # write, so a cancellation at the (unbounded, contended) flock wait
+            # inside ``__aenter__`` still tears nothing.
+            async with _get_mcp_lock():
+                # The config lock spans the whole read-modify-write, not just the
+                # write: the read now happens in the worker thread, so this is
+                # the only thing serializing this PUT's RMW against the sibling
+                # ``config.json`` writers that take the same lock.
+                async with _get_config_lock():
+                    # THE one durable step: the config.json read + removedTools
+                    # sidecar + bookkeeping sidecar + installed spec, in a worker
+                    # thread, behind the shield.
+                    #
+                    # ``_offload_config_write`` is what binds the unit to the
+                    # locks: a worker thread cannot be cancelled, and the shield's
+                    # drain loop keeps re-absorbing cancellations until the worker
+                    # is done, so this await cannot return or raise — and
+                    # therefore ``async with`` cannot run ``__aexit__`` — while a
+                    # write is still in flight. A bare ``to_thread`` per write
+                    # would instead give every write boundary a cancellation point
+                    # at which the locks are released with the worker still
+                    # writing.
+                    try:
+                        changed = await _offload_config_write(
+                            _commit_agent_config,
+                            config=config,
+                            name=name,
+                            mc_cfg_path=mc_cfg_path,
+                            removed_per_key=removed_per_key,
+                            installed_path=installed_path,
+                        )
+                    except ConfigReadError:
+                        # The unit's FIRST step, so this 500 is exact: no write of
+                        # the unit has run and all three targets are unchanged.
+                        logger.exception("Refusing to record removedTools: config unreadable")
+                        return web.json_response(
+                            {"error": "failed to read config file", "code": "config_unreadable"},
+                            status=500,
+                        )
             if changed:
                 logger.info(
                     "Stripped Kiro Crew bookkeeping keys from a PUT to agent config for %r",
                     name,
                 )
-            installed_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
             # Restart kiro-cli sessions so new config takes effect
             await _h._reset_all_sessions(request)
             return web.json_response({"ok": True, "applied": True})
@@ -237,10 +518,13 @@ async def api_default_agent(request: web.Request) -> web.Response:
     import kiro_crew.dashboard.handlers as _h  # noqa: F811
 
     if request.method == "PUT":
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"error": "invalid JSON"}, status=400)
+        denied = await _require_owner(request, "default_agent.write")
+        if denied is not None:
+            return denied
+        body, body_err = await read_bounded_json(request, max_bytes=None)
+        if body_err is not None:
+            return body_err
+        assert body is not None  # read_bounded_json returns (dict, None) on success
         name = body.get("agent", "")
         # Reject non-strings before any use: a JSON list/object here would make
         # the membership check below raise (unhashable) into a 500, and a
@@ -277,22 +561,58 @@ async def api_default_agent(request: web.Request) -> web.Response:
                 status=400,
             )
         path = _h.config_path()
-        try:
-            data = read_config_for_update(path)
-        except ConfigReadError:
-            # Fail closed: writing back a {} baseline would drop every other setting.
-            logger.exception("Refusing to set default agent: config unreadable")
-            return web.json_response(
-                {"error": "failed to read config file", "code": "config_unreadable"}, status=500
-            )
-        data["default_agent"] = name
-        write_config_atomically(path, data)
+        # This read-modify-write must hold the SAME in-process lock every other
+        # ``config.json`` RMW in the dashboard takes (agent create/update/delete,
+        # capability install/uninstall, the agent-config PUT). The event loop no
+        # longer serializes it for free: the PUT's own RMW now runs in a WORKER
+        # THREAD, holding this lock across the offload, so an unlocked read here
+        # can capture a baseline the worker is about to republish — and the last
+        # atomic rename silently reverts the other side's unrelated settings.
+        #
+        # Loop-side ``async with`` rather than an offload: the lock is an
+        # asyncio lock (``LoopBoundLock``) acquired exactly this way by every
+        # sibling RMW in this module, and the read and write below are
+        # synchronous with NO await between them, so once the lock is held the
+        # pair is already indivisible — a worker hop would add a cancellation
+        # point where today there is none.
+        async with _get_config_lock():
+            try:
+                data = read_config_for_update(path)
+            except ConfigReadError:
+                # Fail closed: writing back a {} baseline would drop every other setting.
+                logger.exception("Refusing to set default agent: config unreadable")
+                return web.json_response(
+                    {"error": "failed to read config file", "code": "config_unreadable"},
+                    status=500,
+                )
+            data["default_agent"] = name
+            write_config_atomically(path, data)
         return web.json_response({"ok": True, "default_agent": name})
     cfg = KiroCrewConfig.load()
     return web.json_response({"default_agent": cfg.default_agent})
 
 
 # ── Config Schema ──
+
+
+_CONFIG_SCHEMA_ACP_BACKEND = "agent.acp_backend"
+
+
+def _supply_live_enum(entry: dict) -> None:
+    """In place: give ``agent.acp_backend`` the values this build can actually serve.
+
+    The field carries no static ``enum`` on purpose (see ``AgentConfig``): an
+    edition registers its backends at boot, strictly after ``SCHEMA_REGISTRY`` is
+    built, so a frozen list could only be wrong — it would call a registered
+    backend "not enabled in this build" while the PATCH allowlist accepted it.
+
+    Resolved from the same owner as the PATCH allowlist and the config load path,
+    so the three cannot disagree. One binding today, so it is spelled once rather
+    than made a registry; turn it into a path -> callable map when a second
+    dynamic enum appears.
+    """
+    if entry.get("path") == _CONFIG_SCHEMA_ACP_BACKEND:
+        entry["enumValues"] = selectable_backend_values()
 
 
 async def api_config_schema(request: web.Request) -> web.Response:
@@ -317,6 +637,7 @@ async def api_config_schema(request: web.Request) -> web.Response:
         d = config_entry_to_dict(entry)
         if entry.sensitive or dataclasses.is_dataclass(d.get("defaultValue")):
             d["defaultValue"] = None
+        _supply_live_enum(d)
         result.append(d)
 
     return web.json_response({"entries": result})
@@ -390,10 +711,13 @@ async def api_capability_mcp_list(request: web.Request) -> web.Response:
 
 async def api_capability_mcp_install(request: web.Request) -> web.Response:
     """POST /api/capability/mcp/install — install an MCP server via the capability manager."""
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    denied = await _require_owner(request, "capability_mcp_install")
+    if denied is not None:
+        return denied
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     server_id = body.get("server_id", "").strip()
     if not server_id:
         return web.json_response({"error": "server_id required"}, status=400)
@@ -423,10 +747,13 @@ async def api_capability_mcp_install(request: web.Request) -> web.Response:
 
 async def api_capability_mcp_uninstall(request: web.Request) -> web.Response:
     """POST /api/capability/mcp/uninstall — uninstall an MCP server via the capability manager."""
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    denied = await _require_owner(request, "capability_mcp_uninstall")
+    if denied is not None:
+        return denied
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     server_id = body.get("server_id", "").strip()
     if not server_id:
         return web.json_response({"error": "server_id required"}, status=400)
@@ -472,10 +799,13 @@ async def api_capability_skills_install(request: web.Request) -> web.Response:
     edition's capability manager (no Amazon-internal version-set field is
     exposed on the public API).
     """
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    denied = await _require_owner(request, "capability_skills_install")
+    if denied is not None:
+        return denied
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     package = body.get("package", "").strip()
     if not package:
         return web.json_response({"error": "package required"}, status=400)
@@ -499,10 +829,13 @@ async def api_capability_skills_install(request: web.Request) -> web.Response:
 
 async def api_capability_skills_uninstall(request: web.Request) -> web.Response:
     """POST /api/capability/skills/uninstall — uninstall a skill package."""
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    denied = await _require_owner(request, "capability_skills_uninstall")
+    if denied is not None:
+        return denied
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     package = body.get("package", "").strip()
     if not package:
         return web.json_response({"error": "package required"}, status=400)
@@ -535,6 +868,11 @@ async def _mutate_agent_package(request: web.Request, *, install: bool) -> web.R
     same seam: an allowlist on the name BEFORE it leaves core, ``_redact_external``
     on the manager's message, and an explicit SEL line naming the package.
     """
+    denied = await _require_owner(
+        request, f"capability_agent_{'install' if install else 'uninstall'}"
+    )
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -620,6 +958,9 @@ async def api_capability_plugins_list(request: web.Request) -> web.Response:
 
 async def api_capability_plugins_sync(request: web.Request) -> web.Response:
     """POST /api/capability/plugins/sync — reconcile plugins with agent packages."""
+    denied = await _require_owner(request, "capability_plugins_sync")
+    if denied is not None:
+        return denied
     mgr = _capability_manager()
     if not mgr.available():
         return web.json_response({"error": _CAPABILITY_UNAVAILABLE}, status=503)
@@ -657,6 +998,7 @@ async def api_agents_installed(request: web.Request) -> web.Response:
     (``resolve_agent_bindings(..., project_dir=...)``), spawn validation, and
     Slack — see ``agent_discovery.project_agent_names``.
     """
+
     # list_agents() does glob + per-file resolve(strict=True) + read_bytes +
     # json.loads over ~/.kiro/agents — blocking filesystem work that, on a large
     # agents dir (network home, many project-registry agents), can stall the
@@ -674,17 +1016,41 @@ async def api_agents_installed(request: web.Request) -> web.Response:
 def _normalize_model_key(name: str) -> str:
     """Canonical key for de-duping CC model ids across spelling variants.
 
-    The claude-agent-acp adapter advertises dashed ids (``claude-opus-4-7``)
-    while curated/config entries may use dotted versions (``claude-opus-4.7``);
-    case can also differ. Without normalization the same model surfaces twice in
-    the dropdown (one curated row + one advertised row). Lowercase and fold
-    ``.``→``-`` so equivalent ids collapse to one entry. ``default`` and ``auto``
-    both mean "let the backend pick", so they map to a single key too.
+    Mirrors ``normalizeModelKey`` in ``website/src/lib/model.ts``: both route a
+    model id through the shared canonical registry (``model_registry.json``) so
+    "same model?" has ONE definition across the dashboard (dropdown dedup, slot
+    display, and the #5306 subagent downgrade flag).
+
+    Resolution order:
+    1. ``auto``/``default``/unset -> the ``auto`` sentinel (both mean "let the
+       backend pick"); an empty id stays ``""`` (no pin, distinct from Auto).
+    2. Registry canonical key: a canonical key, a registry alias, or a
+       claude_code provider id -- with or without a region/vendor routing prefix
+       (``us.anthropic.…``, ``global.anthropic.…``) -- folds to its canonical
+       key. This makes an alias and its provider-prefixed canonical id equal
+       (``us.anthropic.claude-opus-4-8[1m]`` == ``claude-opus-4.8`` ->
+       ``opus-4.8-1m``) while keeping DISTINCT registry entries distinct -- the
+       advertised dashed ``claude-opus-4-8`` (200K, ``opus-4.8``) does NOT fold
+       onto dotted ``claude-opus-4.8`` (1M, ``opus-4.8-1m``); the old
+       ``.``->``-`` fold conflated those two different-window models (#5339).
+    3. Fallback for an id the registry does not list (GPT/DeepSeek/Qwen, future
+       models, operator-typed ids): the historical lossless fold -- lowercase,
+       ``.``->``-`` -- so behavior is identity-preserving off the registered set,
+       matching ``from_provider_id``'s pass-through contract.
     """
-    key = (name or "").strip().lower().replace(".", "-")
-    if key in ("default", "auto"):
+    string_fold = (name or "").strip().lower().replace(".", "-")
+    if not string_fold:
+        return ""
+    if string_fold in ("default", "auto"):
         return "auto"
-    return key
+    # Registry lookups are exact and its keys/aliases/provider-ids are all
+    # lowercase, so resolve on the lowercased id (the old helper lowercased too).
+    # canonical_key resolves acp-first then claude_code AND peels a known routing
+    # prefix, so it covers both #5339 halves; a miss returns None.
+    resolved = model_registry.canonical_key((name or "").strip().lower())
+    if resolved is not None:
+        return resolved
+    return string_fold
 
 
 def _advertised_cc_models(request: web.Request) -> list[dict]:
@@ -889,8 +1255,11 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
             # After "auto", never before it: "auto" is the configured default in
             # the general case and leads the list.
             merged.insert(
-                1 if merged and _normalize_model_key(merged[0].get("model_name", "")) == "auto"
-                else 0,
+                (
+                    1
+                    if merged and _normalize_model_key(merged[0].get("model_name", "")) == "auto"
+                    else 0
+                ),
                 {
                     "model_name": canonical_default,
                     "display_name": canonical_default,
@@ -921,10 +1290,9 @@ def _wrap_list_models_argv(argv: list[str]) -> tuple[list[str], str | None]:
     ``is_kiro_cli=True`` is explicit because ``_spawns_kiro_cli``'s basename test
     only matches a literal ``kiro-cli``: a Windows ``kiro-cli.exe``, a wrapper
     shim, or a ``KIROCREW_KIRO_BIN`` pointing at a nonstandard launch path all
-    read as "not kiro-cli". On macOS with ``agent.sandbox="off"`` that
-    misclassification skips the delegation branch — and with it the credential-env
-    scrub — so the child would inherit the sensitive environment. Both ACP spawn
-    paths pass this flag for the same reason.
+    read as "not kiro-cli". The positive classification is also the security gate
+    for default Windows delegation to Kiro's internal sandbox; basename inference
+    cannot grant it. Both ACP spawn paths pass this flag for the same reason.
     """
     return wrap_argv(argv, mode=configured_sandbox_mode(), is_kiro_cli=True)
 
@@ -967,12 +1335,10 @@ async def api_models(request: web.Request) -> web.Response:
         # wrap_argv's "auto" parameter default, so this endpoint can never ask
         # for stricter isolation than the chat spawn of the same binary. It
         # matters wherever the operator set agent.sandbox="off" (deferring
-        # isolation to kiro-cli's own internal sandbox) on a host with no backend
-        # — any Windows host, macOS >= 26: chat runs, while the default-mode wrap
-        # here fail-closed and answered 503 on every 8s poll. The frontend reads
-        # that as "degraded" and serves its auto-only fallback list, so the picker
-        # showed exactly one entry. Same fix, same reason as the `_bg` session in
-        # session.py.
+        # isolation to kiro-cli's own internal sandbox): the one-shot and chat
+        # path must have one posture. The explicit Kiro classification above also
+        # makes the shipped "auto" tier work on Windows via Kiro's built-in
+        # sandbox instead of answering 503 on every 8s poll.
         #
         # OFF the loop: `configured_sandbox_mode()` stats (and on a cache miss
         # re-reads + revalidates) config.json, and `wrap_argv` -> `detect_backend`
@@ -990,6 +1356,7 @@ async def api_models(request: web.Request) -> web.Response:
             env = {**os.environ}
             env["PATH"] = augmented_path(env.get("PATH", ""))
             _resolve_ssh_auth_sock(env)
+            env = scrub_agent_subprocess_env(env)
             proc = await create_subprocess_limited(
                 *argv,
                 stdout=subprocess.PIPE,
@@ -1154,7 +1521,11 @@ async def api_slash_commands(request: web.Request) -> web.Response:
             for c in cc_commands
             if f"/{c}" not in _BLOCKED_SLASH_COMMANDS
         ]
-        result.append({"name": "/side", "description": SLASH_COMMAND_DESCRIPTIONS.get("/side", "")})
+        for command in ("/side", "/workflow"):
+            if not any(item["name"] == command for item in result):
+                result.append(
+                    {"name": command, "description": SLASH_COMMAND_DESCRIPTIONS.get(command, "")}
+                )
         return web.json_response(result)
 
     # Blocked commands stay in _SLASH_COMMANDS (typing one still gets the
@@ -1172,12 +1543,16 @@ async def api_slash_commands(request: web.Request) -> web.Response:
 async def api_agent_detail(request: web.Request) -> web.Response:
     """GET/DELETE/PATCH /api/agents/detail/{name} — view, delete, or update agent config."""
     name = request.match_info["name"]
-    # Parse body early so JSONDecodeError returns 400, not 404 from the file loop.
+    if request.method != "GET":
+        denied = await _require_owner(request, f"agent_detail.{request.method.lower()}")
+        if denied is not None:
+            return denied
+    # Parse body early so a malformed body returns 400, not 404 from the file loop.
     patch_body = None
     if request.method == "PATCH":
         try:
             patch_body = await request.json()
-        except (json.JSONDecodeError, ValueError):
+        except ValueError:
             return web.json_response({"error": "invalid JSON"}, status=400)
         # Valid JSON is not necessarily an object. A top-level array makes
         # ``"skills" in patch_body`` a LIST-membership test (true for
@@ -1188,8 +1563,21 @@ async def api_agent_detail(request: web.Request) -> web.Response:
 
     state: DashboardState = request.app["state"]
     for f in kiro_agents_dir_path().glob("*.json"):
+        spec = _read_agent_spec(
+            f,
+            operation="api_agent_detail",
+            source="dashboard",
+        )
+        if spec is None:
+            continue
+        # Two-step so ``data`` stays typed ``dict`` for the PATCH branch's
+        # re-read below, which reassigns it from a raw ``json.loads``.
+        data = spec
+        # The try stays even though the parse moved out: the DELETE/PATCH
+        # bodies still raise the caught pair mid-flight (the PATCH re-read
+        # under the config lock, unlink), and those were -- and remain --
+        # skip-to-next-file.
         try:
-            data = json.loads(f.read_text(encoding="utf-8"))
             if data.get("name") == name or f.stem == name:
                 if request.method == "DELETE":
                     if f.name in (
@@ -1288,7 +1676,35 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                     async with _get_config_lock():
                         # Re-read under the lock: the copy above was read before
                         # the lock and a concurrent PATCH may have superseded it.
-                        data = json.loads(f.read_text(encoding="utf-8"))
+                        # The branch writes this data back, so bind the same
+                        # agents directory and apply the stricter no-symlink /
+                        # no-escape fence before the hardened read.  Keep the
+                        # filesystem work off the event loop while the shared
+                        # config lock is held.
+                        agents_dir = kiro_agents_dir_path()
+
+                        def _reread_under_lock(
+                            spec_file: Path = f,
+                            root: Path = agents_dir,
+                        ) -> dict[str, Any] | None:
+                            if not _spec_path_is_safe(spec_file, root):
+                                return None
+                            return _read_agent_spec(
+                                spec_file,
+                                operation="api_agent_detail",
+                                source="dashboard",
+                            )
+
+                        reread_data = await asyncio.to_thread(_reread_under_lock)
+                        if reread_data is None:
+                            return web.json_response(
+                                {
+                                    "error": f"'{name}' changed on disk during update; retry.",
+                                    "code": "agent_changed",
+                                },
+                                status=409,
+                            )
+                        data = reread_data
                         # `spec_str` for the same reason as `declared` above: a
                         # hand-edited spec can carry a structured (non-string)
                         # "name", which would crash the sidecar helper's dict
@@ -1334,10 +1750,12 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                             # provider id at the config.loader factory boundary.
                             data["model"] = patch_body["model"] or None
                             if data["model"] is None:
-                                data.pop("model", None)
                                 # Cleared/auto: resume tracking the shipped
                                 # default (re-synced by _refresh_dynamic_fields).
-                                agent_state.set_model_managed(agent_name, True)
+                                # Shared with `kirocrew agent reset-model` so the
+                                # two surfaces cannot disagree on what clearing a
+                                # model means.
+                                clear_model_pin(data, agent_name)
                             else:
                                 # Explicit pick: freeze it against default bumps.
                                 agent_state.set_model_managed(agent_name, False)
@@ -1497,22 +1915,19 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
     )
 
 
-_config_lock: asyncio.Lock | None = None
-_config_lock_loop: asyncio.AbstractEventLoop | None = None
+_config_lock = LoopBoundLock()
 
 
-def _get_config_lock() -> asyncio.Lock:
-    """Return a config lock bound to the current event loop (Python 3.10 compat)."""
-    global _config_lock, _config_lock_loop
-    loop = asyncio.get_running_loop()
-    if _config_lock is None or _config_lock_loop is not loop:
-        _config_lock = asyncio.Lock()
-        _config_lock_loop = loop
+def _get_config_lock() -> LoopBoundLock:
+    """Return the config lock (loop-bound; rebinds when the running loop changes)."""
     return _config_lock
 
 
 async def api_kirocrew_agents_sync(request: web.Request) -> web.Response:
     """POST /api/agents/sync — auto-sync AIM-installed agents into config.json."""
+    denied = await _require_owner(request, "agents.sync")
+    if denied is not None:
+        return denied
     async with _get_config_lock():
         return await _do_agents_sync(request)
 
@@ -1668,13 +2083,78 @@ async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Respons
     )
 
 
+def _model_pin_rejected(model: str, request: web.Request, provider: str) -> str | None:
+    """Reason a crew's model pin is unusable, or ``None`` to allow it.
+
+    An agent's ``model`` is read by kiro-cli when the child starts, so a pin the
+    account cannot serve kills every session and subagent using that agent
+    seconds after spawn, before anything can inspect it. Rejecting it here — at
+    the one moment a human is looking at the value — turns that into a single
+    message on the surface that authored it.
+
+    *provider* is passed in rather than resolved here so this whole path adds no
+    config read of its own: every caller already holds a loaded config, and
+    ``KiroCrewConfig.load()`` deep-copies the validated dict even on a cache
+    hit — work that must not land on the event loop while the config lock is
+    held. It is forwarded to the validator for the same reason.
+
+    A known wrong-flavour registry spelling is reported before entitlement: a
+    live advertised set would otherwise replace the actionable ACP-id mapping
+    with a generic "not available" error. All other values delegate to the
+    per-role validator so the crew form, the role pins and the session-init
+    withhold apply one predicate. ``""``/``"auto"`` mean inherit and always
+    pass; an unknown advertised set means entitlement is unknowable, and the
+    validator accepts rather than accusing on no evidence.
+    """
+    # The retained claude_code seam accepts canonical and registered Bedrock
+    # wire ids that the ACP correction and advertised-id comparison below
+    # intentionally map away from. Its entitlement guard lives in its own
+    # provider path, where full configured ids and bare advertised ids can be
+    # canonicalized before comparison.
+    if provider == "claude_code":
+        return None
+
+    # The registry knows each model under several spellings and only one is what
+    # kiro-cli serves; the others reach the child verbatim and kill it at startup.
+    # Check this before live entitlement because a wrong-flavour id is naturally
+    # absent from that set and would otherwise produce a less actionable error.
+    correction = model_registry.acp_id_correction(model)
+    if correction:
+        # Deliberately NOT prescriptive. Upstream naming does not line up across
+        # providers — Bedrock's ``claude-opus-4-8`` is the registry's
+        # ``claude-opus-4.5``, while ``claude-opus-4-8[1m]`` is ``claude-opus-4.8``
+        # — so a user who typed the Bedrock spelling meaning "Opus 4.8" may not
+        # want the id this maps to. Telling them to adopt it would steer a
+        # plausible-intent user into a quieter capability change than the one
+        # they asked for. Report the mapping, show what is actually served, and
+        # let them choose.
+        served = ", ".join(model_registry.available_models("acp")[:8]) or "auto"
+        return (
+            f"{model!r} is not a model kiro-cli serves. The registry maps that "
+            f"spelling to {correction!r} — confirm that is the model you want, or "
+            f"pick one of: {served}, or 'auto'."
+        )
+    # circular import: handlers.core resolves _get_config_lock from this module,
+    # so importing it at module scope would close the cycle.
+    from kiro_crew.dashboard.handlers.core import _validate_role_model
+
+    return _validate_role_model(model, request, provider=provider)
+
+
 async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
     """POST /api/agents — create a new KiroCrew agent."""
 
+    denied = await _require_owner(request, "agent.create")
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "body must be an object", "code": "body_not_object"}, status=400
+        )
     name = body.get("name", "").strip()
     if not name:
         return web.json_response({"error": "Agent name is required"}, status=400)
@@ -1730,22 +2210,34 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             name,
             kiro_agent,
         )
+    # Passed RAW, not str()-coerced: normalize_agent_model is total and maps a
+    # non-string to "" (inherit). Wrapping in str() first would turn
+    # {"model": 123} into the literal "123", which normalizes to a string the
+    # backend then rejects as an unknown model id.
+    model = normalize_agent_model(body.get("model"))
+    _raw_color = body.get("session_color", "")
+    session_color = _safe_color(_raw_color)
+    if _raw_color not in ("", None) and not session_color:
+        return web.json_response(
+            {"error": "session_color must be #rrggbb or empty", "code": "invalid_color_hex"},
+            status=400,
+        )
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()
         if name in cfg.agents:
             return web.json_response({"error": f"Agent '{name}' already exists"}, status=409)
+        model_reason = _model_pin_rejected(model, request, cfg.agent.provider)
+        if model_reason:
+            return web.json_response({"error": model_reason, "code": "invalid_model"}, status=400)
         cfg.agents[name] = KiroCrewAgentConfig(
             kiro_agent=kiro_agent,
             workspace=body.get("workspace", "default"),
             memory_store=body.get("memory_store", "default"),
-            # Passed RAW, not str()-coerced: normalize_agent_model is total and
-            # maps a non-string to "" (inherit). Wrapping in str() first would
-            # turn {"model": 123} into the literal "123", which normalizes to a
-            # string the backend then rejects as an unknown model id.
-            model=normalize_agent_model(body.get("model")),
+            model=model,
             description=body.get("description", ""),
             triggers=body.get("triggers", ""),
             source=body.get("source", "kirocrew"),
+            session_color=session_color,
         )
         cfg.save()
     _sel().log_api_access(
@@ -1761,15 +2253,32 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
 async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
     """PUT /api/agents/{name} — update a KiroCrew agent."""
 
+    denied = await _require_owner(request, "agent.update")
+    if denied is not None:
+        return denied
     name = request.match_info["name"]
     try:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "body must be an object", "code": "body_not_object"}, status=400
+        )
+    if "model" in body:
+        pending_model = normalize_agent_model(body["model"])
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()
         if name not in cfg.agents:
             return web.json_response({"error": f"Agent '{name}' not found"}, status=404)
+        if "model" in body:
+            # Validated before the write, reusing the config loaded just above so
+            # this costs no extra read.
+            model_reason = _model_pin_rejected(pending_model, request, cfg.agent.provider)
+            if model_reason:
+                return web.json_response(
+                    {"error": model_reason, "code": "invalid_model"}, status=400
+                )
         agent = cfg.agents[name]
         changed: list[str] = []
         if "kiro_agent" in body:
@@ -1793,6 +2302,19 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         if "triggers" in body:
             agent.triggers = body["triggers"]
             changed.append("triggers")
+        if "session_color" in body:
+            _sc = body["session_color"]
+            _norm = _safe_color(_sc)
+            if _sc not in ("", None) and not _norm:
+                return web.json_response(
+                    {
+                        "error": "session_color must be #rrggbb or empty",
+                        "code": "invalid_color_hex",
+                    },
+                    status=400,
+                )
+            agent.session_color = _norm
+            changed.append("session_color")
         if "source" in body:
             agent.source = body["source"]
             changed.append("source")
@@ -1810,6 +2332,9 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
 async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
     """DELETE /api/agents/{name} — delete a KiroCrew agent."""
 
+    denied = await _require_owner(request, "agent.delete")
+    if denied is not None:
+        return denied
     name = request.match_info["name"]
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()

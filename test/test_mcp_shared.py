@@ -535,6 +535,70 @@ class TestCallToolWithLoggingRedaction:
         assert "slug" in captured.get("resources", "")
 
 
+class TestCallToolWithLoggingKind:
+    """``tool_kind`` classifies the invocation; it must not hold the caller.
+
+    The wrapper passed ``session_key`` as ``tool_kind``, so every row it wrote --
+    the bulk of the agent tool surface, across all five MCP servers -- carried a
+    high-cardinality session key where a kind belongs, sitting in the same file as
+    correctly-kinded rows written directly by callers. The field looked populated
+    and trustworthy while carrying no kind at all.
+    """
+
+    _CALLER = "dashboard:chat-7"
+
+    def _capture(self, *, raises: bool = False) -> dict:
+        from kiro_crew.mcp_shared import call_tool_with_logging
+        from kiro_crew.validation import ValidationError
+
+        captured: dict = {}
+
+        class _FakeSel:
+            def log_tool_invocation(self, **kw):
+                captured.update(kw)
+
+        def _validate(_name, raw):
+            if raises:
+                raise ValidationError("slug", "bad arg")
+            return raw
+
+        def _inner(_name, _args):
+            return "ok"
+
+        with patch("kiro_crew.mcp_shared.sel", return_value=_FakeSel()):
+            call_tool_with_logging(
+                "artifact_list",
+                {"slug": "doc"},
+                _validate,
+                _inner,
+                session_key=self._CALLER,
+                downstream_service="kirocrew-core",
+            )
+        assert captured, "the wrapper wrote no audit row at all"
+        return captured
+
+    def test_the_success_row_does_not_put_the_caller_in_tool_kind(self):
+        captured = self._capture()
+        assert captured.get("tool_kind", "") != self._CALLER
+
+    def test_the_validation_failure_row_does_not_either(self):
+        """The other call site. It was the same copy of the same wrong variable,
+        so fixing only the success path would leave every rejected call mislabeled.
+        """
+        captured = self._capture(raises=True)
+        assert captured["outcome"] == "failed"
+        assert captured.get("tool_kind", "") != self._CALLER
+
+    @pytest.mark.parametrize("raises", [False, True])
+    def test_the_caller_is_still_recorded_on_both_paths(self, raises):
+        """Guards the obvious wrong fix: dropping the caller instead of the kind.
+
+        ``session_key`` is what SEL stores as ``caller_identity``, and it is the
+        field the ownership and attribution questions are answered from.
+        """
+        assert self._capture(raises=raises)["session_key"] == self._CALLER
+
+
 # --- run_mcp_stdio_loop busy-queue behavior ----------------------------------
 #
 # A tools/call arriving while a worker is busy used to be silently dropped:
@@ -744,6 +808,15 @@ def _tools_call_with_caller(req_id, tool_name: str, session_key: str) -> dict:
     return msg
 
 
+def _tools_call_with_tenant(req_id, tool_name: str, nonce: str) -> dict:
+    """A forwarded call as an UNNAMED co-tenant receives it: nonce, no identity."""
+    from kiro_crew.mcp_caller import build_tenant_meta
+
+    msg = _tools_call(req_id, tool_name)
+    msg["params"]["_meta"] = build_tenant_meta(nonce)
+    return msg
+
+
 class TestStdioLoopCallerIdentity:
     def setup_method(self):
         mcp_shared._use_content_length = False
@@ -794,6 +867,56 @@ class TestStdioLoopCallerIdentity:
             assert harness.wait_for(lambda: len(harness.responses) >= 1)
             assert seen == ["dashboard:chat-3"]
             assert mcp_caller.current_caller() is None  # cleared after dispatch
+        finally:
+            harness.close()
+
+    def test_tool_sees_the_tenant_nonce_WITHOUT_an_identity(self, monkeypatch):
+        """#5322: the separator arrives even when the identity does not.
+
+        This is the frame an unnamed co-tenant of a pooled backend receives. The
+        nonce must reach the tool (it is what per-tenant state is keyed on when
+        there is nothing else), the caller must stay None (a connection name is not
+        an identity), and both must be cleared afterwards so the next dispatch on
+        this thread cannot inherit them.
+        """
+        from kiro_crew import mcp_caller
+
+        seen: list = []
+
+        def call_tool(name, args):
+            seen.append((mcp_caller.current_caller(), mcp_caller.current_tenant_nonce()))
+            return "ok"
+
+        harness = _LoopHarness(monkeypatch, call_tool)
+        try:
+            harness.send(_tools_call_with_tenant(12, "echo", "n0nce-a"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            assert seen == [(None, "n0nce-a")]
+            assert mcp_caller.current_tenant_nonce() == ""  # cleared after dispatch
+        finally:
+            harness.close()
+
+    def test_a_call_with_no_tenant_block_sees_an_empty_nonce(self, monkeypatch):
+        """The 1:1 topology, where no gateway injects anything.
+
+        An empty nonce is the signal to keep using the backend's own per-process
+        fallback, so it must not be a stale value from a previous call.
+        """
+        from kiro_crew import mcp_caller
+
+        seen: list = []
+
+        def call_tool(name, args):
+            seen.append(mcp_caller.current_tenant_nonce())
+            return "ok"
+
+        harness = _LoopHarness(monkeypatch, call_tool)
+        try:
+            harness.send(_tools_call_with_tenant(13, "echo", "n0nce-a"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            harness.send(_tools_call(14, "echo"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 2)
+            assert seen == ["n0nce-a", ""]
         finally:
             harness.close()
 

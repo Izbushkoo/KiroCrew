@@ -14,8 +14,12 @@ GGUF, or a sandbox.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import contextlib
+import inspect
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -72,6 +76,7 @@ def _make_request(
     query: dict[str, str] | None = None,
     match_info: dict[str, str] | None = None,
     session_key: str = "",
+    body_present: bool | None = None,
 ) -> Any:
     req = MagicMock()
     req.app = {"state": state}
@@ -79,8 +84,16 @@ def _make_request(
     req.query = query or {}
     req.match_info = match_info or {}
     req.headers = {"X-Session-Key": session_key} if session_key else {}
+    # ``can_read_body`` is what ``_shared.read_bounded_json`` consults for its
+    # allow_absent endpoints. It defaults to "a body was supplied", which makes
+    # ``json_body=None`` an ABSENT body -- the common case for the GET tests.
+    # Pass ``body_present=True`` alongside ``json_body=None`` for the other
+    # meaning: a body that is present and whose content is the JSON literal
+    # ``null``, which is a non-object and must be refused, not defaulted.
+    req.can_read_body = json_body is not None if body_present is None else body_present
     if isinstance(json_body, _BadJSON):
         req.json = AsyncMock(side_effect=ValueError("not json"))
+        req.can_read_body = True
     else:
         req.json = AsyncMock(return_value=json_body)
     return req
@@ -163,7 +176,7 @@ class TestPreferencesProjectsHistory:
         req = _make_request(state, method="PUT", json_body=_BadJSON())
         resp = await mem_mod.api_memory_preferences(req)
         assert resp.status == 400
-        assert _body(resp) == {"error": "invalid JSON"}
+        assert _body(resp) == {"error": "invalid JSON", "code": "invalid_json"}
         mem.write_preferences.assert_not_called()
 
     @pytest.mark.asyncio
@@ -270,6 +283,99 @@ def _cfg(idle: float = 6.0, days: int = 30, migrated: bool = False) -> Any:
     cfg.memory.history_max_days = days
     cfg.memory.migrated = migrated
     return cfg
+
+
+class TestRunConfigWriteCancellation:
+    """``run_config_write`` must not hand the config lock on mid-write.
+
+    The worker is a thread and cannot be cancelled, so the only question is
+    whether the lock outlives it. Ordering is forced with events, never slept
+    for.
+    """
+
+    @staticmethod
+    def _run(coro):
+        return asyncio.run(coro)
+
+    def test_a_repeated_cancellation_still_drains_before_unlocking(self):
+        """A SECOND cancel while draining must not release the lock either.
+
+        Awaiting the drain is itself a suspension point. A graceful shutdown
+        that escalates after its timeout cancels twice -- and that is exactly
+        when a config write is most likely to be in flight -- so a drain that
+        absorbs only the first cancellation unwinds the ``async with`` with
+        the thread still inside its read-modify-write.
+
+        The assertion is on ORDER, not on the number of cancels: the second
+        writer must not enter the critical section until the worker returns.
+        """
+        from kiro_crew.dashboard.chat_utils import run_config_write
+        from kiro_crew.dashboard.handlers.agents import _get_config_lock
+
+        in_write = threading.Event()
+        finish = threading.Event()
+        order: list[str] = []
+
+        def _slow_write(*_a, **_k):
+            order.append("worker-start")
+            in_write.set()
+            finish.wait(timeout=10)
+            order.append("worker-end")
+
+        async def _first():
+            # `run_config_write` acquires the lock itself; wrapping the call in a
+            # second acquire would deadlock on a non-reentrant asyncio.Lock.
+            await run_config_write(_slow_write)
+
+        async def _second():
+            async with _get_config_lock():
+                order.append("second-ran")
+
+        async def _drive():
+            first = asyncio.create_task(_first())
+            assert await asyncio.to_thread(in_write.wait, 10), "worker never entered"
+
+            # Cancel TWICE: the second lands while the drain is awaiting.
+            first.cancel()
+            for _ in range(5):
+                await asyncio.sleep(0)
+            first.cancel()
+
+            second = asyncio.create_task(_second())
+            # Yield generously rather than sleeping: had the lock been released,
+            # the second writer would have run by now.
+            for _ in range(200):
+                await asyncio.sleep(0)
+            early = "second-ran" in order
+
+            finish.set()
+            cancelled = False
+            try:
+                await first
+            except asyncio.CancelledError:
+                cancelled = True
+            await asyncio.wait_for(second, timeout=10)
+            return early, cancelled, list(order)
+
+        early, cancelled, seen = self._run(_drive())
+
+        assert not early, (
+            "the config lock was handed to the next writer while the twice-cancelled "
+            "one's worker was still writing: %r" % (seen,)
+        )
+        assert seen.index("worker-end") < seen.index("second-ran"), (
+            "the second writer entered before the worker finished: %r" % (seen,)
+        )
+        assert cancelled, "the cancellation must propagate, not be swallowed"
+
+    def test_an_uncancelled_call_returns_the_worker_result(self):
+        """The loop must not change the ordinary path: the value still comes back."""
+        from kiro_crew.dashboard.chat_utils import run_config_write
+
+        async def _drive():
+            return await run_config_write(lambda a, b=0: a + b, 40, b=2)
+
+        assert self._run(_drive()) == 42
 
 
 class TestMemorySettings:
@@ -420,6 +526,151 @@ class TestRedactAndStoreResolution:
         ctor.assert_called_once()
         created.init.assert_called_once()
         assert mem.vector_store is created
+
+
+# ---------------------------------------------------------------------------
+# _get_vector_store_async (#5221) — the standalone fallback's ``init()`` must
+# never run on the event loop (VectorMemoryStore's caller contract: the
+# Windows path shells out to icacls and would freeze the loop for seconds).
+# ---------------------------------------------------------------------------
+
+
+class TestGetVectorStoreAsync:
+    @staticmethod
+    def _fallback_state() -> Any:
+        """A state whose only resolution path is the standalone fallback."""
+        mem = SimpleNamespace(vector_store=None)
+        return SimpleNamespace(context_builder=SimpleNamespace(memory=mem))
+
+    @pytest.mark.asyncio
+    async def test_standalone_fallback_init_runs_off_event_loop(self, monkeypatch) -> None:
+        """Fail-before: with the sync call reinstated, init runs on this thread."""
+        import kiro_crew.vector_memory as vm_mod
+
+        init_threads: list[threading.Thread] = []
+
+        class RecordingStore:
+            def __init__(self, **kwargs: Any) -> None:
+                pass
+
+            def init(self) -> None:
+                init_threads.append(threading.current_thread())
+
+        monkeypatch.setattr(vm_mod, "VectorMemoryStore", RecordingStore)
+        state = self._fallback_state()
+        with patch(f"{_MOD}.KiroCrewConfig.load", return_value=_cfg()):
+            store = await mem_mod._get_vector_store_async(state)
+
+            assert isinstance(store, RecordingStore)
+            assert len(init_threads) == 1
+            assert init_threads[0] is not threading.current_thread()
+
+            # Cached: the second call takes the sync fast path — same store,
+            # no second ``init()``, and no thread hop at all.
+            with patch(f"{_MOD}.asyncio.to_thread", new_callable=AsyncMock) as hop:
+                assert await mem_mod._get_vector_store_async(state) is store
+            hop.assert_not_awaited()
+        assert len(init_threads) == 1
+
+    @pytest.mark.asyncio
+    async def test_cancelled_first_caller_does_not_double_init(self, monkeypatch) -> None:
+        """Cancelling the first caller (e.g. an aiohttp client disconnect)
+        must not let a racing request arm a second ``init()``: the shared
+        shielded task keeps the in-flight init as the single flight."""
+        import kiro_crew.vector_memory as vm_mod
+
+        init_calls: list[threading.Thread] = []
+        started = threading.Event()
+        release = threading.Event()
+
+        class SlowStore:
+            def __init__(self, **kwargs: Any) -> None:
+                pass
+
+            def init(self) -> None:
+                init_calls.append(threading.current_thread())
+                started.set()
+                release.wait(timeout=5)
+
+        monkeypatch.setattr(vm_mod, "VectorMemoryStore", SlowStore)
+        state = self._fallback_state()
+        with patch(f"{_MOD}.KiroCrewConfig.load", return_value=_cfg()):
+            first = asyncio.ensure_future(mem_mod._get_vector_store_async(state))
+            # Wait until init() is genuinely running in the worker thread,
+            # then cancel the caller mid-init.
+            await asyncio.to_thread(started.wait, 5)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            # A request landing in the cancellation window must join the
+            # orphaned-but-alive init, not start a second one.
+            second = asyncio.ensure_future(mem_mod._get_vector_store_async(state))
+            await asyncio.sleep(0.05)
+            release.set()
+            store = await second
+        assert isinstance(store, SlowStore)
+        assert len(init_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_first_calls_init_once(self, monkeypatch) -> None:
+        """Single-flight: the lock restores the serialization the sync call
+        sites used to get for free from the event loop."""
+        import kiro_crew.vector_memory as vm_mod
+
+        init_calls: list[threading.Thread] = []
+        release = threading.Event()
+
+        class SlowStore:
+            def __init__(self, **kwargs: Any) -> None:
+                pass
+
+            def init(self) -> None:
+                init_calls.append(threading.current_thread())
+                release.wait(timeout=5)
+
+        monkeypatch.setattr(vm_mod, "VectorMemoryStore", SlowStore)
+        state = self._fallback_state()
+        with patch(f"{_MOD}.KiroCrewConfig.load", return_value=_cfg()):
+            t1 = asyncio.ensure_future(mem_mod._get_vector_store_async(state))
+            t2 = asyncio.ensure_future(mem_mod._get_vector_store_async(state))
+            # Let both tasks pass the fast-path check and reach the lock while
+            # the first ``init()`` is still blocked in its worker thread.
+            await asyncio.sleep(0.05)
+            release.set()
+            first, second = await asyncio.gather(t1, t2)
+        assert first is second
+        assert len(init_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_supplied_store_fast_path_pays_no_thread_hop(self) -> None:
+        store = _store()
+        state = _make_state(vector_store=store)
+        with patch(f"{_MOD}.asyncio.to_thread", new_callable=AsyncMock) as hop:
+            assert await mem_mod._get_vector_store_async(state) is store
+        hop.assert_not_awaited()
+
+    def test_no_async_handler_calls_sync_get_vector_store(self) -> None:
+        """Tripwire: every ``async def`` in the handler module must route
+        through ``_get_vector_store_async`` (the one place allowed to call the
+        sync helper, because it offloads the init-bearing path)."""
+        tree = ast.parse(inspect.getsource(mem_mod))
+        offenders: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.AsyncFunctionDef):
+                continue
+            if node.name == "_get_vector_store_async":
+                continue
+            for call in ast.walk(node):
+                if (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Name)
+                    and call.func.id == "_get_vector_store"
+                ):
+                    offenders.append(f"{node.name}:{call.lineno}")
+        assert not offenders, (
+            "async handlers must await _get_vector_store_async(...) instead of "
+            f"calling the sync helper on the event loop (#5221): {offenders}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -837,12 +1088,40 @@ class TestContextPreviewAndObservability:
 
 class TestPromote:
     @pytest.mark.asyncio
-    async def test_invalid_json_body_uses_defaults(self) -> None:
+    async def test_absent_body_uses_defaults(self) -> None:
+        # Every field has a default, so a bodyless POST is legitimate and must
+        # still run the default promotion -- that is what allow_absent buys.
+        store = _store(promote_episodic_patterns=MagicMock(return_value=2))
+        state = _make_state(vector_store=store)
+        req = _make_request(state, method="POST")
+        assert _body(await mem_mod.api_memory_promote(req)) == {"ok": True, "promoted": 2}
+        store.promote_episodic_patterns.assert_called_once_with(5, 0.75)
+
+    @pytest.mark.asyncio
+    async def test_malformed_body_is_400_not_silent_defaults(self) -> None:
+        # A body that is PRESENT but unparseable is a client mistake, not an
+        # absent body: answering 200-with-defaults ran a different promotion
+        # than the caller asked for and told them nothing (issue #5587).
         store = _store(promote_episodic_patterns=MagicMock(return_value=2))
         state = _make_state(vector_store=store)
         req = _make_request(state, method="POST", json_body=_BadJSON())
-        assert _body(await mem_mod.api_memory_promote(req)) == {"ok": True, "promoted": 2}
-        store.promote_episodic_patterns.assert_called_once_with(5, 0.75)
+        resp = await mem_mod.api_memory_promote(req)
+        assert resp.status == 400
+        assert _body(resp)["code"] == "invalid_json"
+        store.promote_episodic_patterns.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_object_body_is_400(self) -> None:
+        # `[]` / `"str"` / `5` are valid JSON but not objects; the .get() calls
+        # below would raise AttributeError into a 500 without the shape guard.
+        store = _store(promote_episodic_patterns=MagicMock(return_value=2))
+        state = _make_state(vector_store=store)
+        for payload in ([], "str", 5):
+            req = _make_request(state, method="POST", json_body=payload)
+            resp = await mem_mod.api_memory_promote(req)
+            assert resp.status == 400, payload
+            assert _body(resp)["code"] == "body_not_object", payload
+        store.promote_episodic_patterns.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_explicit_thresholds_are_forwarded(self) -> None:
@@ -973,7 +1252,9 @@ class TestEmbeddingModelEndpoint:
             req = _make_request(state, method="POST", json_body=payload)
             resp = await mem_mod.api_memory_embedding_model(req)
             assert resp.status == 400
-            assert _body(resp)["code"] == "invalid_json"
+            # The shared guard distinguishes "unparseable" from "parsed, wrong
+            # shape"; this handler used to answer invalid_json for both.
+            assert _body(resp)["code"] == "body_not_object"
 
     @pytest.mark.asyncio
     async def test_validation_error_is_400_with_code(self) -> None:
@@ -1046,6 +1327,28 @@ class TestEmbeddingModelEndpoint:
             resp = await mem_mod.api_memory_embedding_model(req)
         assert resp.status == 503
         assert _body(resp)["code"] == "vector_store_unavailable"
+        prog.begin_apply.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_apply_armed_during_store_await_is_409_and_arms_nothing(self) -> None:
+        """The awaited store acquisition can yield to the loop (#5221), so a
+        concurrent apply may arm between the single-flight gate and
+        ``begin_apply()`` — the post-await re-check must refuse it."""
+        state = _make_state()
+        prog = _prog()
+        req = _make_request(state, method="POST", json_body={"path": ""})
+
+        async def _arm_mid_await(_state: Any) -> Any:
+            prog.is_active.return_value = True
+            return _store()
+
+        with (
+            patch(f"{_MOD}.reembed_progress", return_value=prog),
+            patch(f"{_MOD}._get_vector_store_async", side_effect=_arm_mid_await),
+        ):
+            resp = await mem_mod.api_memory_embedding_model(req)
+        assert resp.status == 409
+        assert _body(resp)["code"] == "model_change_in_progress"
         prog.begin_apply.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1219,7 +1522,11 @@ class TestEnsurePipEdgeCases:
         assert ok is False
         assert "timed out" in err
         proc.kill.assert_called_once()
-        proc.wait.assert_awaited_once()
+        # The critical pin: the reap drains pipes via a SECOND communicate();
+        # a bare wait() on a killed child blocked writing into a full stderr
+        # pipe would hang the handler forever (#5989).
+        assert proc.communicate.call_count == 2
+        proc.wait.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_temp_wrapper_is_unlinked_even_when_already_gone(self, tmp_path: Path) -> None:
@@ -1577,3 +1884,332 @@ class TestMemoryGraphFailure:
         resp = await mem_mod.api_memory_graph(_make_request(state))
         assert resp.status == 500
         assert _body(resp) == {"error": "failed to build memory graph"}
+
+
+class TestConfigWritesRunOffTheEventLoop:
+    """The config read-modify-write must not run on the gateway loop.
+
+    Reading ``config.json``, parsing it, and writing it back through
+    ``write_config_atomically`` (a tmp-file write plus a rename, which can
+    fsync) is all synchronous file I/O. Inline it stalls every other session for
+    its duration -- the class the repo has been closing site by site (#4118,
+    #3803, #4550).
+
+    The load-bearing property is not merely "off the loop" but **the whole
+    transaction on ONE worker**. Offloading only the read would put a suspension
+    point between the read and the write-back while the file is unguarded on
+    disk, so an external editor or CLI landing in that gap would be silently
+    overwritten by a write derived from state nobody re-checked. The gap is zero
+    today because the sequence is synchronous, and these tests are what keep it
+    zero.
+
+    Every seam here is one BOTH shapes reach -- ``write_config_atomically`` is
+    called by the hand-rolled version too -- and each wrapper delegates to the
+    real function, so the assertions are about where real work ran rather than
+    about which helper happens to be patched.
+    """
+
+    def _instrument(self, monkeypatch, tmp_path, initial: str = '{"existing": "kept"}'):
+        """Record which thread each half of the transaction runs on.
+
+        Wrapped at ``update_config_locked`` -- the designated locked primitive --
+        and at the ``write_config_atomically`` it calls internally, so both the
+        read and the write are observed inside the SAME critical section. Both
+        wrappers delegate to the real function, so the file really is written.
+        """
+        import threading
+
+        from kiro_crew.config import loader as loader_mod
+
+        cfg = tmp_path / "config.json"
+        cfg.write_text(initial, encoding="utf-8")
+
+        seen: dict[str, Any] = {"read": [], "write": [], "data": None}
+        real_locked = mem_mod.update_config_locked
+        real_write = loader_mod.write_config_atomically
+
+        def _locked(path=None, **kwargs):
+            seen["read"].append(threading.get_ident())
+            return real_locked(path, **kwargs)
+
+        def _write(path, data, **kwargs):
+            seen["write"].append(threading.get_ident())
+            seen["data"] = data
+            return real_write(path, data, **kwargs)
+
+        monkeypatch.setattr(mem_mod, "update_config_locked", _locked)
+        monkeypatch.setattr(loader_mod, "write_config_atomically", _write)
+        monkeypatch.setattr(mem_mod, "config_path", lambda: cfg)
+        return seen, cfg
+
+    @staticmethod
+    def _assert_one_worker(seen, loop_thread) -> None:
+        assert seen["write"], "the config write never ran"
+        assert seen["write"][0] != loop_thread, (
+            "the config write ran on the gateway loop, stalling every other "
+            "session for a tmp-write plus rename"
+        )
+        assert seen["read"], "the transaction did not go through update_config_locked"
+        assert seen["read"][0] != loop_thread, "the config read ran on the gateway loop"
+        assert seen["read"][0] == seen["write"][0], (
+            "the read and the write ran on different threads, so the file was "
+            "unguarded between them -- an external writer landing in that gap "
+            "would be silently overwritten"
+        )
+
+    @pytest.mark.asyncio
+    async def test_set_migrated_runs_its_whole_transaction_on_one_worker(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        import threading
+
+        seen, cfg = self._instrument(monkeypatch, tmp_path)
+
+        await mem_mod._set_migrated(True)
+
+        self._assert_one_worker(seen, threading.get_ident())
+        on_disk = json.loads(cfg.read_text(encoding="utf-8"))
+        assert on_disk["memory"]["migrated"] is True
+        assert on_disk["existing"] == "kept", "the rest of the config was dropped"
+
+    @pytest.mark.asyncio
+    async def test_settings_put_runs_its_whole_transaction_on_one_worker(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        import threading
+
+        seen, cfg = self._instrument(monkeypatch, tmp_path)
+        monkeypatch.setattr(mem_mod.KiroCrewConfig, "load", staticmethod(lambda: MagicMock()))
+
+        state = _make_state(consolidator=None)
+        req = _make_request(state, method="PUT", json_body={"history_max_days": 30})
+        resp = await mem_mod.api_memory_settings(req)
+
+        assert resp.status == 200
+        self._assert_one_worker(seen, threading.get_ident())
+        on_disk = json.loads(cfg.read_text(encoding="utf-8"))
+        assert on_disk["memory"]["history_max_days"] == 30
+        assert on_disk["existing"] == "kept"
+
+    @pytest.mark.asyncio
+    async def test_embed_model_config_runs_its_whole_transaction_on_one_worker(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        import threading
+
+        seen, cfg = self._instrument(monkeypatch, tmp_path)
+
+        await mem_mod._write_embed_model_config("/models/e5.gguf", 768)
+
+        self._assert_one_worker(seen, threading.get_ident())
+        on_disk = json.loads(cfg.read_text(encoding="utf-8"))
+        assert on_disk["memory"]["embed_model_path"] == "/models/e5.gguf"
+        assert on_disk["memory"]["embedding_dim"] == 768
+        assert on_disk["existing"] == "kept"
+
+    # ── fail-closed contracts: preservation, green on both shapes ────────────
+
+    @pytest.mark.asyncio
+    async def test_set_migrated_still_refuses_to_write_an_unreadable_config(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """A ``{}`` baseline written back would destroy every other setting.
+
+        Driven with a genuinely unparseable file rather than a raising stub, so
+        it exercises the same refusal in either shape.
+        """
+        seen, cfg = self._instrument(monkeypatch, tmp_path, initial="{oops")
+
+        await mem_mod._set_migrated(True)  # must not raise: boot retries next time
+
+        assert seen["write"] == [], "an unreadable config was overwritten anyway"
+        assert cfg.read_text(encoding="utf-8") == "{oops", "the file was modified"
+
+    @pytest.mark.asyncio
+    async def test_settings_put_still_fails_closed_on_an_unreadable_config(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        seen, cfg = self._instrument(monkeypatch, tmp_path, initial="{oops")
+        monkeypatch.setattr(mem_mod.KiroCrewConfig, "load", staticmethod(lambda: MagicMock()))
+
+        state = _make_state(consolidator=None)
+        req = _make_request(state, method="PUT", json_body={"history_max_days": 30})
+        resp = await mem_mod.api_memory_settings(req)
+
+        assert resp.status == 500
+        assert json.loads(resp.body)["code"] == "config_unreadable"
+        assert seen["write"] == []
+        assert cfg.read_text(encoding="utf-8") == "{oops"
+
+    @pytest.mark.asyncio
+    async def test_embed_model_config_still_raises_on_an_unreadable_config(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        seen, cfg = self._instrument(monkeypatch, tmp_path, initial="{oops")
+
+        with pytest.raises(ValueError, match="could not be parsed"):
+            await mem_mod._write_embed_model_config("/models/e5.gguf", 768)
+
+        assert seen["write"] == []
+        assert cfg.read_text(encoding="utf-8") == "{oops"
+
+    @pytest.mark.asyncio
+    async def test_settings_put_rejects_a_bad_body_without_touching_the_config(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """Validation runs ahead of the transaction; a 400 must not write."""
+        seen, cfg = self._instrument(monkeypatch, tmp_path)
+        monkeypatch.setattr(mem_mod.KiroCrewConfig, "load", staticmethod(lambda: MagicMock()))
+
+        state = _make_state(consolidator=None)
+        req = _make_request(state, method="PUT", json_body={"history_max_days": "abc"})
+        resp = await mem_mod.api_memory_settings(req)
+
+        assert resp.status == 400
+        assert seen["write"] == [], "a rejected body still wrote the config"
+        assert cfg.read_text(encoding="utf-8") == '{"existing": "kept"}'
+
+    @pytest.mark.asyncio
+    async def test_cancelling_the_caller_does_not_release_the_lock_early(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """A cancelled caller must not hand the lock over mid-transaction.
+
+        A thread cannot be cancelled. Without the shield, cancelling this
+        coroutine unwinds ``async with _get_config_lock()`` while the worker is
+        still inside its read-modify-write, so the next writer enters the
+        critical section against a file the previous one is still rewriting and
+        lands a config derived from a pre-write snapshot -- the first caller's
+        settings silently revert.
+
+        Ordering is forced with events, never slept for: the worker parks inside
+        the transaction, the caller is cancelled while it is parked, and a second
+        writer then tries to take the lock. It must not get it until the first
+        worker has finished.
+        """
+        import threading
+
+        from kiro_crew.dashboard.chat_utils import run_config_write
+
+        in_txn = threading.Event()
+        finish = threading.Event()
+        order: list[str] = []
+
+        def _slow_writer():
+            order.append("worker-start")
+            in_txn.set()
+            finish.wait(timeout=10)
+            order.append("worker-end")
+
+        async def _second_writer():
+            order.append("second-waiting")
+            await run_config_write(lambda: order.append("second-ran"))
+
+        first = asyncio.create_task(run_config_write(_slow_writer))
+        assert await asyncio.to_thread(in_txn.wait, 10), "the worker never entered"
+
+        first.cancel()
+        second = asyncio.create_task(_second_writer())
+        # Yield generously rather than sleeping: if the lock had been released
+        # the second writer would have run by now.
+        for _ in range(200):
+            await asyncio.sleep(0)
+
+        assert "second-ran" not in order, (
+            "the config lock was handed to the next writer while the cancelled "
+            "caller's worker was still inside the transaction: %r" % (order,)
+        )
+
+        finish.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await first
+        await asyncio.wait_for(second, timeout=10)
+
+        assert order.index("worker-end") < order.index("second-ran"), (
+            "the second writer entered before the first worker finished: %r" % (order,)
+        )
+        assert first.cancelled(), "the cancellation must be re-raised, never swallowed"
+
+    @pytest.mark.asyncio
+    async def test_an_empty_settings_body_does_not_crash_on_a_non_object_section(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """``{"memory": []}`` plus ``PUT {}`` stays a successful no-op.
+
+        ``read_config_for_update`` validates only that the TOP level is an
+        object, so a hand-edited ``memory`` that is a list reaches the mutate.
+        Reaching into it unconditionally calls ``list.update`` -> AttributeError
+        -> 500, where the pre-existing contract answered 200 and changed nothing.
+
+        Scope note: a NON-empty update against the same malformed section still
+        raises, exactly as it did before this PR. That is pre-existing and is
+        deliberately not papered over here -- fixing it would hide which
+        behaviour this change is responsible for.
+        """
+        seen, cfg = self._instrument(monkeypatch, tmp_path, initial='{"memory": []}')
+        monkeypatch.setattr(mem_mod.KiroCrewConfig, "load", staticmethod(lambda: MagicMock()))
+
+        state = _make_state(consolidator=None)
+        req = _make_request(state, method="PUT", json_body={})
+        resp = await mem_mod.api_memory_settings(req)
+
+        assert resp.status == 200, (
+            "an empty body against a non-object memory section stopped being a "
+            "no-op: %r" % (resp.body,)
+        )
+        assert seen["write"] == [], "a no-op PUT rewrote the config"
+        assert json.loads(cfg.read_text(encoding="utf-8")) == {"memory": []}, (
+            "the malformed section was rewritten"
+        )
+
+
+class TestNonObjectBodiesAcrossConvertedHandlers:
+    """Every converted handler answers 400, never 5xx, on a non-object body.
+
+    ``[]`` / ``"s"`` / ``5`` / ``true`` / ``null`` are all VALID JSON, so
+    ``request.json()`` returns them and the ``.get()`` each handler performs
+    next raised ``AttributeError`` from OUTSIDE the parse ``try`` -- a 500 for
+    what is really malformed client input (issue #5587). Enumerated rather than
+    written one test per handler so a handler that loses the guard fails by
+    construction; the agents.py half of the same invariant lives in
+    ``test_json_object_body_guard.py``.
+    """
+
+    _HANDLERS = [
+        ("api_memory_preferences", "PUT"),
+        ("api_memory_projects", "PUT"),
+        ("api_memory_history", "PUT"),
+        ("api_memory_settings", "PUT"),
+        ("api_memory_semantic_write", "PUT"),
+        ("api_memory_import", "POST"),
+        ("api_memory_consolidate", "POST"),
+        ("api_memory_promote", "POST"),
+        ("api_memory_embedding_model", "POST"),
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("payload", [[], "a string", 5, 1.5, True, None], ids=repr)
+    @pytest.mark.parametrize("handler_name,method", _HANDLERS, ids=str)
+    async def test_non_object_body_is_400_not_500(
+        self, handler_name: str, method: str, payload: Any
+    ) -> None:
+        state = _make_state(
+            vector_store=_store(),
+            memory=MagicMock(),
+            consolidator=MagicMock(),
+        )
+        req = _make_request(
+            state,
+            method=method,
+            json_body=payload,
+            session_key="dashboard:ui",
+            # A body IS present in every row -- including the ``null`` one,
+            # which must be refused as a non-object rather than read as an
+            # absent body by the allow_absent endpoints.
+            body_present=True,
+        )
+        handler = getattr(mem_mod, handler_name)
+        with patch(f"{_MOD}.KiroCrewConfig.load", return_value=_cfg()):
+            resp = await handler(req)
+        assert resp.status == 400, f"{handler_name} on {payload!r}: expected 400"
+        assert _body(resp)["code"] == "body_not_object", handler_name

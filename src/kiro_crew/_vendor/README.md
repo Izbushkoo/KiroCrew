@@ -86,7 +86,12 @@ CMAKE_ARGS="-DCMAKE_OSX_ARCHITECTURES=x86_64 -DGGML_METAL=OFF -DGGML_NATIVE=OFF
   -DLLAMA_OPENSSL=OFF -DHTTPLIB_USE_OPENSSL_IF_AVAILABLE=OFF -DLLAMA_CURL=OFF"
 ```
 
-`GGML_NATIVE=OFF` keeps the code generic x86-64 (no -march=native).
+`GGML_NATIVE=OFF` avoids `-march=native`, but the enabled upstream x86 CPU
+kernels still require AVX, AVX2, BMI2, F16C, FMA, SSE3, and SSSE3. The loader
+checks that baseline before using the bundled Linux x86_64 runtime and degrades
+to keyword search when the host cannot execute it. An operator-set
+`LLAMA_CPP_LIB_PATH` bypasses that bundled-runtime gate so a compatible custom
+build remains usable.
 `LLAMA_BUILD_COMMON=OFF` + the OpenSSL/curl switches drop llama-common (not
 part of the shipped closure) and its TLS link against Homebrew's arm64
 OpenSSL, which cannot link into an x86_64 build. `CMAKE_IGNORE_PREFIX_PATH`
@@ -108,6 +113,20 @@ same closure (`libllama` + `libggml*` + vendored `libgomp` on Linux; top-level
 dylibs on macOS), replace `llama_cpp/` with the new wheel's Python code (minus
 `lib/` and `server/`), and re-run the embedding smoke test in
 `test/test_embeddings.py`.
+
+### Local divergences from upstream (re-apply on every upgrade)
+
+The upgrade step above replaces `llama_cpp/` wholesale with the new wheel's
+Python code, which would silently drop the patches below. Each is marked in
+source with a `kiro_crew DIVERGENCE FROM UPSTREAM` comment, so
+`grep -rn 'kiro_crew DIVERGENCE' llama_cpp/` lists what must be re-applied.
+
+- `llama_cpp/llama.py`, `Llama.__init__` — the eager `self.scores` per-token
+  logits buffer is allocated with **zero rows** when the model is opened in
+  embedding mode with `logits_all` off (issue #6827). Upstream always allocates
+  `(n_batch, n_vocab)` float32, which for the shipped Qwen3-Embedding-0.6B is
+  ~1.24 GB that the embedding path never reads. `test/test_embed_scores_buffer.py`
+  parses this file and fails if the divergence goes missing.
 
 ### Updating the vendored tree (checksum manifest)
 

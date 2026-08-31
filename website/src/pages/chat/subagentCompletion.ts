@@ -23,6 +23,8 @@
  * markdown renderer) into a pure module.
  */
 import type { ChatMessage } from '../../types'
+import { normalizeModelKey } from '../../lib/model'
+import { canonicalKey } from '../../providers/modelRegistry'
 
 const SINGLE_PREFIX = '[Subagent completion event]'
 const BATCH_PREFIX = '[Subagent batch completion event]'
@@ -80,6 +82,100 @@ const OUTCOME_BY_GLYPH: Record<string, SubagentOutcome> = {
   '⚠': 'interrupted',
 }
 
+/**
+ * True only when a model was BOTH requested and served, both ids are known, and
+ * they name genuinely different models. The ``"auto"`` sentinel (no explicit
+ * pin) and an unknown ("") id never count as a downgrade — a downgrade is a
+ * broken PROMISE, and neither made one.
+ *
+ * "Same model?" is decided by the shared ``normalizeModelKey`` (``lib/model.ts``,
+ * mirroring the backend ``_normalize_model_key``), which routes both ids through
+ * the canonical registry (#5339): a canonical key, an alias, or a
+ * provider-prefixed id all fold to one key, so a config pin `claude-opus-4.8`
+ * and a served `global.anthropic.claude-opus-4-8[1m]` are equal, while distinct
+ * 1M/200K entries stay distinct. When both ids are in the registry, `reqKey ===
+ * resKey` is the whole answer.
+ *
+ * UNREGISTERED IDS (GPT/DeepSeek/Qwen, future models) are absent from the
+ * Anthropic-only registry, so `normalizeModelKey` leaves them at the lossless
+ * string fold — which does NOT peel a routing prefix or a version tail. For that
+ * case only, we keep the interim heuristic: strip a KNOWN leading routing prefix
+ * and fold a trailing version tail to MEET a tail-less side, then treat a whole
+ * token-suffix match as INCONCLUSIVE (no amber) — a served id under an
+ * unrecognized partition (`newvendor.gpt-…`) is not evidence of a different
+ * model, and a false amber on an honored pin trains users to ignore the signal
+ * (#5394). This heuristic is skipped when either side resolved through the
+ * registry: there the canonical fold is authoritative, so a registered pin
+ * served an unregistered id (or vice versa) is a genuine difference and flags.
+ */
+export function isModelDowngrade(requestedModel: string, resolvedModel: string): boolean {
+  const req = requestedModel.trim()
+  const res = resolvedModel.trim()
+  if (!req || !res) return false
+  const reqKey = normalizeModelKey(req)
+  // `normalizeModelKey` folds `auto`/`default` to `"auto"` — no pin, so nothing
+  // to downgrade from.
+  if (reqKey === 'auto') return false
+  const resKey = normalizeModelKey(res)
+  if (reqKey === resKey) return false
+  // The registry fold is authoritative when it recognizes BOTH sides: two
+  // different canonical keys name genuinely different models (a real 1M/200K or
+  // kiro-distinct downgrade). When only ONE side resolves, comparing the
+  // registry canonical key against the other side's raw string fold would mix
+  // normal forms and can never match (e.g. pin `opus-4.8-1m` vs served
+  // `us-anthropic-claude-opus-4-8-v1:0`), turning an honored version-suffixed pin
+  // into a FALSE downgrade amber (GPT review on #6280). So the registry decides
+  // ONLY the both-registered case; otherwise fall through to the conservative
+  // heuristic, which operates on the RAW string folds of both sides (one normal
+  // form) — a missed downgrade is safer than a false one (#5394).
+  const reqCanon = canonicalKey(req)
+  const resCanon = canonicalKey(res)
+  if (reqCanon !== null && resCanon !== null) return reqCanon !== resCanon
+  // Raw string fold (lowercase, `.`->`-`), NOT the registry-canonical key, so
+  // both sides share one normal form for the prefix/version-tail comparison.
+  const rawFold = (s: string): string => s.toLowerCase().replace(/\./g, '-')
+  const pReq = stripKnownRoutingPrefix(rawFold(req))
+  const pRes = stripKnownRoutingPrefix(rawFold(res))
+  // A version/date tail is folded only to MEET a side that has none — the
+  // canonical-pin-vs-bare-alias shape. When BOTH sides carry a tail the tails
+  // are kept and must agree: dated snapshot ids are first-class pins, and
+  // stripping both tails would silently equate two different snapshots.
+  const reqTail = VERSION_TAIL_RE.test(pReq)
+  const resTail = VERSION_TAIL_RE.test(pRes)
+  const bareReq = reqTail && !resTail ? pReq.replace(VERSION_TAIL_RE, '') : pReq
+  const bareRes = resTail && !reqTail ? pRes.replace(VERSION_TAIL_RE, '') : pRes
+  // A fold that consumed the whole id left nothing to compare — inconclusive.
+  if (!bareReq || !bareRes) return false
+  if (bareReq === bareRes) return false
+  // One bare id is the token-suffix of the other: an unstripped routing prefix
+  // (unknown partition/provider), not a demonstrably different model.
+  if (isTokenSuffix(bareReq, bareRes)) return false
+  return true
+}
+
+/** Trailing version/revision tail: `-v1:0`, `:0`, or a date like `-20250101`.
+ *  No `g` flag — `$`-anchored, and a stateful `lastIndex` would poison
+ *  `.test()` across calls. */
+const VERSION_TAIL_RE = /(?::\d+|-v\d+(?::\d+)?|-\d{6,})$/
+
+/** Drop a KNOWN leading provider/partition prefix from a normalized model key.
+ *  Leading: `us-`/`eu-`/… region, `anthropic-`/`openai-`/`bedrock-`/`global-`. */
+function stripKnownRoutingPrefix(key: string): string {
+  return key.replace(/^(?:[a-z]{2}-)?(?:anthropic-|openai-|bedrock-|global-)+/, '')
+}
+
+/** True when the shorter of the two ids names the WHOLE tail of the longer one
+ *  at a `-` token boundary — the shape an unrecognized routing prefix leaves
+ *  behind (checked by length, so it is inconclusive in BOTH directions: an
+ *  unknown prefix on the served id or on the pin). Anchored on the boundary so
+ *  a version-family extension (`claude-opus-4` vs `claude-opus-4-1`) never
+ *  matches: the longer id there ends in `-1`, not in `-claude-opus-4`. */
+function isTokenSuffix(a: string, b: string): boolean {
+  const [short, long] = a.length <= b.length ? [a, b] : [b, a]
+  return long.endsWith('-' + short)
+}
+
+
 export interface ParsedSingleCompletion {
   kind: 'single'
   agentId: string
@@ -87,6 +183,13 @@ export interface ParsedSingleCompletion {
   agentName: string
   outcome: SubagentOutcome
   task: string
+  /** Model the spawn requested (pinned), '' when none was pinned. Mirrors the
+   *  backend `requestedModel` meta key (#3582). */
+  requestedModel: string
+  /** Model the session actually served, '' when unknown/inconclusive. Mirrors
+   *  the backend `resolvedModel` meta key; the card shows this and flags a
+   *  downgrade when it differs from `requestedModel`. */
+  resolvedModel: string
   /** Everything after the header block — the agent's own output. */
   body: string
 }
@@ -196,6 +299,8 @@ function fromMeta(content: string, meta: Record<string, unknown> | undefined): P
       agentName: isStr(d.agentName) ? d.agentName : '',
       outcome: d.outcome as SubagentOutcome,
       task: isStr(d.task) ? d.task.trim() : '',
+      requestedModel: isStr(d.requestedModel) ? d.requestedModel : '',
+      resolvedModel: isStr(d.resolvedModel) ? d.resolvedModel : '',
       body: keptNote ? [keptNote, body].filter(Boolean).join('\n\n') : body,
     }
   }
@@ -307,6 +412,9 @@ export function parseSubagentCompletion(
     agentName: m[2] || '',
     outcome: OUTCOME_BY_GLYPH[glyph[0]] || 'ok',
     task: (task?.[1] || '').trim(),
+    // Legacy scrollback prose never carried a model; the meta path supplies it.
+    requestedModel: '',
+    resolvedModel: '',
     body: keptNote ? [keptNote, body].filter(Boolean).join('\n\n') : body,
   }
 }

@@ -56,12 +56,14 @@ from kiro_crew.dashboard.chat_handlers import (  # noqa: F401
     api_chat_slot_followup,
     api_chat_slot_interrupt,
     api_chat_slot_model,
+    api_chat_slot_note,
     api_chat_slot_project,
     api_chat_slot_queue_cancel,
     api_chat_slot_queue_edit,
     api_chat_slot_queue_reorder,
     api_chat_slot_reasoning_effort,
     api_chat_slot_reload,
+    api_chat_slot_reset_conversation,
     api_chat_slot_resume,
     api_chat_slot_source_links,
     api_chat_slot_stop,
@@ -159,7 +161,6 @@ from kiro_crew.dashboard.chat_utils import (  # noqa: F401
     _build_stream_chunk,
     _dequeue_next_message,
     _emit_agent_assignment,
-    _extract_bash_command,
     _history_key_for,
     _maybe_consolidate,
     _maybe_inject_persona,
@@ -179,3 +180,4 @@ from kiro_crew.dashboard.chat_voice import (  # noqa: F401
 )
 from kiro_crew.security import is_sensitive_path  # noqa: F401
 from kiro_crew.sel import sel  # noqa: F401
+from kiro_crew.trust_patterns import extract_bash_command as _extract_bash_command  # noqa: F401

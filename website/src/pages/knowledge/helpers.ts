@@ -23,10 +23,6 @@ export function formatRelativeDate(iso: string): string {
   return i18nT('pages.knowledge.helpers.months_ago', { n: Math.floor(days / 30) })
 }
 
-export function copyText(text: string) {
-  navigator.clipboard.writeText(text)
-}
-
 export function useCopy() {
   const [copied, setCopied] = useState(false)
   const copy = (text: string) => {
@@ -53,8 +49,8 @@ export const DEFAULT_STATUS_FILTER = 'active'
 // `sorted(FileReader.SUPPORTED - {''})`, so it cannot silently drift.
 export const FALLBACK_SUPPORTED_FORMATS = [
   '.c', '.cpp', '.csv', '.docx', '.go', '.h', '.htm', '.html', '.java', '.js',
-  '.json', '.jsonl', '.log', '.md', '.ndjson', '.org', '.pdf', '.py', '.rb',
-  '.rs', '.sh', '.ts', '.txt', '.yaml', '.yml',
+  '.json', '.jsonl', '.log', '.md', '.ndjson', '.org', '.pdf', '.ps1', '.psd1',
+  '.psm1', '.py', '.rb', '.rs', '.sh', '.ts', '.txt', '.yaml', '.yml',
 ]
 
 /**

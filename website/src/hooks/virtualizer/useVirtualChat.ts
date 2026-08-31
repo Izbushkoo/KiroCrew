@@ -67,16 +67,29 @@
 // the question is convergence between two strategies rather than first-time
 // adoption.
 //
-// The decision carries one obligation. Height truth spans the DOM, `HeightCache`,
-// `OffsetIndex` and the memos derived from them, and stays coherent by convention
-// — a version counter in the memo deps, plus a session guard held separately by
-// the cache and by the offset tree — rather than by construction. Collapsing that
-// to a single seam, with `OffsetIndex` the only read surface for heights and
-// `HeightCache` purely its persistence backend, is the standing follow-through.
+// The decision carries one obligation, and it is now DISCHARGED. Height truth
+// spans the DOM, `HeightCache`, the offset tree and the geometry derived from
+// them; it used to stay coherent by convention -- a hand-bumped version counter
+// in memo dependency arrays, plus a session guard held separately by the cache
+// and by the tree. `HeightIndex` now owns all of it:
+//   - it holds the cache and the tree, and is the only surface this hook reads
+//     heights through, so the two-readers seam and the duplicated session guard
+//     are gone (one guard, and the tree cannot outlive its cache);
+//   - it announces a geometry change in the same call that mutates the tree, so
+//     the invalidation is subscribed to rather than maintained by hand -- there
+//     is no bump site left to forget.
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react'
 import { isRailSettling, RAIL_SETTLE_MS } from '../useRailWidth'
-import { HeightCache } from './HeightCache'
+import { HeightIndex } from './HeightIndex'
 import {
   loadScrollAnchor,
   saveScrollAnchor,
@@ -91,7 +104,6 @@ import {
   expandWindowDown,
   getOffset as getOffsetFn,
   getTotalHeight,
-  OffsetIndex,
 } from './WindowCalculator'
 import {
   computeAtBottom,
@@ -390,25 +402,10 @@ export function useVirtualChat<T>(
 
   // ---- Persistent state ----
 
-  // HeightCache is created once per sessionId and disposed when sessionId changes.
-  const cacheRef = useRef<HeightCache | null>(null)
-  const cacheSessionRef = useRef<string | null>(null)
-  if (cacheRef.current === null || cacheSessionRef.current !== sessionId) {
-    cacheRef.current?.flush()
-    // Seed the row count so the eviction cap is size-aware from the first
-    // measurement: a session longer than the baseline floor must be allowed to
-    // retain its oldest heights, or scrolling back to the top re-enters
-    // all-estimate territory even on a revisit. `itemCount` is legitimately 0
-    // here when a slot switch changes sessionId before the transcript loads;
-    // HeightCache treats that as "unknown" and sizes the cap from the persisted
-    // blob instead, so no measurements are discarded before the real count
-    // arrives via setRowCount() below.
-    cacheRef.current = new HeightCache(sessionId, { rowCount: itemCount })
-    cacheSessionRef.current = sessionId
-  } else {
-    // Transcripts grow while mounted; keep the cap in step with the row count.
-    cacheRef.current.setRowCount(itemCount)
-  }
+  // The height owner (HeightIndex) is created further down, immediately before
+  // the height lookup that reads it: its key resolver reads `itemsRef` /
+  // `getKeyRef`, which are assigned just below, so constructing it up here would
+  // put those refs in scope before they hold anything.
 
   // One shared ResizeObserver; Element → index map resolves heights cheaply.
   const elIndexRef = useRef<Map<Element, number>>(new Map())
@@ -453,43 +450,74 @@ export function useVirtualChat<T>(
 
   // ---- Scroll-anchor preservation ----
   //
-  // While the user is scrolled up reading history, an UPWARD window shift
-  // mounts rows above the viewport (recomputeWindow / top-sentinel expansion).
-  // Native `overflow-anchor: auto` normally holds the viewport steady, but a
-  // scroll-path recompute can UNMOUNT the browser's chosen anchor node (rows
-  // past WINDOW_UNMOUNT_HYSTERESIS), collapsing anchoring and jumping the
-  // viewport. This ref carries the topmost visible row's key + its screen
-  // offset, captured BEFORE an upward shift; a layout effect after commit
-  // re-reads that row and corrects scrollTop by the delta. This REDUCES
-  // reliance on overflow-anchor (it does not replace it — the CSS is owned by
-  // ChatPage and left alone).
-  const anchorPendingRef = useRef<{ key: string; top: number } | null>(null)
+  // While the user is scrolled up reading history, content can grow ABOVE the
+  // row they are reading, which moves that row down while scrollTop stays put —
+  // that IS the jump. Native `overflow-anchor: auto` normally holds the viewport
+  // steady, but a scroll-path recompute can UNMOUNT the browser's chosen anchor
+  // node (rows past WINDOW_UNMOUNT_HYSTERESIS), collapsing anchoring. So the
+  // hook carries its own anchor: the topmost visible row's key + screen offset,
+  // captured BEFORE the shift, re-read after commit, and the delta paid back
+  // into scrollTop. This REDUCES reliance on overflow-anchor (it does not
+  // replace it — the CSS is owned by ChatPage and left alone).
   // Anchor captured by syncHeightsNow for a spacer-repricing commit. Kept
-  // SEPARATE from anchorPendingRef: that one is consumed by the
-  // windowRange-keyed effect, and window commits land constantly while rows
+  // SEPARATE from shiftAnchorRef: that slot is consumed on a windowRange
+  // commit, and window commits land constantly while rows
   // mount — sharing the slot lets an unrelated window commit consume (and
-  // clear) the anchor before the heightVersion commit it was captured for,
+  // clear) the anchor before the height-sync commit it was captured for,
   // leaving the repricing shift uncompensated (observed as a nondeterministic
   // 170-190px lurch after a far jump with scroll anchoring unavailable).
   const heightAnchorPendingRef = useRef<{ key: string; top: number } | null>(null)
 
   /**
-   * Prepend compensation (load-older history).
+   * ONE compensation routine, THREE triggers, ONE capture point.
    *
-   * A prepend shifts every index up, so pre-existing rows move down by the
-   * inserted height while scrollTop stays put — that IS the jump. The snapshot
-   * must be taken in the RENDER phase (getSnapshotBeforeUpdate idiom): a layout
-   * effect runs after commit, when the row has moved and the delta reads zero.
+   *   TRIGGER 1 — prepend (load-older history): every index shifts up, so
+   *     pre-existing rows move down by the inserted height.
+   *   TRIGGER 2 — upward window shift (scroll recompute / top-sentinel
+   *     expansion): rows mount above the viewport, and they are re-measured
+   *     from the flat estimate, so the content above the reader changes height.
+   *   TRIGGER 3 — tail append (a new message arrives while the reader is
+   *     scrolled up): nothing is inserted above them, but the growth re-syncs
+   *     the offset tree, and every row that has never been measured is
+   *     re-priced from the running MEAN of the measured ones — so the height
+   *     credited above the reader changes anyway and the transcript slides
+   *     (measured in the harness: a row at screen offset 0 landed at 500).
+   *
+   * All three are "the height above the reader grew"; the correction is
+   * identical, so they share this slot and the single consumer below. A parallel
+   * path would fight this one for `scrollTop`, which is why append folds in here
+   * rather than getting an anchor slot of its own.
+   *
+   * The capture is in the RENDER phase (getSnapshotBeforeUpdate idiom) for ALL.
+   * That point is canonical rather than merely convenient: a post-commit read
+   * cannot recover a pre-shift position — the row has already moved and the
+   * delta reads zero — while a pre-shift capture is valid for the window shift
+   * too, because the mounted nodes still carry the PREVIOUS commit's geometry
+   * while the new range renders. Capturing here also removes the stale-anchor
+   * hazard the callback capture had: an anchor taken when a shift was merely
+   * SCHEDULED outlived a no-op window commit and was then applied to an
+   * unrelated later one, yanking the viewport to a row nobody was reading.
    *
    * Arithmetic is no alternative: `getH` prices an unmeasured row from the
    * running MEAN of measured ones, so any measurement re-prices every unmeasured
    * row and the next sync re-reads them all (measured: a 1000px insert displaced
-   * rows by 1500). These refs stay private rather than reusing `anchorPendingRef`,
-   * which the passive itemCount recompute overwrites with its own capture.
+   * rows by 1500).
+   *
+   * Staged, because trigger 1 needs an extra commit before it can measure:
+   *   'awaiting-rebase' — prepend captured; the window must be re-based first
+   *                       (part 1) so the anchor row is still mounted to measure.
+   *   'rebased'         — re-base committed; correct, then re-derive the window.
+   *   'ready'           — window shift captured; correct only. No re-derive:
+   *                       the shift already is the window's own decision.
    */
-  const prependAnchorRef = useRef<{ key: string; top: number } | null>(null)
+  const shiftAnchorRef = useRef<{ key: string; top: number } | null>(null)
+  const shiftStageRef = useRef<'awaiting-rebase' | 'rebased' | 'ready' | null>(null)
   const prependCountRef = useRef(0)
-  const prependRefineRef = useRef(false)
+  /** Set by part 1 in the commit it schedules a re-base in, cleared by part 2 in
+   *  that same commit. Part 2 now also watches `itemCount` (for trigger 3), so
+   *  it shares a commit with part 1 and would otherwise consume a prepend anchor
+   *  before the re-base kept its row mounted — see part 2. */
+  const rebaseScheduledRef = useRef(false)
   /** Previous render's identity. `items` is held because `itemsRef` has already
    *  advanced by the time the capture runs, while the mounted nodes still carry
    *  the PREVIOUS commit's indices. */
@@ -498,6 +526,9 @@ export function useVirtualChat<T>(
   })
   const prependPrev = prependPrevRef.current
   const prependFirstKey = itemCount > 0 ? getKey(items[0], 0) : null
+  // Guards the shared slot: a prepend capture in THIS render must not then be
+  // overwritten by the window-shift branch below (a re-base changes the range).
+  let anchorCapturedThisRender = false
   // A front-insert grows the count AND changes index 0's key. A slot switch does
   // both, hence the session guard; a plain append leaves index 0 alone.
   if (
@@ -521,10 +552,20 @@ export function useVirtualChat<T>(
         })
       : null
     if (prependAnchor) {
-      prependAnchorRef.current = prependAnchor
+      shiftAnchorRef.current = prependAnchor
+      shiftStageRef.current = 'awaiting-rebase'
       prependCountRef.current = itemCount - prependPrev.count
+      anchorCapturedThisRender = true
     }
   }
+  // TRIGGER 3's predicate, read BEFORE the mirror below advances: the count grew
+  // while index 0 kept its key, which is a TAIL append (a front insert renames
+  // index 0 and is trigger 1's; a slot switch changes the session).
+  const tailAppended =
+    itemCount > prependPrev.count &&
+    prependPrev.session === sessionId &&
+    prependPrev.firstKey !== null &&
+    prependFirstKey === prependPrev.firstKey
   prependPrevRef.current = { session: sessionId, count: itemCount, firstKey: prependFirstKey, items }
 
   // Window range for what is currently mounted. Initial state is the TAIL of
@@ -538,23 +579,63 @@ export function useVirtualChat<T>(
   })
   // Live mirror of windowRange for imperative reads (debug probe).
   const windowRangeRef = useRef(windowRange)
+  // TRIGGER 2 capture. Read BEFORE the mirror advances, so the comparison is
+  // against the range that is still on screen. Keyed on the range having
+  // ACTUALLY moved up in committed state — not on a shift being scheduled —
+  // which is what makes a no-op window commit incapable of stranding an anchor.
+  if (!anchorCapturedThisRender && windowRange.start < windowRangeRef.current.start && !stickRef.current) {
+    const shiftEl = scrollerRef.current
+    const shiftAnchor = shiftEl
+      ? captureTopAnchorFrom(shiftEl, elIndexRef.current.entries(), (idx) => {
+          const it = items[idx]
+          return it ? getKey(it, idx) : null
+        })
+      : null
+    if (shiftAnchor) {
+      shiftAnchorRef.current = shiftAnchor
+      shiftStageRef.current = 'ready'
+      anchorCapturedThisRender = true
+    }
+  }
+  // TRIGGER 3 capture. Same slot, same stage as trigger 2: an append needs the
+  // correction only, never a re-base — existing indices do not move, so the
+  // anchor row is already mounted. Keyed on the window start having stayed put,
+  // which is what separates this from trigger 2 (an upward shift) and keeps the
+  // two from double-capturing in one render.
+  //
+  // This capture is what makes the correction possible at all: the DOM read here
+  // is the PREVIOUS commit's geometry, so it records where the reader's row was
+  // BEFORE the re-pricing lands. The offset tree is re-synced later in this same
+  // render (see the `offsetIndex` memo), and after that commit the row has
+  // already moved — a post-commit read would measure zero drift.
+  if (!anchorCapturedThisRender && tailAppended && windowRange.start === windowRangeRef.current.start && !stickRef.current) {
+    const appendEl = scrollerRef.current
+    const appendAnchor = appendEl
+      ? captureTopAnchorFrom(appendEl, elIndexRef.current.entries(), (idx) => {
+          const it = items[idx]
+          return it ? getKey(it, idx) : null
+        })
+      : null
+    if (appendAnchor) {
+      shiftAnchorRef.current = appendAnchor
+      shiftStageRef.current = 'ready'
+    }
+  }
   windowRangeRef.current = windowRange
 
   // isAtBottom is the only render-affecting scroll state we expose (drives the
   // caller's jump-to-bottom pill).
   const [isAtBottom, setIsAtBottom] = useState<boolean>(true)
 
-  // Bumped whenever a mounted row's measured height changes IN PLACE (a
-  // ResizeObserver re-measure with no window/itemCount change). The offset
-  // memos below read the mutable HeightCache through `getH`, whose identity is
-  // stable, so they only recompute when windowRange/itemCount change — NOT
-  // when heights change. After a content SHRINK (streaming finalize, widget
-  // settle, markdown reflow) `totalHeight` would stay stale-large and
-  // `offsetAfter = totalHeight - offset(end)` would inflate into a phantom
-  // bottom spacer (the "blank space at the bottom" bug, and the "flicker when
-  // the scroll stops"). Including this version in the memo deps forces a
-  // recompute on every genuine height change so the spacers track reality.
-  const [heightVersion, setHeightVersion] = useState(0)
+  // NOTE: geometry invalidation is NOT a piece of state here. It lives on the
+  // height owner, which announces a change in the same call that mutates the
+  // tree -- see the `useSyncExternalStore` subscription further down, and
+  // HeightIndex.syncAndAnnounce. A local counter used to serve this role, which
+  // meant every writer had to remember to bump it: after a content SHRINK
+  // (streaming finalize, widget settle, markdown reflow) a missed bump left
+  // `totalHeight` stale-large and inflated `offsetAfter` into a phantom bottom
+  // spacer (the "blank space at the bottom" bug, and the "flicker when the
+  // scroll stops"), with nothing to catch it.
 
   // ---- Reading-position anchor (persisted; see ScrollAnchorCache) ----
   //
@@ -645,64 +726,80 @@ export function useVirtualChat<T>(
     stickRef.current = pendingRestoreRef.current ? false : followOutput
   }
 
-  // ---- Height lookup ----
-  const getH = useCallback(
-    (i: number) => {
-      const it = itemsRef.current[i]
-      if (!it) return estimatedHeight
-      const k = getKeyRef.current(it, i)
-      const cache = cacheRef.current!
-      // peek(), not get(): this closure feeds the BULK scans (OffsetIndex.sync,
-      // window/offset math), which touch every row. Promoting on those reads
-      // would rewrite LRU order into transcript-index order and evict rows the
-      // user just viewed. Genuine access is recorded by set() on measurement.
-      const cached = cache.peek(k)
-      // Math.max(h, 1) so zero-height items still register with IO.
-      if (cached !== undefined) return Math.max(cached, 1)
-      // Unmeasured row: estimate from the running mean of MEASURED heights,
-      // capped by MAX_MEAN_PX so one pathological row cannot inflate every
-      // unmeasured historical row. averageHeight() falls back to the
-      // configured estimate only while nothing has been measured at all — it
-      // deliberately does NOT hold back for a minimum sample, because measuring
-      // that gate in a browser made the drift ~7.5x worse (see HeightCache).
-      return cache.averageHeight(estimatedHeight)
-    },
-    [estimatedHeight],
-  )
-
-  // ---- Offset index (O(log N) prefix-sum tree over row heights) ----
+  // ---- Height owner (single read surface for row heights) ----
+  //
+  // `HeightIndex` holds the persisted `HeightCache` AND the O(log N) prefix-sum
+  // tree, and is the only thing this hook asks about heights. Nothing below
+  // reads `HeightCache` directly -- see HeightIndex's own doc for why the read
+  // surface is three methods (resolved height vs measurement-or-undefined, and
+  // promoting vs not) rather than one.
   //
   // The hot paths (per-rAF scroll window recompute, offset/total spacers, the
-  // 120ms streaming tick) would each walk all N rows via the O(N) free functions
-  // (getOffset / getTotalHeight / computeWindow), which dominates scroll frames
-  // on 5000+ row transcripts. `OffsetIndex` answers the same questions in
-  // O(log N) / O(1). It is the authoritative tree, synced HERE on an itemCount
-  // (or getH) change so the offset memos have fresh data on the same render,
-  // and additionally on height changes by `scheduleHeightSync` (the 120ms tick
-  // — the sync point OffsetIndex's own doc prescribes). It is NOT synced on the
-  // per-rAF scroll path (a same-count sync still O(N)-scans the prefix).
+  // 120ms streaming tick) would otherwise walk all N rows via the O(N) free
+  // functions (getOffset / getTotalHeight / computeWindow), which dominates
+  // scroll frames on 5000+ row transcripts. The tree is synced HERE on an
+  // itemCount / estimate change so the offset memos have fresh data on the same
+  // render, and additionally on height changes by `scheduleHeightSync` (the
+  // 120ms tick). It is NOT synced on the per-rAF scroll path (a same-count sync
+  // still O(N)-scans the prefix).
   //
-  // `sessionId` is a dependency because the tree caches heights read through
-  // the (session-scoped) HeightCache: switching to a different session with the
-  // SAME item count changes neither itemCount nor getH's identity, so without
-  // this the tree would keep serving the previous transcript's heights and
-  // render wrong spacers until the next measurement tick corrected it. A
-  // session change invalidates every height, so rebuild rather than sync.
-  const offsetIndexRef = useRef<OffsetIndex | null>(null)
-  const offsetIndexSessionRef = useRef<string | null>(null)
-  const offsetIndex = useMemo(() => {
-    if (offsetIndexRef.current === null || offsetIndexSessionRef.current !== sessionId) {
-      offsetIndexRef.current = new OffsetIndex(itemCount, getH)
-      offsetIndexSessionRef.current = sessionId
-    } else {
-      offsetIndexRef.current.sync(itemCount, getH)
-    }
-    return offsetIndexRef.current
-  }, [itemCount, getH, sessionId])
+  // ONE session guard, and ONE record of session identity. Previously the cache
+  // and the tree each carried their own guard and both had to agree: switching to
+  // a different session with the SAME item count changes neither itemCount nor
+  // the getter's identity, so a guard on only one of them left the tree serving
+  // the previous transcript's heights -- a transcript opening at the wrong scroll
+  // position. Because the owner holds both, the tree cannot outlive its cache.
+  //
+  // The guard reads the session off the OWNER rather than a parallel ref beside
+  // it. A second spelling of the same identity is the very pattern this change
+  // exists to remove, and it could drift from the owner it describes; asking the
+  // owner what session it holds cannot. `?.` covers the first render, where the
+  // absent owner reads as "not this session" and constructs.
+  const heightIndexRef = useRef<HeightIndex | null>(null)
+  if (heightIndexRef.current?.sessionId !== sessionId) {
+    heightIndexRef.current?.flush()
+    // Seed the row count so the eviction cap is size-aware from the first
+    // measurement: a session longer than the baseline floor must be allowed to
+    // retain its oldest heights, or scrolling back to the top re-enters
+    // all-estimate territory even on a revisit. `itemCount` is legitimately 0
+    // here when a slot switch changes sessionId before the transcript loads;
+    // HeightCache treats that as "unknown" and sizes the cap from the persisted
+    // blob instead, so no measurements are discarded before the real count
+    // arrives via setRowCount() below.
+    heightIndexRef.current = new HeightIndex(sessionId, {
+      rowCount: itemCount,
+      estimate: estimatedHeight,
+      // Late-bound on purpose: resolved at call time from the live refs, so a
+      // steered bubble's rewritten `ts` cannot orphan its measurement.
+      keyAt: (i) => {
+        const it = itemsRef.current[i]
+        return it ? getKeyRef.current(it, i) : null
+      },
+    })
+  } else {
+    // Transcripts grow while mounted; keep the cap in step with the row count.
+    heightIndexRef.current.setRowCount(itemCount)
+    heightIndexRef.current.setEstimate(estimatedHeight)
+  }
+  const heightIndex = heightIndexRef.current
 
-  // Debounced height→memo sync. Cache writes (RO re-measure, measureRef seed)
-  // call this instead of bumping heightVersion directly. The bump (which
-  // invalidates the offset memos) fires only after heights have been STABLE
+  // ---- Height lookup ----
+  // Kept as a stable getter because the O(N) free functions still take one.
+  const getH = heightIndex.getHeight
+
+  const offsetIndex = useMemo(() => {
+    heightIndex.sync(itemCount)
+    return heightIndex
+    // `estimatedHeight` is an intentional invalidation key, not a value this body
+    // reads: a changed estimate must re-sync so still-unmeasured rows pick up the
+    // new placeholder height. eslint cannot see that because the estimate reaches
+    // the tree through the owner (setEstimate above) rather than this closure.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [heightIndex, itemCount, estimatedHeight])
+
+  // Debounced height sync. Cache writes (RO re-measure, measureRef seed) call
+  // this; the owner announces the change (which invalidates the geometry reads)
+  // only after heights have been STABLE
   // for HEIGHT_SYNC_DEBOUNCE_MS, and only if the total actually changed. This
   // (a) corrects a one-time shrink's phantom spacer a beat later, and
   // (b) refuses to re-render during a continuous height oscillation (an
@@ -733,24 +830,24 @@ export function useVirtualChat<T>(
   // fires for a user who was actually following.
   const railSettleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const railSettleFollowRef = useRef(false)
-  const lastSyncedTotalRef = useRef(-1)
   const heightSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const syncHeightsNow = useCallback(() => {
-    const idx = offsetIndexRef.current
+    const idx = heightIndexRef.current
     if (!idx) return
-    idx.sync(itemsRef.current.length, getH)
-    const total = idx.totalHeight()
-    if (Math.abs(total - lastSyncedTotalRef.current) > 1) {
-      lastSyncedTotalRef.current = total
+    // The owner mutates the tree, decides whether the total actually moved, and
+    // announces it -- there is no version to bump here, so there is no bump to
+    // forget. The callback runs only when a change IS being announced, after the
+    // mutation and before subscribers see it.
+    idx.syncAndAnnounce(itemsRef.current.length, () => {
       // Spacer repricing about to commit: rows ABOVE the viewport re-price
       // (estimates replaced by real heights), which moves everything below by
       // the delta. Chrome's native scroll anchoring absorbs that shift; iOS
       // Safari has none, so a reader sees the transcript slide under their
       // finger (measured 13-25px right after a far jump, when a whole streak
       // of first measurements lands in one sync). Capture the top visible row
-      // now so the anchor-compensation layout effect (keyed on heightVersion
-      // below) can hold it steady across the commit. Skipped while stick is
-      // armed — the bottom pin owns positioning there.
+      // now so the anchor-compensation layout effect below can hold it steady
+      // across the commit. Skipped while stick is armed -- the bottom pin owns
+      // positioning there.
       if (!stickRef.current && scrollerRef.current) {
         const a = captureTopAnchorFrom(scrollerRef.current, elIndexRef.current.entries(), (i) => {
           const it = itemsRef.current[i]
@@ -758,9 +855,12 @@ export function useVirtualChat<T>(
         })
         if (a) heightAnchorPendingRef.current = a
       }
-      setHeightVersion((v) => v + 1)
-    }
-  }, [getH, scrollerRef])
+    })
+    // No `getH` dependency: the owner is read from its ref inside, and the tree
+    // sync no longer takes a getter. Listing it here would tie this callback's
+    // identity to the owner's, which the imperative writers must NOT rely on for
+    // freshness (they resolve the owner at call time instead).
+  }, [scrollerRef])
   const scheduleHeightSync = useCallback((immediate = false) => {
     if (heightSyncTimerRef.current) {
       clearTimeout(heightSyncTimerRef.current)
@@ -776,27 +876,19 @@ export function useVirtualChat<T>(
     }, HEIGHT_SYNC_DEBOUNCE_MS)
   }, [syncHeightsNow])
 
-  // NOTE: `heightVersion` is an intentional manual-invalidation key in the
-  // three memos below — it is not referenced in the bodies, so eslint flags it
-  // as "unnecessary", but removing it reintroduces the stale-spacer bug
-  // (memos reading the mutable OffsetIndex never recompute on a height change).
-  // Do NOT remove it. `offsetIndex` has a STABLE ref identity (it is the same
-  // tree object mutated in place by sync), so it is listed for clarity but the
-  // real triggers are itemCount / heightVersion / windowRange.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const totalHeight = useMemo(() => offsetIndex.totalHeight(), [offsetIndex, itemCount, heightVersion])
-  const offsetBefore = useMemo(
-    () => offsetIndex.offsetOf(windowRange.start),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [offsetIndex, windowRange.start, itemCount, heightVersion],
-  )
+  // Geometry is READ, not memoized-and-invalidated. Subscribing to the owner is
+  // what schedules a re-render when heights move; the three values below are then
+  // read fresh during that render, so there is no invalidation token to list in a
+  // dependency array and no way for one to go stale. `totalHeight()` is O(1) and
+  // `offsetOf` is O(log N), so memoizing them was never buying much -- and what it
+  // cost was a hand-maintained key that eslint could not see and review could not
+  // check.
+  const heightCommit = useSyncExternalStore(offsetIndex.subscribe, offsetIndex.getVersion)
+  const totalHeight = offsetIndex.totalHeight()
+  const offsetBefore = offsetIndex.offsetOf(windowRange.start)
   // Height of all items AFTER the window — used as the bottom spacer so the
   // scroll content keeps its full size while only the window renders real DOM.
-  const offsetAfter = useMemo(
-    () => Math.max(0, offsetIndex.totalHeight() - offsetIndex.offsetOf(windowRange.end)),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [offsetIndex, windowRange.end, itemCount, totalHeight, heightVersion],
-  )
+  const offsetAfter = Math.max(0, totalHeight - offsetIndex.offsetOf(windowRange.end))
 
   // Topmost visible mounted row, resolved against the LIVE items. Used by the
   // scroll-anchor preservation path and the debounced reading-position save.
@@ -865,7 +957,7 @@ export function useVirtualChat<T>(
     const el = scrollerRef.current
     if (!el) return
     const count = itemsRef.current.length
-    const idx = offsetIndexRef.current
+    const idx = heightIndexRef.current
     // Window bounds in O(log N) via the OffsetIndex prefix-sum tree rather than
     // the O(N) computeWindow linear scan — this is the per-rAF scroll hot path.
     // Fall back to computeWindow only if the tree is somehow absent.
@@ -889,15 +981,10 @@ export function useVirtualChat<T>(
     } else {
       next = computeWindow(Math.max(0, el.scrollTop - leadingOffset(el)), el.clientHeight, count, getH, overscan)
     }
-    // On an upward shift (window start moving up → more rows mount above
-    // the viewport) while the user is scrolled up (stick released), record the
-    // top anchor so the post-commit layout effect can hold the viewport steady.
-    // Skipped while stick is armed — the pin path owns positioning then.
-    const cur = windowRangeRef.current
-    if (next.start < cur.start && !stickRef.current) {
-      const a = captureTopAnchor()
-      if (a) anchorPendingRef.current = a
-    }
+    // No anchor capture here. An upward shift is compensated from the
+    // render-phase capture keyed on the range actually moving up (TRIGGER 2),
+    // which cannot strand an anchor when this recompute's own update is merged
+    // away to a no-op.
     setWindowRange((prev) => {
       let merged: { start: number; end: number }
       if (expandOnly) {
@@ -925,7 +1012,7 @@ export function useVirtualChat<T>(
       if (prev.start === merged.start && prev.end === merged.end) return prev
       return merged
     })
-  }, [getH, overscan, scrollerRef, captureTopAnchor, leadingOffset])
+  }, [getH, overscan, scrollerRef, leadingOffset])
 
   // ---- Pin helpers (the only code that writes el.scrollTop for follow) ----
 
@@ -1221,10 +1308,19 @@ export function useVirtualChat<T>(
         const it = itemsRef.current[idx]
         if (!it) continue
         const newH = measureBorderBoxHeight(entry.target as HTMLElement)
-        const k = getKeyRef.current(it, idx)
-        const prevH = cacheRef.current!.get(k)
+        // Resolved at call time, never captured: a callback that closed over the
+        // owner would keep writing into the PREVIOUS session's heights after a
+        // slot switch -- the same wrong-transcript class this owner exists to
+        // close, reintroduced through a stale closure.
+        const hi = heightIndexRef.current
+        if (!hi) continue
+        // readMeasured (promoting): this row is mounted, so the read is genuine
+        // access. `undefined` MUST stay reachable here -- the branch below tells
+        // a first mount apart from a genuine resize by exactly that, so a
+        // resolved height would classify every scroll-driven mount as a resize.
+        const prevH = hi.readMeasured(idx)
         if (prevH !== newH) {
-          cacheRef.current!.set(k, newH)
+          hi.setMeasured(idx, newH)
           // First-mount (prev undefined) happens during scroll-driven window
           // expansion; re-pinning then would interrupt the user's scroll. Only
           // genuine resizes (streaming growth, widget load) drive the pin —
@@ -1383,19 +1479,11 @@ export function useVirtualChat<T>(
         for (const entry of entries) {
           if (!entry.isIntersecting) continue
           if (entry.target === topSentinelRef.current) {
-            // Upward expansion mounts rows above the viewport. Capture
-            // the top anchor first (while stick is released — reading history)
-            // so the compensation layout effect can hold the viewport steady.
-            //
-            // Only when there is actually room to expand: at start === 0
-            // expandWindowUp is a no-op, so a captured anchor would never be
-            // consumed by an upward shift and would instead be applied to the
-            // NEXT layout pass — a downward expansion — yanking the viewport
-            // back to a stale row.
-            if (!stickRef.current && windowRangeRef.current.start > 0) {
-              const a = captureTopAnchor()
-              if (a) anchorPendingRef.current = a
-            }
+            // Upward expansion mounts rows above the viewport, and TRIGGER 2
+            // compensates it from the render phase. Nothing to capture here:
+            // at start === 0 expandWindowUp is a no-op, and keying the capture
+            // on the committed range moving up makes that case a non-event
+            // instead of something this site has to screen for.
             setWindowRange((prev) => expandWindowUp(prev, overscan))
             onTopReachedRef.current?.()
           } else if (entry.target === bottomSentinelRef.current) {
@@ -1409,62 +1497,25 @@ export function useVirtualChat<T>(
     if (topSentinelRef.current) io.observe(topSentinelRef.current)
     if (bottomSentinelRef.current) io.observe(bottomSentinelRef.current)
     return () => io.disconnect()
-  }, [overscan, scrollerEl, captureTopAnchor])
-
-  // ---- Scroll-anchor preservation: hold the viewport steady across an
-  //      upward window shift ----
-  //
-  // Runs after every windowRange commit. If recomputeWindow / top-sentinel
-  // expansion captured a top anchor (only on an upward shift while stick is
-  // released), re-read that row's screen position in the freshly-committed DOM
-  // and correct scrollTop by the delta so the row the user is looking at does
-  // not jump when rows mount/unmount above it. Skipped when stick is armed (the
-  // pin path owns positioning) or nothing was captured. The scrollTop write is
-  // recorded in lastWriteTopRef so the passive scroll listener classifies it as
-  // a self-scroll (isSelfScroll / SELF_SCROLL_EPSILON) and does not release
-  // stick or treat it as a user scroll.
-  useLayoutEffect(() => {
-    const pending = anchorPendingRef.current
-    anchorPendingRef.current = null
-    if (!pending) return
-    const el = scrollerRef.current
-    if (!el || stickRef.current || typeof el.getBoundingClientRect !== 'function') return
-    let node: HTMLElement | null = null
-    for (const [n, idx] of elIndexRef.current.entries()) {
-      const it = itemsRef.current[idx]
-      if (it && getKeyRef.current(it, idx) === pending.key) {
-        node = n as HTMLElement
-        break
-      }
-    }
-    if (!node) return
-    const srTop = el.getBoundingClientRect().top
-    const newTop = node.getBoundingClientRect().top - srTop
-    const delta = newTop - pending.top
-    if (Math.abs(delta) > 0.5) {
-      // Instant, and accounted as a 'pin' write: this is our own correction, so
-      // the follow guard must recognise the resulting scroll event as self-scroll
-      // rather than user input. Routed through the chokepoint so the accounting
-      // cannot be forgotten here (see writeScrollTop).
-      writeScrollTop(el, el.scrollTop + delta, 'auto', 'pin')
-    }
-  }, [windowRange, scrollerRef, writeScrollTop])
+  }, [overscan, scrollerEl])
 
   /**
-   * Prepend compensation, part 1: re-base the window by the inserted count so
-   * the rows being read stay mounted — including the anchor row, which part 2
-   * has to measure. Runs pre-paint, so the shifted-but-uncorrected frame is
-   * never shown.
+   * Part 1 — TRIGGER 1 only: re-base the window by the inserted count so the
+   * rows being read stay mounted, including the anchor row that part 2 has to
+   * measure. Runs pre-paint, so the shifted-but-uncorrected frame is never
+   * shown. A window shift needs no equivalent: it IS a range change already.
    */
   useLayoutEffect(() => {
     const inserted = prependCountRef.current
     if (inserted <= 0) return
     prependCountRef.current = 0
-    if (stickRef.current || !prependAnchorRef.current) {
-      prependAnchorRef.current = null
+    if (stickRef.current || !shiftAnchorRef.current) {
+      shiftAnchorRef.current = null
+      shiftStageRef.current = null
       return
     }
-    prependRefineRef.current = true
+    shiftStageRef.current = 'rebased'
+    rebaseScheduledRef.current = true
     setWindowRange((r) => ({
       start: Math.min(itemCount, r.start + inserted),
       end: Math.min(itemCount, r.end + inserted),
@@ -1472,24 +1523,41 @@ export function useVirtualChat<T>(
   }, [itemCount])
 
   /**
-   * Prepend compensation, part 2: re-read the anchor row in the shifted DOM and
-   * move scrollTop by however far it travelled, which holds the user's place
-   * whatever mix of inserted rows and re-estimated heights caused the shift.
+   * Part 2 — the single consumer for ALL THREE triggers: re-read the anchor row in
+   * the shifted DOM and move scrollTop by however far it travelled, which holds
+   * the user's place whatever mix of inserted rows and re-estimated heights
+   * caused the shift.
    *
-   * INVARIANT — the passive itemCount recompute runs BETWEEN these two layout
-   * effects; part 2 must re-derive the window after correcting scrollTop.
+   * Gated on the stage, not on this effect having run: the deps include
+   * `recomputeWindow`, whose identity changes as heights are measured, so an
+   * ungated read here would consume a prepend anchor before part 1 had re-based
+   * the window to keep its row mounted.
    *
-   * Then recompute the window, because the passive itemCount recompute has
-   * already run by this point — React flushes it between these two layout
-   * effects — so it sized the window from the PRE-correction offset and its
-   * update lands after this write. Re-deriving from the corrected scrollTop is
-   * what stops that stale range being the one left committed.
+   * The scrollTop write is recorded in lastWriteTopRef so the passive scroll
+   * listener classifies it as a self-scroll (isSelfScroll / SELF_SCROLL_EPSILON)
+   * and does not release stick or treat it as user input.
+   *
+   * After a 'rebased' correction only, re-derive the window: the passive
+   * itemCount recompute has already run by this point — React flushes it between
+   * these two layout effects — so it sized the window from the PRE-correction
+   * offset and its update lands after this write. Re-deriving from the corrected
+   * scrollTop is what stops that stale range being the one left committed. A
+   * 'ready' (window-shift) correction must NOT re-derive: that range is the
+   * window's own decision, and recomputing it here would fight the scroll.
    */
   useLayoutEffect(() => {
-    if (!prependRefineRef.current) return
-    prependRefineRef.current = false
-    const pending = prependAnchorRef.current
-    prependAnchorRef.current = null
+    // Part 1 just scheduled the re-base in THIS commit (both effects watch
+    // itemCount). Its anchor row may not be mounted yet, so stand down once and
+    // leave the slot intact for the re-based commit that follows.
+    if (rebaseScheduledRef.current) {
+      rebaseScheduledRef.current = false
+      return
+    }
+    const stage = shiftStageRef.current
+    if (stage !== 'rebased' && stage !== 'ready') return
+    shiftStageRef.current = null
+    const pending = shiftAnchorRef.current
+    shiftAnchorRef.current = null
     const el = scrollerRef.current
     if (!pending || !el || stickRef.current) return
     const newTop = rowTopFrom(el, elIndexRef.current.entries(), (idx) => {
@@ -1498,13 +1566,28 @@ export function useVirtualChat<T>(
     }, pending.key)
     if (newTop === null) return
     const delta = newTop - pending.top
+    // Instant, and accounted as a 'pin' write: this is our own correction, so
+    // the follow guard must recognise the resulting scroll event as self-scroll
+    // rather than user input. Routed through the chokepoint so the accounting
+    // cannot be forgotten here (see writeScrollTop).
     if (Math.abs(delta) > 0.5) writeScrollTop(el, el.scrollTop + delta, 'auto', 'pin')
-    recomputeWindow()
-  }, [windowRange, scrollerRef, writeScrollTop, recomputeWindow])
+    if (stage === 'rebased') recomputeWindow()
+    // `itemCount` is an invalidation key, not a value this body reads: TRIGGER 3
+    // captures in a render that changes no windowRange, so without it the
+    // correction would wait for an unrelated window commit and be applied to
+    // geometry that had already drifted.
+  }, [windowRange, itemCount, scrollerRef, writeScrollTop, recomputeWindow])
 
-  // Same correction for a HEIGHT-SYNC commit (spacer repricing): keyed on
-  // heightVersion, consuming the anchor syncHeightsNow captured. See
-  // heightAnchorPendingRef for why this cannot share the window effect's slot.
+  // Same correction for a HEIGHT-SYNC commit (spacer repricing), keyed on the
+  // owner's announced version. See heightAnchorPendingRef for why this cannot
+  // share the window effect's slot.
+  //
+  // `heightCommit` is the invalidation key: the effect must run in the commit the
+  // announcement scheduled, and the version identifies it. Unlike the counter this
+  // replaced, it cannot go stale or be forgotten -- the owner bumps it in the same
+  // call that mutates the tree, so there is no bump site to miss. It is also a
+  // real subscribed value rather than a token invisible to tooling, which is why
+  // no exhaustive-deps exemption is needed here any more.
   useLayoutEffect(() => {
     const pending = heightAnchorPendingRef.current
     heightAnchorPendingRef.current = null
@@ -1520,7 +1603,7 @@ export function useVirtualChat<T>(
     if (Math.abs(delta) > 0.5) {
       writeScrollTop(el, el.scrollTop + delta, 'auto', 'pin')
     }
-  }, [heightVersion, scrollerRef, writeScrollTop])
+  }, [heightCommit, scrollerRef, writeScrollTop])
 
 
   // ---- Follow-output: pin to bottom when items append ----
@@ -1608,7 +1691,7 @@ export function useVirtualChat<T>(
       // guard must classify the resulting scroll event as self-scroll rather
       // than user input (stick is already false; recording the position does
       // not re-arm it — evaluateAutoPin never pins with stick released).
-      const idxTree = offsetIndexRef.current
+      const idxTree = heightIndexRef.current
       const off = idxTree ? idxTree.offsetOf(index) : getOffsetFn(index, count, getH)
       const target = Math.max(0, off - anchor.top)
       writeScrollTop(el, target, 'auto', 'pin')
@@ -1762,15 +1845,17 @@ export function useVirtualChat<T>(
         ro?.observe(el)
         // Seed the cache with the current height so the next render has a real
         // height for placeholders. A changed value must also bump
-        // heightVersion: this seed is the SECOND cache writer (besides the RO)
+        // reach the tree: this seed is the SECOND cache writer (besides the RO)
         // and the RO won't re-fire for a value we just seeded, so without this
-        // the offset memos keep a stale height and leave a phantom spacer.
+        // the geometry keeps a stale height and leaves a phantom spacer.
         const it = itemsRef.current[index]
         if (it) {
-          const k = getKeyRef.current(it, index)
           const h = measureBorderBoxHeight(el)
-          if (h > 0 && cacheRef.current!.get(k) !== h) {
-            cacheRef.current!.set(k, h)
+          // Owner resolved at call time, not captured -- see the ResizeObserver
+          // callback above for why a closed-over owner is a wrong-session write.
+          const hi = heightIndexRef.current
+          if (hi && h > 0 && hi.readMeasured(index) !== h) {
+            hi.setMeasured(index, h)
             // Eager (per the option): this branch fires at most once per row
             // (the guard above skips re-attaches whose height is already
             // cached), so it cannot be the render storm the debounce guards
@@ -1901,7 +1986,12 @@ export function useVirtualChat<T>(
     const emit = (i: number) => {
       const it = items[i]
       const key = getKey(it, i)
-      const cached = cacheRef.current!.get(key)
+      // readMeasured (promoting): this row is rendering, which is genuine
+      // access. The unmeasured fallback stays the FLAT `estimatedHeight` rather
+      // than the running mean the offset math uses -- preserved verbatim; the
+      // two disagreeing for an unmeasured row is a pre-existing divergence, not
+      // something this refactor should quietly change.
+      const cached = heightIndex.readMeasured(i)
       const height = cached !== undefined ? Math.max(cached, 1) : estimatedHeight
       out.push({ data: it, index: i, key, mounted: true, height })
     }
@@ -1917,7 +2007,19 @@ export function useVirtualChat<T>(
       if ((i >= start && i < end) || isSticky(items[i], i)) emit(i)
     }
     return out
-  }, [items, itemCount, windowRange.start, windowRange.end, getKey, estimatedHeight, isSticky])
+    // `heightIndex` is a real dependency: its identity changes on a session
+    // switch, and the emitted placeholder heights must be re-derived from the
+    // new session's measurements rather than the previous transcript's.
+  }, [
+    heightIndex,
+    items,
+    itemCount,
+    windowRange.start,
+    windowRange.end,
+    getKey,
+    estimatedHeight,
+    isSticky,
+  ])
 
   // ---- Debug probe (zero behavior change) ----
   // Exposes window.__vcSnapshot() for diagnosing scroll/geometry bugs (e.g.
@@ -1930,11 +2032,15 @@ export function useVirtualChat<T>(
       const el = scrollerRef.current
       const count = itemsRef.current.length
       // Mounted rows: read true DOM height vs what the cache believes.
+      // peekMeasured, NOT readMeasured: this probe is a devtools observer and
+      // must not perturb the LRU order it is reporting on. (Before the read
+      // surface named promotion explicitly, this path promoted -- the one
+      // deliberate behaviour change here, devtools-only and unreachable in
+      // normal operation.)
       const rows: { index: number; cached: number | undefined; dom: number; delta: number }[] = []
+      const hi = heightIndexRef.current
       for (const [node, idx] of elIndexRef.current.entries()) {
-        const it = itemsRef.current[idx]
-        const key = it ? getKeyRef.current(it, idx) : ''
-        const cached = key ? cacheRef.current!.get(key) : undefined
+        const cached = hi?.peekMeasured(idx)
         const dom = (node as HTMLElement).offsetHeight
         rows.push({ index: idx, cached, dom, delta: dom - (cached ?? estimatedHeight) })
       }
@@ -1942,8 +2048,7 @@ export function useVirtualChat<T>(
       // How many of ALL items have a real measurement vs fall back to estimate.
       let measured = 0
       for (let i = 0; i < count; i++) {
-        const it = itemsRef.current[i]
-        if (it && cacheRef.current!.get(getKeyRef.current(it, i)) !== undefined) measured++
+        if (hi?.peekMeasured(i) !== undefined) measured++
       }
       // Direct children of the scroller (header / spacers / footer) so we can
       // see exactly what occupies space below the last mounted row.
@@ -2007,7 +2112,7 @@ export function useVirtualChat<T>(
         clearTimeout(anchorSaveTimerRef.current)
         anchorSaveTimerRef.current = null
       }
-      cacheRef.current?.flush()
+      heightIndexRef.current?.flush()
     }
   }, [detachSmoothAbort])
 

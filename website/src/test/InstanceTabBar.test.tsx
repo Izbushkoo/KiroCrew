@@ -1,9 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { screen, waitFor } from '@testing-library/react'
+import { screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders, createTestStore } from './helpers'
 import InstanceTabBar, {
   setCrewPins,
+  setStableOrder,
   resolvePinnedPref,
   clippedChipIds,
 } from '../components/InstanceTabBar'
@@ -51,12 +52,13 @@ beforeEach(() => {
   vi.clearAllMocks()
   localStorage.clear()
   setCrewPins([])
+  setStableOrder(false)
   vi.mocked(isEmbeddedPane).mockReturnValue(false)
 })
 
 /** Open the crew dropdown and return the menu row for `name`. */
 async function openSwitcher(u: ReturnType<typeof userEvent.setup>, name: RegExp) {
-  await u.click(await screen.findByRole('button', { name: /Switch crew/i }))
+  await u.click(await screen.findByRole('button', { name: /Switch instance/i }))
   return await screen.findByRole('menuitemradio', { name })
 }
 
@@ -69,7 +71,7 @@ describe('InstanceTabBar', () => {
     })
     const { container } = renderWithProviders(<InstanceTabBar />, { store })
     // No switcher, and the instances poll is disabled while embedded.
-    expect(container.querySelector('[aria-label^="Switch crew"]')).toBeNull()
+    expect(container.querySelector('[aria-label^="Switch instance"]')).toBeNull()
     expect(api.listInstances).not.toHaveBeenCalled()
   })
 
@@ -77,7 +79,7 @@ describe('InstanceTabBar', () => {
     vi.mocked(api.listInstances).mockResolvedValue(listResp([]))
     const { container } = renderWithProviders(<InstanceTabBar />)
     await waitFor(() => expect(api.listInstances).toHaveBeenCalled())
-    expect(container.querySelector('[aria-label^="Switch crew"]')).toBeNull()
+    expect(container.querySelector('[aria-label^="Switch instance"]')).toBeNull()
   })
 
   it('renders Local + a tab per connected instance and switches to Local', async () => {
@@ -193,7 +195,7 @@ describe('InstanceTabBar', () => {
     vi.mocked(api.listInstances).mockResolvedValue(listResp([never]))
     const { container } = renderWithProviders(<InstanceTabBar />)
     await waitFor(() => expect(api.listInstances).toHaveBeenCalled())
-    expect(container.querySelector('[aria-label^="Switch crew"]')).toBeNull()
+    expect(container.querySelector('[aria-label^="Switch instance"]')).toBeNull()
   })
 
   it('keeps the tab and activates it when a reconnect attempt fails', async () => {
@@ -239,7 +241,7 @@ describe('InstanceTabBar', () => {
     // even by screen readers that skip a button's child content.
     expect(await screen.findByRole('button', { name: /3 unread elsewhere/i })).toBeInTheDocument()
 
-    await u.click(screen.getByRole('button', { name: /Switch crew/i }))
+    await u.click(screen.getByRole('button', { name: /Switch instance/i }))
     expect(await screen.findByLabelText('3 unread')).toBeInTheDocument()
   })
 
@@ -263,12 +265,12 @@ describe('InstanceTabBar', () => {
 
     // No chip row at all until something is pinned, so a single-crew user pays
     // no header width for the feature.
-    expect(await screen.findByRole('button', { name: /Switch crew/i })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: /Switch instance/i })).toBeInTheDocument()
     expect(screen.queryByTestId('crew-chip-row')).toBeNull()
 
     // Pin it from the crew's own row: one lit/unlit pin per destination, no
     // second list of the same crews.
-    await u.click(screen.getByRole('button', { name: /Switch crew/i }))
+    await u.click(screen.getByRole('button', { name: /Switch instance/i }))
     const pinItem = await screen.findByTestId('crew-pin-cd-1')
     expect(pinItem).toHaveAttribute('aria-checked', 'false')
     await u.click(pinItem)
@@ -292,7 +294,7 @@ describe('InstanceTabBar', () => {
     const u = userEvent.setup()
     renderWithProviders(<InstanceTabBar />, { store })
 
-    await u.click(await screen.findByRole('button', { name: /Switch crew/i }))
+    await u.click(await screen.findByRole('button', { name: /Switch instance/i }))
     await u.click(await screen.findByTestId('crew-pin-cd-1'))
     expect(store.getState().instances.activeId).toBeNull()
 
@@ -314,7 +316,7 @@ describe('InstanceTabBar', () => {
     const u = userEvent.setup()
     renderWithProviders(<InstanceTabBar />)
 
-    await u.click(await screen.findByRole('button', { name: /Switch crew/i }))
+    await u.click(await screen.findByRole('button', { name: /Switch instance/i }))
     const pin = await screen.findByTestId('crew-pin-cd-1')
     pin.focus()
     await u.keyboard('{Enter}')
@@ -330,7 +332,7 @@ describe('InstanceTabBar', () => {
     const u = userEvent.setup()
     renderWithProviders(<InstanceTabBar />)
 
-    await u.click(await screen.findByRole('button', { name: /Switch crew/i }))
+    await u.click(await screen.findByRole('button', { name: /Switch instance/i }))
     // One pin per destination (Local + the crew), each naming its own crew.
     expect(await screen.findByTestId('crew-pin-__local__')).toHaveAccessibleName(/Pin Local/i)
     expect(await screen.findByTestId('crew-pin-cd-1')).toHaveAccessibleName(/Pin Cloud One/i)
@@ -347,7 +349,7 @@ describe('InstanceTabBar', () => {
     const u = userEvent.setup()
     renderWithProviders(<InstanceTabBar />)
 
-    await u.click(await screen.findByRole('button', { name: /Switch crew/i }))
+    await u.click(await screen.findByRole('button', { name: /Switch instance/i }))
     const glyph = (await screen.findByTestId('crew-pin-cd-1')).querySelector('svg')
     expect(glyph?.getAttribute('class')).toMatch(/text-muted/)
     expect(glyph?.getAttribute('class')).not.toMatch(/opacity-/)
@@ -364,7 +366,7 @@ describe('InstanceTabBar', () => {
     const u = userEvent.setup()
     renderWithProviders(<InstanceTabBar />)
 
-    await u.click(await screen.findByRole('button', { name: /Switch crew/i }))
+    await u.click(await screen.findByRole('button', { name: /Switch instance/i }))
     const glyph = (await screen.findByTestId('crew-pin-cd-1')).querySelector('svg')
     expect(glyph?.getAttribute('class')).toMatch(/fill-current/)
     expect(glyph?.getAttribute('class')).not.toMatch(/opacity-/)
@@ -399,6 +401,64 @@ describe('InstanceTabBar', () => {
     const row = await screen.findByTestId('crew-chip-row')
     expect(row.textContent).toMatch(/Cloud One/)
     expect(row.textContent).not.toMatch(/Local/)
+  })
+
+  it('stable order keeps a pinned active crew in place instead of leading with it', async () => {
+    // Frequent switchers opt in: the crew on screen holds its configured slot and
+    // is only highlighted, so switching never reshuffles the row.
+    setCrewPins(['__local__', 'cd-1'])
+    setStableOrder(true)
+    vi.mocked(api.listInstances).mockResolvedValue(listResp([conn()]))
+    const store = createTestStore({
+      instances: { warm: { 'cd-1': { port: 7778, token: 't' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {} },
+    })
+    const { container } = renderWithProviders(<InstanceTabBar />, { store })
+
+    // No separate leading active chip — the active crew lives inside the row.
+    const row = await screen.findByTestId('crew-chip-row')
+    expect(container.querySelector('.tb-crew-active-chip')).toBeNull()
+    // Both pinned destinations are in the row, in their configured order.
+    expect(row.textContent).toMatch(/Local/)
+    expect(row.textContent).toMatch(/Cloud One/)
+    // ...and the active crew is highlighted where it sits, not moved.
+    expect(within(row).getByRole('button', { name: /Cloud One/i })).toHaveAttribute('aria-current', 'true')
+  })
+
+  it('still leads with the active crew under stable order when it is NOT pinned', async () => {
+    // Stable order fixes the pinned row; an unpinned active crew has no slot
+    // there, so it still leads to stay reachable without opening the dropdown.
+    setCrewPins(['__local__'])
+    setStableOrder(true)
+    vi.mocked(api.listInstances).mockResolvedValue(listResp([conn()]))
+    const store = createTestStore({
+      instances: { warm: { 'cd-1': { port: 7778, token: 't' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {} },
+    })
+    const { container } = renderWithProviders(<InstanceTabBar />, { store })
+
+    const lead = await waitFor(() => {
+      const el = container.querySelector('.tb-crew-active-chip')
+      expect(el).not.toBeNull()
+      return el as HTMLElement
+    })
+    expect(lead.textContent).toMatch(/Cloud One/)
+  })
+
+  it('toggles stable order from the dropdown, persists it, and keeps the menu open', async () => {
+    vi.mocked(api.listInstances).mockResolvedValue(listResp([conn()]))
+    const store = createTestStore({
+      instances: { warm: { 'cd-1': { port: 7778, token: 't' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {} },
+    })
+    const u = userEvent.setup()
+    renderWithProviders(<InstanceTabBar />, { store })
+
+    await u.click(await screen.findByRole('button', { name: /Switch instance/i }))
+    const toggle = await screen.findByTestId('crew-stable-order-toggle')
+    expect(toggle).toHaveAttribute('aria-checked', 'false')
+    await u.click(toggle)
+    // Persisted, and the menu stayed open so the checkmark flip is visible and a
+    // second adjustment needs no reopen.
+    await waitFor(() => expect(localStorage.getItem('mc-crew-switcher-stable-order')).toBe('1'))
+    expect(await screen.findByTestId('crew-stable-order-toggle')).toHaveAttribute('aria-checked', 'true')
   })
 
 })

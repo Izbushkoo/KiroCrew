@@ -36,8 +36,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew import platform_compat
+from kiro_crew.agent_discovery import _read_agent_spec
 from kiro_crew.config.loader import config_dir, read_local_secret
 from kiro_crew.config.paths import kiro_agents_dir
+from kiro_crew.env import sanitize_spec_env
+from kiro_crew.github_runner import prevalidated_gh_env
 from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.port_resolution import resolve_serving_port
 from kiro_crew.sandbox import (
@@ -197,6 +200,36 @@ def _kill_proc_group(proc: subprocess.Popen) -> None:
         proc.kill()
     except Exception:
         pass
+
+
+def _drain_after_kill(proc: subprocess.Popen, job_id: str | None) -> None:
+    """Reap a SIGKILLed child's pipes without leaking fds or hijacking the result.
+
+    ``communicate(timeout=5)`` can ITSELF raise ``TimeoutExpired``: the child
+    outlived the group kill (uninterruptible I/O, or no pgid resolved so only
+    ``proc.kill()`` was tried), or another process inherited the write end of
+    the pipe and holds it open, so EOF never arrives. Waiting longer cannot help
+    once SIGKILL has been sent, and the caller has already decided the outcome —
+    so swallow that one exception rather than letting it displace the caller's
+    ``raise`` / ``return``. Closing the pipes has to happen either way:
+    ``Popen._communicate`` closes them as a side effect of reaching EOF, which
+    is exactly the path not taken here, and nothing else ever closes them.
+    """
+    try:
+        proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "Post-kill drain timed out (5s) for cron %s (pid %s); the child "
+            "outlived SIGKILL or another process holds the pipe — closing pipes",
+            job_id, proc.pid,
+        )
+    finally:
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
 
 
 if TYPE_CHECKING:
@@ -365,11 +398,62 @@ class McpToolClient:
 
     def __init__(self, server_name: str):
         self._server_name = server_name
-        argv = _resolve_mcp_server(server_name)
-        if not argv:
+        resolved = _resolve_mcp_server(server_name)
+        if not resolved:
             raise RuntimeError(f"MCP server '{server_name}' not found in agent config")
+        argv, spec_env = resolved
         sandboxed_argv, self._sandbox_cleanup = wrap_argv(list(argv), mode="standard")
         sandboxed_argv = cgroup_scope_argv(sandboxed_argv)  # cgroup DoS ceiling
+        # SECURITY: the confinement wrappers prepended above (`systemd-run` on
+        # Linux, `env` -> `sandbox-exec` on macOS) are absolute paths, pinned by
+        # the functions that prepend them. That matters here because Popen is
+        # handed an env whose PATH is overlaid from the per-server agent config
+        # below, and CPython resolves a slash-less argv[0] through THAT env's PATH
+        # (os.get_exec_path) -- a bare-name wrapper would be redirectable to an
+        # attacker binary running BEFORE confinement exists. Pinning belongs in
+        # those producers, not here: re-pinning at the spawn site would also
+        # rewrite argv[0] on the fail-open no-sandbox path, where argv[0] is the
+        # OPERATOR-declared command and silently resolving it against the
+        # gateway's own directories would override the very PATH selection the
+        # spec `env` block exists to provide.
+        #
+        # Build the subprocess env: start from the secret-scrubbed cron env, then
+        # overlay the per-server `env` block from the agent config (e.g. the PATH
+        # that lets a launcher resolve a helper binary it shells out to). A
+        # launcher that execs a binary reachable only via that env dies before the
+        # initialize handshake if the env is dropped. Three filters apply, and all
+        # three are load-bearing:
+        #   * _clean_cron_env() strips secrets from the INHERITED env;
+        #   * _CRON_ENV_DENY is re-applied to the spec overlay so a denied key
+        #     cannot be reintroduced through the config;
+        #   * sanitize_spec_env() drops loader/interpreter-injection keys
+        #     (LD_*, DYLD_*, and the specific PYTHONPATH/HOME/STARTUP/USERBASE
+        #     startup channels -- see env._SPEC_ENV_DENIED_PREFIXES; it is a prefix
+        #     set, NOT all of PYTHON*). Those are NOT in _CRON_ENV_DENY, and the spec
+        #     env is externally authorable, so without this an `LD_PRELOAD` in a
+        #     server's `env` block would be honoured by the dynamic loader inside
+        #     the confinement wrapper process -- executing attacker code before
+        #     the wrapper establishes containment. Pinning argv[0] does not help:
+        #     the loader acts on the pinned binary. This is the same reason
+        #     mcp_discovery routes its probe's spec env through the sanitizer;
+        #     PATH is deliberately NOT denied, since forwarding it is the point.
+        #   * sanitize_spec_env() ALSO drops the reserved KIROCREW_ namespace
+        #     (env._SPEC_ENV_RESERVED_PREFIXES), which is an authorization control
+        #     rather than a containment one and is the reason the two other filters
+        #     are not sufficient here. The server this bridge most often spawns is
+        #     `kirocrew-cron` itself, and mcp_cron._caller_is_cli() is just
+        #     `os.environ.get("KIROCREW_CLI") == "1"` -- so a `KIROCREW_CLI: "1"`
+        #     in that server's `env` block would make the spawned server treat a
+        #     SCRIPT CRON as the admin CLI and let it run cron_remove_all across
+        #     every session. Sandboxing does not bound that: confinement limits what
+        #     the child may touch, not whose jobs Kiro Crew thinks it owns. The deny
+        #     lives in the shared sanitizer rather than in _CRON_ENV_DENY so the
+        #     discovery probe -- which applies no cron deny-set at all -- is covered
+        #     by the same control instead of a second copy of it.
+        proc_env = _clean_cron_env()
+        proc_env.update(
+            sanitize_spec_env((k, v) for k, v in spec_env.items() if k not in _CRON_ENV_DENY)
+        )
         # Capture stderr to a tempfile instead of DEVNULL so spawn/handshake
         # failures are legible. DEVNULL hid the real cause -- wrong
         # Node version, expired auth cookies, OOM kill, sandbox failure -- behind
@@ -384,6 +468,7 @@ class McpToolClient:
                 stdout=subprocess.PIPE,
                 stderr=self._stderr_file,
                 text=True,
+                env=proc_env,
             )
         except Exception:
             self._stderr_file.close()
@@ -501,8 +586,15 @@ class McpToolClient:
 
 
 @lru_cache(maxsize=16)
-def _resolve_mcp_server(name: str) -> tuple[str, ...] | None:
-    """Read MCP server command from agent config (cached per process)."""
+def _resolve_mcp_server(name: str) -> tuple[tuple[str, ...], dict[str, str]] | None:
+    """Read MCP server command + env from agent config (cached per process).
+
+    Returns ``(argv, env)``. The per-server ``env`` block is required for
+    launchers that shell out to a helper binary only reachable via the ``PATH``
+    the config supplies: dropping it makes the spawned MCP die at the JSON-RPC
+    ``initialize`` handshake. When the config has no ``env`` block -- or declares
+    one that is not a JSON object -- the env dict is empty.
+    """
     cfg_path = kiro_agents_dir() / "kirocrew.json"
     if not cfg_path.exists():
         # Fall back to any kirocrew-named agent spec in the same agents dir.
@@ -511,11 +603,78 @@ def _resolve_mcp_server(name: str) -> tuple[str, ...] | None:
             break
     if not cfg_path.exists():
         return None
-    cfg = json.loads(cfg_path.read_text())
+    # The agents dir is user-writable and shared with other tools, so this goes
+    # through the hardened agent-spec reader (size cap, sensitive-symlink
+    # screen, explicit UTF-8, non-object rejection, SEL denial event) instead of
+    # a bare ``read_text`` + ``json.loads``. ``None`` covers every unusable file
+    # -- including the malformed-JSON and non-UTF-8 cases the old form let
+    # escape as an unhandled JSONDecodeError / UnicodeDecodeError into the cron
+    # runner -- and degrades to "no such server", the same answer an absent
+    # entry already produced.
+    cfg = _read_agent_spec(
+        cfg_path,
+        operation="cron_resolve_mcp_server",
+        source="cron",
+    )
+    if cfg is None:
+        return None
     spec = cfg.get("mcpServers", {}).get(name)
     if not spec:
         return None
-    return tuple([spec["command"]] + spec.get("args", []))
+    argv = tuple([spec["command"]] + spec.get("args", []))
+    # A hand-edited config can spell `env` as anything JSON allows. Only a
+    # mapping has .items(), so a string/list/number would raise AttributeError
+    # here and fail EVERY ctx.call_tool for that server with a traceback that
+    # names this function rather than the malformed config. Treat a non-mapping
+    # as absent and say so once: the declaration cannot be honoured either way,
+    # and a silent drop reads as the env-drop bug this function exists to fix.
+    raw_env = spec.get("env")
+    if raw_env is not None and not isinstance(raw_env, dict):
+        logger.warning(
+            "MCP server %r declares a non-object 'env' (%s); ignoring it",
+            name,
+            type(raw_env).__name__,
+        )
+        raw_env = None
+    env: dict[str, str] = {}
+    for raw_key, raw_value in (raw_env or {}).items():
+        key, value = str(raw_key), str(raw_value)
+        # Stringifying is not enough: `Popen` validates the env at the execve
+        # boundary and rejects the WHOLE spawn over one bad pair -- ValueError
+        # "illegal environment variable name" for `=` in a name, "embedded null
+        # byte" for a NUL in either half. Since that fires before the fork, a
+        # single malformed entry in this block aborts EVERY ctx.call_tool for the
+        # server, and the traceback names Popen rather than the config that is
+        # actually wrong -- the same failure shape, for the same reason, as the
+        # non-object `env` handled above. An empty name is not a crash but is
+        # unreachable (`getenv("")` is always NULL), so it is dropped on the same
+        # "cannot be honoured either way" ground.
+        #
+        # Dropped per ENTRY rather than rejected per SERVER: the sibling entries
+        # are still honourable, and the whole point of this function is that a
+        # server whose launcher needs a config-supplied PATH must keep working.
+        # Logged for the reason the non-object branch logs -- a silent drop reads
+        # as the env-drop bug this function exists to fix. The name is named so
+        # the operator knows which entry to edit; the value never is, since it
+        # can hold a credential.
+        if not key:
+            reason = "empty name"
+        elif "=" in key:
+            reason = "'=' in name"
+        elif "\0" in key:
+            reason = "NUL byte in name"
+        elif "\0" in value:
+            reason = "NUL byte in value"
+        else:
+            env[key] = value
+            continue
+        logger.warning(
+            "MCP server %r declares an invalid 'env' entry %r (%s); ignoring it",
+            name,
+            key,
+            reason,
+        )
+    return argv, env
 
 
 def _split_script_spec(script_path: str) -> tuple[str, str]:
@@ -617,6 +776,9 @@ def run_script_sandboxed(
         "import sys\n"
         "sys.path[:] = [p for p in sys.path if p not in ('', sys.path[0])]\n"
         "import json, os, types\n"
+        "from kiro_crew.config.loader import KiroCrewConfig\n"
+        "from kiro_crew.platform.bootstrap import boot_platform\n"
+        "boot_platform(KiroCrewConfig.load())\n"
         "from kiro_crew.cron_script import ScriptContext, Skip, Done, Report\n"
         f"sys.path.insert(0, os.path.dirname({file_path_str!r}))\n"
         f"mod = types.ModuleType('_cron_script')\n"
@@ -656,13 +818,13 @@ def run_script_sandboxed(
             # Tighten the DACL BEFORE writing the secret bytes so the file is
             # never on disk under the parent-inherited %TEMP% DACL on Windows.
             # On POSIX mkstemp already births the file 0600 so ordering is a
-            # no-op; on Windows mkstemp cannot set an owner-only DACL, and the
-            # icacls subprocess restrict_to_owner spawns is a measurable window
+            # no-op; on Windows mkstemp cannot set an owner-only DACL, so the
+            # interval between create and lockdown is a real window
             # if we wrote first. Matches the fail-loud convention of the other
             # internal-secret writers (token_secret, refresh_tokens, snapshot,
             # server._write_secret_file, token_auth) — chmod_safe swallows
             # OSError and would hide a lockdown failure. Both calls stay inside
-            # the outer try so an icacls failure still hits the finally that
+            # the outer try so a lockdown failure still hits the finally that
             # unlinks the secret + launcher (otherwise the fd leaks and temp
             # files persist).
             platform_compat.restrict_to_owner(secret_path)
@@ -684,6 +846,12 @@ def run_script_sandboxed(
         # The child must dial the gateway the credential above was minted for:
         # same dial_port, resolved once above, not a second resolution here.
         clean_env["_KIROCREW_DIAL_PORT"] = str(dial_port)
+        # Pre-resolve gh OUTSIDE the sandbox and pin its identity for the
+        # child: the sandbox's single-uid user namespace maps every root-owned
+        # path component to the overflow uid, so the child's own ownership
+        # walk refuses ANY gh on the host. Empty when the host has no usable
+        # gh -- scripts that never call gh are unaffected either way.
+        clean_env.update(prevalidated_gh_env())
 
         sandboxed_argv = cgroup_scope_argv(sandboxed_argv)  # cgroup DoS ceiling
         proc = popen_limited(
@@ -698,7 +866,7 @@ def run_script_sandboxed(
                 # Popen.communicate does not kill the child on timeout
                 # (unlike subprocess.run) — clean up before re-raising.
                 _kill_proc_group(proc)
-                proc.communicate(timeout=5)
+                _drain_after_kill(proc, job_id)
                 raise
         finally:
             cancelled = _unregister_proc(job_id, proc)
@@ -706,8 +874,25 @@ def run_script_sandboxed(
             return {"status": "cancelled", "error": "Cancelled by user"}
 
         if proc.returncode != 0 and not stdout.strip():
-            error_text = stderr[:500] or f"exit {proc.returncode}"
-            error_text = redact(error_text)
+            # Report the TERMINAL stderr context, not the head. A process that
+            # dies hard leaves its diagnosis LAST -- the traceback is the final
+            # thing written -- while whatever a startup path logged first (a
+            # data-home migration warning, a deprecation notice, an import
+            # banner) sits in front of it. Bounding from the head therefore
+            # reports the noise and truncates the cause, and the operator reads
+            # a cron failure whose message describes something that did not kill
+            # the job.
+            #
+            # ``rstrip`` first so a trailing newline does not spend part of the
+            # budget, and so an all-whitespace stderr still falls through to the
+            # exit-code fallback rather than reporting blank text.
+            #
+            # Redact the WHOLE stream before bounding: slicing first would cut
+            # a credential that straddles the 500-char boundary in half, and
+            # ``redact`` cannot recognise the surviving fragment, so it would
+            # reach logs and the persisted ``last_error`` unmasked.
+            tail = redact(stderr.rstrip())
+            error_text = tail[-500:] if tail else f"exit {proc.returncode}"
             return {"status": "error", "error": error_text}
 
         try:
@@ -715,7 +900,10 @@ def run_script_sandboxed(
         except (json.JSONDecodeError, IndexError):
             return {
                 "status": "error",
-                "error": f"Bad output: {redact(stdout[:200])}",
+                # Redact the complete stdout BEFORE truncating: slicing first
+                # could cut a credential at the boundary, leaving its unredacted
+                # head in the diagnostic.
+                "error": f"Bad output: {redact(stdout)[:200]}",
             }
     except subprocess.TimeoutExpired:
         return {"status": "error", "error": f"Script timed out after {timeout}s"}
@@ -893,7 +1081,7 @@ def run_command_sandboxed(command: str, timeout: int = 300, job_id: str | None =
                 output, stderr_out = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
                 _kill_proc_group(proc)
-                proc.communicate(timeout=5)
+                _drain_after_kill(proc, job_id)
                 return {"status": "error", "output": f"❌ Command timed out after {timeout}s", "exit_code": -1}
         finally:
             if job_id:
@@ -905,7 +1093,13 @@ def run_command_sandboxed(command: str, timeout: int = 300, job_id: str | None =
         if proc.returncode != 0:
             output = f"⚠️ Exit code {proc.returncode}\n\n{output}"
             if stderr_out:
-                output += f"\n\nstderr:\n{stderr_out[:1000]}"
+                # A command that dies hard leaves its diagnosis last: report the
+                # stderr tail, not the head, so a chatty startup warning can't
+                # displace the terminal error. Redact the complete stderr BEFORE
+                # truncating: slicing first could cut off a credential's
+                # detectable prefix (e.g. the scheme of a token-bearing URL),
+                # letting the raw secret tail through redaction.
+                output += f"\n\nstderr:\n{redact(stderr_out.rstrip())[-1000:]}"
         return {
             "status": "ok" if proc.returncode == 0 else "error",
             "output": output,

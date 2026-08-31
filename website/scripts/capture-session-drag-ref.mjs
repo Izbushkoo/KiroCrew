@@ -59,6 +59,10 @@ const slots = [
   slot(PRIVATE, 'Personal notes', { messages: 9, memory_mode: 'incognito' }),
 ]
 
+/** Only the flat-view scenario needs folders — the flat toggle exists solely to
+ *  escape a folder tree, so the lane never renders without at least one. */
+const FOLDERS = [{ id: 'f-release', name: 'Release work', order: 0 }]
+
 const detail = {
   running: false,
   has_more: false,
@@ -113,12 +117,15 @@ async function main() {
   })
 
   let page = null
-  async function load(theme) {
+  async function load(theme, { folders = [], flat = false } = {}) {
     if (page) await page.close()
     page = await context.newPage()
     logPageProblems(page)
-    await stubDashboardApi(page, { slots, theme, extra })
+    await stubDashboardApi(page, { slots, theme, extra, folders })
     await page.addInitScript(s => localStorage.setItem('mc-active-slot', s), ACTIVE)
+    // Flat view is a persisted sidebar preference, so seed it before boot
+    // rather than clicking the toggle (which is only rendered once folders load).
+    if (flat) await page.addInitScript(() => localStorage.setItem('mc-sidebar-flat-view', '1'))
     await page.goto(base + '/', { waitUntil: 'domcontentloaded' })
     await page.waitForTimeout(2500)
   }
@@ -184,6 +191,24 @@ async function main() {
     // What the pill actually says, so the copy is asserted rather than trusted to
     // follow from the reason attribute.
     const pillText = zoneVisible ? (await zone.first().innerText()).trim() : null
+    // The drag preview must still be on screen out here, over the pane. The
+    // sidebar rides inside OverlayDrawer's morph clip-path and a clip-path clips
+    // fixed-position descendants too, so an in-place overlay is erased the
+    // moment the cursor leaves the sidebar — exactly the half of the gesture
+    // that aims at the chat. A layout box alone does not prove visibility
+    // (clipping does not shrink it), so also walk the ancestor chain: any
+    // clip-path above the ghost means it is being cut.
+    const ghostLoc = page.getByTestId('session-drag-ghost')
+    const ghostBox = (await ghostLoc.count()) ? await ghostLoc.first().boundingBox() : null
+    const ghostClipped = await page.evaluate(() => {
+      const g = document.querySelector('[data-testid="session-drag-ghost"]')
+      if (!g) return null
+      for (let el = g.parentElement; el; el = el.parentElement) {
+        if (getComputedStyle(el).clipPath !== 'none') return true
+      }
+      return false
+    })
+    const ghostOverPane = !!ghostBox && ghostBox.x >= pane.x && ghostClipped === false
     // Where the cue is drawn, so "anchored on the composer" is guarded rather
     // than eyeballed: the outline must sit ON the composer, and the pill just
     // above it — NOT floating in the middle of the transcript.
@@ -210,7 +235,7 @@ async function main() {
       await page.mouse.up()
       await page.waitForTimeout(300)
     }
-    return { zoneVisible, refused, reason, pillText, anchored }
+    return { zoneVisible, refused, reason, pillText, anchored, ghostOverPane }
   }
 
   /** Crop tight around the drop pill (which only exists mid-drag). */
@@ -242,6 +267,7 @@ async function main() {
   record('drop zone invites (not refuses) a normal session', normal.refused === false)
   record('an invited drag carries no refusal reason', normal.reason === null, `reason=${normal.reason}`)
   record('cue is anchored on the composer, not floating mid-pane', normal.anchored === true)
+  record('drag preview stays visible out over the pane', normal.ghostOverPane === true)
 
   const chip = page.locator('[data-testid="session-ref-chip"]')
   const chipCount = await chip.count()
@@ -336,6 +362,42 @@ async function main() {
     record(`${theme}: dropping a session on itself stages nothing`, stagedAfterSelf === 0,
       `chips=${stagedAfterSelf}`)
   }
+
+  // ---------------------------------------------------------------- scenario 6
+  // FLAT view (every chat in one lane, no folder tree). The same gesture has to
+  // work here — and reordering still must not, which is why the lane's
+  // DndContext registers the chat pane and nothing else.
+  await load('dark', { folders: FOLDERS, flat: true })
+  const laneCount = await page.getByTestId('flat-view-lane').count()
+  record('flat view is the lane under test', laneCount === 1, `lanes=${laneCount}`)
+  const flatDrag = await dragSessionToPane(REF, { midShot: '11-flat-drag-dark' })
+  record('flat view: drop zone appears while dragging a session', flatDrag.zoneVisible)
+  record('flat view: drop zone invites (not refuses) a normal session', flatDrag.refused === false)
+  record('flat view: drag preview stays visible out over the pane', flatDrag.ghostOverPane === true)
+  const flatChips = await page.locator('[data-testid="session-ref-chip"]').count()
+  const flatChipKey = flatChips
+    ? await page.locator('[data-testid="session-ref-chip"]').first().getAttribute('data-session-ref')
+    : null
+  record('flat view: drop stages a chip for that session', flatChips === 1 && flatChipKey === REF,
+    `count=${flatChips} key=${flatChipKey}`)
+  await composerShot('12-flat-chip-staged-dark')
+  // Order stays a pure function of the sort key: no in-lane drop target exists,
+  // so there is nothing a release inside the sidebar could reorder against.
+  const inLaneTargets = await page.locator('[data-folder-drop]').count()
+  record('flat view: no in-lane drop target, so hand-reordering stays off', inLaneTargets === 0,
+    `targets=${inLaneTargets}`)
+  // A refused (private) session must be refused here too.
+  const flatPrivate = await dragSessionToPane(PRIVATE)
+  record('flat view: drop zone refuses an incognito session', flatPrivate.refused === true)
+  const afterFlatPrivate = await page.locator('[data-testid="session-ref-chip"]').count()
+  record('flat view: dropping an incognito session stages nothing', afterFlatPrivate === 1,
+    `chips 1 -> ${afterFlatPrivate}`)
+  // The rows are drag sources now, which must not swallow the tap that switches
+  // session — MouseSensor only activates past 5px, so a click is still a click.
+  await page.locator('[data-slot-key="chat-flake"]').first().click()
+  await page.waitForTimeout(700)
+  const switched = await page.locator('[data-slot-key="chat-flake"] .session-active').count()
+  record('flat view: clicking a row still switches session', switched === 1, `active=${switched}`)
 
   await page.close()
   await context.close()

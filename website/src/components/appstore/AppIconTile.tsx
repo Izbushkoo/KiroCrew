@@ -1,7 +1,7 @@
 /**
  * AppIconTile — the square icon thumbnail shared by the store's LIST surfaces.
  *
- * Discover's ``AppListRow`` and the Library's ``InstalledAppCard`` render the
+ * Discover's ``AppListRow`` and the Library's ``LaunchpadTile`` render the
  * same app, so they must render the same thumbnail with the same fallback chain:
  * the app's theme-appropriate icon → a name-hashed gradient carrying a glyph.
  * Keeping that in one component is what stops the two tabs from drifting apart

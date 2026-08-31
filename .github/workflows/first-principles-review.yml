@@ -25,8 +25,9 @@ name: First Principles Review
 # screenshots, generated files) skips green, so pr-readiness.yml never wedges.
 #
 # ADVISORY: it upserts one verdict comment and is NON-BLOCKING except on a
-# genuine BLOCK verdict (and even that red is override-able by a human, since it
-# is not a required status check). Same auth path as design-review.yml: OIDC ->
+# genuine BLOCK verdict, which fails this check and blocks PR readiness
+# (override-able by a human via `/ai-review override`). Same auth path as
+# design-review.yml: OIDC ->
 # Amazon Bedrock; Fable 5 runs through anthropics/claude-code-action with
 # use_bedrock.
 
@@ -160,24 +161,66 @@ jobs:
           # Strip embedded media: a screenshot-heavy body is pure cost to a
           # reviewer that judges prose, and an attachment URL is not intent.
           stripped="$(printf '%s' "$raw" | perl -0777 -pe 's/!\[[^\]]*\]\([^)]*\)/[image removed]/g; s{<img\b[^>]*>}{[image removed]}gi; s{<video\b.*?</video>}{[video removed]}gsi; s{<source\b[^>]*>}{[media removed]}gi; s{https?://\S*user-attachments\S*}{[media removed]}g' 2>/dev/null || printf '%s' "$raw")"
-          # Cap at 8000 bytes; iconv drops a trailing split multibyte character so
-          # the file stays well-formed UTF-8. Mark an over-cap body rather than
+          # Cap at 8000 bytes, dropping a trailing split multibyte character so the
+          # file stays well-formed UTF-8. Mark an over-cap body rather than
           # truncating it silently.
-          capped="$(printf '%s' "$stripped" | head -c 8000 | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null || printf '%s' "$stripped" | head -c 8000)"
-          { printf '%s\n' "$capped"
-            if [ "$(printf '%s' "$stripped" | wc -c)" -gt 8000 ]; then
-              printf '\n[description TRUNCATED at 8000 bytes]\n'
-            fi
-          } > "$INTENT"
+          #
+          # One perl read does the cap, because the two obvious shell spellings both
+          # break on precisely the over-cap input the cap exists for. `printf |
+          # head -c` gives the writer SIGPIPE once `head` has its bytes, and under
+          # `pipefail` that 141 fails the step -- a race below the ~64 KiB pipe
+          # buffer (a 30 KB body lost it) and certain above. And `iconv -c` drops
+          # INVALID bytes but still exits 1 on an INCOMPLETE sequence at EOF, so a
+          # `|| <raw fallback>` appended a second copy to the partial output already
+          # captured: 15,998 bytes of malformed UTF-8 from an 8000-byte cap.
+          full="$(mktemp)"
+          printf '%s' "$stripped" > "$full"
+          perl -e '
+            open(my $fh, "<:raw", $ARGV[0]) or die; read($fh, my $b, 8000);
+            # A lead byte with fewer continuation bytes than it declares is the
+            # tail the cap split; anything else invalid was already in the body.
+            $b =~ s/(?:[\xC2-\xDF]|[\xE0-\xEF][\x80-\xBF]?|[\xF0-\xF4][\x80-\xBF]{0,2})\z//;
+            print $b, "\n";
+          ' "$full" > "$INTENT"
+          if [ "$(wc -c < "$full")" -gt 8000 ]; then
+            printf '\n[description TRUNCATED at 8000 bytes]\n' >> "$INTENT"
+          fi
+          rm -f "$full"
           echo "Wrote the diff ($(wc -c < "$PATCH") bytes) and the PR intent ($(wc -c < "$INTENT") bytes) as data files."
+
+      - name: Resolve human override
+        id: human_override
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          exact="<!-- ai-review-human-override target=first-principles head=$HEAD "
+          all="<!-- ai-review-human-override target=all head=$HEAD "
+          record="$(gh api "repos/$REPO/issues/$PR/comments" --paginate 2>/dev/null \
+            | jq -sr --arg exact "$exact" --arg all "$all" \
+              'add // [] | [.[] | select(.user.login == "github-actions[bot]")
+              | select((.body | startswith($exact)) or (.body | startswith($all)))]
+              | (last.body // "")' 2>/dev/null || true)"
+          actor="$(printf '%s\n' "$record" | sed -nE '1s/^.* actor=([^ ]+) source=([0-9]+) -->$/\1/p')"
+          source="$(printf '%s\n' "$record" | sed -nE '1s/^.* actor=([^ ]+) source=([0-9]+) -->$/\2/p')"
+          if [ -n "$actor" ] && [ -n "$source" ]; then
+            echo "active=true" >> "$GITHUB_OUTPUT"
+            echo "actor=$actor" >> "$GITHUB_OUTPUT"
+            echo "source=$source" >> "$GITHUB_OUTPUT"
+          else
+            echo "active=false" >> "$GITHUB_OUTPUT"
+          fi
 
       # Dependabot PRs run with a read-only token and NO secrets/OIDC, so the
       # Bedrock role assumption below can never succeed. Skip for Dependabot (a
       # version bump has no premise to interrogate) -- same skip contract as the
       # other reviewer lanes. github.actor is set by GitHub and cannot be spoofed
-      # by PR content.
+      # by PR content. Also skip when a human override is recorded, so an OIDC
+      # failure can never keep the override from clearing the lane.
       - uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
-        if: github.actor != 'dependabot[bot]' && steps.scope.outputs.surface == 'true'
+        if: github.actor != 'dependabot[bot]' && steps.scope.outputs.surface == 'true' && steps.human_override.outputs.active != 'true'
         with:
           role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
           aws-region: us-west-2
@@ -193,7 +236,8 @@ jobs:
           github.actor != 'dependabot[bot]'
           && steps.scope.outputs.surface == 'true'
           && steps.contract.outputs.available == 'true'
-        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+          && steps.human_override.outputs.active != 'true'
+        uses: anthropics/claude-code-action@24dcd50c0568f0fc9e9211213a4fd2d9eb15c4e0 # v1
         with:
           # Inference via Amazon Bedrock. Model id form (bare, regional `us.`
           # inference profile, no `[1m]` tag) is load-bearing -- see the
@@ -257,10 +301,30 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           HEAD: ${{ github.event.pull_request.head.sha }}
           EXEC_FILE: ${{ steps.review.outputs.execution_file }}
+          HUMAN_OVERRIDE: ${{ steps.human_override.outputs.active }}
+          OVERRIDE_ACTOR: ${{ steps.human_override.outputs.actor }}
           ACTOR: ${{ github.actor }}
           SURFACE: ${{ steps.scope.outputs.surface }}
           CONTRACT: ${{ steps.contract.outputs.available }}
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
         run: |
+          if [ "$HUMAN_OVERRIDE" = "true" ]; then
+            OV_MARKER="<!-- first-principles-review -->"
+            {
+              echo "$OV_MARKER"
+              echo "## First Principles Review (Fable 5) — ✅ human override accepted"
+              echo
+              echo "_@$OVERRIDE_ACTOR overrode this lane for \`$HEAD\` via \`/ai-review override\` (this commit only)._"
+            } > /tmp/ai-override-note.md
+            ov_existing="$(gh api "repos/$REPO/issues/$PR/comments" --paginate --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$OV_MARKER\"))) | .id" 2>/dev/null | head -n1 || true)"
+            if [ -n "$ov_existing" ] && [ "$ov_existing" != "null" ]; then
+              gh api --method PATCH "repos/$REPO/issues/comments/$ov_existing" --field body="$(cat /tmp/ai-override-note.md)" >/dev/null || true
+            else
+              gh pr comment "$PR" --body-file /tmp/ai-override-note.md || true
+            fi
+            echo "verdict=OVERRIDE" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           MARKER="<!-- first-principles-review -->"
           find_existing() {
             gh api "repos/$REPO/issues/$PR/comments" --paginate \
@@ -272,10 +336,17 @@ jobs:
             echo "verdict=SKIPPED" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if [ "$SURFACE" = "true" ] && [ "$CONTRACT" != "true" ]; then
-            # The contract does not exist on the base commit: the lane cannot
-            # review the PR that introduces or moves it. Say so plainly rather
-            # than reporting a verdict it never produced.
+          if [ "$SURFACE" = "true" ] && [ "$CONTRACT" = "false" ]; then
+            # `false`, not just "not true": the contract step RAN and reported the
+            # contract absent from the base commit, so the lane cannot review the
+            # PR that introduces or moves it. Say so plainly rather than reporting
+            # a verdict it never produced. An EMPTY value would mean that step
+            # never ran, which is a different fact and must not be reported as a
+            # missing contract -- it falls through to the incomplete branch below.
+            # Not reachable in this lane today (the contract step runs before
+            # everything that could fail closed), but it IS reachable in
+            # fork-first-principles-review.yml, where the intent fetch sits in
+            # between; keep the two guards identical.
             echo "verdict=NO_CONTRACT" >> "$GITHUB_OUTPUT"
             {
               echo "$MARKER"
@@ -339,7 +410,7 @@ jobs:
           case "$verdict" in
             PASS) badge="✅ PASS" ;;
             CONCERNS) badge="🟡 CONCERNS" ;;
-            BLOCK) badge="🔴 BLOCK (advisory)" ;;
+            BLOCK) badge="🔴 BLOCK" ;;
             *) badge="" ;;
           esac
           if [ -n "$badge" ]; then
@@ -348,7 +419,7 @@ jobs:
               echo "$MARKER"
               echo "## First Principles Review (Fable 5) — $badge"
               echo
-              echo "_Advisory premise-level review of \`$HEAD\` — why this exists and whether the shipped surface is the smallest honest version. Updated in place on each push; does **not** block merge._"
+              echo "_Premise-level review of \`$HEAD\` — why this exists and whether the shipped surface is the smallest honest version. Updated in place on each push. **A BLOCK verdict blocks PR readiness**; PASS/CONCERNS are advisory._"
               echo
               printf '%s\n' "$summary"
             } > /tmp/fp-comment.md
@@ -357,11 +428,23 @@ jobs:
             # NOT post the raw model/error text: it can carry internal detail
             # (AWS account ids, ARNs, endpoints, stack traces) into a public
             # comment. Post a generic, leak-safe notice; humans read the job logs.
+            # Name the cause from the model step's OWN outcome instead of
+            # asserting one: this branch is reached both when the model ran and
+            # returned nothing usable and when the model was never called at all,
+            # and "the model call errored" sent contributors to debug a call that
+            # had not happened.
+            case "${REVIEW_OUTCOME:-}" in
+              skipped) why="the review step never ran, because an earlier step in this job failed — no model call was made" ;;
+              failure) why="the review step failed" ;;
+              cancelled) why="the review step was cancelled" ;;
+              success) why="the review step completed but returned no verdict header" ;;
+              *)       why="the review step reported no outcome" ;;
+            esac
             {
               echo "$MARKER"
               echo "## First Principles Review (Fable 5) — ⚠️ could not complete"
               echo
-              echo "_The first-principles review did not produce a verdict for \`$HEAD\` (the model call errored or returned no verdict header). See the First Principles Review job logs. Advisory — does not block merge._"
+              echo "_The first-principles review did not produce a verdict for \`$HEAD\` ($why). See the First Principles Review job logs. Advisory — does not block merge._"
             } > /tmp/fp-comment.md
           fi
           # Defense-in-depth: scrub credential shapes AND AWS account ids / ARNs
@@ -417,7 +500,13 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
           ACTOR: ${{ github.actor }}
           VERDICT: ${{ steps.post.outputs.verdict }}
+          HUMAN_OVERRIDE: ${{ steps.human_override.outputs.active }}
+          OVERRIDE_ACTOR: ${{ steps.human_override.outputs.actor }}
         run: |
+          if [ "$HUMAN_OVERRIDE" = "true" ]; then
+            echo "Human judgment by $OVERRIDE_ACTOR overrides First Principles Review for $HEAD. Passing gate."
+            exit 0
+          fi
           if [ "$ACTOR" = "dependabot[bot]" ]; then
             echo "Dependabot PR: first-principles review skipped (non-blocking)."
             exit 0

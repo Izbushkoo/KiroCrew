@@ -106,7 +106,7 @@ test). The sweep's own behavior belongs in its own module's tests.
 
 ## Which conftest you are standing on
 
-There are **three** testpaths (`setup.cfg`'s `testpaths = test transfer
+There are **two** testpaths (`setup.cfg`'s `testpaths = test
 src/kiro_crew/apps/builtins`) and they do **not** get the same fixtures. Know which
 floor is under your file before you decide what to isolate yourself:
 
@@ -125,7 +125,7 @@ It also pins the other real host paths a test must not reach: the subagent regis
 running gateway sweeps stray entries there as orphans), the 610MB embedding-model
 download, and the agent-state sidecar.
 
-Two members are there for a different reason — a **process-global** that any testpath
+Five members are there for a different reason — a **process-global** that any testpath
 can poison for every test after it, which is the same failure shape as host mutation
 one scope down:
 
@@ -139,6 +139,44 @@ one scope down:
   running. See the Rules entry — that thread makes the sandbox probe's fork child
   multithreaded, which the kernel answers with an EINVAL the probe used to cache as
   "this host has no sandbox backend".
+* `_restore_log_record_factory` puts `logging`'s record factory back. There is one such
+  slot per process, and `log_redaction`'s wrapper deliberately clears `args` and
+  `exc_info` on every record it creates, so leaving it installed reds whatever unrelated
+  test later asserts on either field. `cli._setup_cli_logging` installs it for a
+  long-lived command, so grepping `cli.main()` finds only some of the tests that reach
+  it — most call that helper directly, and they are in `test_cli_logging.py`, whose own
+  `_pristine_logging` fixture restores handlers and levels but not the factory, which is
+  why that file looks like it already handles this. Restored rather than blamed, for the
+  same reason the CWD restore is: production installs it once per process and never
+  undoes it, so a test driving that code cannot avoid it.
+  `log_redaction.uninstall_log_redaction()` exists for a test that wants to assert on
+  the uninstalled state itself.
+* `_restore_logger_levels` puts every logger's level and `disabled` flag back. A level is
+  process-global AND hierarchical, so an explicit one left on `kiro_crew` decides what
+  every `kiro_crew.*` logger in the worker may emit and it outranks the root level
+  `caplog.at_level()` sets — the victim's `caplog.text` comes back **empty**, not wrong,
+  which reads as "the code stopped logging" rather than as pollution.
+  `cli._setup_cli_logging` pins `kiro_crew` at WARNING, and test modules across the suite
+  run it for real by driving `cli.main()` in process. Restored rather than blamed, for the
+  same reason the CWD restore is. **Handlers are deliberately not restored**: one is
+  routinely paired with a module-global recording it as installed
+  (`dashboard.handlers.updates._log_ring_handler_installed`), and a floor can detach the
+  handler but cannot know to clear the flag, which leaves the singleton reporting
+  installed with nothing attached. The root logger's handler list is doubly excluded —
+  pytest's own `catching_logs` adds one per test phase and removes it at the phase
+  boundary, so writing back a setup-phase snapshot during teardown would drop the handler
+  the teardown phase is capturing through.
+* `_restore_autonudge_singleton` puts `autonudge._INSTANCE` back to whatever the test
+  inherited. `AutoNudgeService.start()` publishes itself there and `stop()` clears it, so
+  a test that starts the service — or drives a dashboard handler that does — leaves a live
+  instance holding timer TASKS created on that test's event loop. Every later test in the
+  same worker then reaches those tasks through the singleton on a loop that has since
+  closed, which is how `test_dashboard_chat.py`'s `TestCloseBroadcastDurability` came to
+  answer 500 from a leak in an unrelated file. Restored rather than blamed, for the same
+  reason the CWD restore is: production really does publish this singleton. The teardown
+  retires the leaked instance's timers through `_cancel_timer`, which is the one place
+  that knows a task on a closed loop must be DROPPED rather than cancelled — `Task.cancel`
+  schedules through `loop.call_soon` and raises `RuntimeError: Event loop is closed`.
 
 It registers the xdist worker budget too — the policy is in the repo-root
 `xdist_budget.py`, a plain module rather than a second conftest, because the module
@@ -154,8 +192,8 @@ When you add isolation, put it in the rootdir conftest **only** if a test in any
 testpath could damage the host, poison a process global for every later test, or
 consume enough of a shared *resource* — memory, cores, disk — to take the machine down
 with it. Otherwise it belongs in `test/conftest.py`, where it costs the in-package
-suites nothing. Both of the entries above started life in `test/conftest.py` and were
-silently absent from the in-package tests, which is how each was found.
+suites nothing. The first two of those entries started life in `test/conftest.py` and
+were silently absent from the in-package tests, which is how each was found.
 
 Resource consumption belongs on that list for the same reason damage does: a guard
 that only covers `test/` is invisibly absent from the other two testpaths, and the
@@ -225,7 +263,7 @@ which testpath asked for the workers.
 - **Never leave the process working directory somewhere else.** The CWD is
   per-PROCESS, so under xdist one test's `os.chdir` becomes every later test's starting
   directory on that worker. Use `monkeypatch.chdir`, which reverts on its own; the
-  rootdir conftest's `_restore_cwd` puts it back either way.
+  rootdir conftest's `pytest_runtest_teardown` puts it back either way.
 
   This was survivable only while the directory outlived the run. With
   `tmp_path_retention_policy = failed` pytest removes a passing test's `tmp_path` at
@@ -253,6 +291,15 @@ which testpath asked for the workers.
   add a subsystem with a background worker, ask which directory its thread captured
   and whether anything deletes that directory underneath it.
 
+  One shared directory also means one shared **chain lock**, and that is the wrong
+  tier for a test whose assertion depends on a fail-closed critical SEL write
+  *winning* that lock — on the event-loop thread the acquire is a single non-blocking
+  attempt, so any sibling's writer holding the lock at the wrong moment refuses the
+  audit and fails the test with no code defect anywhere (issue #7029, the issue-radar
+  trust flake). Such tests request `sel_private_root` (rootdir conftest): it rebinds
+  the singleton to a per-test, per-xdist-worker directory built `sync=True` — no
+  background writer at all — so no concurrent writer exists to contend with.
+
 - **When you stub a lifecycle method, SPY and delegate — never replace.** A stub that
   only records the call leaves whatever that method was supposed to stop still running.
   The worked example cost 19 failures in files that contain no metrics code at all:
@@ -279,6 +326,16 @@ which testpath asked for the workers.
   own transient condition instead of letting an ambiguous EINVAL be cached as a verdict
   about the host. Neither replaces the rule: **anything you start, something must
   stop — and a stub is not a stop.**
+
+  A second shape of the same hook survives even a clean shutdown: CPython cannot
+  unregister an at-fork hook, so after a proper `shutdown()` the hook still runs in
+  every fork child and restarts a ticker thread that exits almost immediately. Each
+  fork then races that short-lived thread independently — one fork child can count 1
+  thread while the next counts 2. The consequence for tests: **a single-threaded
+  pre-check fork proves nothing about the fork that produces the verdict.** A guard
+  for the multithreaded collapse must read the collapse off the verdict itself (the
+  probe's reason names it; `sandbox._probe_reason_is_multithreaded_collapse`), not
+  predict it from a separate probe.
 
 - **A handler that answers before its work finishes must be awaited, not slept on.**
   `api_chat_slot_slack_link` returns 200 as soon as the link is persisted and hands the
@@ -335,6 +392,15 @@ which testpath asked for the workers.
   per run to `<platform temp>/kc-pytest-<user>-<pid>`, which the run removes at the end,
   so an unregistered directory no longer accumulates in the shared temp root forever.
   Residue there is still **reported** — relocation is not absolution.
+
+  On **macOS** `<platform temp>` is forced to `/tmp` (`_SHORT_TMP_BASE`), which is what
+  Linux and CI already resolve to. launchd's per-user temp dir is
+  `/var/folders/<2>/<30 random>/T`: long enough that an AF_UNIX socket under a pytest temp
+  dir exceeds Darwin's 104-byte `sun_path` and cannot bind at all, and random enough that
+  the path clears the credential redactor's entropy floor — `/` is inside its
+  `[A-Za-z0-9+/]{40,}` run, so a temp path is one contiguous match and comes back
+  `[REDACTED: credential]`. Both are properties of the host prefix rather than of the code
+  under test, and both used to fail ~13 tests locally while CI stayed green.
 
   A run only ever deletes the root it created itself — there is deliberately no sweep of
   other runs' roots, because every signal for "that directory is abandoned" is unsound from
@@ -609,7 +675,7 @@ rest of the list, which is why a single-file run needs no `--override-ini` at al
 | Debugging a specific failure | `pytest --lf` with the override, or `-k "test_name" -n0` |
 | One file | `pytest test/test_foo.py -n0 -q` |
 | Small-RAM laptop | Run a subset. For a full run, let the budget clamp `-n auto` and expect it to be slow; do not raise it. |
-| Checkpoint before committing | `scripts/check_black_formatting.py && isort && flake8 && mypy && python -m pytest` |
+| Checkpoint before committing | `scripts/check_black_formatting.py && scripts/check_subprocess_encoding.py && isort && flake8 && mypy && python -m pytest` |
 
 ## Determinism: the five flake classes
 
@@ -642,6 +708,38 @@ body = os.urandom(20_000)
 # RIGHT: same entropy, same code path, one outcome
 body = random.Random(20260803).randbytes(20_000)
 ```
+
+**Host MEMORY is the other one, and it fails with a misleading exception.**
+`SubagentManager.spawn` refuses — returning before it registers anything in
+`_tasks` — while the machine looks short of memory, and it does so twice: an
+absolute floor (`check_memory_available` against `agent.spawn_min_memory_gb`) and
+the posture tier (`cached_admission_check`, refusing while the cgroup-clamped
+reading is CRITICAL). What makes it expensive to diagnose is that a refusal IS a
+`SubagentInfo` — a done one carrying `error` — so `assert info is not None` still
+passes and the test dies on the NEXT line, at `await mgr._tasks[info.id]`, with a
+bare `KeyError` naming an id nothing else mentions. Measured on a CI runner with
+~0.5 GB free.
+
+Fix: pin the reading with `healthy_host_memory` (`test/conftest.py`), which any
+file driving `spawn` opts into at module scope:
+
+```python
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+```
+
+It pins only the HOST reading — a caller that names its own `path` is feeding the
+`/proc/meminfo` parser a fixture file rather than asking about this machine, so
+those tests still run the real function and a parser regression still goes red. A
+test that is actually ABOUT either guard patches it in its own body, which lands on
+top of the fixture and reverts to it.
+
+Opt-in rather than autouse, because the pin is not free of consequence: the tests
+that drive the probe with no `path` and stub `safe_read_file` underneath it —
+`test_subagent_coverage.py::TestCheckMemoryAvailable` — never reach their own stub
+once the reading is pinned. `test_subagent_spawn_host_pin.py` is what keeps opt-in
+from decaying into "whoever remembered": a module that names `SubagentManager` and
+calls `.spawn(` must be pinned or excluded with a reason, so the next spawning test
+file cannot land unpinned.
 
 ### 2. Wall-clock races
 
@@ -693,6 +791,26 @@ mark is the tool for a test that genuinely cannot share a worker.
 
 Mutate process globals through `monkeypatch`, which reverts on teardown even when the
 test fails. Raw assignment does not.
+
+**Sharding does not just scatter this class, it hides it — so a full-suite run is the wrong
+place to be finding it.** `ci.yml` slices the suite into duration-balanced `pytest-split`
+groups, and a leaker only damages tests that land in the *same process*, so a leak whose
+victim sits in another shard is not observable in PR CI at all. The release job runs the
+suite whole and is therefore the first place it appears — as failures in files that have
+nothing to do with the cause, at a point where the diff that introduced it is long merged.
+Running the full suite more often narrows that window; it does not close it, because which
+tests share a worker still varies run to run.
+
+What closes it is a floor fixture per process-global chokepoint: snapshot at setup, compare
+at teardown, restore to **what the test inherited** (not to a pristine value, so a leak from
+an earlier test is not re-reported against every test after it). So when you introduce a new
+process-global, ship its floor entry with it rather than relying on a full-suite run to
+notice. Whether that entry also *fails* the test depends on whether reaching the global is a
+defect: `_no_leaked_telemetry_exporter` fails, because nothing legitimately leaves an
+exporter running; the CWD restore and `_restore_log_record_factory` restore silently, because
+production really does `chdir` and really does install a record factory, and a test driving
+that code cannot avoid inheriting it. Restore either way — the damage is to other tests, and
+stopping it propagating is the part that is never optional.
 
 ### 5. Absolute time budgets on instrumented runs
 

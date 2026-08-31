@@ -11,12 +11,15 @@ package, so we load them by path with importlib. Everything here is stdlib and
 runs on the full CI matrix (3.10 + 3.12); the TOML path is version-guarded
 because tomllib is 3.11+.
 """
-import importlib.util
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
+
+import pytest
+from skill_script_helpers import load_skill_script
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_DIR = REPO_ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "prepare-pr"
@@ -25,12 +28,7 @@ PROFILES_DIR = SKILL_DIR / "profiles"
 
 
 def _load(module_name, filename):
-    path = SCRIPTS_DIR / filename
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_skill_script(module_name, SCRIPTS_DIR / filename)
 
 
 resolve_profile = _load("_pp_resolve_profile", "resolve_profile.py")
@@ -57,16 +55,109 @@ def _toml_available():
 def test_generic_fallback_on_empty_repo(tmp_path):
     prof = resolve_profile.resolve(str(tmp_path))
     assert prof["source"] == "generic"
+    assert prof["setup"] == []
     assert prof["gates"] == []
     assert prof["reviewers"] == []
     assert prof["readiness"] == {"status_context": None, "defer_label": None}
     assert prof["single_commit"] is False
 
 
+def test_profile_is_loaded_from_base_ref_not_worktree(tmp_path):
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    profile = tmp_path / ".prepare-pr.toml"
+    profile.write_text("[project]\nsingle_commit = true\n")
+    subprocess.run(["git", "add", ".prepare-pr.toml"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=tmp_path, check=True)
+    profile.write_text("[project]\nsingle_commit = false\n")
+
+    resolved = resolve_profile.resolve(str(tmp_path), base_ref="HEAD")
+
+    assert resolved["source"] == "config"
+    assert resolved["single_commit"] is True
+
+
+def test_branch_only_profile_is_ignored_when_base_has_none(tmp_path):
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    (tmp_path / "README.md").write_text("base\n")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=tmp_path, check=True)
+    (tmp_path / ".prepare-pr.toml").write_text("[project]\nsingle_commit = true\n")
+
+    resolved = resolve_profile.resolve(str(tmp_path), base_ref="HEAD")
+
+    assert resolved["source"] == "generic"
+    assert resolved["single_commit"] is False
+
+
+def test_branch_deleting_a_review_workflow_cannot_drop_the_lane(tmp_path):
+    """Auto-detection is pinned to the base ref too: deleting a review workflow
+    in the checkout must not remove that reviewer from the resolved profile."""
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    wf = tmp_path / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    (wf / "codex-review.yml").write_text("name: review\n")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=tmp_path, check=True)
+    (wf / "codex-review.yml").unlink()
+
+    resolved = resolve_profile.resolve(str(tmp_path), base_ref="HEAD")
+
+    assert resolved["source"] == "auto-detect"
+    assert [r["name"] for r in resolved["reviewers"]] == ["codex-review"]
+    assert resolved["reviewers"][0]["contract"] == ".github/workflows/codex-review.yml"
+
+
+def test_unresolvable_base_ref_is_a_hard_error(tmp_path):
+    """A base ref that names nothing must fail loudly, never silently hand
+    resolution back to the branch checkout."""
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    (tmp_path / "README.md").write_text("base\n")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=tmp_path, check=True)
+
+    with pytest.raises(RuntimeError, match="cannot resolve base ref"):
+        resolve_profile.resolve(str(tmp_path), base_ref="no-such-ref")
+
+
+def test_cli_without_base_ref_pins_to_the_remote_default_branch(tmp_path):
+    """The documented no-argument invocation must not read reviewer authority
+    from the branch checkout when a remote base exists to pin to."""
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=upstream, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=upstream, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=upstream, check=True)
+    (upstream / ".prepare-pr.toml").write_text("[project]\nsingle_commit = true\n")
+    subprocess.run(["git", "add", ".prepare-pr.toml"], cwd=upstream, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=upstream, check=True)
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(upstream), str(clone)], check=True)
+    (clone / ".prepare-pr.toml").write_text("[project]\nsingle_commit = false\n")
+
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "resolve_profile.py"), str(clone)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+
+    assert json.loads(proc.stdout)["single_commit"] is True
+
+
 def test_autodetect_python_stack(tmp_path):
     (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
     prof = resolve_profile.resolve(str(tmp_path))
     assert prof["source"] == "auto-detect"
+    assert prof["setup"] == []
     assert "python -m pytest -q" in prof["gates"]
 
 
@@ -106,6 +197,8 @@ def test_kirocrew_markers_load_bundled_profile(tmp_path):
     assert prof["source"] == "kirocrew"
     assert prof["single_commit"] is True
     assert prof["base_branch"] == "main"
+    assert prof["setup"] == ["(cd website && npx playwright install chromium)"]
+    assert all("playwright install" not in gate for gate in prof["gates"])
     assert prof["readiness"]["status_context"] == "PR Readiness"
     models = {r["name"]: r["model"] for r in prof["reviewers"]}
     assert models["gpt"] == "gpt-5.6-sol"
@@ -185,14 +278,16 @@ def test_charter_budgets_match_the_ci_workflows():
         f"({opus_blocking} BLOCKING / {opus_advisory} advisory)"
     )
 
-    gpt_workflow = (
-        REPO_ROOT / ".github" / "workflows" / "codex-review.yml"
+    # The GPT lane's budget lives with the contract that applies it -- the
+    # shared review-core prompt (#5852) -- not in the workflow that splices it.
+    gpt_contract = (
+        REPO_ROOT / ".github" / "review-prompts" / "gpt-review-core.md"
     ).read_text(encoding="utf-8")
-    assert "BUDGET: report ALL findings that genuinely meet WHAT BLOCKS" in gpt_workflow, (
-        "codex-review.yml's BUDGET is expected to be report-ALL; if a numeric "
+    assert "BUDGET: report ALL findings that genuinely meet WHAT BLOCKS" in gpt_contract, (
+        "gpt-review-core.md's BUDGET is expected to be report-ALL; if a numeric "
         "cap returned, restore the numeric charter assertions here"
     )
-    assert re.search(r"BUDGET: at most \d+ BLOCKING", gpt_workflow) is None
+    assert re.search(r"BUDGET: at most \d+ BLOCKING", gpt_contract) is None
     assert "report-ALL" in skill, (
         "the gpt charter's budget no longer matches codex-review.yml "
         "(expected the report-ALL wording)"
@@ -217,25 +312,25 @@ def _ci_workflow_run_text() -> str:
     )
 
 
-def test_every_floor_gate_names_a_real_target():
-    """A gate naming a script that does not exist fails for the wrong reason.
+def test_every_floor_command_names_a_real_target():
+    """A floor command naming a missing script fails for the wrong reason.
 
     The floor is data, so nothing type-checks it: a renamed script or npm
     script turns a gate into a command-not-found, which reads as a defect in
     the branch under review rather than as rot in the floor.
     """
     data = json.loads((PROFILES_DIR / "kirocrew.json").read_text(encoding="utf-8"))
-    gates = "\n".join(data["gates"])
+    commands = "\n".join(data["setup"] + data["gates"])
 
-    for rel in sorted(set(re.findall(r"\bscripts/[A-Za-z0-9_.-]+\.(?:py|sh)", gates))):
-        assert (REPO_ROOT / rel).is_file(), f"gate references missing script {rel}"
+    for rel in sorted(set(re.findall(r"\bscripts/[A-Za-z0-9_.-]+\.(?:py|sh)", commands))):
+        assert (REPO_ROOT / rel).is_file(), f"floor references missing script {rel}"
 
-    npm_scripts = set(re.findall(r"\bnpm(?: --prefix \S+)? run ([a-z0-9:-]+)", gates))
+    npm_scripts = set(re.findall(r"\bnpm(?: --prefix \S+)? run ([a-z0-9:-]+)", commands))
     declared = json.loads(
         (REPO_ROOT / "website" / "package.json").read_text(encoding="utf-8")
     )["scripts"]
     for name in sorted(npm_scripts):
-        assert name in declared, f"gate references undeclared npm script {name!r}"
+        assert name in declared, f"floor references undeclared npm script {name!r}"
 
 
 def test_ci_blocking_scans_are_covered_by_the_floor():
@@ -251,7 +346,10 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
     """
     run_text = _ci_workflow_run_text()
     data = json.loads((PROFILES_DIR / "kirocrew.json").read_text(encoding="utf-8"))
-    gates = "\n".join(data["gates"])
+    # Only repeatable verdict-producing gates satisfy the CI floor. A command
+    # filed under setup runs once per worktree, so counting it here would let a
+    # future blocking CI check disappear from later prepare-pr passes.
+    floor = "\n".join(data["gates"])
 
     exempt_scripts = {
         # Chooses WHICH tests to run for the changed surface; not itself a gate.
@@ -273,17 +371,17 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
     }
 
     invoked = set(re.findall(r"\bscripts/[A-Za-z0-9_.-]+\.(?:py|sh)", run_text))
-    missing = sorted(s for s in invoked - exempt_scripts if s not in gates)
+    missing = sorted(s for s in invoked - exempt_scripts if s not in floor)
     assert not missing, (
-        "ci.yml runs these scripts but the prepare-pr gate floor does not: "
+        "ci.yml runs these scripts but the prepare-pr floor does not: "
         f"{missing}. Add them to profiles/kirocrew.json gates[] in their "
         "CI-exact form, or exempt them here with a reason."
     )
 
     npm_invoked = set(re.findall(r"\bnpm run ([a-z0-9:-]+)", run_text))
-    npm_missing = sorted(n for n in npm_invoked if f"run {n}" not in gates)
+    npm_missing = sorted(n for n in npm_invoked if f"run {n}" not in floor)
     assert not npm_missing, (
-        f"ci.yml runs these npm scripts but the gate floor does not: {npm_missing}"
+        f"ci.yml runs these npm scripts but the floor does not: {npm_missing}"
     )
 
     # A blocking step can also be a bare binary -- `cfn-lint`, `mypy`, `flake8`
@@ -294,44 +392,157 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
         # Environment setup, not gates.
         "pip": "installs the pinned lint tool",
         "uv": "resolves/installs dependencies",
-        "sudo": "privileged provisioning -- belongs in setup, never in a gate",
+        "sudo": "privileged provisioning -- belongs in manual host setup",
         # Wrappers whose payload is already covered by another assertion.
         "bash": "an interpreter prefix -- the payload is the .sh path, covered by "
                 "the script scan above",
         "npm": "covered by the npm-script scan above",
         "npx": "covered by the npm-script scan and the tsc/eslint assertions",
-        "python": "covered by the scripts/ scan and the pytest gate",
-        "python3": "covered by the scripts/ scan and the pytest gate",
-        "unshare": "namespace wrapper around the pytest gate",
-        # Diagnostic only: the blob-reconcile step in frontend-coverage-merge
-        # always exits 0 and never changes a job verdict, so it is not a gate.
-        "node": "runs the diagnostic frontend-blob-reconcile step, which never gates",
+        "python": "covered by the scripts/ scan and the scoped-test gate, which "
+                  "runs pytest (or falls back to the full suite)",
+        "python3": "covered by the scripts/ scan and the scoped-test gate, which "
+                   "runs pytest (or falls back to the full suite)",
+        "unshare": "namespace wrapper around the backend test gate",
+        # node runs two kinds of step: the diagnostic blob-reconcile step in
+        # frontend-coverage-merge (always exits 0, never a gate) and the
+        # bundle-size gate. The latter IS a gate and is carried in gates[]
+        # (analyze-mode build + scripts/check-bundle-size.mjs); this exemption
+        # covers only the diagnostic step. A future gating node step must be
+        # added to gates[] by hand -- the tool scan cannot see through this
+        # exemption, so keep the reason accurate.
+        "node": "diagnostic blob-reconcile step; the gating bundle-size step is in gates[]",
     }
     tools = set(re.findall(r"(?m)^\s*run: ([a-z][a-z0-9_-]+) ", run_text))
     tool_missing = sorted(
-        t for t in tools - set(exempt_tools) if not re.search(rf"\b{re.escape(t)}\b", gates)
+        t for t in tools - set(exempt_tools) if not re.search(rf"\b{re.escape(t)}\b", floor)
     )
     assert not tool_missing, (
-        f"ci.yml runs these tools but the gate floor does not: {tool_missing}. "
+        f"ci.yml runs these tools but the floor does not: {tool_missing}. "
         "Add each to profiles/kirocrew.json gates[] in its CI-exact form, or "
         "add it to exempt_tools here with the reason it is not a local gate."
     )
 
 
-def test_floor_typechecks_the_way_ci_does():
-    """`npm run typecheck` is a no-op gate; the floor must use `tsc -b`.
+def test_test_gates_are_diff_scoped_and_carry_a_base_ref():
+    """The test gates must be diff-aware, and that means a base ref is mandatory.
 
-    ci.yml documents this: the root tsconfig is `files: []` plus project
-    references, so `tsc --noEmit` -- what the `typecheck` script runs -- checks
-    ZERO files and always passes. A floor carrying the convenient script would
-    look enforced and catch nothing, which is worse than having no gate.
+    A diff-aware gate whose base ref is missing cannot know which surface the
+    change touches, so it would reduce the wrong suite -- a sibling of the
+    "no-op that always passes" failure `references/gate-floor.md` calls worse
+    than a missing gate. The runner fails closed on an empty base, so the floor's
+    job is to always supply one.
+    """
+    data = json.loads((PROFILES_DIR / "kirocrew.json").read_text(encoding="utf-8"))
+    gates = data["gates"]
+
+    for surface in ("backend", "frontend"):
+        entries = [g for g in gates if f"run_scoped_tests.py --surface {surface}" in g]
+        assert len(entries) == 1, f"expected exactly one {surface} test gate, got {entries}"
+        entry = entries[0]
+        assert "SCOPED_TESTS_BASE_REF=" in entry, (
+            f"the {surface} test gate must pass SCOPED_TESTS_BASE_REF; without it "
+            "the runner cannot know which surface the diff touches"
+        )
+        # Resolve-then-use, so an unresolvable base returns nonzero instead of
+        # inlining an empty substitution and reducing on nothing.
+        assert entry.startswith('BASE="$(git merge-base HEAD origin/main)" &&'), (
+            f"the {surface} test gate must resolve the base first and short-circuit"
+        )
+
+    assert "python3 scripts/run_scoped_tests.py --test" in gates, (
+        "the runner's self-test must sit ahead of its scans -- a PR that changes "
+        "the reducer has to fail the self-test, not silently reduce"
+    )
+
+
+def test_scoped_frontend_gate_keeps_the_lanes_npm_test_used_to_carry():
+    """A reduced frontend run must not silently drop jscpd or the Electron specs.
+
+    `npm --prefix website test` ran three things: `pretest` (jscpd), `test:website`
+    (vitest) and `test:electron`. The cross-surface path runs only vitest, so the
+    other two have to appear as gates in their own right or they vanish from the
+    floor without anyone deciding that they should.
+    """
+    data = json.loads((PROFILES_DIR / "kirocrew.json").read_text(encoding="utf-8"))
+    gates = "\n".join(data["gates"])
+    for script in ("jscpd", "test:electron"):
+        assert f"run {script}" in gates, (
+            f"{script!r} was covered transitively by `npm test`; the reduced "
+            "frontend gate does not run it, so it needs its own floor entry"
+        )
+
+
+def test_scoped_runner_self_test_passes():
+    """The runner's escalations are its whole contract, so CI runs its self-test.
+
+    Its `--test` mode asserts that an unresolvable base fails closed, that every
+    hardcoded broad-impact path resolves on disk, that surface ownership treats
+    documentation as backend-owned rather than inert, that the cross-surface list
+    arrives in each runner's own path space, and that a hostile target cannot
+    reach argv as an option. A green suite that never exercises those is not
+    evidence.
+    """
+    script = REPO_ROOT / "scripts" / "run_scoped_tests.py"
+    assert script.is_file(), "scripts/run_scoped_tests.py is missing"
+    proc = subprocess.run(
+        [sys.executable, str(script), "--test"],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, (
+        f"run_scoped_tests.py --test failed (rc={proc.returncode}):\n"
+        f"{proc.stdout}\n{proc.stderr}"
+    )
+
+
+def test_floor_typechecks_the_way_ci_does():
+    """The floor spells out `tsc -b` rather than going through an npm script.
+
+    Build mode is what makes the check real: the root tsconfig is `files: []`
+    plus project references, and references are followed only by `-b`, so any
+    single-project invocation there compiles an EMPTY program and passes
+    unconditionally. Naming the command directly means the floor cannot be
+    changed out from under itself by an edit to `package.json` -- the same reason
+    ci.yml's Type check step spells it out too.
     """
     gates = "\n".join(
         json.loads((PROFILES_DIR / "kirocrew.json").read_text(encoding="utf-8"))["gates"]
     )
     assert "tsc -b" in gates, "the gate floor no longer type-checks with `tsc -b`"
     assert "run typecheck" not in gates, (
-        "the floor uses the `typecheck` npm script, which checks zero files"
+        "the floor reaches type-checking through an npm script, so a package.json "
+        "edit can silently change what this gate runs"
+    )
+
+
+def test_typecheck_script_actually_type_checks():
+    """`npm run typecheck` must run in BUILD mode, or it checks nothing at all.
+
+    `website/tsconfig.json` is a solution-style config -- `{"files": [], "references":
+    [...]}`. TypeScript follows `references` only in build mode, so `tsc --noEmit`
+    there compiles an empty program: measured 0 files listed, exit 0 with a genuine
+    type error present in `src/App.tsx`. `npm run check` chains this script, so the
+    one command that looks like a pre-push gate would pass over the whole tree.
+
+    Nothing else pins the spelling, so without this a revert to `tsc --noEmit`
+    restores a gate that is enforced in appearance only.
+    """
+    scripts = json.loads(
+        (REPO_ROOT / "website" / "package.json").read_text(encoding="utf-8")
+    )["scripts"]
+    typecheck = scripts["typecheck"]
+
+    assert "tsc -b" in typecheck, (
+        f"website `typecheck` script is {typecheck!r}; it must use build mode "
+        "(`tsc -b`) because the root tsconfig has `files: []` and a "
+        "non-build invocation there type-checks zero files"
+    )
+    assert "--noEmit" not in typecheck, (
+        f"website `typecheck` script is {typecheck!r}; `--noEmit` selects "
+        "single-project mode, which compiles an empty program against the "
+        "solution-style root tsconfig"
     )
 
 
@@ -426,6 +637,7 @@ def test_gate_rationale_reference_exists_and_is_pointed_at():
 def test_bundled_kirocrew_profile_is_valid_json():
     data = json.loads((PROFILES_DIR / "kirocrew.json").read_text())
     assert data["name"] == "kirocrew"
+    assert isinstance(data["setup"], list)
     # Every reviewer must carry a served model id (no bare gpt-5.6).
     for r in data["reviewers"]:
         assert r["model"] and r["model"] != "gpt-5.6"
@@ -437,6 +649,8 @@ def test_toml_config_path(tmp_path):
         "[project]\n"
         'base_branch = "trunk"\n'
         "single_commit = true\n\n"
+        "[setup]\n"
+        'commands = ["make bootstrap"]\n\n'
         "[gates]\n"
         'commands = ["make check"]\n\n'
         "[review]\n"
@@ -451,6 +665,7 @@ def test_toml_config_path(tmp_path):
         prof = resolve_profile.resolve(str(tmp_path))
         assert prof["source"] == "config"
         assert prof["base_branch"] == "trunk"
+        assert prof["setup"] == ["make bootstrap"]
         assert prof["gates"] == ["make check"]
         assert prof["rule_files"] == ["AGENTS.md"]
         assert prof["reviewers"][0]["model"] == "gpt-5.6-sol"
@@ -474,14 +689,21 @@ def test_partial_toml_config_fills_gates_from_autodetect(tmp_path):
     prof = resolve_profile.resolve(str(tmp_path))
     assert prof["source"] == "config"
     assert prof["base_branch"] == "trunk"
+    assert prof["setup"] == []
     assert "python -m pytest -q" in prof["gates"]  # filled from auto-detect
 
 
 def test_normalize_defaults_fill_missing_keys():
     prof = resolve_profile.normalize({}, "generic")
-    for key in ("source", "base_branch", "single_commit", "gates",
+    for key in ("source", "base_branch", "single_commit", "setup", "gates",
                 "rule_files", "reviewers", "readiness"):
         assert key in prof
+
+
+def test_legacy_profile_without_setup_stays_compatible():
+    prof = resolve_profile.normalize({"gates": ["make check"]}, "config")
+    assert prof["setup"] == []
+    assert prof["gates"] == ["make check"]
 
 
 def test_single_commit_string_false_is_not_truthy():
@@ -498,6 +720,70 @@ def test_symlinked_config_is_refused(tmp_path):
     prof = resolve_profile.resolve(str(tmp_path))
     # A symlinked config is refused -> resolution does not take the "config" path.
     assert prof["source"] != "config"
+
+
+# --------------------------------------------------------------------------
+# TreeReader interface parity
+# --------------------------------------------------------------------------
+def test_tree_reader_worktree_and_pinned_parity(tmp_path):
+    """#6236: WorktreeReader and PinnedTreeReader share the TreeReader contract."""
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'parity'\n")
+    (tmp_path / "package.json").write_text('{"scripts": {"build": "npm run build"}}')
+    wf = tmp_path / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    (wf / "test-review.yml").write_text("name: test\n")
+    (wf / "other.yaml").write_text("name: other\n")
+
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial"], cwd=tmp_path, check=True)
+
+    wt_reader = resolve_profile.WorktreeReader(str(tmp_path))
+    pinned_reader = resolve_profile.PinnedTreeReader(str(tmp_path), "HEAD")
+
+    # has()
+    assert wt_reader.has("pyproject.toml") is True
+    assert pinned_reader.has("pyproject.toml") is True
+    assert wt_reader.has("missing.txt") is False
+    assert pinned_reader.has("missing.txt") is False
+
+    # read()
+    assert wt_reader.read("package.json") == '{"scripts": {"build": "npm run build"}}'
+    assert pinned_reader.read("package.json") == '{"scripts": {"build": "npm run build"}}'
+    assert wt_reader.read("missing.txt") is None
+    assert pinned_reader.read("missing.txt") is None
+
+    # ls()
+    assert wt_reader.ls(".github/workflows") == [
+        ".github/workflows/other.yaml",
+        ".github/workflows/test-review.yml",
+    ]
+    assert pinned_reader.ls(".github/workflows") == [
+        ".github/workflows/other.yaml",
+        ".github/workflows/test-review.yml",
+    ]
+    assert wt_reader.ls(".nonexistent") == []
+    assert pinned_reader.ls(".nonexistent") == []
+
+    # Detection functions take reader directly
+    assert resolve_profile.detect_gates(wt_reader) == ["python -m pytest -q", "npm run build"]
+    assert resolve_profile.detect_gates(pinned_reader) == ["python -m pytest -q", "npm run build"]
+    assert resolve_profile.detect_kirocrew(wt_reader) is False
+    assert resolve_profile.detect_kirocrew(pinned_reader) is False
+
+    reviewers = resolve_profile.detect_reviewers(wt_reader)
+    assert len(reviewers) == 1
+    assert reviewers[0]["name"] == "test-review"
+
+
+def test_unreadable_prepare_pr_toml_raises(tmp_path):
+    """A present but unreadable/malformed .prepare-pr.toml raises, never silently ignored."""
+    (tmp_path / ".prepare-pr.toml").write_bytes(b"\xff\xfe\x00\x00malformed")
+    with pytest.raises(Exception):
+        resolve_profile.resolve(str(tmp_path))
 
 
 # --------------------------------------------------------------------------

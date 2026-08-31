@@ -156,6 +156,28 @@ def test_delete_items_batch_is_never_called_on_the_event_loop():
     )
 
 
+def test_resolve_old_item_ids_is_never_called_on_the_event_loop():
+    """Ratchet: the full-source _old_item_ids read stays on a worker thread.
+
+    ``_resolve_old_item_ids`` materializes one row per item in the source --
+    tens of thousands on a large library, over a second of blocking SQLite --
+    so the ingest paths resolve it inside the off-loop duplicate-gate hop. A
+    call added straight to a coroutine body reintroduces the per-ingest loop
+    stall this helper exists to prevent, so it must fail here rather than in
+    production. Nested closures handed to ``run_to_completion`` (the gate
+    hops) are not coroutine bodies and correctly do not trip this.
+    """
+    offenders = _on_loop_call_sites("_resolve_old_item_ids")
+    assert offenders == [], (
+        "_resolve_old_item_ids is reached from the event loop at:\n  "
+        + "\n  ".join(offenders)
+        + "\nResolve the group inside the off-loop duplicate-gate hop (the "
+          "run_to_completion(_gate) closure) as ingest_file/ingest_text do, or "
+          "wrap the call in asyncio.to_thread. The read is a full-source scan "
+          "and must never run on the loop thread."
+    )
+
+
 @pytest.mark.asyncio
 async def test_handle_deleted_runs_the_delete_off_the_loop_thread(tmp_path, monkeypatch):
     """The offload is real: the delete executes on some other thread."""
@@ -601,15 +623,6 @@ def test_deduped_state_write_drops_the_group_the_gate_just_deleted(tmp_path):
         store.close()
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "Pre-existing on main, not introduced here: a transformed file's ownership "
-    "bookkeeping is inert because _adopt_reassigned_item matches a folder row on "
-    "COALESCE(text_hash, content_hash) and a refused row's text_hash is derived "
-    "from a byte-identical SIBLING row, which a lone PDF does not have. main "
-    "writes an unconditional empty group here, so the row never named the item "
-    "either. Closing it needs the incoming document's TEXT hash carried out of "
-    "the gate instead of guessed, which changes what the gate reports. Strict, so "
-    "this starts failing the moment someone lands that and the xfail goes stale."))
 @pytest.mark.asyncio
 async def test_deduped_state_write_recovers_a_transformed_files_reassigned_item(tmp_path):
     """A transformed file must not be stranded when adoption silently matched nothing.
@@ -901,7 +914,7 @@ async def test_duplicate_gate_records_terminal_state_even_when_cancelled(tmp_pat
         started = asyncio.Event()
         release = threading.Event()
 
-        def finalizer() -> None:
+        def finalizer(_text_hash: str) -> None:
             recorded.append("terminal state written")
 
         real_gate = pipeline._skip_as_duplicate
@@ -993,7 +1006,7 @@ async def test_duplicate_gate_and_terminal_state_are_one_transaction(tmp_path):
             "SELECT id FROM items WHERE source_id = ?", (target,)).fetchall()]
         assert superseded, "nothing to supersede -- the delete under test is a no-op"
 
-        def exploding_finalizer() -> None:
+        def exploding_finalizer(_text_hash: str) -> None:
             raise RuntimeError("terminal state write failed")
 
         with pytest.raises(RuntimeError, match="terminal state write failed"):

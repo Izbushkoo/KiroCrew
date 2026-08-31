@@ -10,7 +10,7 @@
 // - user-facing copy comes from the failure `code`, not from the raw library
 //   `message`
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, act, fireEvent } from '@testing-library/react'
+import { render, screen, cleanup, act, fireEvent, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 
@@ -75,6 +75,30 @@ describe('AboutPanel download states', () => {
     cleanup()
     vi.unstubAllGlobals()
     delete (window as unknown as { updateAPI?: unknown }).updateAPI
+  })
+
+  it('takes the lane pair from the live push over the mount-time getInfo answer', async () => {
+    // `info` is a one-shot getInfo() read from mount; every later check pushes its
+    // own answer on the lifecycle payload. A check that runs while this panel is
+    // open therefore has to win, or the chip keeps folding on a stale not-ahead
+    // and renames insider bytes to a stable release that does not exist.
+    const { setState } = mountWithStates({
+      version: '0.5.0-insider.2',
+      channel: 'stable',
+      stampedChannel: 'insider',
+      channelSwitchable: true,
+      // The mount-time answer: stable publishes exactly these bytes.
+      laneVersion: '0.5.0-insider.2',
+      runningAheadOfLane: false,
+    })
+    // With only that, the chip folds -- the promoted-stable case.
+    const chip = await screen.findByTestId('about-version')
+    await waitFor(() => expect(chip.textContent).toContain('0.5.0'))
+    expect(chip.textContent).not.toContain('insider')
+
+    // A later check finds stable at an OLDER release: these bytes are ahead of it.
+    setState({ state: 'not-available', laneVersion: '0.4.1-insider.1', runningAheadOfLane: true })
+    await waitFor(() => expect(chip.textContent).toContain('0.5.0-insider.2'))
   })
 
   it('renders a determinate progress bar when percent is present', async () => {
@@ -160,21 +184,33 @@ describe('AboutPanel download states', () => {
   it('keeps the install button terminal after dispatch (no re-arm before the quit)', async () => {
     // `update:install` resolves as soon as the install is DISPATCHED; on macOS the
     // platform installer then works for several more seconds before the app quits.
-    // The button must NOT become clickable again in that window -- a clickable
-    // "Restart & Update" followed by an unexplained quit reads as a crash.
+    // The button must NOT become clickable again in that window -- an
+    // install-and-restart action followed by an unexplained quit reads as a crash.
     const { setState } = mountWithStates()
     setState({ state: 'downloaded', version: '0.1.3' })
 
-    const btn = await screen.findByRole('button', { name: /restart & update/i })
+    const btn = await screen.findByRole('button', { name: /install update & restart app/i })
     expect(btn.hasAttribute('disabled')).toBe(false)
     fireEvent.click(btn)
 
     const restarting = await screen.findByRole('button', { name: /restarting/i })
     // The card's last words before the gateway goes down must explain the
-    // coming silence -- the dashboard disconnects for the whole handoff.
-    expect((await screen.findByTestId('update-card')).textContent).toMatch(/go quiet/i)
+    // potentially long handoff and the automatic return.
+    const cardText = (await screen.findByTestId('update-card')).textContent
+    expect(cardText).toMatch(/several minutes/i)
+    expect(cardText).toMatch(/reopen automatically/i)
+    expect(cardText).not.toMatch(/installation progress/i)
     expect(restarting.hasAttribute('disabled')).toBe(true)
-    expect(screen.queryByRole('button', { name: /restart & update/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /install update & restart app/i })).toBeNull()
+  })
+
+  it('warns before dispatch when Windows will take over in a separate installer window', async () => {
+    const { setState } = mountWithStates()
+    setState({ state: 'downloaded', version: '0.1.3', installHandoff: 'windows-installer' })
+
+    const cardText = (await screen.findByTestId('update-card')).textContent
+    expect(cardText).toMatch(/Windows installation window/i)
+    expect(cardText).toMatch(/progress/i)
   })
 
   // When an update downloads but never applies, the card just re-offers the

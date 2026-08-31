@@ -25,12 +25,18 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import logging
 import os
 import pathlib
+import queue
 import sys
 import tempfile
+from logging.handlers import QueueListener
 
 import pytest
+
+from kiro_crew import cli
+from kiro_crew.log_redaction import install_log_redaction
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _ROOT_CONFTEST = _REPO_ROOT / "conftest.py"
@@ -126,6 +132,236 @@ class TestTheDataHomeIsPinnedForEveryTestpath:
         assert config_dir().resolve() == mine.resolve()
 
 
+class TestTheAgentSpecHomeIsPinnedForEveryTestpath:
+    """The agent specs decide which MCP servers the operator's real agent has.
+
+    A third axis, and the reason it needs one: ``kiro_agents_dir()`` is a LAZY
+    resolver (``kiro_home()`` -> ``$KIRO_HOME`` or ``Path.home()/.kiro``), so the data
+    home does not reach it and neither does ``_SHARED_KIRO_PATHS`` -- whose own ratchet
+    docstring records lazy resolvers as outside its scope. Before this floor part
+    existed, a suite run inside a throwaway clone rewrote the machine-wide
+    ``kirocrew.json`` with that clone's venv and a per-test data home in ``env``, and
+    every new session on the machine then failed ``internal_auth_mismatch`` once both
+    were deleted (#4912).
+    """
+
+    def test_the_spec_write_target_is_not_the_operators_real_home(self) -> None:
+        from kiro_crew import agent
+
+        target = agent.kiro_agents_dir_path().resolve()
+
+        assert not _inside_a_guarded_root(target), (
+            f"the agent-spec write target is a real home path: {target}"
+        )
+
+    def test_every_seam_in_the_tables_is_actually_pinned(self) -> None:
+        """A table entry nobody patches is documentation, not isolation."""
+        unpinned = []
+        for module, attr in _root._AGENT_SPEC_HOOKS:
+            mod = sys.modules.get(module)
+            if mod is None:
+                unpinned.append(f"{module} not imported, so {attr} could not be set")
+                continue
+            value = getattr(mod, attr, None)
+            if value is None or _inside_a_guarded_root(pathlib.Path(value).resolve()):
+                unpinned.append(f"{module}.{attr} = {value!r}")
+
+        assert not unpinned, "these agent-spec seams still resolve a real home:\n" + "\n".join(
+            f"    {entry}" for entry in unpinned
+        )
+
+    def test_the_resolver_itself_is_pinned_so_no_consumer_needs_registering(self) -> None:
+        """The single accessor: one override inside the function body covers everyone.
+
+        This is what replaced a per-module table. 16 modules bind ``kiro_agents_dir``
+        by name and that copies the function OBJECT, so patching this module's
+        attribute never reached them -- but a value the function BODY reads does,
+        because a function's globals are always its defining module's. Asserting on a
+        module that binds the name by hand is what proves the reach, not the
+        definition site.
+        """
+        from kiro_crew.config import paths
+        from kiro_crew.slack import handler
+
+        assert paths._agents_dir_override is not None, "the floor installed no override"
+        assert handler.kiro_agents_dir is paths.kiro_agents_dir, (
+            "slack.handler no longer binds the resolver by name, so this test has "
+            "stopped proving that a bound copy honours the override"
+        )
+        assert not _inside_a_guarded_root(handler.kiro_agents_dir().resolve())
+
+    def test_the_hook_modules_are_imported_so_the_table_can_reach_them(self) -> None:
+        """The session fixture's whole job: patching cannot precede importing.
+
+        Distinct from the assertion above, which would also pass if a module simply
+        happened to be imported by collection. This one is what makes the four write
+        seams' coverage independent of collection order.
+        """
+        missing = [
+            module for module, _attr in _root._AGENT_SPEC_HOOKS if sys.modules.get(module) is None
+        ]
+
+        assert not missing, f"hook modules never imported, so their seams leak: {missing}"
+
+    def test_a_test_that_redirects_the_home_itself_is_followed(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The pin defers rather than overriding a test's own isolation.
+
+        ~35 tests isolate with ``patch("<module>.Path.home", ...)`` -- global by
+        construction, since ``from pathlib import Path`` binds the same class object
+        everywhere -- and then read through a module's own resolver. A pin that
+        answered a fixed tmp dir regardless would hand those tests an empty directory
+        instead of the tree they just built, which is how an earlier revision of this
+        floor broke five test groups at once.
+        """
+        from kiro_crew.config import paths
+
+        monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
+
+        assert paths.kiro_agents_dir() == tmp_path / ".kiro" / "agents"
+
+    def test_the_two_resolvers_cannot_drift_apart_on_the_default(
+        self, unpinned_agent_spec_home
+    ) -> None:
+        """With no override installed the two answers must be the SAME default.
+
+        They are compared against each other by the write guard, so a layout change
+        landing in only one of them would read a shared target as private and fail
+        OPEN on the machine-wide home. Delegation makes that impossible by
+        construction; this pins it so a future edit that re-spells the default in both
+        places still has to keep them equal.
+        """
+        from kiro_crew.config import paths
+
+        assert paths.kiro_agents_dir() == paths.ambient_agents_dir()
+
+    def test_one_directory_is_shared_across_the_seams(self) -> None:
+        """A spec written through one seam has to be readable through another."""
+        from kiro_crew import agent, agent_discovery
+
+        assert agent.KIRO_AGENTS_DIR == agent_discovery._KIRO_AGENTS_DIR
+
+    def test_the_guards_ambient_reference_is_left_resolving_the_real_home(self) -> None:
+        """The write guard's AMBIENT reference must stay override-blind.
+
+        ``_decline_shared_agent_home`` asks "is my target the one every instance under
+        this environment shares?", so it reads ``ambient_agents_dir()`` -- which
+        deliberately does NOT follow ``_agents_dir_override``. Point it at the honouring
+        resolver instead and the pin moves both sides of that comparison together: the
+        guard reads a privately redirected target as the shared one, then declines from
+        a linked git worktree -- green in CI, red on a developer machine, which is the
+        setup this repo mandates.
+        """
+        from kiro_crew.config import paths
+
+        assert _inside_a_guarded_root(paths.ambient_agents_dir().resolve()), (
+            "ambient_agents_dir followed the override; the write guard can no longer "
+            "tell a redirected target from the shared one"
+        )
+        assert (
+            paths.kiro_agents_dir() != paths.ambient_agents_dir()
+        ), "the two resolvers agree, so the guard's comparison proves nothing"
+
+        from kiro_crew import agent
+
+        assert agent._decline_shared_agent_home(audit=False) is None, (
+            "the floor's pinned target is being treated as the shared agent home"
+        )
+
+    def test_the_ambient_resolver_has_exactly_one_caller(self) -> None:
+        """``ambient_agents_dir`` is override-BLIND, so a second caller is a leak.
+
+        Its docstring says "not a general-purpose reader" -- this makes that
+        enforceable. Anything that reads it resolves the operator's REAL agents dir
+        even under the floor's pin, which is the leak this seam exists to close; the
+        write guard is the one caller whose question is genuinely about the
+        environment.
+        """
+        allowed = {"kiro_crew/config/paths.py", "kiro_crew/agent.py"}
+        callers = set()
+        for path in sorted(_SRC.rglob("*.py")):
+            if "_vendor" in path.parts:
+                continue
+            rel = path.relative_to(_REPO_ROOT / "src").as_posix()
+            if rel in allowed:
+                continue
+            try:
+                source = path.read_text(encoding="utf-8")
+            except OSError:  # pragma: no cover - unreadable source
+                continue
+            if "ambient_agents_dir" in source:
+                callers.add(rel)
+
+        assert not callers, (
+            "ambient_agents_dir is override-blind and gained new readers, each of "
+            f"which resolves the operator's real agents dir: {sorted(callers)}. Use "
+            "kiro_agents_dir() unless the question is genuinely about the environment."
+        )
+
+    def test_a_new_agents_dir_hook_is_an_opt_in_none_not_a_frozen_path(self) -> None:
+        """The half of the deleted ratchet that did NOT become obsolete.
+
+        Retiring the per-module table killed the bound-NAME half of that ratchet -- a
+        bound copy now honours the override by construction. This half survives: a
+        module-level ``*KIRO_AGENTS_DIR`` initialized to a RESOLVED path freezes the
+        answer at import, so it follows neither the override nor the hook table and
+        nothing goes red. ``None`` (the opt-in hook shape) and a plain string literal
+        (``security``'s ``.kiro/agents`` matcher) are the two legitimate shapes.
+        """
+        frozen: dict[str, int] = {}
+        for path in sorted(_SRC.rglob("*.py")):
+            if "_vendor" in path.parts or "/tests/" in path.as_posix():
+                continue
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except (OSError, SyntaxError):  # pragma: no cover - unreadable source
+                continue
+            rel = path.relative_to(_REPO_ROOT / "src").as_posix()
+            pending: list[ast.stmt] = list(tree.body)
+            while pending:
+                node = pending.pop(0)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                pending.extend(
+                    child for child in ast.iter_child_nodes(node) if isinstance(child, ast.stmt)
+                )
+                if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
+                    continue
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                named = [
+                    t
+                    for t in targets
+                    if isinstance(t, ast.Name) and t.id.endswith("KIRO_AGENTS_DIR")
+                ]
+                if not named:
+                    continue
+                if isinstance(node.value, ast.Constant) and (
+                    node.value.value is None or isinstance(node.value.value, str)
+                ):
+                    continue
+                for target in named:
+                    frozen[f"{rel} {target.id}"] = node.lineno
+
+        assert not frozen, (
+            "these module-level agents-dir hooks are initialized to something other "
+            "than None or a string literal, so they freeze a path at import and follow "
+            "neither the resolver override nor the hook table:\n"
+            + "\n".join(f"    {where}:{line}" for where, line in sorted(frozen.items()))
+        )
+
+    def test_a_test_can_still_override_the_seams_itself(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The floor is a safety net, not a cage."""
+        from kiro_crew import agent
+
+        mine = tmp_path / "my-own-agents"
+        monkeypatch.setattr(agent, "KIRO_AGENTS_DIR", mine)
+
+        assert agent.kiro_agents_dir_path() == mine
+
+
 class TestTheSharedKiroPathsArePinned:
     """``~/.kiro`` is kiro-cli's own home -- machine-wide, shared with the real agent.
 
@@ -203,15 +439,13 @@ class TestTheSharedKiroPathRatchet:
         # longer matches the thing it protects -- weakening the guard to satisfy an
         # isolation ratchet, which is backwards.
         ("kiro_crew/security.py", "_EXTRACT_INTO_TRUST_ROOT_RE"): "security anchor: must name the REAL home",
-        # Also not redirectable: the home-anchoring IS the security property. These name
-        # OTHER products' credential stores (kiro-cli, amazon-q), and the module's own
-        # comment records that an entry either equals the home-anchored path inside
-        # `_SENSITIVE_HOME_DIRS`' fence or falls outside it and must not be trusted --
-        # so a redirected value would manufacture a forgeable "trusted" path. They are
-        # only ever READ, and `test_kiro_usage_api.py` stubs the tuples per test, which
-        # is the right seam: stub the READER, never move the anchor.
-        ("kiro_crew/dashboard/handlers/kiro_usage_api.py", "_CLI_SQLITE_DBS"): "security anchor: must name the REAL home",
-        ("kiro_crew/dashboard/handlers/kiro_usage_api.py", "_OTHER_SQLITE_DBS"): "security anchor: must name the REAL home",
+        # The kiro-cli/amazon-q sqlite tuples that used to sit here as direct
+        # ``Path.home()`` bindings are now PROJECTIONS over the canonical table in
+        # ``kiro_crew/identity_stores.py`` (``sqlite_dbs(...)`` resolves the home
+        # inside the call), so they no longer match this tripwire's import-time
+        # shape and need no exclusion. Their anchor rule ("must name the REAL
+        # home"; stub the READER, never move the anchor) is carried forward by
+        # ``test_identity_stores.py::TestUsageTuplesAnchorTheRealHome``.
         # An ALLOW-LIST root, so the same rule applies from the other direction: the
         # file browser's first permitted root is the operator's real home BY DESIGN,
         # since that is the directory the user is entitled to browse. Redirecting it
@@ -528,6 +762,350 @@ class TestTheWorkingDirectoryIsRestored:
         )
 
 
+# ── driving the floor's own between-test restores ─────────────────────────
+
+
+def _autouse_floor_generator(name: str):
+    """The plain generator function behind one of the rootdir conftest's autouse fixtures.
+
+    The floor tests below drive one setup -> teardown cycle of the REAL fixture code,
+    which is what lets a SINGLE test observe the restore the floor performs between
+    tests. An injector/observer pair cannot do that reliably: pytest-split partitions
+    the collected suite into shard groups BEFORE xdist runs, so it can place the two
+    halves in different CI shards regardless of any ``xdist_group`` mark, and an
+    observer whose meaning depends on which test ran before it is unprovable in a
+    sharded run.
+
+    Asserts the attribute still IS an autouse fixture on the way through: the floor's
+    guarantee is that it fires around every test, and a fixture demoted to a plain
+    helper (or one whose ``autouse`` was dropped) would still pass a direct drive.
+    """
+    definition = getattr(_root, name)
+    marker = getattr(definition, "_fixture_function_marker", None) or getattr(
+        definition, "_pytestfixturefunction", None
+    )
+    assert marker is not None and marker.autouse, (
+        f"conftest.{name} is not an autouse fixture, so the floor it implements is unarmed"
+    )
+    return getattr(definition, "__wrapped__", definition)
+
+
+def _listener_thread_alive(listener: QueueListener) -> bool:
+    """Whether the listener's drain thread is still running.
+
+    ``QueueListener.stop`` joins the thread and then drops the handle, so a stopped
+    listener reports ``None`` here. Checked rather than trusting the cleared slot: the
+    leak this floor absorbs is the live thread and the descriptor it holds, and dropping
+    the reference alone would satisfy every assertion about the slot while leaking both.
+    """
+    thread = getattr(listener, "_thread", None)
+    return thread is not None and thread.is_alive()
+
+
+class TestDynamicCredentialEnvironmentIsRestored:
+    """A dynamic per-host Jira token must not leak to the next test.
+
+    ``load_credentials`` propagates ``JIRA_TOKEN_<HEX>`` keys even though they are
+    not members of the fixed ``_CREDENTIAL_KEYS`` tuple, so the floor's restore has
+    to recognise the dynamic shape too — a snapshot bounded to the fixed keys would
+    pass over it. The restore under test is ``conftest._no_credential_env_residue``'s
+    own teardown, driven directly (see ``_autouse_floor_generator``).
+    """
+
+    def test_this_test_starts_without_the_dynamic_token(self) -> None:
+        """Which is only true if no earlier test on this worker leaked one."""
+        assert "JIRA_TOKEN_AABBCC" not in os.environ
+
+    def test_an_injected_dynamic_token_is_removed_by_the_floors_own_teardown(self) -> None:
+        """One full cycle of the real fixture: snapshot while absent, inject, restore.
+
+        A failure part-way cannot leak the token past this test: the live autouse
+        instance of the same fixture wraps this test too, and its snapshot predates
+        the injection.
+        """
+        cycle = _autouse_floor_generator("_no_credential_env_residue")()
+        next(cycle)  # the floor's setup: snapshot, taken while the token is absent
+
+        os.environ["JIRA_TOKEN_AABBCC"] = "token-from-this-test"
+
+        with pytest.raises(StopIteration):
+            next(cycle)  # the floor's teardown: the restore under test
+        assert "JIRA_TOKEN_AABBCC" not in os.environ
+
+
+# ── the logging record factory ─────────────────────────────────────────────
+
+
+class TestTheLogRecordFactoryIsRestored:
+    """``logging.setLogRecordFactory`` is ONE process-global slot, per worker.
+
+    ``log_redaction``'s wrapper clears ``args`` and ``exc_info`` on every record created
+    after it, so a test that leaves it installed reds whatever unrelated test later
+    asserts on either field -- and because PR CI shards, the victim usually lands in a
+    different process and the pollution is invisible until an unsharded release run.
+    ``conftest._restore_log_record_factory`` is what removes the class; without a test,
+    an edit to it reverts silently and the failures reappear in files that have nothing
+    to do with the cause. Its teardown is driven directly (see
+    ``_autouse_floor_generator``), so the proof needs no adjacent observer test.
+    """
+
+    def test_this_test_starts_with_the_stdlib_factory(self) -> None:
+        """Which is only true if no earlier test on this worker left a wrapper installed."""
+        assert logging.getLogRecordFactory() is logging.LogRecord
+
+    def test_a_leaked_wrapper_is_removed_by_the_floors_own_teardown(self) -> None:
+        """One full cycle of the real fixture: snapshot, install and leave installed, restore.
+
+        The install is exactly the leak the floor absorbs in the wild — a test driving
+        the real ``cli.main()`` reaches ``_setup_cli_logging``, which installs this
+        wrapper and never removes it. A failure part-way cannot leak the wrapper past
+        this test: the live autouse instance of the same fixture wraps this test too,
+        and its snapshot predates the install.
+        """
+        cycle = _autouse_floor_generator("_restore_log_record_factory")()
+        next(cycle)  # the floor's setup: snapshot, taken while the stdlib factory holds
+
+        install_log_redaction([])
+        assert logging.getLogRecordFactory() is not logging.LogRecord
+
+        with pytest.raises(StopIteration):
+            next(cycle)  # the floor's teardown: the restore under test
+        assert logging.getLogRecordFactory() is logging.LogRecord, (
+            f"the record factory is still {logging.getLogRecordFactory()!r} -- a wrapper "
+            "left installed by a test would rewrite every later record on its worker"
+        )
+
+    def test_the_restore_target_is_what_the_test_inherited_not_the_stdlib(self) -> None:
+        """The floor restores the INHERITED factory, so a higher-scoped installer survives.
+
+        Pinned because it is the documented reason the floor is a fixture rather than a
+        ``pytest_runtest_setup`` hookimpl: a class- or module-scoped fixture that installs
+        a factory for its whole scope must not have it torn out after the first test.
+        """
+        sentinel_calls: list[str] = []
+
+        def sentinel(*args: object, **kwargs: object) -> logging.LogRecord:
+            sentinel_calls.append("made")
+            return logging.LogRecord(*args, **kwargs)  # type: ignore[arg-type]
+
+        before = logging.getLogRecordFactory()
+        logging.setLogRecordFactory(sentinel)
+        try:
+            cycle = _autouse_floor_generator("_restore_log_record_factory")()
+            next(cycle)  # snapshot taken while the sentinel is installed
+            install_log_redaction([])
+            with pytest.raises(StopIteration):
+                next(cycle)
+            assert logging.getLogRecordFactory() is sentinel, (
+                "the floor restored past the factory this cycle inherited, so a "
+                "higher-scoped installer would be torn out after its first test"
+            )
+        finally:
+            logging.setLogRecordFactory(before)
+
+
+# ── logger levels ──────────────────────────────────────────────────────────
+
+
+class TestLoggerLevelsAreRestored:
+    """A logger's level is PROCESS-GLOBAL, per worker, and HIERARCHICAL.
+
+    Together those are what make this leak class so hard to attribute. ``Logger.debug``
+    gates on the EFFECTIVE level, so an explicit level left on ``kiro_crew`` decides what
+    every ``kiro_crew.*`` logger in the worker may emit, and it outranks the root level
+    ``caplog.at_level()`` sets -- the victim gets ``caplog.text == ""``, nothing at all
+    rather than the wrong text, from a test that passes alone. The suite reaches this
+    through ``cli._setup_cli_logging``, which pins ``kiro_crew`` at WARNING, and which
+    test modules across the suite run for real by driving ``cli.main()`` in process.
+
+    ``conftest._restore_logger_levels`` is what removes the class; without a test, an edit
+    to it reverts silently and the failures reappear in files that have nothing to do with
+    the cause. Its teardown is driven directly (see ``_autouse_floor_generator``), so the
+    proof needs no adjacent observer test.
+    """
+
+    def test_this_test_starts_with_an_unconfigured_kiro_crew_logger(self) -> None:
+        """Which is only true if no earlier test on this worker left a level on it."""
+        assert logging.getLogger("kiro_crew").level == logging.NOTSET
+
+    def test_a_leaked_level_is_removed_by_the_floors_own_teardown(self) -> None:
+        """One full cycle of the real fixture: snapshot, pin a level and leave it, restore.
+
+        The pin is exactly the leak the floor absorbs in the wild — ``_setup_cli_logging``
+        sets ``kiro_crew`` to WARNING once per process and never undoes it. A failure
+        part-way cannot leak the level past this test: the live autouse instance of the
+        same fixture wraps this test too, and its snapshot predates the pin.
+        """
+        cycle = _autouse_floor_generator("_restore_logger_levels")()
+        next(cycle)  # the floor's setup: snapshot, taken while the level is NOTSET
+
+        logging.getLogger("kiro_crew").setLevel(logging.WARNING)
+        assert logging.getLogger("kiro_crew").level == logging.WARNING
+
+        with pytest.raises(StopIteration):
+            next(cycle)  # the floor's teardown: the restore under test
+        level = logging.getLogger("kiro_crew").level
+        assert level == logging.NOTSET, (
+            f"kiro_crew is still pinned at {logging.getLevelName(level)} -- every "
+            "kiro_crew.* record below that level would be dropped before it reaches "
+            "the root handler caplog captures through"
+        )
+
+    def test_a_logger_created_during_the_test_is_restored_to_pristine(self) -> None:
+        """The gap a plain snapshot cannot see: a logger that did not exist at setup.
+
+        The floor restores a name missing from its "before" snapshot to the pristine
+        ``(NOTSET, enabled)`` state rather than passing over it, and this is the only
+        place that behaviour is exercised with a genuinely fresh name.
+        """
+        name = "kiro_crew._floor_probe_6351"
+        assert name not in logging.Logger.manager.loggerDict
+
+        cycle = _autouse_floor_generator("_restore_logger_levels")()
+        next(cycle)  # snapshot taken while the logger does not exist
+
+        probe = logging.getLogger(name)
+        probe.setLevel(logging.CRITICAL)
+        probe.disabled = True
+
+        with pytest.raises(StopIteration):
+            next(cycle)
+        assert probe.level == logging.NOTSET and probe.disabled is False, (
+            "a logger created mid-test kept its configuration -- the floor's "
+            "missing-from-snapshot branch no longer restores to pristine"
+        )
+
+    def test_a_debug_record_from_a_kiro_crew_logger_still_reaches_caplog(self, caplog) -> None:
+        """The capability the level restore exists to protect, asserted directly.
+
+        The level assertion above pins the mechanism; this pins the OUTCOME, in the exact
+        shape the victim test uses -- ``at_level`` on the root logger, a ``debug`` call on
+        a ``kiro_crew.*`` child -- so a future floor that restores something subtly
+        different still has to keep this working.
+        """
+        with caplog.at_level("DEBUG"):
+            logging.getLogger("kiro_crew.slack.gateway").debug("floor canary")
+        assert "floor canary" in caplog.text
+
+
+# ── the CLI log queue listener ─────────────────────────────────────────────
+
+
+class TestTheLogQueueListenerIsRestored:
+    """``cli._LOG_QUEUE_LISTENER`` is ONE process-global slot, per worker.
+
+    ``_setup_cli_logging`` starts a ``QueueListener`` for a LONG-LIVED command and never
+    stops it -- correct in production, which does it once per process -- so every test
+    that drives the real ``cli.main()`` for ``serve`` / ``gateway`` / ``chat`` leaves one
+    running. The SHORT-LIVED branch then reads it: it takes the ``else`` path and does not
+    touch the global, so a test asserting a short-lived verb starts no listener sees the
+    PREVIOUS test's and fails on its own first line, in a file that cleans up after itself
+    correctly. Two tests in ``test_cli_logging.py`` assert exactly that, and under
+    ``-n auto --dist loadgroup`` whether a leaker precedes them on the worker varies run
+    to run, so it surfaces as an intermittent failure rather than an ordering bug.
+
+    ``conftest._restore_log_queue_listener`` is what removes the class; without a test, an
+    edit to it reverts silently and the failures reappear as a flake. Its teardown is
+    driven directly (see ``_autouse_floor_generator``), so the proof needs no adjacent
+    observer test.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_cli_logging(self, monkeypatch):
+        """Foreground mode, and remove the handlers these tests' real setup calls attach.
+
+        Driving the real ``_setup_cli_logging`` is the point -- a test that assigned the
+        global instead would pass even if the production install site moved -- but it also
+        attaches a handler holding an open descriptor, and the floor under test
+        deliberately does not restore handlers. Removing only what this test ADDED is what
+        ``_pristine_logging`` does; the snapshotted list is never written back, because
+        ``caplog`` swaps a handler on the root logger at every phase boundary and writing
+        a setup-phase list back during teardown would drop the one it is capturing
+        through.
+        """
+        monkeypatch.setattr("kiro_crew.cli._fd_targets_file", lambda fd, path: False)
+        loggers = (logging.getLogger(), logging.getLogger("kiro_crew"))
+        saved = [(lgr, lgr.handlers[:]) for lgr in loggers]
+        yield
+        for lgr, handlers in saved:
+            for handler in lgr.handlers[:]:
+                if handler not in handlers:
+                    lgr.removeHandler(handler)
+                    handler.close()
+
+    def test_this_test_starts_with_no_listener(self) -> None:
+        """Which is only true if no earlier test on this worker left one running."""
+        assert cli._LOG_QUEUE_LISTENER is None
+
+    def test_a_leaked_listener_is_removed_by_the_floors_own_teardown(self) -> None:
+        """One full cycle of the real fixture: snapshot, leak a listener, restore.
+
+        The leak is produced by the real ``_setup_cli_logging`` on the real long-lived
+        branch, which is exactly how it happens in the wild, so the test still fails if
+        the production install site moves. A failure part-way cannot leak the listener
+        past this test: the live autouse instance of the same fixture wraps this test too,
+        and its snapshot predates the install.
+        """
+        cycle = _autouse_floor_generator("_restore_log_queue_listener")()
+        next(cycle)  # the floor's setup: snapshot, taken while the slot is empty
+
+        cli._setup_cli_logging("gateway", 1)
+        leaked = cli._LOG_QUEUE_LISTENER
+        assert leaked is not None, "the long-lived branch no longer starts a listener"
+
+        with pytest.raises(StopIteration):
+            next(cycle)  # the floor's teardown: the restore under test
+        assert cli._LOG_QUEUE_LISTENER is None, (
+            f"the slot still holds {cli._LOG_QUEUE_LISTENER!r} -- the next test to run "
+            "_setup_cli_logging for a SHORT-LIVED command would read this listener and "
+            "fail asserting it started none"
+        )
+        assert not _listener_thread_alive(leaked), (
+            "the listener object was dropped but its thread is still running -- it holds "
+            "the file handler's descriptor open on a gateway.log under a tmp_path the "
+            "next test deletes"
+        )
+
+    def test_the_restore_target_is_what_the_test_inherited(self, monkeypatch) -> None:
+        """The floor restores the INHERITED listener, so a higher-scoped installer survives.
+
+        Same reason the record-factory floor restores to its snapshot: a class- or
+        module-scoped fixture that starts a listener for its whole scope must not have it
+        torn out after the first test.
+        """
+        sentinel = QueueListener(queue.SimpleQueue())
+        monkeypatch.setattr(cli, "_LOG_QUEUE_LISTENER", sentinel)
+
+        cycle = _autouse_floor_generator("_restore_log_queue_listener")()
+        next(cycle)  # snapshot taken while the sentinel holds the slot
+
+        cli._setup_cli_logging("gateway", 1)
+        assert cli._LOG_QUEUE_LISTENER is not sentinel
+
+        with pytest.raises(StopIteration):
+            next(cycle)
+        assert cli._LOG_QUEUE_LISTENER is sentinel, (
+            "the floor restored past the listener this cycle inherited, so a "
+            "higher-scoped installer would be torn out after its first test"
+        )
+
+    def test_a_short_lived_command_leaves_the_slot_alone(self, monkeypatch) -> None:
+        """The production behaviour the floor exists to accommodate, pinned at source.
+
+        ``_setup_cli_logging`` deliberately does not clear the global on the short-lived
+        branch -- a listener a long-lived command started genuinely still exists -- which
+        is why the leak is absorbed in the test seam rather than by clearing it there. If
+        this ever changes, the floor becomes redundant rather than wrong, and this test is
+        what says so.
+        """
+        sentinel = QueueListener(queue.SimpleQueue())
+        monkeypatch.setattr(cli, "_LOG_QUEUE_LISTENER", sentinel)
+
+        cli._setup_cli_logging("status", 1)
+
+        assert cli._LOG_QUEUE_LISTENER is sentinel
+
+
 # ── the worker budget ─────────────────────────────────────────────────────
 
 
@@ -558,8 +1136,8 @@ class TestTheWorkerBudgetIsMemoryBounded:
         invoked: a test that inspected only the live plugin manager would pass from
         ``test/`` even after a regression put the hook back in the wrong file.
         """
-        root_conftest = (_REPO_ROOT / "conftest.py").read_text()
-        suite_conftest = (_REPO_ROOT / "test" / "conftest.py").read_text()
+        root_conftest = (_REPO_ROOT / "conftest.py").read_text(encoding="utf-8")
+        suite_conftest = (_REPO_ROOT / "test" / "conftest.py").read_text(encoding="utf-8")
         hook = "def pytest_xdist_auto_num_workers"
 
         assert hook in root_conftest, (

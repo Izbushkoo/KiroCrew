@@ -24,6 +24,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, ArrowDownToLine, ArrowLeft, ArrowUpFromLine, FileDown, Loader2, MessageSquare, Play, Sparkles, TerminalSquare, X, ChevronDown, ChevronUp } from 'lucide-react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { Btn } from '../../components/ui'
+import { useConfirm } from '../../components/ConfirmDialog'
 import { useIsMobile } from '../../hooks/useIsMobile'
 import SearchableSelect from '../../components/SearchableSelect'
 import { useAppDispatch, useAppSelector } from '../../store'
@@ -96,6 +97,7 @@ const isFlushAbort = (err: Error): boolean => err.message === FLUSH_FAILED
  */
 
 export default function PapyrusPage() {
+  const { confirm, confirmDialog } = useConfirm()
   const queryClient = useQueryClient()
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
@@ -452,11 +454,13 @@ export default function PapyrusPage() {
     //
     // Placed above the clear so the early return leaves every guard exactly as it
     // was; the ordering the tests pin (clear -> reload) is unchanged.
-    if (dirtyRef.current && !window.confirm(
-      i18nT('apps.papyrus.workspace.co_author_conflict_discard_confirm', {
+    if (dirtyRef.current && !(await confirm({
+      title: i18nT('apps.papyrus.workspace.co_author_conflict_discard_title'),
+      body: i18nT('apps.papyrus.workspace.co_author_conflict_discard_confirm', {
         file: conflicted ?? '',
       }),
-    )) return
+      confirmLabel: i18nT('apps.papyrus.workspace.co_author_conflict_discard_button'),
+    }))) return
     // Cleared BEFORE the reload, and the refs too: `reloadOpenFile` refuses to adopt
     // while the buffer is dirty, and its no-flush branch would otherwise re-record the
     // very conflict being resolved. So the guard has to be down for the reload to run.
@@ -486,7 +490,7 @@ export default function PapyrusPage() {
       dirtyRef.current = true
       setDirty(true)
     }
-  }, [reloadOpenFile])
+  }, [reloadOpenFile, confirm])
 
   const applyCompileResult = useCallback((result: Awaited<ReturnType<typeof papyrusApi.compile>>) => {
     setDiagnostics(Array.isArray(result.errors) ? result.errors : [])
@@ -882,7 +886,7 @@ export default function PapyrusPage() {
         {hasConflict && (
           // The conflict has to be VISIBLE and have an exit. A silent read-only editor
           // whose saves fail would be worse than the overwrite it replaced.
-          <span className="flex items-center gap-2 text-[12px] text-warning">
+          <span className="flex items-center gap-2 text-[12px] text-warn">
             <AlertTriangle className="lucide-inline" />
             {i18nT('apps.papyrus.workspace.co_author_conflict')}
             <Btn onClick={resolveConflict}>
@@ -1056,7 +1060,7 @@ export default function PapyrusPage() {
           </div>
 
           {/* Status bar */}
-          <div className="flex items-center gap-4 px-3 py-1 border-t border-border bg-bg-subtle text-[12px] text-muted shrink-0">
+          <div className="flex items-center gap-4 px-3 py-1 border-t border-border bg-bg-accent text-[12px] text-muted shrink-0">
             <span title={i18nT('apps.papyrus.workspace.save_and_compile_hint')}>
               {i18nT('apps.papyrus.workspace.cursor_position', { line: cursor.line, column: cursor.column })}
             </span>
@@ -1133,6 +1137,7 @@ export default function PapyrusPage() {
           )}
         </AnimatePresence>
       </div>
+      {confirmDialog}
     </div>
   )
 }

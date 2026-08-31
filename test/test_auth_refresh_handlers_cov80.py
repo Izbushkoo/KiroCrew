@@ -30,7 +30,7 @@ import json
 import time
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -43,11 +43,47 @@ from kiro_crew.dashboard.refresh_tokens import (
     RefreshStateManager,
     generate_refresh_token,
     refresh_cookie_name,
+    refresh_token_peer_key,
+    refresh_token_requires_peer,
+    validate_refresh_token,
 )
-from kiro_crew.dashboard.tailnet import TailnetTrust
-from kiro_crew.dashboard.token_auth import MAX_SESSION_TTL_SECS, generate_token
+from kiro_crew.dashboard.tailnet import ForwardedPeer, TailnetTrust
+from kiro_crew.dashboard.token_auth import (
+    MAX_SESSION_TTL_SECS,
+    _b64url_decode,
+    generate_token,
+    required_peer_key_unverified,
+    validate_token,
+)
 
 PORT = 7777
+PHONE_PEER_KEY = "ts:node:phone@example.com|phone.tail.ts.net"
+
+
+def _phone_peer(node: str = "phone.tail.ts.net") -> ForwardedPeer:
+    return ForwardedPeer(
+        login="phone@example.com",
+        node=node,
+        address="100.64.0.5",
+    )
+
+
+def _phone_trust(*, pin_scope: str = "node") -> TailnetTrust:
+    return TailnetTrust(
+        trust_identity=True,
+        allowed_logins=("phone@example.com",),
+        pin_scope=pin_scope,
+    )
+
+
+def _legacy_claimless_require_peer_refresh() -> tuple[str, str, str, float]:
+    """Build the pre-fix signed shape that had require_peer but no peer_key."""
+    token, chain_id, jti, exp = generate_refresh_token("phone")
+    payload = json.loads(rt._b64url_decode(token.split(".", 1)[0]))
+    payload["require_peer"] = "1"
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    encoded = rt._b64url_encode(raw)
+    return f"{encoded}.{rt._sign(raw)}", chain_id, jti, exp
 
 
 @pytest.fixture(autouse=True)
@@ -288,6 +324,299 @@ async def test_me_reports_both_expiries(state: RefreshStateManager) -> None:
 
 
 @pytest.mark.asyncio
+async def test_me_reads_session_exp_from_the_validated_credential(
+    state: RefreshStateManager,
+) -> None:
+    """``session_exp`` comes from ``request["auth_token"]``, not a re-extracted cookie.
+
+    The middleware publishes the credential it actually validated. Extraction
+    order here is no longer guaranteed to reproduce it (a valid ``?token=`` wins
+    over the cookie, and an invalid one now falls back to it), so reading the
+    cookie blind can report another credential's expiry — and this value is what
+    drives the frontend's proactive-refresh scheduler.
+    """
+    short_cookie = generate_token("alice", ttl_seconds=3600, register_nonce=False)
+    validated = generate_token("alice", ttl_seconds=MAX_SESSION_TTL_SECS, register_nonce=False)
+    request = _mk("GET", "/api/auth/me", user="alice", cookies={f"mc_token_{PORT}": short_cookie})
+    request["auth_token"] = validated
+
+    payload = _body(await h.api_auth_me(request))
+    # The published credential's ceiling, not the 1-hour cookie's.
+    assert payload["session_exp"] > time.time() + 3600 + 60
+
+
+@pytest.mark.asyncio
+async def test_me_falls_back_to_the_cookie_when_nothing_was_published(
+    state: RefreshStateManager,
+) -> None:
+    """A surface that published no credential still reports a usable expiry.
+
+    On the first request of a link exchange the published credential is the link
+    token, whose nonce that request just added to the cookie denylist, so the
+    numeric read yields nothing. Falling back keeps this no worse than the
+    re-extraction it replaces.
+    """
+    access = generate_token("bob", ttl_seconds=MAX_SESSION_TTL_SECS, register_nonce=False)
+    request = _mk("GET", "/api/auth/me", user="bob", cookies={f"mc_token_{PORT}": access})
+    payload = _body(await h.api_auth_me(request))
+    assert payload["session_exp"] > time.time()
+
+
+@pytest.mark.asyncio
+async def test_require_peer_is_enforced_before_the_grace_replay_return(
+    state: RefreshStateManager,
+) -> None:
+    """The grace-replay branch must not hand back a cached pair unverified.
+
+    Regression for a check sited too late: grace replay re-serves the previously
+    issued pair and re-sets BOTH cookies without minting anything, so a peer
+    check placed at the mint left a REFRESH_GRACE_SECS window in which a replayed
+    token was honoured with no identity check at all.
+    """
+    refresh, chain_id, jti, _exp = generate_refresh_token(
+        "phone", require_peer=True, peer_key=PHONE_PEER_KEY
+    )
+    # Stage exactly the state the grace branch reads: this jti consumed as the
+    # chain head, with the replacement pair it minted available for replay.
+    state.mark_consumed(
+        jti,
+        chain_id,
+        time.time() + 3600,
+        "203.0.113.9",
+        json.dumps(
+            {
+                "session_exp": time.time() + 3600,
+                "refresh_exp": time.time() + 3600,
+                "_access_token": "cached-access",
+                "_refresh_token": "cached-refresh",
+            }
+        ),
+    )
+    request = _mk(
+        "POST",
+        "/api/auth/refresh",
+        origin="http://localhost:7777",
+        cookies={refresh_cookie_name(str(PORT)): refresh},
+    )
+    response = await h.api_auth_refresh(request)
+    assert response.status == 401
+    # The machine id is the contract; ``error`` is localizable prose.
+    assert _body(response)["code"] == "peer_identity_unverified"
+    # No credential leaked through the replay path.
+    assert "Set-Cookie" not in response.headers
+    # Refused, NOT revoked - an unverified caller must not be able to sign a
+    # legitimate session out by replaying one consumed token.
+    assert not state.is_chain_revoked(chain_id)
+
+
+@pytest.mark.asyncio
+async def test_require_peer_chain_refuses_to_rotate_without_a_verified_peer(
+    state: RefreshStateManager,
+) -> None:
+    """An identity-bound chain must not rotate when no tailnet peer resolves.
+
+    This is the whole security argument for the persistent QR shape: it drops the
+    boot bound, so identity is the only thing left bounding it. An address pin is
+    no substitute — behind ``tailscale serve`` every request arrives from
+    127.0.0.1, so ``ip:127.0.0.1`` excludes nobody on the tailnet.
+
+    The chain is REFUSED, not revoked: identity resolution fails transiently, and
+    burning a 30-day credential over a daemon blip would turn a recoverable
+    hiccup into a re-scan.
+    """
+    refresh, chain_id, _jti, _exp = generate_refresh_token(
+        "phone", require_peer=True, peer_key=PHONE_PEER_KEY
+    )
+    request = _mk(
+        "POST",
+        "/api/auth/refresh",
+        origin="http://localhost:7777",
+        cookies={refresh_cookie_name(str(PORT)): refresh},
+    )
+    response = await h.api_auth_refresh(request)
+    assert response.status == 401
+    # The machine id is the contract; ``error`` is localizable prose.
+    assert _body(response)["code"] == "peer_identity_unverified"
+    # Refused, NOT revoked - the same chain must still be usable once identity
+    # can be established again.
+    assert not state.is_chain_revoked(chain_id)
+
+
+def test_require_peer_survives_rotation_and_defaults_off() -> None:
+    """The claim is carried, and absent by default.
+
+    A chain that lost the claim on its first rotation would silently become an
+    ordinary rotating session - the same defect one rotation later.
+    """
+    bound, _c, _j, _e = generate_refresh_token("phone", require_peer=True, peer_key=PHONE_PEER_KEY)
+    assert refresh_token_requires_peer(bound) is True
+    assert refresh_token_peer_key(bound) == PHONE_PEER_KEY
+    plain, _c2, _j2, _e2 = generate_refresh_token("desktop")
+    assert refresh_token_requires_peer(plain) is False
+
+
+def test_require_peer_refresh_cannot_be_minted_without_a_device_key() -> None:
+    with pytest.raises(ValueError, match="original peer_key"):
+        generate_refresh_token("phone", require_peer=True)
+
+
+def test_require_peer_fails_closed_on_an_undecodable_payload() -> None:
+    """An undecodable payload answers True, not False.
+
+    The conservative direction here is the opposite of ``refresh_token_boot``'s:
+    answering False would let a signed-but-unreadable token rotate WITHOUT the
+    identity check its chain was minted to require.
+    """
+    assert refresh_token_requires_peer("not-a-token") is True
+    assert refresh_token_requires_peer("") is True
+
+
+@pytest.mark.asyncio
+async def test_require_peer_rotation_preserves_signed_device_on_both_cookies(
+    state: RefreshStateManager,
+    audit: list,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A matching peer may rotate, and neither half may lose the binding."""
+    monkeypatch.setattr(h, "resolve_forwarded_peer", AsyncMock(return_value=_phone_peer()))
+    token, _chain, _jti, _exp = generate_refresh_token(
+        "phone", require_peer=True, peer_key=PHONE_PEER_KEY
+    )
+    response = await h.api_auth_refresh(
+        _mk(
+            cookies={refresh_cookie_name(str(PORT)): token},
+            app_keys={"tailnet_trust": _phone_trust()},
+        )
+    )
+    assert response.status == 200
+    new_access = response.cookies[f"mc_token_{PORT}"].value
+    new_refresh = response.cookies[refresh_cookie_name(str(PORT))].value
+    assert required_peer_key_unverified(new_access) == PHONE_PEER_KEY
+    assert refresh_token_peer_key(new_refresh) == PHONE_PEER_KEY
+    assert refresh_token_requires_peer(new_refresh) is True
+
+
+@pytest.mark.asyncio
+async def test_require_peer_rotation_rejects_another_allowed_node_without_consuming(
+    state: RefreshStateManager,
+    audit: list,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same allowlisted login is insufficient for a node-scoped credential."""
+    monkeypatch.setattr(
+        h,
+        "resolve_forwarded_peer",
+        AsyncMock(return_value=_phone_peer("other-phone.tail.ts.net")),
+    )
+    token, chain_id, jti, _exp = generate_refresh_token(
+        "phone", require_peer=True, peer_key=PHONE_PEER_KEY
+    )
+    response = await h.api_auth_refresh(
+        _mk(
+            cookies={refresh_cookie_name(str(PORT)): token},
+            app_keys={"tailnet_trust": _phone_trust()},
+        )
+    )
+    assert response.status == 401
+    assert _body(response)["code"] == "peer_identity_mismatch"
+    assert "Set-Cookie" not in response.headers
+    assert not state.is_consumed(jti)
+    assert not state.is_chain_revoked(chain_id)
+
+
+@pytest.mark.asyncio
+async def test_legacy_claimless_require_peer_refresh_requires_one_rescan(
+    state: RefreshStateManager,
+    audit: list,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verified peer cannot claim an unsafe pre-fix chain after restart."""
+    monkeypatch.setattr(h, "resolve_forwarded_peer", AsyncMock(return_value=_phone_peer()))
+    token, chain_id, jti, _exp = _legacy_claimless_require_peer_refresh()
+    response = await h.api_auth_refresh(
+        _mk(
+            cookies={refresh_cookie_name(str(PORT)): token},
+            app_keys={"tailnet_trust": _phone_trust()},
+        )
+    )
+    assert response.status == 401
+    assert _body(response)["code"] == "peer_binding_missing"
+    assert "Set-Cookie" not in response.headers
+    assert not state.is_consumed(jti)
+    assert not state.is_chain_revoked(chain_id)
+
+
+@pytest.mark.asyncio
+async def test_require_peer_grace_replay_checks_signed_device_before_cached_pair(
+    state: RefreshStateManager,
+    audit: list,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-IP replay from another node cannot receive cached replacement cookies."""
+    monkeypatch.setattr(
+        h,
+        "resolve_forwarded_peer",
+        AsyncMock(return_value=_phone_peer("other-phone.tail.ts.net")),
+    )
+    token, chain_id, jti, _exp = generate_refresh_token(
+        "phone", require_peer=True, peer_key=PHONE_PEER_KEY
+    )
+    state.mark_consumed(
+        jti,
+        chain_id,
+        time.time() + 3600,
+        "203.0.113.9",
+        json.dumps(
+            {
+                "session_exp": time.time() + 3600,
+                "refresh_exp": time.time() + 3600,
+                "_access_token": "cached-access",
+                "_refresh_token": "cached-refresh",
+            }
+        ),
+    )
+    response = await h.api_auth_refresh(
+        _mk(
+            cookies={refresh_cookie_name(str(PORT)): token},
+            app_keys={"tailnet_trust": _phone_trust()},
+        )
+    )
+    assert response.status == 401
+    assert _body(response)["code"] == "peer_identity_mismatch"
+    assert "Set-Cookie" not in response.headers
+    assert not state.is_chain_revoked(chain_id)
+
+
+@pytest.mark.asyncio
+async def test_require_peer_rotation_preserves_signed_login_scope(
+    state: RefreshStateManager,
+    audit: list,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issued scope, rather than today's config, controls refresh comparison."""
+    login_key = "ts:login:phone@example.com"
+    monkeypatch.setattr(
+        h,
+        "resolve_forwarded_peer",
+        AsyncMock(return_value=_phone_peer("replacement-phone.tail.ts.net")),
+    )
+    token, _chain, _jti, _exp = generate_refresh_token(
+        "phone", require_peer=True, peer_key=login_key
+    )
+    response = await h.api_auth_refresh(
+        _mk(
+            cookies={refresh_cookie_name(str(PORT)): token},
+            app_keys={"tailnet_trust": _phone_trust(pin_scope="node")},
+        )
+    )
+    assert response.status == 200
+    assert required_peer_key_unverified(response.cookies[f"mc_token_{PORT}"].value) == login_key
+    assert (
+        refresh_token_peer_key(response.cookies[refresh_cookie_name(str(PORT))].value) == login_key
+    )
+
+
+@pytest.mark.asyncio
 async def test_me_reports_zero_refresh_exp_for_an_unusable_refresh_cookie(
     state: RefreshStateManager,
 ) -> None:
@@ -377,6 +706,123 @@ async def test_refresh_happy_path_rotates_both_cookies(
     assert state.is_consumed(jti)
     assert audit[-1] == ("alice", "refresh_token_use", "ok", "")
     assert chain_id
+
+
+@pytest.mark.asyncio
+async def test_rotation_carries_the_boot_binding_onto_both_new_cookies(
+    state: RefreshStateManager, audit: list
+) -> None:
+    """Rotation must CARRY the boot claim rather than drop it.
+
+    This is the one place the "signed in until the gateway restarts" guarantee
+    can be lost without anything else noticing: drop the claim and the rotated
+    pair is an ordinary 20h/30d session that keeps working after the restart it
+    was supposed to end at.
+
+    Re-deriving the id instead of carrying it is deliberately NOT asserted here,
+    because it is not reachable as a defect — validate_refresh_token has already
+    rejected a stale binding, so in-process the carried and re-derived values are
+    the same. Writing a test that "caught" it would only be testing the mock.
+
+    Asserted on the SET-COOKIE values rather than on the JSON body, because the
+    body deliberately carries no tokens — the cookies are the credential that
+    the phone actually keeps.
+    """
+    from kiro_crew.dashboard import boot_id
+    from kiro_crew.dashboard.refresh_tokens import refresh_token_boot
+
+    bid = boot_id.current_boot_id()
+    token, _chain, _jti, _exp = generate_refresh_token("alice", boot=bid)
+    response = await h.api_auth_refresh(_mk(cookies={refresh_cookie_name(str(PORT)): token}))
+    assert response.status == 200
+
+    cookies = {morsel.key: morsel.value for morsel in response.cookies.values()}
+
+    new_access = cookies[f"mc_token_{PORT}"]
+    new_refresh = cookies[refresh_cookie_name(str(PORT))]
+
+    assert json.loads(_b64url_decode(new_access.split(".")[0]))["boot"] == bid
+    assert refresh_token_boot(new_refresh) == bid
+
+    # And the rotated pair dies with the process, which is the property the
+    # carrying exists to preserve.
+    with patch.object(boot_id, "_boot_id", "a-different-process"):
+        valid, _uid, _reason = validate_token(new_access, use_session_exp=True)
+        assert not valid
+        r_valid, _u, _r, _c, _j, _e = validate_refresh_token(new_refresh)
+        assert not r_valid
+
+
+@pytest.mark.asyncio
+async def test_a_boot_bound_rotation_keeps_its_address_pin(
+    state: RefreshStateManager, audit: list
+) -> None:
+    """The pin must survive rotation, or enabling refresh loses it silently.
+
+    A phone-access session used to be minted ``no_refresh``, so it never rotated
+    and the ``ip:`` pin set at the token->session exchange held for its whole
+    life. Letting it rotate without carrying the pin means a stolen rotated
+    cookie authenticates from any reachable peer — which is the regression this
+    asserts against, on the path where tailnet identity trust is OFF (the
+    default) and the tailnet branch therefore does nothing.
+    """
+    from kiro_crew.dashboard import boot_id
+    from kiro_crew.dashboard.token_auth import _state as _token_state
+    from kiro_crew.dashboard.token_auth import check_token_ip
+
+    def rt_state_has_binding(tok: str) -> bool:
+        return _token_state.has_binding(tok)
+
+    token, _chain, _jti, _exp = generate_refresh_token("alice", boot=boot_id.current_boot_id())
+    request = _mk(cookies={refresh_cookie_name(str(PORT)): token})
+    response = await h.api_auth_refresh(request)
+    assert response.status == 200
+
+    new_access = response.cookies[f"mc_token_{PORT}"].value
+    # Asserted FIRST and explicitly: check_token_ip returns True for an UNBOUND
+    # token, so a bare "the right peer passes" assertion passes vacuously on
+    # exactly the bug this test exists to catch.
+    assert rt_state_has_binding(new_access), "rotated token was left unbound"
+    assert check_token_ip(new_access, request.remote), "rotated token lost its address pin"
+    assert not check_token_ip(new_access, "198.51.100.7"), "pin must reject another peer"
+
+
+@pytest.mark.asyncio
+async def test_an_unbound_rotation_is_left_unpinned(
+    state: RefreshStateManager, audit: list
+) -> None:
+    """Ordinary sessions keep today's roaming behaviour.
+
+    Pinning every rotation would break a laptop that changes address mid-session,
+    which currently survives because its rotated token is unbound. That is a
+    separate decision, so this pins the scope of the fix above.
+    """
+    from kiro_crew.dashboard.token_auth import _state as _token_state
+    from kiro_crew.dashboard.token_auth import check_token_ip
+
+    token, _chain, _jti, _exp = generate_refresh_token("alice")
+    response = await h.api_auth_refresh(_mk(cookies={refresh_cookie_name(str(PORT)): token}))
+    assert response.status == 200
+    new_access = response.cookies[f"mc_token_{PORT}"].value
+    # Asserted on the BINDING itself, not via check_token_ip: that helper answers
+    # True for an unbound token, so it cannot tell "unbound" from "bound and
+    # matching" and would pass either way.
+    assert not _token_state.has_binding(new_access)
+    assert check_token_ip(new_access, "198.51.100.7")
+
+
+@pytest.mark.asyncio
+async def test_rotation_of_an_unbound_chain_stays_unbound(
+    state: RefreshStateManager, audit: list
+) -> None:
+    """The default path must not acquire a binding it never asked for."""
+    from kiro_crew.dashboard.refresh_tokens import refresh_token_boot
+
+    token, _chain, _jti, _exp = generate_refresh_token("alice")
+    response = await h.api_auth_refresh(_mk(cookies={refresh_cookie_name(str(PORT)): token}))
+    assert response.status == 200
+    value = response.cookies[refresh_cookie_name(str(PORT))].value
+    assert refresh_token_boot(value) == ""
 
 
 @pytest.mark.asyncio

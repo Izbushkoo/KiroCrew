@@ -8,8 +8,8 @@ used — auth is entirely delegated to the user's own ``gh`` CLI session.
 Layout::
 
     <data_dir>/config.json                          # connected repos, no secrets
-    <data_dir>/repos/{owner}__{repo}/issues-cache.json  # last-fetched open issues
-    <data_dir>/repos/{owner}__{repo}/members-cache.json # repo members (derived)
+    <data_dir>/repos/{owner}/{repo}/issues-cache.json   # last-fetched open issues
+    <data_dir>/repos/{owner}/{repo}/members-cache.json  # repo members (derived)
 
 ``root`` is accepted on every function (mirroring code_review_sage's
 ``store.py``) so tests can point at a tmp dir instead of the real app data dir.
@@ -71,13 +71,6 @@ def _config_lock(root: Path | None = None):
     with open(lock_path, "w") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             yield
-
-
-def repo_slug_dir_name(owner: str, repo: str) -> str:
-    # Use nested directories (owner/repo) so repos whose names contain "__"
-    # don't collide.  This helper remains for migration/test use; repo_data_dir
-    # is the canonical path builder.
-    return f"{owner}/{repo}"
 
 
 # ── provider-scoped storage ─────────────────────────────────────────────────
@@ -631,7 +624,31 @@ def add_connected_repo(
 # on the server. Any provider not listed here is matched case-SENSITIVELY -- the
 # fail-safe default for an authorization gate, so an unknown/self-managed
 # provider never silently widens the allowlist to case-variants.
+#
+# Azure DevOps is deliberately ABSENT. Its documented uniqueness rule for both
+# project names and Git repository names is "must not be identical", which does
+# not state a case-folding rule; the naming-restrictions page states one
+# explicitly only for Artifacts FEED names ("can't differ from another feed name
+# only by capitalization"), and that explicit contrast is evidence against
+# assuming the same for projects and repos. Listing it on an unverified
+# assumption is the one direction that fails unsafely: it would merge two
+# distinct projects' caches and admit a case-variant through the gate. It can be
+# added once the behaviour is confirmed against a real organization.
 _CASE_INSENSITIVE_NAME_PROVIDERS = frozenset({"github"})
+
+
+def name_compare_key(name: str, provider: str) -> str:
+    """``name`` reduced to the form ``provider``'s case semantics compare on.
+
+    The ONE definition of "same name" for a provider. A caller that needs a dict
+    or set key rather than a pairwise comparison -- a probe memo, a
+    connected-repo membership test -- goes through this instead of hand-rolling a
+    ``.casefold()``, so it cannot drift from :func:`_name_matches` and start
+    disagreeing with the authorization gate about which names are the same.
+    """
+    if provider.lower() in _CASE_INSENSITIVE_NAME_PROVIDERS:
+        return name.casefold()
+    return name
 
 
 def _name_matches(a: str, b: str, provider: str) -> bool:
@@ -644,9 +661,7 @@ def _name_matches(a: str, b: str, provider: str) -> bool:
     case-variant of a connected GitLab project pass the gate and then resolve to
     a DIFFERENT project under the owner's credentials.
     """
-    if provider.lower() in _CASE_INSENSITIVE_NAME_PROVIDERS:
-        return a.casefold() == b.casefold()
-    return a == b
+    return name_compare_key(a, provider) == name_compare_key(b, provider)
 
 
 def _same_repo(
@@ -1268,9 +1283,17 @@ def _normalize_tagging(raw: Any) -> dict[str, list[dict]]:
 
 
 def read_tagging_cache(owner: str, repo: str, root: Path | None = None) -> dict | None:
-    """Return ``{"suggestions", "generated_at"}`` for a repo, or None when
-    nothing has been generated yet (an unreadable / stale-schema file is a miss,
-    same guard as the other caches)."""
+    """Return ``{"suggestions", "generated_at", "ui_language"}`` for a repo, or None
+    when nothing has been generated yet (an unreadable / stale-schema file is a
+    miss, same guard as the other caches).
+
+    ``ui_language`` is the BCP-47 tag the cached ``reason`` text was WRITTEN in, so
+    a caller can tell a servable entry from one that predates a language switch.
+    Absent reads as ``""`` — identical to the unconfigured sentinel — which is why
+    adding it did not need a schema bump: a document written before this field is
+    still valid, and an install that never set a language keeps every cached
+    suggestion across the upgrade. Bumping the schema would have discarded them
+    all, which is a worse trade for a field whose absence is meaningful."""
     path = tagging_cache_path(owner, repo, root)
     if not path.is_file():
         return None
@@ -1283,12 +1306,13 @@ def read_tagging_cache(owner: str, repo: str, root: Path | None = None) -> dict 
     return {
         "suggestions": _normalize_tagging(data.get("suggestions")),
         "generated_at": str(data.get("generated_at") or ""),
+        "ui_language": str(data.get("ui_language") or ""),
     }
 
 
 def _write_tagging_cache_unlocked(
     owner: str, repo: str, suggestions: dict[str, list[dict]], generated_at: str,
-    root: Path | None = None,
+    root: Path | None = None, ui_language: str = "",
 ) -> None:
     atomic_write(
         tagging_cache_path(owner, repo, root),
@@ -1296,6 +1320,7 @@ def _write_tagging_cache_unlocked(
             {
                 "schema": TAGGING_CACHE_SCHEMA, "owner": owner, "repo": repo,
                 "suggestions": suggestions, "generated_at": generated_at,
+                "ui_language": ui_language,
             },
             indent=2,
         ),
@@ -1303,21 +1328,65 @@ def _write_tagging_cache_unlocked(
 
 
 def merge_tagging_suggestions(
-    owner: str, repo: str, batch: dict[str, list[dict]], *, root: Path | None = None
+    owner: str, repo: str, batch: dict[str, list[dict]], *,
+    verify_language: Callable[[], str],
+    root: Path | None = None, ui_language: str = "",
 ) -> dict:
     """Merge one generated batch into the repo's cached suggestions; return the
-    merged document.
+    merged document, or the untouched one when the batch is refused.
 
     The batch WINS for the issues it covers — a regenerate must replace a stale
     proposal — while every issue outside the batch keeps its existing entry, so
-    analysing the queue in slices accumulates instead of overwriting."""
+    analysing the queue in slices accumulates instead of overwriting.
+
+    EXCEPT across a language change. Each cached entry carries `reason` prose, so
+    accumulating a batch generated in one language on top of entries generated in
+    another would leave the queue showing two languages at once, with nothing to
+    say which rows are which. When the stored tag differs from ``ui_language`` the
+    surviving entries are dropped and the batch starts a fresh document: a
+    regenerate the user can trigger is a better state than a permanently mixed
+    one. Same reasoning as the issue-ai cache, which refuses a hit whose tag no
+    longer matches.
+
+    ``verify_language`` is what makes that safe under concurrency, and it has to
+    be checked HERE rather than by the caller. The caller's own pre-write check
+    and this write would not be atomic, so a switch landing between them lets a
+    stale generation replace a newer-language one that already landed — the replace
+    semantics above turn a lost race into lost data. Re-reading the configured
+    language inside the lock closes that: the check and the write it authorises
+    cannot be separated. REQUIRED, not optional: there is one caller and it always
+    has a language to verify against, so a default would only offer a way to write
+    without the guard that makes writing safe. Refusing returns the CURRENT
+    document with ``stale_language`` set, so the caller can report that nothing was
+    written rather than claiming a batch it did not persist. The stored language is
+    deliberately NOT echoed back: no caller reads it, and the one place that needs
+    it -- the two tagging routes' servable-cache gate -- reads it from
+    :func:`read_tagging_cache`, which is where it lives.
+
+    Deliberately a callable rather than a compare-and-set on the stored tag: a CAS
+    would also refuse the ordinary case of two same-language batches accumulating
+    slice by slice, where the second read the document before the first wrote. What
+    makes a write valid is that the CONFIGURED language is still the one the batch
+    was generated under, not what other writers did in the meantime."""
     with _tagging_cache_lock(owner, repo, root):
+        if verify_language() != ui_language:
+            current = read_tagging_cache(owner, repo, root)
+            return {
+                "suggestions": (current or {}).get("suggestions") or {},
+                "generated_at": (current or {}).get("generated_at") or "",
+                "stale_language": True,
+            }
         current = read_tagging_cache(owner, repo, root)
-        merged = dict(current["suggestions"]) if current else {}
+        if current is not None and str(current.get("ui_language") or "") == ui_language:
+            merged = dict(current["suggestions"])
+        else:
+            merged = {}
         merged.update(_normalize_tagging(batch))
         generated_at = _now_iso()
-        _write_tagging_cache_unlocked(owner, repo, merged, generated_at, root)
-    return {"suggestions": merged, "generated_at": generated_at}
+        _write_tagging_cache_unlocked(
+            owner, repo, merged, generated_at, root, ui_language=ui_language
+        )
+    return {"suggestions": merged, "generated_at": generated_at, "stale_language": False}
 
 
 def drop_tagging_suggestions(
@@ -1331,8 +1400,167 @@ def drop_tagging_suggestions(
             return {"suggestions": {}, "generated_at": ""}
         drop = {int(n) for n in numbers}
         remaining = {k: v for k, v in current["suggestions"].items() if int(k) not in drop}
-        _write_tagging_cache_unlocked(owner, repo, remaining, current["generated_at"], root)
+        # Carries the stored tag through: this rewrites the document, and dropping
+        # the tag here would make every surviving entry read as "generated with no
+        # language configured" and become servable again after a switch.
+        _write_tagging_cache_unlocked(
+            owner, repo, remaining, current["generated_at"], root,
+            ui_language=str(current.get("ui_language") or ""),
+        )
         return {"suggestions": remaining, "generated_at": current["generated_at"]}
+
+
+# ── dependency-edge cache (blocked-by / blocking graph) ──────────────────────
+#
+# One document per repo holding the dependency DAG for its OPEN work items: the
+# GitHub-native blocked-by edges plus the ones we infer from timeline
+# cross-references. Schema-versioned exactly like ISSUES_CACHE_SCHEMA — a stale
+# or missing stamp reads as a MISS (returns None) so the /deps route refetches
+# with the current edge shape rather than serving a graph missing a field.
+#
+#   v1: {schema, fetched_at, edges:[{blocked, blocker, source}], nodes:{...}}
+DEPS_CACHE_SCHEMA = 1
+
+# How long a synced dependency graph is served before it is considered stale.
+#
+# This constant has TWO consumers with DIFFERENT needs, which is why it stays at
+# ten minutes even though the /deps route alone would be happy with hours:
+#
+#   * the /deps route, which since serve-stale-revalidate-behind no longer blocks
+#     a request on an expired cache (it returns the stale graph and refreshes in
+#     the background), so for the route this TTL governs how often a BACKGROUND
+#     rebuild fires and a long value would be harmless;
+#   * crew_runtime._read_or_refresh_deps, the sweep that feeds SIG_DEP_UNBLOCKED.
+#     For the sweep this TTL IS the freshness horizon on which a crew waiting for
+#     its blocker to merge gets woken, so raising it directly delays that wake.
+#
+# Serve-stale already removes the ~11s stall a user could hit here, so there is
+# nothing left to buy by stretching it -- and the cost would land on the sweep,
+# not on the route that wanted it. Decoupling the two horizons (a long refresh
+# interval for the route, a short one for the sweep) is a separate change.
+DEPS_CACHE_TTL_SEC = 600.0
+
+# Edge provenance. A native edge is one GitHub itself records via the
+# dependencies API; an inferred edge is backfilled from a timeline
+# cross-reference so the graph is useful in repos where nobody sets native
+# dependencies. A native edge WINS over an inferred duplicate (see
+# _normalize_deps).
+DEP_SOURCE_NATIVE = "native"
+DEP_SOURCE_INFERRED = "inferred"
+_DEP_SOURCES = (DEP_SOURCE_NATIVE, DEP_SOURCE_INFERRED)
+
+
+def deps_cache_path(owner: str, repo: str, root: Path | None = None) -> Path:
+    return repo_data_dir(owner, repo, root) / "deps-cache.json"
+
+
+def _normalize_deps(
+    edges: Any, nodes: Any
+) -> tuple[list[dict], dict[str, dict]]:
+    """Coerce a raw deps payload to ``(edges, nodes)`` in the stored shape.
+
+    Deliberately tolerant: a partially-written or hand-edited document should
+    degrade to a smaller graph, never break the /deps route. Edges are
+    deduplicated on the ``(blocked, blocker)`` pair with a NATIVE edge winning
+    over an inferred duplicate (a self-edge, or one with a non-positive number,
+    is dropped). ``nodes`` keeps only well-formed entries keyed by the number as
+    a string, matching the on-the-wire JSON object-key type.
+    """
+    by_pair: dict[tuple[int, int], dict] = {}
+    if isinstance(edges, list):
+        for raw in edges:
+            if not isinstance(raw, dict):
+                continue
+            raw_blocked = raw.get("blocked")
+            raw_blocker = raw.get("blocker")
+            if raw_blocked is None or raw_blocker is None:
+                continue
+            try:
+                blocked = int(raw_blocked)
+                blocker = int(raw_blocker)
+            except (TypeError, ValueError):
+                continue
+            if blocked <= 0 or blocker <= 0 or blocked == blocker:
+                continue
+            source = raw.get("source")
+            if source not in _DEP_SOURCES:
+                source = DEP_SOURCE_INFERRED
+            pair = (blocked, blocker)
+            existing = by_pair.get(pair)
+            # Native wins: only overwrite an existing entry when the newcomer is
+            # native and the incumbent is not, so a native edge is never demoted
+            # to inferred by a later duplicate.
+            if existing is None or (
+                source == DEP_SOURCE_NATIVE
+                and existing.get("source") != DEP_SOURCE_NATIVE
+            ):
+                by_pair[pair] = {"blocked": blocked, "blocker": blocker, "source": source}
+    out_edges = [by_pair[p] for p in sorted(by_pair)]
+
+    out_nodes: dict[str, dict] = {}
+    if isinstance(nodes, dict):
+        for key, val in nodes.items():
+            try:
+                number = int(key)
+            except (TypeError, ValueError):
+                continue
+            if number <= 0 or not isinstance(val, dict):
+                continue
+            out_nodes[str(number)] = {
+                "kind": str(val.get("kind") or "issue"),
+                "state": str(val.get("state") or "open"),
+                "title": str(val.get("title") or ""),
+            }
+    return out_edges, out_nodes
+
+
+def read_deps_cache(owner: str, repo: str, root: Path | None = None) -> dict | None:
+    """Return ``{"edges", "nodes", "fetched_at"}`` for a repo, or None when the
+    graph has never been synced.
+
+    An unreadable file, or one written under an older ``DEPS_CACHE_SCHEMA`` (or
+    with no stamp at all), is treated as a MISS — same guard as every other
+    cache — so the route refetches with the current edge shape.
+    """
+    path = deps_cache_path(owner, repo, root)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or data.get("schema") != DEPS_CACHE_SCHEMA:
+        return None  # stale schema → treat as a miss so the route refetches
+    edges, nodes = _normalize_deps(data.get("edges"), data.get("nodes"))
+    fetched_at = data.get("fetched_at")
+    return {
+        "edges": edges,
+        "nodes": nodes,
+        "fetched_at": float(fetched_at)
+        if isinstance(fetched_at, (int, float)) and not isinstance(fetched_at, bool)
+        else 0.0,
+    }
+
+
+def write_deps_cache(
+    owner: str, repo: str, edges: list[dict], nodes: dict[str, dict],
+    *, root: Path | None = None,
+) -> None:
+    """Store the dependency graph for a repo, stamping the current schema and the
+    fetch time. Edges/nodes are normalized on the way in (native-wins dedup,
+    self-edges dropped) so a caller cannot persist a malformed graph."""
+    norm_edges, norm_nodes = _normalize_deps(edges, nodes)
+    atomic_write(
+        deps_cache_path(owner, repo, root),
+        json.dumps(
+            {
+                "schema": DEPS_CACHE_SCHEMA, "owner": owner, "repo": repo,
+                "fetched_at": time.time(),
+                "edges": norm_edges, "nodes": norm_nodes,
+            },
+            indent=2,
+        ),
+    )
 
 
 def add_label_to_cache(owner: str, repo: str, label: dict, *, root: Path | None = None) -> None:
@@ -1641,6 +1869,11 @@ def _merge_findings(existing: Any, raw: Any) -> dict[str, Any] | None:
     There is deliberately NO per-field clear: an empty string means "leave this
     alone", which is what makes a partial patch safe for an LLM writer. Clear
     everything with an explicit null and re-write what should remain.
+
+    All of the above is the contract for writes WITHIN one investigation run.
+    Across a run boundary it is the wrong contract, and
+    :func:`write_investigation` decides that question before calling here — see
+    :func:`_findings_run_key`.
     """
     if raw is None:
         return None
@@ -1660,6 +1893,26 @@ def _merge_findings(existing: Any, raw: Any) -> dict[str, Any] | None:
     return _normalize_findings(combined)
 
 
+def _findings_run_key(existing: dict[str, Any]) -> str | None:
+    """Which run's session the STORED findings were written under, or None when
+    that is not known.
+
+    ``findings_slot_key`` is stamped by :func:`write_investigation` on every
+    write, so a record written by this build always answers for itself. A record
+    written BEFORE the field existed carries findings but no stamp, and the
+    honest backfill is the record's own ``slot_key``: those findings were
+    written by whatever session the record pointed at at the time. That reading
+    keeps a mid-run partial update on an upgraded record merging exactly as it
+    did before, and still moves the boundary when the slot later changes,
+    because this is read from the PRE-patch record — before a new ``slot_key``
+    overwrites the old one.
+    """
+    raw = existing.get("findings_slot_key") if "findings_slot_key" in existing else existing.get("slot_key")
+    if not isinstance(raw, str):
+        return None
+    return raw.strip() or None
+
+
 def write_investigation(
     owner: str, repo: str, number: int, patch: dict[str, Any], *,
     root: Path | None = None, kind: str = "issue",
@@ -1672,7 +1925,30 @@ def write_investigation(
     ``findings`` (merged per key by :func:`_merge_findings`, so a patch carrying
     only ``verdict`` keeps the stored ``root_cause``/``summary``/labels; an
     explicit ``None`` clears them). A partial patch (even ``{}``, which just bumps
-    the open stamp) is valid. Returns the stored record."""
+    the open stamp) is valid. Returns the stored record.
+
+    Per-key merging is right WITHIN one investigation run and wrong ACROSS runs:
+    a re-run (Issue Radar's "Start over", or any path that opens a replacement
+    session) that records a ``verdict`` and ``summary`` but no ``root_cause``
+    would inherit the PREVIOUS run's ``root_cause``, leaving the record — the
+    only copy — holding a verdict assembled from two investigations with nothing
+    marking which parts came from which.
+
+    So the run boundary is owned HERE rather than by callers, because only here
+    is it atomic with the write. The record remembers the session its findings
+    were written under (``findings_slot_key``), and the FIRST findings write
+    under a different session REPLACES rather than merges; later writes from that
+    same session merge as before. The previous verdict therefore survives right
+    up until a new one exists and never blends with it — which is why the clear
+    is not done when the replacement session opens (the record is the only copy,
+    so an abandoned re-run would lose the prior verdict permanently).
+
+    A boundary is only crossed when BOTH sessions are known and differ. An
+    unknown owner (findings recorded through the MCP tool for an item with no
+    session linked) falls back to merging: the store cannot tell those findings
+    from ones the about-to-be-linked session just wrote, and merging is the
+    non-destructive reading. Clearing the link (``slot_key: ""``) is not a new
+    run either."""
     number = int(number)
     now = _now_iso()
     lock_path = investigation_path(owner, repo, number, root, kind=kind).with_suffix(".lock")
@@ -1680,6 +1956,10 @@ def write_investigation(
     with open(lock_path, "w") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             existing = read_investigation(owner, repo, number, root, kind=kind) or {}
+            # Read the findings' owning session from the PRE-patch record: the
+            # patch below may replace slot_key, and the comparison needs the old
+            # one.
+            findings_run_key = _findings_run_key(existing)
 
             record: dict[str, Any] = {
                 "owner": owner,
@@ -1691,6 +1971,9 @@ def write_investigation(
                 "started_at": existing.get("started_at") or now,
                 "last_opened_at": now,
                 "findings": existing.get("findings"),
+                # Only meaningful while findings are stored; re-stamped below
+                # whenever they change.
+                "findings_slot_key": findings_run_key if existing.get("findings") else None,
             }
 
             if "slot_key" in patch and isinstance(patch["slot_key"], str):
@@ -1702,9 +1985,41 @@ def write_investigation(
                 if st in _INVESTIGATION_STATUSES:
                     record["status"] = st
             if "findings" in patch:
-                record["findings"] = _merge_findings(
-                    existing.get("findings"), patch.get("findings")
+                # Runs AFTER slot_key is applied: a patch may carry both, and the
+                # session it names is the run this write belongs to.
+                raw = patch.get("findings")
+                # None (the explicit clear), a non-dict, and a dict with nothing
+                # in it all normalize to None — so this is "the patch carries a
+                # real verdict", which is the only thing that may cross a run
+                # boundary.
+                fresh = _normalize_findings(raw)
+                crossed_runs = bool(
+                    findings_run_key
+                    and record["slot_key"]
+                    and findings_run_key != record["slot_key"]
                 )
+                if fresh is not None:
+                    if crossed_runs:
+                        # First findings of a new run: REPLACE. Nothing from the
+                        # previous run survives into the new verdict.
+                        record["findings"] = fresh
+                    else:
+                        record["findings"] = _merge_findings(existing.get("findings"), raw)
+                    # A real verdict was written, so the current session owns it.
+                    # The merge above always keeps `fresh`, so this is never a
+                    # stamp on an empty findings object.
+                    record["findings_slot_key"] = record["slot_key"]
+                elif raw is None:
+                    # The explicit clear. No findings, so no owning run.
+                    record["findings"] = None
+                    record["findings_slot_key"] = None
+                # else: nothing to write — an empty dict, a whitespace-only value,
+                # or a malformed one. Findings AND their owning run are both left
+                # exactly as the pre-patch record had them. Advancing the stamp
+                # here would silently re-home the PREVIOUS run's findings onto the
+                # new session, so the next real write would merge into them
+                # instead of replacing them — the very blend this boundary
+                # exists to stop, reachable through a no-op.
 
             atomic_write(
                 investigation_path(owner, repo, number, root, kind=kind),

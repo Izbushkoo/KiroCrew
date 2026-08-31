@@ -15,7 +15,6 @@ import tempfile
 
 
 def aws(profile, region, *args):
-    cmd = ["aws"] + (["--profile", profile] if profile else []) + ["--region", region, *args]
     # Every AWS spawn from these LLM-facing helpers MUST route through the
     # sandbox chokepoint. An ImportError fallback that ran unsandboxed when
     # kiro_crew wasn't importable is exactly the environment an attacker would
@@ -23,6 +22,7 @@ def aws(profile, region, *args):
     # package venv (pip install -e / the skill's documented invocation), never
     # bare python3 without kiro_crew on sys.path.
     try:
+        from kiro_crew.deploy.engine import resolve_aws_bin
         from kiro_crew.sandbox import run_limited, sandboxed_spawn_argv
     except ImportError:
         sys.stderr.write(
@@ -31,6 +31,13 @@ def aws(profile, region, *args):
             "python (see skills/artifact-deploy/SKILL.md).\n"
         )
         sys.exit(1)
+    # Resolved absolutely (shared deploy-engine resolver) so a GUI-launched
+    # gateway's minimal PATH still finds the CLI (#4770).
+    cmd = (
+        [resolve_aws_bin()]
+        + (["--profile", profile] if profile else [])
+        + ["--region", region, *args]
+    )
     wrapped_argv, env, cleanup = sandboxed_spawn_argv(cmd)
     # Kernel RLIMIT ceiling on the child (fork bomb / FD / mem / CPU) — the
     # spawn-audit rule requires this on every sandbox-routed spawn; run_limited
@@ -59,14 +66,25 @@ def aws(profile, region, *args):
 def _validate_args(profile: str, region: str, dist_id: str, slug: str) -> None:
     """Validate all argv before any aws call. Exit 2 on mismatch."""
     import re as _re
-    _PROFILE_RE = _re.compile(r"^[a-zA-Z0-9._:/-]+$")
+
+    # VERBATIM copy of kiro_crew.constants.AWS_PROFILE_NAME_PATTERN (#6063):
+    # this script runs standalone (no package import), so the shared shape is
+    # embedded literally and byte-equality is enforced by the drift guard in
+    # test/test_aws_profile_charset.py. No leading '-' (option-shaped), '+'
+    # admitted (IAM Identity Center names), \Z rejects trailing newlines,
+    # length capped at 128.
+    _PROFILE_RE = _re.compile(r"^[A-Za-z0-9_.+][A-Za-z0-9_.+-]{0,127}\Z")
     _REGION_RE = _re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
     _DIST_ID_RE = _re.compile(r"^[A-Z0-9]{13,14}$")
     _SLUG_RE = _re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
     errors = []
     if profile and not _PROFILE_RE.match(profile):
-        errors.append(f"--profile: invalid format: {profile!r}")
+        errors.append(
+            f"--profile: invalid format: {profile!r} (allowed: letters, digits, "
+            "'.', '_', '+', '-'; no leading '-'; max 128 chars — ':' and '/' "
+            "are no longer accepted)"
+        )
     if not _REGION_RE.match(region):
         errors.append(f"--region: not a valid AWS region: {region!r}")
     if not _DIST_ID_RE.match(dist_id):

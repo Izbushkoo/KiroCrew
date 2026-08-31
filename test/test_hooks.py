@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -809,13 +810,26 @@ class TestSafeReadFile:
 class TestShouldAutoApproveSpawn:
     """Test _should_auto_approve_spawn helper from handler.py."""
 
+    @staticmethod
+    def _spawn_event(**overrides):
+        base = {
+            "tool_name": "spawn_run",
+            "mcp_server_name": "kirocrew-core",
+            "mcp_identity_trusted": True,
+            "title": "spawn_run",
+            "is_shell": False,
+            "shell_classified": True,
+        }
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
     def test_approves_spawn_run_when_flag_true(self):
         from kiro_crew.hooks import HookManager
         from kiro_crew.slack.handler import _should_auto_approve_spawn
 
         ctx = MagicMock()
         ctx.hooks = HookManager(HooksConfig.from_dict({"auto_approve_subagent_spawn": True}))
-        assert _should_auto_approve_spawn(ctx, "spawn_run") is True
+        assert _should_auto_approve_spawn(ctx, self._spawn_event()) is True
 
     def test_rejects_when_flag_false(self):
         from kiro_crew.hooks import HookManager
@@ -823,7 +837,7 @@ class TestShouldAutoApproveSpawn:
 
         ctx = MagicMock()
         ctx.hooks = HookManager(HooksConfig.from_dict({"auto_approve_subagent_spawn": False}))
-        assert _should_auto_approve_spawn(ctx, "spawn_run") is False
+        assert _should_auto_approve_spawn(ctx, self._spawn_event()) is False
 
     def test_rejects_non_spawn_tool(self):
         from kiro_crew.hooks import HookManager
@@ -831,7 +845,121 @@ class TestShouldAutoApproveSpawn:
 
         ctx = MagicMock()
         ctx.hooks = HookManager(HooksConfig.from_dict({"auto_approve_subagent_spawn": True}))
-        assert _should_auto_approve_spawn(ctx, "spawn_run_privileged") is False
+        event = self._spawn_event(tool_name="spawn_run_privileged", title="spawn_run_privileged")
+        assert _should_auto_approve_spawn(ctx, event) is False
+
+    def test_rejects_shell_event_with_forged_spawn_title(self):
+        """The issue's attack: a SHELL event titled spawn_run must not ride
+        the spawn rung — the title is model-authored."""
+        from kiro_crew.hooks import HookManager
+        from kiro_crew.slack.handler import _should_auto_approve_spawn
+
+        ctx = MagicMock()
+        ctx.hooks = HookManager(HooksConfig.from_dict({"auto_approve_subagent_spawn": True}))
+        event = self._spawn_event(
+            tool_name="", mcp_server_name="", title="spawn_run", is_shell=True
+        )
+        assert _should_auto_approve_spawn(ctx, event) is False
+
+
+class TestEventIsSpawnRun:
+    """The canonical spawn identity predicate the rung keys on.
+
+    Mutation pin: reverting any consumer to a title-only check must fail the
+    forged-shell and canonical-mismatch directions below.
+    """
+
+    @staticmethod
+    def _event(**fields):
+        return SimpleNamespace(
+            tool_name=fields.get("tool_name", ""),
+            mcp_server_name=fields.get("mcp_server_name", ""),
+            mcp_identity_trusted=fields.get("mcp_identity_trusted", False),
+            title=fields.get("title", ""),
+            is_shell=fields.get("is_shell", False),
+            shell_classified=fields.get("shell_classified", False),
+        )
+
+    def _genuine(self, **overrides):
+        fields = dict(
+            tool_name="spawn_run",
+            mcp_server_name="kirocrew-core",
+            mcp_identity_trusted=True,
+            title="spawn_run",
+        )
+        fields.update(overrides)
+        return self._event(**fields)
+
+    def test_canonical_trusted_core_spawn_is_genuine(self):
+        from kiro_crew.hooks import event_is_spawn_run
+
+        assert event_is_spawn_run(self._genuine()) is True
+
+    def test_rephrased_title_falls_to_the_ladder_despite_canonical_identity(self):
+        # A genuine spawn whose display title was rephrased does NOT ride the
+        # rung: the channel deny plane keys on the title, so approving here
+        # would bypass a title-keyed deny rule. Falling to the ladder is a
+        # downgrade (prompt/trust), never a hard block.
+        from kiro_crew.hooks import event_is_spawn_run
+
+        assert event_is_spawn_run(self._genuine(title="Spawn agents")) is False
+
+    def test_canonical_mismatch_refuses_regardless_of_a_forged_title(self):
+        from kiro_crew.hooks import event_is_spawn_run
+
+        event = self._genuine(tool_name="execute_bash")
+        assert event_is_spawn_run(event) is False
+
+    def test_untrusted_identity_provenance_fails_closed(self):
+        # tool_name non-emptiness alone is not proof of provenance: a future
+        # inline population path leaves the flag False and must fail closed.
+        from kiro_crew.hooks import event_is_spawn_run
+
+        assert event_is_spawn_run(self._genuine(mcp_identity_trusted=False)) is False
+
+    def test_foreign_server_spawn_run_tool_is_refused(self):
+        # A third-party MCP server exposing a tool literally named spawn_run
+        # must not ride the crew's spawn rung.
+        from kiro_crew.hooks import event_is_spawn_run
+
+        assert event_is_spawn_run(self._genuine(mcp_server_name="evil-server")) is False
+
+    def test_builtin_named_spawn_run_without_a_server_is_refused(self):
+        # kiro-cli sets tool_name for built-ins too, with an empty server
+        # name — a built-in cannot satisfy the MCP-server pin.
+        from kiro_crew.hooks import event_is_spawn_run
+
+        assert event_is_spawn_run(self._genuine(mcp_server_name="")) is False
+
+    def test_shell_event_with_forged_title_refuses_without_canonical_identity(self):
+        from kiro_crew.hooks import event_is_spawn_run
+
+        event = self._event(tool_name="", title="spawn_run", is_shell=True, shell_classified=True)
+        assert event_is_spawn_run(event) is False
+
+    def test_unclassified_event_with_forged_title_fails_closed(self):
+        # The correlated cache miss: tool_name empty AND shell_classified
+        # False AND is_shell miss-default False. Canonical-only means no
+        # evidence -> refuse.
+        from kiro_crew.hooks import event_is_spawn_run
+
+        event = self._event(tool_name="", title="spawn_run", shell_classified=False)
+        assert event_is_spawn_run(event) is False
+
+    def test_non_shell_event_with_forged_title_fails_closed(self):
+        # CI GPT-lane finding: a no-_meta.kiro NON-shell tool (e.g. send_file
+        # re-titled "spawn_run") must not ride the rung either — there is no
+        # title fallback. The rung not firing is a downgrade to the channel's
+        # normal ladder, never a hard block.
+        from kiro_crew.hooks import event_is_spawn_run
+
+        event = self._event(tool_name="", title="spawn_run", is_shell=False, shell_classified=True)
+        assert event_is_spawn_run(event) is False
+
+    def test_plain_non_spawn_title_refuses(self):
+        from kiro_crew.hooks import event_is_spawn_run
+
+        assert event_is_spawn_run(self._event(tool_name="", title="grep")) is False
 
 
 class TestMutatingKindBeatsTheTitle:
@@ -967,14 +1095,405 @@ class TestMutatingKindBeatsTheTitle:
     def test_rejects_none_context(self):
         from kiro_crew.slack.handler import _should_auto_approve_spawn
 
-        assert _should_auto_approve_spawn(None, "spawn_run") is False
+        event = SimpleNamespace(
+            tool_name="spawn_run",
+            mcp_server_name="kirocrew-core",
+            mcp_identity_trusted=True,
+            title="spawn_run",
+            is_shell=False,
+            shell_classified=True,
+        )
+        assert _should_auto_approve_spawn(None, event) is False
 
     def test_rejects_none_hooks(self):
         from kiro_crew.slack.handler import _should_auto_approve_spawn
 
         ctx = MagicMock()
         ctx.hooks = None
-        assert _should_auto_approve_spawn(ctx, "spawn_run") is False
+        event = SimpleNamespace(
+            tool_name="spawn_run",
+            mcp_server_name="kirocrew-core",
+            mcp_identity_trusted=True,
+            title="spawn_run",
+            is_shell=False,
+            shell_classified=True,
+        )
+        assert _should_auto_approve_spawn(ctx, event) is False
+
+
+class TestCanonicalMcpIdentityGoverned:
+    """An ORDINARY MCP permission request — no first-party app-own-server
+    auto-approve involved — is governed under its trusted
+    ``mcp__<server>__<tool>`` identity as well as its LLM-authored title, so a
+    per-tool ceiling rule binds even when the title is benign prose. The
+    canonical name is ADDED to the deny floor and governance, never substituted
+    for the title, so the title/raw-command floor keeps denying on its own."""
+
+    @staticmethod
+    def _deny_canonical(monkeypatch, denied: str):
+        """Governance that denies exactly *denied*, recording what it saw.
+
+        The gate asks ONE question carrying every identity for the call (title,
+        trusted tool name, canonical MCP reference), so this double records all of
+        them and denies if any matches -- mirroring the real tightest-wins
+        evaluation over a single profile snapshot.
+        """
+        import kiro_crew.hooks as hooks_mod
+
+        seen: list[str] = []
+
+        def fake_gov(ctx, name, *a, **k):
+            targets = [name, *k.get("extra_titles", ()), k.get("mcp_ref", "")]
+            for target in targets:
+                if target and target not in seen:
+                    seen.append(target)
+            if denied in targets:
+                return "Blocked by governance policy: denied"
+            return None
+
+        monkeypatch.setattr(hooks_mod, "_governance_denial", fake_gov)
+        return seen
+
+    def test_governance_denies_canonical_behind_prose_title(self, monkeypatch):
+        # THE REGRESSION. A policy denies the weather server's wipe_disk tool, but
+        # select_tool_title handed us the model's prose description. Governing
+        # only the title would permit, the call would reach the human prompt,
+        # and an "allow" would run a tool the ceiling forbids.
+        seen = self._deny_canonical(monkeypatch, "@weather:srv/wipe_disk")
+        mgr = HookManager()
+        r = mgr.on_tool_call(
+            "Check tomorrow's forecast",  # benign model-authored prose
+            mcp_server_name="weather:srv",
+            mcp_tool_name="wipe_disk",
+            tool_kind="other",
+        )
+        assert r.action == TOOL_DENY
+        # Both identities were offered to governance — the title (permitted)
+        # AND the trusted canonical reference (denied).
+        assert "Check tomorrow's forecast" in seen
+        assert "@weather:srv/wipe_disk" in seen
+
+    def test_deny_floor_matches_canonical_behind_prose_title(self, monkeypatch):
+        # Same bypass, via the effective deny set rather than governance.
+        cfg = HooksConfig(auto_deny_tools=["mcp__weather:srv__wipe_disk"])
+        mgr = HookManager(cfg)
+        r = mgr.on_tool_call(
+            "Check tomorrow's forecast",
+            mcp_server_name="weather:srv",
+            mcp_tool_name="wipe_disk",
+            tool_kind="other",
+        )
+        assert r.action == TOOL_DENY
+
+    def test_partial_mcp_identity_governs_the_server_never_a_malformed_name(self, monkeypatch):
+        # Only ONE trusted field → no canonical per-TOOL name exists. What the
+        # server alone supports is a SERVER-level question, which the governance
+        # grammar has (``@server`` covers every tool under it), so that is what
+        # governance is asked — and nothing else is synthesised.
+        #
+        # The shapes this guards against are the malformed ones a title-encoded
+        # identity could produce: a dangling ``__`` separator, or an empty server
+        # (``mcp____wipe_disk``), either of which could match a prefix rule and
+        # deny an unrelated call. Composing the reference from the trusted fields
+        # cannot produce them, and this pins that. Denying the tool-qualified form
+        # must NOT deny the call either: the tool was never proven.
+        seen = self._deny_canonical(monkeypatch, "@weather:srv/")
+        mgr = HookManager()
+        r = mgr.on_tool_call(
+            "Check tomorrow's forecast", mcp_server_name="weather:srv", tool_kind="other"
+        )
+        assert r.action != TOOL_DENY
+        assert seen == ["Check tomorrow's forecast", "@weather:srv"]
+        assert not any(t.endswith("__") or "mcp____" in t for t in seen)
+
+    def test_title_floor_survives_canonical_enforcement(self, monkeypatch):
+        # PRESERVATION. Governance permits EVERYTHING here, so the only thing
+        # that can produce a deny is the title-keyed security floor. The display
+        # title names a sensitive path while the canonical name is innocuous:
+        # canonical enforcement is additive, so it must not have displaced the
+        # title from the checks it was already in. Governance must permit for
+        # this to mean anything — a stub that denies the canonical name would
+        # pass even if the title had been substituted away.
+        self._deny_canonical(monkeypatch, "nothing-is-denied")
+        mgr = HookManager()
+        r = mgr.on_tool_call(
+            "~/.aws/credentials",
+            mcp_server_name="files:srv",
+            mcp_tool_name="nothing_to_see",
+            tool_kind="read",
+        )
+        assert r.action == TOOL_DENY
+
+    def test_raw_command_floor_survives_canonical_enforcement(self, monkeypatch):
+        # PRESERVATION, the shell half: benign title, benign canonical name,
+        # dangerous raw command, and governance permitting everything — so the
+        # deny can only come from the command being evaluated. (For this input
+        # the effective deny set is what fires; the point is that adding the
+        # canonical identity did not displace `command` from the checks that
+        # see it.)
+        self._deny_canonical(monkeypatch, "nothing-is-denied")
+        mgr = HookManager()
+        r = mgr.on_tool_call(
+            "Tidy up some files",
+            command="cat ~/.ssh/id_rsa",
+            is_shell=True,
+            mcp_server_name="shell:srv",
+            mcp_tool_name="nothing_to_see",
+            tool_kind="execute",
+        )
+        assert r.action == TOOL_DENY
+
+    def test_non_mcp_call_unaffected(self, monkeypatch):
+        # Neither trusted field (a shell/built-in tool, or a backend that omits
+        # _meta.kiro): governance sees the title and nothing else.
+        seen = self._deny_canonical(monkeypatch, "never-matches")
+        mgr = HookManager()
+        r = mgr.on_tool_call("List the files", tool_kind="read")
+        assert r.action == TOOL_AUTO_APPROVE
+        assert seen == ["List the files"]
+
+
+class TestBuiltinToolIdentityGoverned:
+    """A BUILT-IN tool proves ``_meta.kiro.toolName`` but no ``mcpServerName``,
+    so no canonical ``@server/tool`` reference exists for it. Its trusted name
+    must still reach the deny floor and governance on its own, or a rule naming
+    the real tool is bypassable behind a benign model-authored title."""
+
+    def test_deny_floor_matches_builtin_tool_name_behind_prose_title(self):
+        # THE REGRESSION. deny=["fs_write"] with a benign title and no MCP
+        # server: the canonical form is empty, so before this the title was the
+        # only deny target and the policy-denied built-in reached the human.
+        cfg = HooksConfig(auto_deny_tools=["fs_write"])
+        mgr = HookManager(cfg)
+        r = mgr.on_tool_call(
+            "Update the changelog",  # benign model-authored prose
+            mcp_tool_name="fs_write",  # trusted _meta.kiro.toolName
+            tool_kind="edit",
+        )
+        assert r.action == TOOL_DENY
+
+    def test_governance_denies_builtin_tool_name_behind_prose_title(self, monkeypatch):
+        # Same bypass on the governance plane. The identity is asked as a plain
+        # tool item, never as an ``@server/tool`` reference -- a built-in has no
+        # server, so synthesising one would invent a name nothing matches.
+        seen = TestCanonicalMcpIdentityGoverned._deny_canonical(monkeypatch, "fs_write")
+        mgr = HookManager()
+        r = mgr.on_tool_call(
+            "Update the changelog",
+            mcp_tool_name="fs_write",
+            tool_kind="edit",
+        )
+        assert r.action == TOOL_DENY
+        # Both were offered: the title (permitted) AND the trusted name (denied).
+        assert "Update the changelog" in seen
+        assert "fs_write" in seen
+
+    def test_identity_equal_to_the_title_is_not_asked_twice(self, monkeypatch):
+        # A backend whose title already IS the tool name must not cost a second
+        # identical governance query.
+        seen = TestCanonicalMcpIdentityGoverned._deny_canonical(monkeypatch, "never-matches")
+        mgr = HookManager()
+        mgr.on_tool_call("fs_read", mcp_tool_name="fs_read", tool_kind="read")
+        assert seen == ["fs_read"]
+
+    def test_every_identity_shares_one_profile_resolution(self, monkeypatch):
+        # THE SNAPSHOT CONTRACT. Title, trusted tool name and MCP reference are
+        # one question against one resolved profile. Resolving per identity let a
+        # profile hot-reloaded mid-call answer each from a different snapshot, so
+        # a tool both complete profiles deny could be permitted by every single
+        # lookup -- and each resolve walked ``profiles/`` on the event loop.
+        import kiro_crew.platform.governance_profiles as profiles_mod
+
+        calls = []
+        real = profiles_mod.resolve_active_scope
+
+        def counting(session_key, **kw):
+            calls.append(session_key)
+            return real(session_key, **kw)
+
+        monkeypatch.setattr(profiles_mod, "resolve_active_scope", counting)
+        mgr = HookManager()
+        mgr.on_tool_call(
+            "Update the changelog",
+            session_key="s1",
+            mcp_server_name="weather:srv",
+            mcp_tool_name="fs_write",
+            tool_kind="edit",
+        )
+        # Three identities in play (title, fs_write, @weather:srv/fs_write) and
+        # exactly ONE profile resolution.
+        assert len(calls) == 1, f"expected one profile resolution, got {len(calls)}"
+
+
+class TestServerLevelGovernanceBindsOnPartialIdentity:
+    """A trusted SERVER identity with no trusted tool name is still a complete
+    question for governance, whose grammar has a server level: ``@server`` covers
+    every tool under it. Exercised through the REAL policy engine rather than a
+    stubbed ``_governance_denial``, because what is at stake is precisely whether
+    the raw target this gate emits is one the ``mcp`` matcher can bind a
+    server-level rule to."""
+
+    @staticmethod
+    def _ceiling_denying(server_ref: str):
+        """A real ceiling whose ``mcp`` scope denies *server_ref*."""
+        from kiro_crew.platform.governance import (
+            MODE_DENY,
+            GovernanceCeiling,
+            ScopedRuleset,
+            parse_policy,
+        )
+
+        return GovernanceCeiling(
+            version=1,
+            boot=parse_policy({"version": 1, "boot": {"fail_closed": True}}).boot,
+            controls={"mcp": ScopedRuleset(mode=MODE_DENY, deny=(server_ref,), matcher="mcp")},
+        )
+
+    @staticmethod
+    def _install(monkeypatch, ceiling):
+        """Run the gate against *ceiling* with the real security authority."""
+        import kiro_crew.hooks as hooks_mod
+        from kiro_crew.platform import current_context
+
+        real = current_context()
+
+        class _Ctx:
+            security = real.security
+            governance = ceiling
+
+        monkeypatch.setattr(hooks_mod, "current_context", lambda: _Ctx())
+
+    def test_server_level_deny_binds_without_a_trusted_tool_name(self, monkeypatch):
+        # THE REGRESSION. kiro-cli supplied `_meta.kiro.mcpServerName` but no
+        # `toolName` — an uncached permission event, or a backend that omits it.
+        # The title is the model's own prose, so governing on the title alone
+        # leaves a `deny @github` ceiling with nothing to bind to, and the call
+        # walks past the ceiling to a human who can approve it.
+        self._install(monkeypatch, self._ceiling_denying("@github"))
+        mgr = HookManager()
+        r = mgr.on_tool_call(
+            "Read a public README",  # benign model-authored prose
+            mcp_server_name="github",
+            mcp_tool_name="",  # not proven
+            tool_kind="other",
+        )
+        assert r.action == TOOL_DENY
+
+    def test_server_level_deny_still_binds_on_a_full_identity(self, monkeypatch):
+        # PRESERVATION: `@server` covers every tool under it, so the complete
+        # identity is denied by the same rule.
+        self._install(monkeypatch, self._ceiling_denying("@github"))
+        mgr = HookManager()
+        r = mgr.on_tool_call(
+            "Read a public README",
+            mcp_server_name="github",
+            mcp_tool_name="get_file",
+            tool_kind="other",
+        )
+        assert r.action == TOOL_DENY
+
+    def test_tool_level_deny_does_not_widen_to_the_whole_server(self, monkeypatch):
+        # The partial target must not be a blunter instrument than the grammar
+        # allows: `@github/delete_repo` denies that tool, and a call that proves
+        # only the server is NOT that tool, so it is not denied by this rule.
+        # Without this, "govern the server when the tool is unknown" would
+        # quietly become "deny the server whenever any of its tools is denied".
+        self._install(monkeypatch, self._ceiling_denying("@github/delete_repo"))
+        mgr = HookManager()
+        r = mgr.on_tool_call(
+            "Read a public README",
+            mcp_server_name="github",
+            mcp_tool_name="",
+            tool_kind="other",
+        )
+        assert r.action != TOOL_DENY
+
+    def test_an_ungoverned_server_is_not_denied(self, monkeypatch):
+        # The control that keeps the test above honest: same partial identity,
+        # a rule naming a DIFFERENT server, so the deny must not fire.
+        self._install(monkeypatch, self._ceiling_denying("@gitlab"))
+        mgr = HookManager()
+        r = mgr.on_tool_call(
+            "Read a public README",
+            mcp_server_name="github",
+            mcp_tool_name="",
+            tool_kind="other",
+        )
+        assert r.action != TOOL_DENY
+
+    def test_a_server_name_containing_the_separator_still_binds(self, monkeypatch):
+        # A ``__``-bearing server name must reach governance intact. Encoded into
+        # an ``mcp__<server>`` title it re-parses as server ``npm`` + tool
+        # ``playwright_mcp`` and the ceiling denying the real server never binds --
+        # a human would be asked to approve a server the policy forbids.
+        self._install(monkeypatch, self._ceiling_denying("@npm__playwright_mcp"))
+        mgr = HookManager()
+        r = mgr.on_tool_call(
+            "Open a page",
+            mcp_server_name="npm__playwright_mcp",
+            mcp_tool_name="",
+            tool_kind="other",
+        )
+        assert r.action == TOOL_DENY
+
+    def test_a_tool_name_containing_the_separator_still_binds(self, monkeypatch):
+        # The sibling, and the one no title spelling can fix: the title form is
+        # read by splitting on the LAST ``__``, so ``@github`` + ``repo__delete``
+        # encodes to ``mcp__github__repo__delete`` and reads back as server
+        # ``github__repo`` with tool ``delete``. A ``deny @github/repo__delete``
+        # ceiling would then never bind and approval could run the denied tool.
+        self._install(monkeypatch, self._ceiling_denying("@github/repo__delete"))
+        mgr = HookManager()
+        r = mgr.on_tool_call(
+            "Read a public README",
+            mcp_server_name="github",
+            mcp_tool_name="repo__delete",
+            tool_kind="other",
+        )
+        assert r.action == TOOL_DENY
+
+    def test_both_segments_containing_the_separator_still_bind(self, monkeypatch):
+        # Both halves ambiguous at once — the branch a per-segment patch on either
+        # side alone would still leave open.
+        self._install(monkeypatch, self._ceiling_denying("@npm__gh/repo__delete"))
+        mgr = HookManager()
+        r = mgr.on_tool_call(
+            "Read a public README",
+            mcp_server_name="npm__gh",
+            mcp_tool_name="repo__delete",
+            tool_kind="other",
+        )
+        assert r.action == TOOL_DENY
+
+    def test_a_specific_tool_rule_does_not_deny_the_server_only_question(self, monkeypatch):
+        # The other half of the server-level question: an unproven tool must not be
+        # denied by a rule naming a specific one, or closing the missed denies
+        # above would trade them for a false one.
+        self._install(monkeypatch, self._ceiling_denying("@npm__playwright_mcp/wipe"))
+        mgr = HookManager()
+        r = mgr.on_tool_call(
+            "Open a page",
+            mcp_server_name="npm__playwright_mcp",
+            mcp_tool_name="",
+            tool_kind="other",
+        )
+        assert r.action != TOOL_DENY
+
+    def test_partial_identity_never_reaches_the_raw_deny_regex_plane(self, monkeypatch):
+        # The server-only target belongs to the governance grammar, where
+        # `mcp__<server>` means `@server`. The deny plane matches raw text and
+        # operator regexes, where it is simply a different string — so a rule
+        # written against the canonical identity must NOT start matching calls
+        # whose tool was never proven.
+        cfg = HooksConfig(auto_deny_tools=["mcp__github__delete_repo"])
+        mgr = HookManager(cfg)
+        r = mgr.on_tool_call(
+            "Read a public README",
+            mcp_server_name="github",
+            mcp_tool_name="",
+            tool_kind="other",
+        )
+        assert r.action != TOOL_DENY
 
 
 class TestAppOwnMcpServerAutoApprove:
@@ -1142,8 +1661,8 @@ class TestAppOwnMcpServerAutoApprove:
 
     def test_own_server_governs_canonical_tool_not_prose_title(self, monkeypatch):
         # The auto-approve must govern the REAL tool (trusted mcp_server_name +
-        # mcp_tool_name → canonical mcp__server__tool), NOT the LLM prose title.
-        # A per-tool policy denying mcp__myapp:srv__danger must block the call
+        # mcp_tool_name → canonical ``@server/tool``), NOT the LLM prose title.
+        # A per-tool policy denying ``@myapp:srv/danger`` must block the call
         # even though the prose title never matches that policy — closing the
         # bypass where an own-server auto-approve skipped per-tool governance.
         import kiro_crew.hooks as hooks_mod
@@ -1153,8 +1672,13 @@ class TestAppOwnMcpServerAutoApprove:
         seen: list[str] = []
 
         def fake_gov(ctx, name, *a, **k):
-            seen.append(name)
-            if name == "mcp__myapp:srv__danger":
+            # One question carries every identity for the call, so match against
+            # all of them rather than a single target.
+            targets = [name, *k.get("extra_titles", ()), k.get("mcp_ref", "")]
+            for target in targets:
+                if target and target not in seen:
+                    seen.append(target)
+            if "@myapp:srv/danger" in targets:
                 return "Blocked by governance policy: denied"
             return None
 
@@ -1168,10 +1692,10 @@ class TestAppOwnMcpServerAutoApprove:
             tool_kind="other",
         )
         assert r.action == TOOL_DENY
-        # BOTH governance calls ran: the prose title (permitted) AND the
-        # reconstructed canonical name (denied).
+        # BOTH identities were offered in the one query: the prose title
+        # (permitted) AND the canonical reference (denied).
         assert "Do a risky thing" in seen
-        assert "mcp__myapp:srv__danger" in seen
+        assert "@myapp:srv/danger" in seen
 
     def test_own_server_honors_canonical_deny_rule(self, monkeypatch):
         # The always-on deny floor (auto_deny_tools / denied regexes) must apply
@@ -1349,3 +1873,215 @@ class TestAppOwnMcpServerAutoApprove:
 
         monkeypatch.setattr(hooks_mod, "_BUILTIN_APP_NAMES", frozenset())
         assert hooks_mod._is_first_party_app("myapp") is False
+
+
+class TestTargetPathSpellings:
+    """The sensitive-path keystone read ``path`` and ``file_path`` but not
+    ``filePath`` -- the camel-case form ``_SEARCH_DENY_ARG_KEYS`` has accepted for
+    the search plane all along. A backend sending that spelling reached NEITHER
+    read, so a write to a sensitive path under it was never gated.
+
+    ``cli_chat`` shares ``target_paths`` with the gate, so a prompt cannot
+    disclose a path the keystone did not inspect.
+    """
+
+    @staticmethod
+    def _gate():
+        from kiro_crew.hooks import HookManager, HooksConfig
+
+        return HookManager(HooksConfig.from_dict({}))
+
+    @pytest.mark.parametrize("key", ["path", "file_path", "filePath"])
+    def test_a_sensitive_path_is_denied_under_every_spelling(self, key):
+        from kiro_crew.hooks import TOOL_DENY
+
+        decision = self._gate().on_tool_call(
+            "Tidy up the notes",
+            session_key="cli_chat",
+            tool_kind="edit",
+            raw_params={key: "~/.ssh/id_rsa"},
+        )
+        assert decision.action == TOOL_DENY, (
+            f"a sensitive path under {key!r} reached no check; the human would be "
+            "asked to approve what the keystone must refuse outright"
+        )
+
+    def test_a_second_innocent_alias_cannot_shadow_a_sensitive_one(self):
+        """Every value present is checked, so a deny cannot be dodged by adding a
+        benign alias. This is why the fix does not 'normalize onto one key and
+        reject conflicts' -- a conflict rule has to pick a winner, and picking
+        wrong is exactly how the sensitive value slips past.
+
+        Uses a READ kind deliberately. An ``edit`` would also be caught by the
+        write-protected-config gate further down, so the deny would prove nothing
+        about the sensitive-path keystone this test exists to pin -- a mutation
+        limiting the keystone to the FIRST path still passed while the kind was
+        ``edit``.
+        """
+        from kiro_crew.hooks import TOOL_DENY
+
+        decision = self._gate().on_tool_call(
+            "Read the notes",
+            session_key="cli_chat",
+            tool_kind="read",
+            raw_params={"path": "/tmp/harmless.txt", "filePath": "~/.aws/credentials"},
+        )
+        assert decision.action == TOOL_DENY
+
+    def test_an_ordinary_path_is_still_allowed_under_every_spelling(self):
+        """The absence direction: widening the spellings must not start denying
+        ordinary files, or the gate would refuse most real edits."""
+        from kiro_crew.hooks import TOOL_DENY
+
+        for key in ("path", "file_path", "filePath"):
+            decision = self._gate().on_tool_call(
+                "Tidy up the notes",
+                session_key="cli_chat",
+                tool_kind="edit",
+                raw_params={key: "/tmp/notes.md"},
+            )
+            assert decision.action != TOOL_DENY, f"{key!r} wrongly denied an ordinary file"
+
+    def test_target_paths_ignores_non_string_and_blank_values(self):
+        from kiro_crew.hooks import target_paths
+
+        assert target_paths({"path": {"nested": 1}, "filePath": "   "}) == []
+        assert target_paths(None) == []
+        assert target_paths({"path": "/a", "file_path": "/a"}) == ["/a"], "deduped"
+
+
+class TestTargetPathNestedExtraction:
+    """``target_paths`` read only the TOP-LEVEL ``TARGET_PATH_KEYS`` string
+    values, so a tool that nests its path inside an array argument — the batch
+    read shape ``{"operations": [{"mode": "Line", "path": …}]}`` — yielded ``[]``
+    and the sensitive-path keystone in ``on_tool_call`` never saw the target.
+    Worse than a missed deny: a read-kind call with the nested spelling was
+    AUTO-APPROVED while the flat spelling of the same path is denied (#6543).
+
+    The fix recurses into dict/list values (depth-bounded) and stays
+    extract-only; ``cli_chat``'s consent prompt shares the helper, so the
+    disclosure and the gate widen together.
+    """
+
+    @staticmethod
+    def _gate():
+        from kiro_crew.hooks import HookManager, HooksConfig
+
+        return HookManager(HooksConfig.from_dict({}))
+
+    def test_a_sensitive_path_nested_in_an_array_argument_is_denied(self):
+        """The reported fence miss, end to end through the gate."""
+        from kiro_crew.hooks import TOOL_DENY
+
+        decision = self._gate().on_tool_call(
+            "Read the notes",
+            session_key="cli_chat",
+            tool_kind="read",
+            raw_params={"operations": [{"mode": "Line", "path": "~/.ssh/id_rsa"}]},
+        )
+        assert decision.action == TOOL_DENY, (
+            "a sensitive path nested in an array argument reached no check; "
+            "the call would be auto-approved"
+        )
+
+    def test_single_op_array_extraction(self):
+        from kiro_crew.hooks import target_paths
+
+        params = {"operations": [{"mode": "Line", "path": "~/.ssh/id_rsa"}]}
+        assert target_paths(params) == ["~/.ssh/id_rsa"]
+
+    def test_two_op_array_extraction_preserves_order_and_dedups(self):
+        from kiro_crew.hooks import target_paths
+
+        params = {
+            "operations": [
+                {"mode": "Line", "path": "/tmp/a.txt"},
+                {"mode": "Line", "file_path": "~/.aws/credentials"},
+                {"mode": "Line", "path": "/tmp/a.txt"},
+            ]
+        }
+        assert target_paths(params) == ["/tmp/a.txt", "~/.aws/credentials"]
+
+    def test_negative_control_pattern_only_yields_nothing(self):
+        """A search-shaped call with no path key emits no candidates — the
+        widening must not start inventing targets from unrelated arguments."""
+        from kiro_crew.hooks import target_paths
+
+        assert target_paths({"pattern": "x"}) == []
+        assert target_paths({"operations": [{"mode": "Directory", "depth": 2}]}) == []
+
+    def test_list_of_strings_directly_under_a_path_key_is_collected(self):
+        from kiro_crew.hooks import target_paths
+
+        assert target_paths({"path": ["/tmp/a", "~/.ssh/id_rsa"]}) == [
+            "/tmp/a",
+            "~/.ssh/id_rsa",
+        ]
+
+    def test_an_ordinary_nested_path_is_still_allowed(self):
+        """The absence direction: recursing must not start denying ordinary
+        batch reads, or the gate would refuse most real multi-file calls."""
+        from kiro_crew.hooks import TOOL_DENY
+
+        decision = self._gate().on_tool_call(
+            "Read the notes",
+            session_key="cli_chat",
+            tool_kind="read",
+            raw_params={"operations": [{"mode": "Line", "path": "/tmp/notes.md"}]},
+        )
+        assert decision.action != TOOL_DENY, "ordinary nested path wrongly denied"
+
+    def test_a_deeply_nested_path_is_still_found_without_raising(self):
+        """The walk is iterative and exhaustive: depth alone cannot hide a
+        path (no RecursionError, no fail-open depth bound)."""
+        from kiro_crew.hooks import target_paths
+
+        deep: dict = {"path": "~/.ssh/id_rsa"}
+        for _ in range(1000):
+            deep = {"wrapper": [deep]}
+        result = target_paths(deep)
+        assert result == ["~/.ssh/id_rsa"]
+        assert result.truncated is False
+
+    def test_work_cap_fails_closed_as_truncated_and_the_gate_denies(self):
+        """An attacker-shaped payload that exhausts the work caps must mark the
+        result truncated, and the gate must DENY the unverifiable call rather
+        than trust a partial scan — deny-by-default, never silent fail-open."""
+        from kiro_crew.hooks import (
+            _TARGET_PATH_MAX_PATHS,
+            TOOL_DENY,
+            target_paths,
+        )
+
+        # Path-count cap: more distinct candidates than the cap.
+        flood = {"path": [f"/n/a/{i}" for i in range(_TARGET_PATH_MAX_PATHS + 10)]}
+        result = target_paths(flood)
+        assert result.truncated is True
+        assert len(result) == _TARGET_PATH_MAX_PATHS
+
+        # Node-budget cap: a huge container structure with no paths at all is
+        # still unverifiable — the walk stopped before proving absence.
+        wide: dict = {"blobs": [{"x": i} for i in range(20_000)]}
+        assert target_paths(wide).truncated is True
+
+        decision = self._gate().on_tool_call(
+            "Read the notes",
+            session_key="cli_chat",
+            tool_kind="read",
+            raw_params=flood,
+        )
+        assert decision.action == TOOL_DENY, (
+            "a truncated (unverifiable) argument scan must deny, or the cap "
+            "becomes a bypass: park a sensitive path beyond it"
+        )
+
+    def test_ordinary_calls_are_nowhere_near_the_work_caps(self):
+        """The caps must not start refusing real batch reads."""
+        from kiro_crew.hooks import target_paths
+
+        params = {
+            "operations": [{"mode": "Line", "path": f"/tmp/f{i}.txt"} for i in range(40)]
+        }
+        result = target_paths(params)
+        assert len(result) == 40
+        assert result.truncated is False

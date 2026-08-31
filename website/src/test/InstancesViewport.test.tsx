@@ -3,10 +3,26 @@ import { act, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders, createTestStore } from './helpers'
 import InstancesViewport from '../components/InstancesViewport'
+import { setActiveId } from '../store/instancesSlice'
+import {
+  consumeChatHandoff,
+  installSoftNavigate,
+  __resetErrorJournalForTests,
+  __resetNavSeamForTests,
+} from '../utils/errorReport'
+import { __resetInstanceFailuresForTests } from '../utils/instanceFailureReport'
 
 // The postinstall patch (scripts/patch-happy-dom-iframe.mjs) makes happy-dom's
 // disabled-iframe path dispatch 'load' instead of throwing DOMException when
 // handleDisabledFileLoadingAsSuccess is true — no per-test workaround needed.
+
+// The host drag strips only render under the Electron shell, so the focus-mode
+// suppression test needs that to be true. Only `isElectron` is overridden; the
+// per-platform flags and caption widths keep their real values.
+vi.mock('../lib/electron', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../lib/electron')>()),
+  isElectron: true,
+}))
 
 vi.mock('../lib/embedded', () => ({ isEmbeddedPane: vi.fn(() => false) }))
 import { isEmbeddedPane } from '../lib/embedded'
@@ -45,6 +61,12 @@ import { api } from '../api/client'
 beforeEach(() => {
   vi.clearAllMocks()
   vi.mocked(isEmbeddedPane).mockReturnValue(false)
+  // Module-level state in the failure recorder: without this the de-dup from an
+  // earlier test would suppress the report a later one asserts on.
+  __resetInstanceFailuresForTests()
+  __resetErrorJournalForTests()
+  __resetNavSeamForTests()
+  sessionStorage.clear()
 })
 
 describe('InstancesViewport', () => {
@@ -111,6 +133,25 @@ describe('InstancesViewport', () => {
     expect((frame.parentElement as HTMLElement).style.display).toBe('none')
   })
 
+  it('delegates microphone and fullscreen to the cross-origin pane', async () => {
+    // The pane is a cross-origin iframe (same host, different port), where
+    // both features are denied unless the parent delegates them. Dropping
+    // either regresses a user-visible capability: mic -> getUserMedia rejects
+    // with NotAllowedError; fullscreen -> the fullscreen button on native
+    // <video> controls inside the embedded chat renders disabled.
+    const store = createTestStore({
+      instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {} },
+    })
+    renderWithProviders(<InstancesViewport />, { store })
+    const frame = await waitFor(() => {
+      const f = document.querySelector('iframe')
+      if (!f) throw new Error('no iframe yet')
+      return f as HTMLIFrameElement
+    })
+    expect(frame.getAttribute('allow')).toBe('microphone; fullscreen')
+    expect(frame.hasAttribute('allowfullscreen')).toBe(true)
+  })
+
   it('renders the active instance iframe with the loopback token URL', async () => {
     const store = createTestStore({
       instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {} },
@@ -153,6 +194,69 @@ describe('InstancesViewport', () => {
     expect(screen.getByRole('button', { name: /Retry/i })).toBeInTheDocument()
     // No iframe is mounted for a non-warm instance.
     expect(document.querySelector('iframe')).toBeNull()
+  })
+
+  it('offers an agent hand-off carrying the diagnosis ladder, not just Retry', async () => {
+    // Retry is right for a momentary drop, and useless for the failures a first
+    // connect actually hits — SSH config, a remote gateway that is not running, a
+    // wrong port. The panel's evidence arrives on a SUCCESSFUL poll, so this panel
+    // has to journal it itself, and the report has to carry `probes`: ssh ok +
+    // remote dashboard failed names a different repair than ssh failed does.
+    __resetErrorJournalForTests()
+    vi.mocked(api.listInstances).mockResolvedValue({
+      instances: [
+        {
+          id: 'cd-1',
+          name: 'Cloud One',
+          ssh_host: 'cd-1-alias',
+          remote_port: 7777,
+          local_port: 0,
+          ttl: '20h',
+          remote_bin: '',
+          was_connected: true,
+          status: {
+            instance_id: 'cd-1',
+            state: 'error',
+            error: 'ssh unreachable',
+            remote_port: 7777,
+            diagnosis: {
+              code: 'remote_down',
+              ok: false,
+              reason: 'SSH works but the remote dashboard is not responding',
+              probes: [
+                { name: 'ssh', ok: true },
+                { name: 'remote_dashboard', ok: false },
+              ],
+            },
+          },
+        },
+      ],
+      warm_set_cap: 5,
+    })
+    const store = createTestStore({
+      instances: { warm: {}, activeId: 'cd-1', mru: ['cd-1'], unread: {} },
+    })
+    renderWithProviders(<InstancesViewport />, { store })
+
+    expect(await screen.findByText(/Connection error/i)).toBeInTheDocument()
+    // Present alongside Retry, not instead of it.
+    expect(screen.getByRole('button', { name: /Retry/i })).toBeInTheDocument()
+
+    // Click it: the button resolves its own report by EXACT message match, so this
+    // is the only assertion that catches a label re-derived locally from the
+    // status — the journal would still be correct while the prompt lost the ladder.
+    installSoftNavigate(() => {})
+    await userEvent.click(await screen.findByRole('button', { name: /agent/i }))
+    const prompt = consumeChatHandoff() ?? ''
+    expect(prompt).toContain('Code: remote_down')
+    expect(prompt).toContain('probes: ssh=ok -> remote_dashboard=FAILED')
+    // And the hand-off must be VISIBLE. This panel lives inside the viewport's
+    // opaque root overlay, which covers the local pane while a remote tab is
+    // active, and the hand-off only soft-navigates the local SPA to /chat —
+    // underneath it. Without returning to Local the user keeps staring at this same
+    // error panel and reads the button as dead, while every further click stacks
+    // another copy of the prompt onto the hand-off queue.
+    expect(store.getState().instances.activeId).toBeNull()
   })
 
   it('surfaces the error panel for an active warm-but-disconnected tab (stale warm)', async () => {
@@ -265,9 +369,9 @@ describe('InstancesViewport', () => {
 
     expect(await screen.findByText(/Connection error/i)).toBeInTheDocument()
     // The full switcher renders atop the panel: Local + the instance tab.
-    const bar = await screen.findByRole('group', { name: /Remote crews/i })
+    const bar = await screen.findByRole('group', { name: /Remote instances/i })
     expect(bar).toBeInTheDocument()
-    await u.click(screen.getByRole('button', { name: /Switch crew/i }))
+    await u.click(screen.getByRole('button', { name: /Switch instance/i }))
     expect(screen.getByRole('menuitemradio', { name: /Local/i })).toBeInTheDocument()
     expect(screen.getByRole('menuitemradio', { name: /Cloud One/i })).toBeInTheDocument()
 
@@ -298,7 +402,7 @@ describe('InstancesViewport', () => {
     })
     renderWithProviders(<InstancesViewport macInset />, { store })
 
-    const bar = await screen.findByRole('group', { name: /Remote crews/i })
+    const bar = await screen.findByRole('group', { name: /Remote instances/i })
     expect(bar.style.paddingLeft).toBe('84px')
   })
 
@@ -354,10 +458,198 @@ describe('InstancesViewport', () => {
 
     expect(await screen.findByText(/Loading pane/i)).toBeInTheDocument()
     // The full switcher renders atop the overlay: the user can always escape.
-    const bar = await screen.findByRole('group', { name: /Remote crews/i })
+    const bar = await screen.findByRole('group', { name: /Remote instances/i })
     expect(bar).toBeInTheDocument()
     // Not the error panel — no Retry while the load is still in flight.
     expect(screen.queryByText(/Connection error/i)).toBeNull()
+  })
+
+  it('suppresses the host drag strips in focus mode so the pane can peek its own chrome', async () => {
+    // The strips are `-webkit-app-region: drag`, which the compositor resolves
+    // BEFORE hit-testing. In focus mode the pane hides its own header to match the
+    // host, so there is no header left to drag by — and leaving the strips up makes
+    // the pane's top band answer neither hover nor clicks, so its chrome can never
+    // be summoned back. This is the bug reported on the desktop app: switching to a
+    // remote crew left the top region drag-only and dead.
+    const { setFocusModeEnabled } = await import('../hooks/useFocusMode')
+    mockConnectedCd1()
+    const store = createTestStore({
+      instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: { 'cd-1': true } },
+    })
+    renderWithProviders(<InstancesViewport />, { store })
+
+    // The pane reports the gaps in its own header that the host may drag by.
+    await act(async () => {
+      window.dispatchEvent(new MessageEvent('message', {
+        data: { type: 'mc-drag-gaps', v: 1, gaps: [{ x: 100, w: 300 }] },
+        origin: 'http://127.0.0.1:7778',
+      }))
+    })
+    await waitFor(() => expect(document.querySelectorAll('.host-drag-strip').length).toBeGreaterThan(0))
+
+    await act(async () => { setFocusModeEnabled(true) })
+    // A pane that has never reported keeps VISIBLE chrome (it may be a
+    // pre-focus-mode install rendering its full header), so the strips stay.
+    await waitFor(() => expect(document.querySelectorAll('.host-drag-strip').length).toBeGreaterThan(0))
+    // Its first report brings the focus-mode steady state: chrome hidden, no
+    // strips left to swallow the top band's hover.
+    await act(async () => {
+      window.dispatchEvent(new MessageEvent('message', {
+        data: { type: 'mc-focus-chrome', v: 1, on: false },
+        origin: 'http://127.0.0.1:7778',
+      }))
+    })
+    await waitFor(() => expect(document.querySelectorAll('.host-drag-strip').length).toBe(0))
+
+    // While the pane's header is PEEKED the strips must come back: the pane's
+    // own -webkit-app-region CSS is inert (draggable regions are only collected
+    // from the host document, never a cross-origin iframe), so these strips are
+    // the only thing that lets the peeked header move the window.
+    await act(async () => {
+      window.dispatchEvent(new MessageEvent('message', {
+        data: { type: 'mc-focus-chrome', v: 1, on: true },
+        origin: 'http://127.0.0.1:7778',
+      }))
+    })
+    await waitFor(() => expect(document.querySelectorAll('.host-drag-strip').length).toBeGreaterThan(0))
+    await act(async () => {
+      window.dispatchEvent(new MessageEvent('message', {
+        data: { type: 'mc-focus-chrome', v: 1, on: false },
+        origin: 'http://127.0.0.1:7778',
+      }))
+    })
+    await waitFor(() => expect(document.querySelectorAll('.host-drag-strip').length).toBe(0))
+
+    await act(async () => { setFocusModeEnabled(false) })
+    await waitFor(() => expect(document.querySelectorAll('.host-drag-strip').length).toBeGreaterThan(0))
+  })
+
+  it('adopts focus mode from a pane and shares it back across every pane', async () => {
+    // Focus mode belongs to the WINDOW, so a toggle driven inside one pane has to
+    // become the host's value too — that is what makes the top-bar icon agree and
+    // what carries the state to the OTHER panes on the next model broadcast. The
+    // reverse direction (host -> pane) rides `mc-host-model.focusMode`.
+    const { focusModeEnabled, __resetFocusMode } = await import('../hooks/useFocusMode')
+    __resetFocusMode()
+    mockConnectedCd1()
+    const store = createTestStore({
+      instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: { 'cd-1': true } },
+    })
+    renderWithProviders(<InstancesViewport />, { store })
+
+    expect(focusModeEnabled()).toBe(false)
+    await act(async () => {
+      window.dispatchEvent(new MessageEvent('message', {
+        data: { type: 'mc-set-focus-mode', v: 1, on: true },
+        origin: 'http://127.0.0.1:7778',
+      }))
+    })
+    await waitFor(() => expect(focusModeEnabled()).toBe(true))
+
+    // A malformed payload from a pane must not flip window state.
+    await act(async () => {
+      window.dispatchEvent(new MessageEvent('message', {
+        data: { type: 'mc-set-focus-mode', v: 1, on: 'yes' },
+        origin: 'http://127.0.0.1:7778',
+      }))
+    })
+    expect(focusModeEnabled()).toBe(true)
+    __resetFocusMode()
+  })
+
+  it('takes chrome visibility from the ACTIVE pane only', async () => {
+    // A pane's peeked header is the only thing on screen when that pane fills the
+    // window, so the host has to act on its report — the traffic lights are AppKit
+    // views on THIS window and the pane cannot touch them. But only the active
+    // pane may speak: a background pane's peek must not summon the lights over a
+    // different pane's content.
+    const { focusChromeVisible, setFocusChromeVisible, __resetFocusMode } = await import('../hooks/useFocusMode')
+    __resetFocusMode()
+    setFocusChromeVisible(false)
+    mockConnectedCd1()
+    const store = createTestStore({
+      instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: { 'cd-1': true } },
+    })
+    renderWithProviders(<InstancesViewport />, { store })
+
+    expect(focusChromeVisible()).toBe(false)
+    await act(async () => {
+      window.dispatchEvent(new MessageEvent('message', {
+        data: { type: 'mc-focus-chrome', v: 1, on: true },
+        origin: 'http://127.0.0.1:7778',
+      }))
+    })
+    await waitFor(() => expect(focusChromeVisible()).toBe(true))
+
+    // A report from a pane that is NOT active is ignored.
+    setFocusChromeVisible(false)
+    // Separate act: the component tracks the active id in a ref written during
+    // render, so the switch has to COMMIT before the message is delivered —
+    // otherwise the listener still sees cd-1 as active and the test would pass
+    // for the wrong reason.
+    await act(async () => { store.dispatch(setActiveId(null)) })
+    await act(async () => {
+      window.dispatchEvent(new MessageEvent('message', {
+        data: { type: 'mc-focus-chrome', v: 1, on: true },
+        origin: 'http://127.0.0.1:7778',
+      }))
+    })
+    expect(focusChromeVisible()).toBe(false)
+    __resetFocusMode()
+  })
+
+  it('applies the incoming pane\'s chrome state on switch instead of the outgoing one\'s', async () => {
+    // A switch necessarily happens from a PEEKED header — the tab bar lives on
+    // it — so the window store holds `true` at that moment. The incoming pane's
+    // chrome state did not change, so it re-posts nothing; without a switch-time
+    // apply, the traffic lights stay stranded over the new pane until its next
+    // hover cycle. The store must flip to the incoming pane's last-known state;
+    // a pane that has NEVER reported defaults to visible (it may be a
+    // pre-focus-mode install whose header never hides).
+    const { focusModeEnabled, focusChromeVisible, setFocusChromeVisible, setFocusModeEnabled, __resetFocusMode } = await import('../hooks/useFocusMode')
+    __resetFocusMode()
+    setFocusModeEnabled(true)
+    mockConnectedCd1()
+    const store = createTestStore({
+      instances: {
+        warm: { 'cd-1': { port: 7778, token: 'tok' }, 'cd-2': { port: 7779, token: 'tok2' } },
+        activeId: 'cd-1', mru: ['cd-1', 'cd-2'], unread: {}, ready: { 'cd-1': true, 'cd-2': true },
+      },
+    })
+    renderWithProviders(<InstancesViewport />, { store })
+    try {
+      // cd-1 reports hidden (its focus-mode steady state), then the user drives
+      // the switch from a re-peeked tab bar: the store holds `false` for cd-1.
+      await act(async () => {
+        window.dispatchEvent(new MessageEvent('message', {
+          data: { type: 'mc-focus-chrome', v: 1, on: false },
+          origin: 'http://127.0.0.1:7778',
+        }))
+      })
+      await waitFor(() => expect(focusChromeVisible()).toBe(false))
+
+      // Switch to cd-2, which has never reported: the store must rise to the
+      // visible default rather than keep cd-1's `false` — a non-conforming
+      // pane renders its full header, and hiding the lights under it strands
+      // a header that cannot drag the window.
+      await act(async () => { store.dispatch(setActiveId('cd-2')) })
+      await waitFor(() => expect(focusChromeVisible()).toBe(true))
+
+      // Switching BACK re-applies cd-1's remembered state — its stored report,
+      // not the default. The report was recorded even while cd-1 was inactive.
+      await act(async () => { store.dispatch(setActiveId('cd-1')) })
+      await waitFor(() => expect(focusChromeVisible()).toBe(false))
+
+      // Focus mode OFF: a switch must NOT touch chrome state (it is
+      // unconditionally visible and owned by the surfaces themselves).
+      setFocusModeEnabled(false)
+      expect(focusModeEnabled()).toBe(false)
+      setFocusChromeVisible(true)
+      await act(async () => { store.dispatch(setActiveId('cd-2')) })
+      expect(focusChromeVisible()).toBe(true)
+    } finally {
+      __resetFocusMode()
+    }
   })
 
   it('dismisses the loading overlay when the pane posts mc-embedded-ready from its tunnel origin', async () => {
@@ -473,7 +765,7 @@ describe('InstancesViewport', () => {
       vi.useRealTimers()
     }
     // The escape-hatch strip is on the panel (query resolves under real timers).
-    expect(await screen.findByRole('group', { name: /Remote crews/i })).toBeInTheDocument()
+    expect(await screen.findByRole('group', { name: /Remote instances/i })).toBeInTheDocument()
   })
 
   it('Retry after a load timeout force-reloads the iframe even for an identical token', async () => {

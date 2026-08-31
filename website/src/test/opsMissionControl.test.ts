@@ -410,7 +410,6 @@ describe('a parked signal is visibly parked, not silently gone', () => {
 
   it('uses a Lucide icon and no emoji', () => {
     expect(panel).toContain('BellOff')
-    // eslint-disable-next-line no-control-regex
     expect(panel).not.toMatch(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u)
   })
 })
@@ -542,32 +541,14 @@ describe('the Handover coverage card distinguishes configured from working', () 
   })
 })
 
-describe('the ops panels use theme tokens that actually exist', () => {
-  // tailwind.config.js defines ok / warn / danger; there is no `success` or `warning`
-  // token and index.css defines no --success/--warning, so `text-success` and
-  // `text-warning` silently rendered with NO color override — a warning that was not
-  // yellow and a verified badge that was not green.
-  for (const file of [
-    'OpsMissionControlPage.tsx',
-    'SignalsPanel.tsx',
-    'HandoverPanel.tsx',
-    'SettingsPanel.tsx',
-  ]) {
-    it(`${file} uses no phantom color class`, () => {
-      const src = readPanel(file)
-      expect(src).not.toMatch(/text-success\b/)
-      expect(src).not.toMatch(/text-warning\b/)
-      // Same failure mode, a different set of names: `bg-panel`, `border-line` and
-      // `border-subtle` are NOT keys in tailwind.config.js (the palette has `card`,
-      // `border`, `border-strong`), so those utilities emit nothing — an invisible border
-      // or a background that never applied. The real tokens are `bg-card`/`bg-bg-elevated`
-      // and `border-border`. Found in UX review.
-      expect(src).not.toMatch(/\bbg-panel\b/)
-      expect(src).not.toMatch(/\bborder-line\b/)
-      expect(src).not.toMatch(/\bborder-subtle\b/)
-    })
-  }
-})
+// The per-panel phantom-color denylist that used to live here is gone: the
+// repo-wide `phantom-classes` gate (website/scripts/check-phantom-classes.mjs)
+// now asks Tailwind whether a class is emitted, for every file, so this file
+// list is neither needed nor safe. It had a hole of exactly the kind a
+// hardcoded denylist grows: `bg-card-hover` was live on
+// OpsMissionControlPage.tsx:349 and :733 — a file in the list above — and no
+// assertion named it, because a denylist can only ban the names someone
+// remembered. The gate needs no names.
 
 /**
  * The team memory-exchange repo, the on-call schedule, and sync status.
@@ -848,7 +829,6 @@ describe('the Board renders the artifact a colleague gets handed', () => {
 
   it('uses a Lucide icon for the section, never an emoji', () => {
     expect(page).toMatch(/FileText className="lucide-inline"/)
-    // eslint-disable-next-line no-control-regex
     expect(page).not.toMatch(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u)
   })
 
@@ -941,7 +921,6 @@ describe('Settings surfaces the notification channels and their on/off', () => {
   it('uses Lucide icons for the card and every channel, never an emoji', () => {
     expect(panel).toMatch(/BellRing className="lucide-inline"/)
     expect(panel).toMatch(/UserCheck className="lucide-inline"/)
-    // eslint-disable-next-line no-control-regex
     expect(panel).not.toMatch(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u)
   })
 

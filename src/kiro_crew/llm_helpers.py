@@ -11,13 +11,17 @@ import json
 import logging
 import random
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.acp.client import AcpError, AcpPromptBusy
+from kiro_crew import name_grant
+from kiro_crew.acp.client import AcpError, AcpPromptBusy, advertised_model_ids
 from kiro_crew.acp.types import EVENT_STEER_CONSUMED, TurnUsage
+from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.hooks import fire_tool_hooks, get_global_hook_store
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
@@ -27,7 +31,13 @@ from kiro_crew.providers.base import (
     LLMEvent,
     LLMProvider,
 )
-from kiro_crew.security import is_denied, is_sensitive_bash_command, is_sensitive_path
+from kiro_crew.security import (
+    is_denied,
+    is_sensitive_bash_command,
+    is_sensitive_path,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 from kiro_crew.sel import sel as _sel
 
 _PROMPT_BUSY_RETRIES = 2
@@ -193,6 +203,608 @@ def first_advertised_fallback(advertised: Any, rejected: str | None) -> str | No
     return None
 
 
+# ── Throttle-exhaustion fallback chain (agent.fallback_model) ──
+#
+# When the active model's same-model transient budget (_TRANSIENT_RETRIES)
+# exhausts on a throttle/capacity error, an ordered chain of fallback models is
+# tried instead of surfacing the error. This lives entirely on the Kiro Crew
+# side (kiro-cli
+# has no fallback mechanism) and is NEVER silent: every swap is logged at
+# warning, published on the provider (TURN_FALLBACK_ATTR) so the delivering
+# surface can prepend a visible notice, and — on the interactive path —
+# announced in chat (see dashboard/chat_runner). An empty chain (the default)
+# disables the feature: behavior is byte-for-byte the pre-feature error surface.
+
+# Attempts per fallback candidate: initial + ONE ~2s retry — deliberately NOT a
+# fresh _TRANSIENT_RETRIES budget. Throttle-exhaustion events are often
+# cell-scoped and model-agnostic (a frontend admission-tier outage takes out
+# ALL models in the cell), so deep per-candidate retries mostly re-confirm a
+# correlated outage slowly. One retry covers the uncorrelated single-shot 5xx
+# on a healthy candidate while keeping the worst case bounded (~35s of backoff
+# across a 4-candidate chain).
+FALLBACK_CANDIDATE_ATTEMPTS = 2
+
+
+def fallback_rewound_transient_budget() -> int:
+    """Same-model counter value that grants a fresh fallback candidate its budget.
+
+    The dashboard's interactive ladder does not hold a :class:`FallbackState`
+    between turns — after a swap it rewinds ``slot._transient_5xx_retries`` so
+    the candidate gets exactly :data:`FALLBACK_CANDIDATE_ATTEMPTS` - 1 further
+    passes through the same-model retry branch (the re-queued turn itself is
+    the first attempt) before the next exhaustion advances the chain. Deriving
+    the rewind here keeps the per-candidate budget in ONE place with
+    :meth:`FallbackState.should_retry_active`, the encoding the unattended
+    surfaces use. Clamped at zero so the counter can never go negative:
+    a FALLBACK_CANDIDATE_ATTEMPTS above TRANSIENT_RETRIES + 1 cannot be
+    expressed by this counter encoding at all — it collapses to the full
+    same-model budget (the documented "deliberately not a fresh full budget"
+    stance caps the useful range at TRANSIENT_RETRIES + 1).
+    """
+    return max(0, TRANSIENT_RETRIES - (FALLBACK_CANDIDATE_ATTEMPTS - 1))
+
+
+# Provider attribute carrying the active fallback as ``(primary, candidate)``.
+# Doubles as (a) the sticky-restore marker — the next stream_and_collect call
+# on the same provider probes one ``set_model(primary)`` restore — and (b) the
+# visibility source for unattended surfaces (cron/heartbeat read it after the
+# turn and prepend a warning line to the delivered result). Cleared on a
+# successful restore, never on turn completion: the swap is sticky for the
+# remainder of the session by design.
+TURN_FALLBACK_ATTR = "_kc_active_fallback"
+
+# Exception attribute carrying the chain-exhaustion story (set by the fallback
+# walks when every candidate also failed). The delivering surface appends it to
+# the terminal error text via :func:`append_fallback_story` so an unattended
+# failure names the whole walk, not just the last candidate's error.
+FALLBACK_STORY_ATTR = "_kc_fallback_story"
+
+# Bound on the story text a consumer will accept. The walked ids originate in
+# ``agent.fallback_model`` config (LLM-reachable via MCP) and the advertised
+# check fails OPEN on an empty list, so an arbitrarily long config string can
+# reach the walk — bound and redact it centrally before it rides any error
+# surface (WS frames, Slack alerts, log lines).
+_FALLBACK_STORY_CAP = 500
+
+
+def fallback_story_of(exc: BaseException) -> str:
+    """The chain-exhaustion story carried on *exc*, redacted+capped, or ``""``.
+
+    Reads :data:`FALLBACK_STORY_ATTR`; anything but a non-empty string is
+    treated as absent (the attribute is best-effort — a frozen exception type
+    may have refused the set, and a hostile ``__getattribute__`` must not
+    break error delivery). Redaction and the :data:`_FALLBACK_STORY_CAP`
+    bound live HERE so every consumer (cron alert, sub-agent error, heartbeat
+    log) gets the same safe text — no per-surface drift. Never raises.
+    """
+    try:
+        story = getattr(exc, FALLBACK_STORY_ATTR, None)
+        if not isinstance(story, str) or not story:
+            return ""
+        story = redact_credentials(redact_exfiltration_urls(story)[0])[0]
+    except Exception:  # noqa: BLE001 — a story must never break error delivery
+        logger.debug("fallback story read/redaction failed", exc_info=True)
+        return ""
+    return story[:_FALLBACK_STORY_CAP]
+
+
+def append_fallback_story(text: str, exc: BaseException, *, budget: int | None = None) -> str:
+    """Append *exc*'s chain-exhaustion story to terminal error *text*.
+
+    THE consumer for :data:`FALLBACK_STORY_ATTR` on unattended surfaces
+    (cron failure alerts, sub-agent ``info.error``, the heartbeat failure
+    log). The interactive dashboard does not use it — it rebuilds a richer
+    story from ``slot._fallback_walked``. No story ⇒ *text* is returned
+    unchanged (capped at *budget* when one is given). The story arrives
+    redacted+capped from :func:`fallback_story_of`. Never raises.
+
+    :param budget: optional total length bound for the composite. The ERROR
+        text is trimmed to leave the story room — the story is the part a
+        verbose backend error must never push out — but keeps a FLOOR of half
+        the budget: an oversized story (config-sourced ids can approach
+        :data:`_FALLBACK_STORY_CAP`, which may equal a caller's cap) must not
+        evict the actual error either, so past the floor it is the story tail
+        that truncates. Degenerate budgets (a handful of characters — no real
+        caller passes one) keep the error head and may lose the story
+        entirely. ``None`` appends unbounded (caller owns the cap); a
+        negative value is normalized to 0 (a negative slice would DROP the
+        bound instead of tightening it).
+    """
+    if budget is not None and budget < 0:
+        budget = 0
+    story = fallback_story_of(exc)
+    if not story:
+        return text if budget is None else text[:budget]
+    if budget is not None:
+        # Reserve " [" + story + "]" out of the budget, but never trim the
+        # error text below half the budget; the final cap then truncates the
+        # story tail instead.
+        text = text[: max(budget // 2, budget - len(story) - 3)]
+    out = f"{text} [{story}]" if text else story
+    return out if budget is None else out[:budget]
+
+
+def annotate_model_fallback(text: str, provider: Any) -> str:
+    """Prepend the throttle-fallback warning to a delivered unattended result.
+
+    Unattended surfaces (cron/heartbeat results, the sub-agent completion
+    event) have no chat card to announce a fallback swap on, so the delivered
+    result text itself carries the warning — the same visibility contract as
+    the interactive notice card. The marker is read from
+    :data:`TURN_FALLBACK_ATTR` (set by the shared fallback walk) and left in
+    place: the swap is sticky for the session, so every run served by the
+    fallback repeats the warning until the restore probe moves the session
+    back. Model ids come from config, which is LLM-reachable via MCP — redact
+    before they reach Slack/dashboard. One body for every surface (was two
+    spellings: ``slack/gateway`` + an inline block in ``subagent``). Never
+    raises: an annotation failure must not turn a successful run into a
+    failed one — the un-annotated *text* is returned instead.
+    """
+    try:
+        fb = getattr(provider, TURN_FALLBACK_ATTR, None)
+        if not fb:
+            return text
+        primary, candidate = fb
+        # Same threat model as _FALLBACK_STORY_CAP: the ids originate in
+        # config (LLM-reachable via MCP), so bound them as well as redacting.
+        safe_primary = redact_credentials(redact_exfiltration_urls(str(primary))[0])[0][
+            :_FALLBACK_STORY_CAP
+        ]
+        safe_candidate = redact_credentials(redact_exfiltration_urls(str(candidate))[0])[0][
+            :_FALLBACK_STORY_CAP
+        ]
+        line = (
+            f"⚠️ Model '{safe_primary}' throttled; this run was served by fallback "
+            f"'{safe_candidate}'."
+        )
+        return f"{line}\n\n{text}" if text else line
+    except Exception:  # noqa: BLE001 — annotation is best-effort visibility
+        logger.debug("fallback annotation failed", exc_info=True)
+        return text
+
+
+def provider_fallback_active(provider: Any) -> bool:
+    """True while *provider* carries an active fallback marker.
+
+    THE shared usage-attribution guard: while a fallback serves the session,
+    an explicit model pin (``job.model`` / ``info.model`` / ``slot.model``)
+    must NOT be recorded as the turn's model — the durable usage row would
+    bill the fallback's spend to a model that never executed. Callers blank
+    the explicit value when this is true (mirroring the ``_seq_downgraded``
+    precedent), deferring to ``model_source`` — which reads the model that
+    actually ran.
+    """
+    marker = getattr(provider, TURN_FALLBACK_ATTR, None)
+    return isinstance(marker, (tuple, list)) and len(marker) >= 2
+
+
+def next_fallback_candidate(
+    chain: Sequence[str],
+    active_model: str,
+    advertised: Sequence[str] | None,
+) -> str | None:
+    """First usable fallback candidate from *chain*, or ``None``.
+
+    Skips empties, the currently-active model (a chain entry equal to what is
+    already failing cannot help), and — when an advertised list is known — any
+    id the backend did not advertise (unentitled/unknown). ``"auto"`` is a
+    legitimate candidate (the backend's availability-aware routing) and is
+    filtered by the same advertised check: a partition that does not serve
+    ``"auto"`` skips it rather than sending a no-op swap. An EMPTY advertised
+    list fails OPEN (candidates accepted): entitlement unknown is not
+    entitlement denied, matching ``model_is_unusable``'s stance, and the
+    substitute ``set_model`` path re-validates against the live list anyway.
+    """
+    adv = {a.strip().lower() for a in (advertised or []) if isinstance(a, str) and a.strip()}
+    act = (active_model or "").strip().lower()
+    for cand in chain:
+        if not isinstance(cand, str):
+            continue
+        low = cand.strip().lower()
+        if not low or low == act:
+            continue
+        if adv and low not in adv:
+            logger.debug("model fallback: skipping %r (not advertised)", cand)
+            continue
+        return cand
+    return None
+
+
+@dataclass
+class FallbackState:
+    """Walk state for one logical turn's fallback-chain traversal.
+
+    ``pos`` is the next chain index to consider (monotonic — a candidate is
+    never revisited), ``active`` the candidate currently being attempted,
+    ``attempts`` how many attempts the active candidate has consumed (capped at
+    :data:`FALLBACK_CANDIDATE_ATTEMPTS`), ``primary`` the model that was active
+    when the chain walk started, and ``walked`` every candidate actually tried
+    (for the chain-exhausted error story).
+    """
+
+    chain: tuple[str, ...]
+    pos: int = 0
+    active: str | None = None
+    attempts: int = 0
+    primary: str = ""
+    walked: list[str] = dataclass_field(default_factory=list)
+
+    def next_candidate(self, active_model: str, advertised: Sequence[str] | None) -> str | None:
+        """Advance to and return the next usable candidate, or ``None``."""
+        remaining = self.chain[self.pos :]
+        cand = next_fallback_candidate(remaining, active_model, advertised)
+        if cand is None:
+            self.pos = len(self.chain)
+            return None
+        self.pos += remaining.index(cand) + 1
+        return cand
+
+    def should_retry_active(self) -> bool:
+        """Consume one more attempt on the active candidate, if budget remains.
+
+        THE single home of the per-candidate retry budget/trigger (was three
+        spellings: ``stream_and_collect`` Case 2.75, the sub-agent ladder, and
+        the dashboard's counter rewind — the last derives its counter from the
+        same constant via :func:`fallback_rewound_transient_budget`). ``True``
+        means the caller retries the active candidate once more (the attempt is
+        already recorded); ``False`` means no candidate is active or its
+        :data:`FALLBACK_CANDIDATE_ATTEMPTS` budget is spent — advance the chain
+        via :func:`advance_fallback_candidate`.
+        """
+        if self.active is None or self.attempts >= FALLBACK_CANDIDATE_ATTEMPTS:
+            return False
+        self.attempts += 1
+        return True
+
+    def exhaustion_story(self) -> str | None:
+        """One-line story of a spent chain walk, or ``None`` when none ran.
+
+        ``None`` (nothing was actually walked — e.g. every candidate was
+        skipped as unadvertised) means the error should surface exactly as it
+        did before the fallback feature existed, with no story attached.
+        """
+        if not self.walked:
+            return None
+        return (
+            f"{self.primary or 'the selected model'} throttled; "
+            f"fallbacks {', '.join(self.walked)} also unavailable"
+        )
+
+
+async def advance_fallback_candidate(
+    provider: Any,
+    fb_state: "FallbackState",
+    *,
+    surface: str,
+    log_suffix: str = "",
+) -> str | None:
+    """One chain-walk step — THE shared advance used by every fallback surface.
+
+    ``stream_and_collect`` (Case 2.75), the sub-agent transient ladder, and the
+    dashboard's ``_fallback_swap_for_turn`` all advance the chain through this
+    single body so throttle classification, marker semantics, and skip rules
+    cannot diverge across surfaces. It: seeds ``fb_state.primary`` from a
+    surviving sticky marker first (a session already on a fallback whose true
+    primary only the marker remembers) and the active model second; walks the
+    chain skipping the primary, unadvertised ids, and the currently-active
+    (failing) candidate; applies the first candidate whose substitute
+    ``set_model`` lands; publishes the sticky marker
+    (:data:`TURN_FALLBACK_ATTR`); and emits the greppable swap warning.
+    Returns the applied candidate, or ``None`` when the chain is exhausted or
+    the provider exposes no ``set_model`` seam — the caller then surfaces the
+    original error exactly as before this feature existed.
+    """
+    advertised = provider_advertised_ids(provider)
+    # An empty read means the session is auto-routed (``provider_active_model``
+    # deliberately filters the ``"auto"`` sentinel) or genuinely unknown; either
+    # way ``"auto"`` is the honest primary. Seeding it (a) makes the restore
+    # probe re-enter auto routing instead of hitting the dashboard's
+    # stale-clear arm with an empty primary (which would let the backfill pin
+    # the fallback permanently), (b) suppresses the auto->auto no-op swap via
+    # the active-skip below, and (c) keeps the notice card naming a real
+    # primary instead of a placeholder.
+    active = provider_active_model(provider) or (fb_state.active or "") or "auto"
+    if not fb_state.primary:
+        _marker = getattr(provider, TURN_FALLBACK_ATTR, None)
+        _marker_primary = ""
+        if isinstance(_marker, (tuple, list)) and _marker and isinstance(_marker[0], str):
+            _marker_primary = _marker[0].strip()
+        fb_state.primary = _marker_primary or active
+    set_model_fn = resolve_substitute_set_model(provider)
+    if set_model_fn is None:
+        return None
+    while True:
+        cand = fb_state.next_candidate(fb_state.primary or active, advertised)
+        if cand is None:
+            return None
+        if cand.strip().lower() == (active or "").strip().lower():
+            # With a marker-seeded primary, the chain can still name the
+            # CURRENTLY-failing fallback the session sits on — retrying it is
+            # what this walk exists to escape.
+            continue
+        _raw_before = provider_raw_model(provider)
+        try:
+            await set_model_fn(cand)
+        except Exception:
+            logger.debug(
+                "model fallback: set_model(%r) failed; skipping candidate",
+                cand,
+                exc_info=True,
+            )
+            continue
+        # Witness the swap before publishing: a non-raising set_model can be a
+        # silent no-op (resolve_usable_model collapses an unservable target to
+        # "" and returns without switching). Publishing an unwitnessed swap
+        # would announce a model that never took over and retry the same
+        # failing model. Only enforceable when the model attribute is readable
+        # (a provider exposing no model string cannot be witnessed — fail open,
+        # matching the pre-existing trust in set_model for such providers).
+        _raw_after = provider_raw_model(provider)
+        if (
+            _raw_before
+            and _raw_after == _raw_before
+            and _raw_after.strip().lower() != cand.strip().lower()
+        ):
+            logger.debug(
+                "model fallback: set_model(%r) was a silent no-op (model still %r); "
+                "skipping candidate",
+                cand,
+                _raw_after,
+            )
+            continue
+        fb_state.active = cand
+        fb_state.attempts = 1
+        fb_state.walked.append(cand)
+        try:
+            setattr(provider, TURN_FALLBACK_ATTR, (fb_state.primary, cand))
+        except Exception:
+            logger.debug("publishing fallback marker failed", exc_info=True)
+        logger.warning(
+            "model fallback: %s -> %s (reason=throttle-exhaustion, surface=%s%s)",
+            fb_state.primary or "?",
+            cand,
+            surface,
+            log_suffix,
+        )
+        return cand
+
+
+def resolve_substitute_set_model(provider: Any) -> Callable[[str], Awaitable[None]] | None:
+    """The provider's substitute-path ``set_model`` coroutine, or ``None``.
+
+    Prefers ``provider.set_model``; falls back to the wrapped client
+    (``provider.client`` / ``provider._client``) for wrappers like
+    ``AcpProvider`` that do not re-export it. Callers pre-filter candidates
+    against the advertised list, so the explicit-pick guard inside
+    ``AcpClient.set_model`` / ``AcpSessionProvider.set_model`` does not fire
+    for a served candidate.
+    """
+    try:
+        fn = getattr(provider, "set_model", None)
+    except Exception:  # pragma: no cover - exotic property getters
+        fn = None
+    if callable(fn):
+        return fn
+    for attr in ("client", "_client"):
+        try:
+            inner = getattr(provider, attr, None)
+        except Exception:  # pragma: no cover - exotic property getters
+            inner = None
+        try:
+            fn = getattr(inner, "set_model", None) if inner is not None else None
+        except Exception:  # pragma: no cover - exotic property getters
+            fn = None
+        if callable(fn):
+            return fn
+    return None
+
+
+def provider_advertised_ids(provider: Any) -> list[str]:
+    """Advertised model ids from the provider, ``[]`` when unknown."""
+    getter = getattr(provider, "available_models", None)
+    if not callable(getter):
+        return []
+    try:
+        return advertised_model_ids(getter())
+    except Exception:
+        return []
+
+
+def provider_active_model(provider: Any) -> str:
+    """The model currently serving the provider's session, ``""`` if unknown."""
+    for attr in ("served_model", "_model"):
+        try:
+            val = getattr(provider, attr, "")
+        except Exception:  # pragma: no cover - exotic property getters
+            val = ""
+        if isinstance(val, str) and val.strip() and val.strip().lower() != "auto":
+            return val.strip()
+    return ""
+
+
+def provider_raw_model(provider: Any) -> str:
+    """The provider's raw model attribute, ``"auto"`` INCLUDED, ``""`` if unknown.
+
+    The witness reader for fallback state transitions: unlike
+    :func:`provider_active_model` (which filters the ``"auto"`` sentinel for
+    walk semantics), this reports the attribute verbatim so a caller can
+    observe whether a non-raising ``set_model`` actually moved the session.
+    ``resolve_usable_model`` collapses an unservable target to ``""`` and
+    ``set_model`` then returns WITHOUT switching — treating "didn't raise" as
+    "switched" is what let a no-op restore clear sticky state while still on
+    the fallback (and the backfill then pinned it permanently).
+    """
+    for attr in ("served_model", "_model"):
+        try:
+            val = getattr(provider, attr, "")
+        except Exception:  # pragma: no cover - exotic property getters
+            val = ""
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+async def probe_fallback_restore(
+    provider: Any,
+    *,
+    surface: str = "unattended",
+    state: tuple[Any, Any] | None = None,
+    stale: bool = False,
+    clear: Callable[[], None] | None = None,
+    on_restored: Callable[[], None] | None = None,
+    log_suffix: str = "",
+) -> None:
+    """One ``set_model(primary)`` restore probe at the start of a turn.
+
+    THE single restore-probe body: the unattended surfaces call it bare (state
+    read from :data:`TURN_FALLBACK_ATTR`), and the dashboard's slot probe wraps
+    it (``chat_runner._probe_fallback_restore_for_slot_locked``) with the
+    slot-held state and hooks below, so the probe/witness/clear sequencing
+    cannot diverge across surfaces. The restore only fires while the session is
+    still on the fallback this feature set (a user/session-level model change
+    in between clears the sticky state without touching the model — never
+    override an explicit later pick). Success clears the state and logs
+    (recovery is the quiet default: no chat notice); failure keeps the fallback
+    for this turn. Never raises.
+
+    :param state: ``(primary, candidate)`` override. Default: read the
+        provider's :data:`TURN_FALLBACK_ATTR` marker (no-op when absent).
+    :param stale: caller-known extra staleness the marker cannot see (the
+        dashboard's explicit-pick generation check) — treated exactly like the
+        session having moved off the fallback.
+    :param clear: replaces the default marker clear (the dashboard drops slot
+        fields AND the marker as one logical record).
+    :param on_restored: hook running after a witnessed restore, before *clear*
+        (the dashboard's slot-model heal).
+    :param log_suffix: appended inside the log parentheses, e.g. ``", slot=k"``.
+    """
+    try:
+        # The whole state read is guarded: a hostile marker property, a
+        # raising ``__bool__``/``__str__``, or a malformed tuple must not
+        # break the "never raises" contract — an unreadable state simply
+        # skips the probe.
+        if state is None:
+            marker = getattr(provider, TURN_FALLBACK_ATTR, None)
+            if not marker:
+                return
+            primary, candidate = marker
+        else:
+            primary, candidate = state
+            if not candidate:
+                return
+        # Coerce ONCE; every later comparison uses the plain string. The
+        # marker path deliberately has no empty-candidate early return (a
+        # ``(primary, "")`` marker still probes and clears — pre-existing
+        # semantics), while the state path mirrors the slot probe's
+        # no-active-fallback no-op.
+        candidate = "" if candidate is None else str(candidate)
+        primary_missing = not primary
+    except Exception:
+        logger.debug("fallback restore: unreadable fallback state; skipping probe", exc_info=True)
+        return
+
+    def _default_clear() -> None:
+        try:
+            setattr(provider, TURN_FALLBACK_ATTR, None)
+        except Exception:
+            pass
+
+    def _run_hook(fn: Callable[[], None], what: str) -> None:
+        # Caller-supplied hooks must not break the never-raises contract: a
+        # failing heal/clear aborts the TURN it runs at the start of, which is
+        # far worse than the stale state it was tidying.
+        try:
+            fn()
+        except Exception:
+            logger.debug("fallback restore %s hook failed", what, exc_info=True)
+
+    _clear = clear if clear is not None else _default_clear
+    current = provider_active_model(provider)
+    if current and candidate and current.strip().lower() != candidate.strip().lower():
+        # The session moved off our fallback by other means (explicit pick,
+        # session reset). The sticky state is stale — drop it, restore nothing.
+        _run_hook(_clear, "clear")
+        return
+    if stale or primary_missing:
+        _run_hook(_clear, "clear")
+        return
+    set_model_fn = resolve_substitute_set_model(provider)
+    if set_model_fn is None:
+        return
+    try:
+        await set_model_fn(primary)
+    except Exception as exc:
+        logger.info(
+            "model fallback: primary %s still unavailable (%s); staying on %s " "(surface=%s%s)",
+            primary,
+            exc,
+            candidate,
+            surface,
+            log_suffix,
+        )
+        return
+    # Witness the restore before clearing: a non-raising set_model(primary)
+    # can be a silent no-op (e.g. an "auto" primary on a partition that
+    # stopped advertising it resolves to "" and returns without switching).
+    # Clearing the marker while still on the fallback would let the next
+    # backfill pin the temporary fallback permanently. Keep the marker and
+    # retry at the next turn start instead.
+    _raw = provider_raw_model(provider)
+    if _raw and candidate and _raw.strip().lower() == candidate.strip().lower():
+        logger.info(
+            "model fallback: restore to %s was a silent no-op (still on %s); "
+            "keeping fallback (surface=%s%s)",
+            primary,
+            candidate,
+            surface,
+            log_suffix,
+        )
+        return
+    if on_restored is not None:
+        # A failed heal does not block the clear: the two writes are one
+        # logical record, a half-cleared record is worse than a missed heal,
+        # and the stale-state paths above never heal either — retaining the
+        # record would not buy a retry of the heal. The dashboard's actual
+        # hooks are plain attribute writes that realistically cannot raise;
+        # this guard is for the "never raises" contract, not an expected path.
+        _run_hook(on_restored, "on_restored")
+    _run_hook(_clear, "clear")
+    logger.warning(
+        "model fallback: restored %s -> %s (reason=primary-recovered, surface=%s%s)",
+        candidate,
+        primary,
+        surface,
+        log_suffix,
+    )
+
+
+def configured_fallback_chain() -> tuple[str, ...]:
+    """The throttle-fallback chain derived from ``agent.fallback_model``, or ``()``.
+
+    The config is a SINGLE value; the walk order is derived here (the one
+    derivation every surface shares): ``""`` disables the feature everywhere
+    (``()`` — callers pass it straight to ``fallback_models=`` and Case 2.75
+    stays inert); ``"auto"`` (the default) yields ``("auto",)`` — defer to the
+    backend's availability-aware routing; a concrete id yields
+    ``(id, "auto")`` — the pinned fallback first, ``"auto"`` as the final
+    fallthrough (the backend routes to whatever is actually available).
+
+    ``KiroCrewConfig.load()`` is fingerprint-cached (mtime/size/mode of both
+    config files), so the steady-state cost is two stats — the same read the
+    interactive turn path already performs inline on the event loop every
+    turn.
+    """
+    try:
+        fm = KiroCrewConfig.load().agent.fallback_model
+    except Exception:
+        return ()
+    if not fm:
+        return ()
+    if fm == "auto":
+        return ("auto",)
+    return (fm, "auto")
+
+
 class PromptBusyExhaustedError(Exception):
     """Provider was shut down after prompt-busy retries were exhausted."""
 
@@ -251,7 +863,7 @@ def _extract_tool_input_strings(tool_input: str) -> list[str]:
         return []
     try:
         parsed = json.loads(tool_input)
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         # Not JSON — treat the raw string as a path/command candidate
         return [tool_input]
     if isinstance(parsed, str):
@@ -282,10 +894,6 @@ class ToolApprovalPolicy(Enum):
     AUTO_APPROVE = "auto_approve"
     REJECT_ALL = "reject_all"
     HOOK_BASED = "hook_based"
-
-
-# Callback type for custom tool approval logic
-OnPermissionCallback = Callable[[LLMEvent], Awaitable[bool]]
 
 
 # ── Stream and Collect ──
@@ -470,7 +1078,11 @@ async def run_bg_oneliner(
                 from kiro_crew.dashboard.handlers.usage import persist_token_record_async
 
                 usage = provider_last_turn_usage(session, since=stats_before)
-                if usage.credits or usage.input_tokens or usage.output_tokens:
+                # One shared predicate across every persist gate: a claude-seam
+                # turn recovered through the live-stats path can bill cost or
+                # cache tokens with zero credits AND zero fresh token counts;
+                # a gate testing only the kiro dimensions silently drops it.
+                if usage_has_billing(usage):
                     await persist_token_record_async(
                         sel_session_key,
                         # The model the session SERVED, never the one requested: a
@@ -524,10 +1136,46 @@ def _attempt_usage(provider: Any, *, since: Any = _NO_PRIOR_STATS) -> TurnUsage:
     if since is not _NO_PRIOR_STATS and stats is since:
         return TurnUsage()
     try:
+        # Prefer the stats object's own converter: it is the single source of
+        # truth for stats -> TurnUsage and carries every billing dimension the
+        # turn filled (claude seam: token counts + cache fields + cost_usd; kiro:
+        # credits). Duck-typed so the doubles in tests (and any stats holder
+        # predating the converter) fall through to the credits-only constructor,
+        # which is byte-identical for the kiro seam. The converter's failure is
+        # contained so a faulty to_turn_usage degrades to the credits read
+        # rather than silently zeroing a turn that previously billed.
+        to_usage = getattr(stats, "to_turn_usage", None)
+        if callable(to_usage):
+            try:
+                usage = to_usage()
+            except Exception:
+                logger.debug("to_turn_usage failed; falling back to credits", exc_info=True)
+                usage = None
+            if isinstance(usage, TurnUsage):
+                return usage
         return TurnUsage(credits=float(getattr(stats, "credits", 0.0) or 0.0))
     except Exception:
         logger.debug("attempt usage read failed", exc_info=True)
     return TurnUsage()
+
+
+def usage_has_billing(usage: TurnUsage) -> bool:
+    """True when *usage* carries any billing dimension worth a row.
+
+    The single predicate behind every persist gate. Three hand-maintained
+    copies of ``credits or input_tokens or output_tokens`` is how the claude
+    seam's ``cost_usd`` (and a cost-free cache-only turn) got dropped in the
+    first place (#6758); a gate that reads this cannot drift from its siblings
+    when the next billing dimension is added.
+    """
+    return bool(
+        usage.credits
+        or usage.cost_usd
+        or usage.input_tokens
+        or usage.output_tokens
+        or usage.cache_creation_tokens
+        or usage.cache_read_tokens
+    )
 
 
 def _sum_usage(left: TurnUsage, right: TurnUsage) -> TurnUsage:
@@ -539,6 +1187,12 @@ def _sum_usage(left: TurnUsage, right: TurnUsage) -> TurnUsage:
             + int(getattr(right, "input_tokens", 0) or 0),
             output_tokens=int(getattr(left, "output_tokens", 0) or 0)
             + int(getattr(right, "output_tokens", 0) or 0),
+            cache_creation_tokens=int(getattr(left, "cache_creation_tokens", 0) or 0)
+            + int(getattr(right, "cache_creation_tokens", 0) or 0),
+            cache_read_tokens=int(getattr(left, "cache_read_tokens", 0) or 0)
+            + int(getattr(right, "cache_read_tokens", 0) or 0),
+            cost_usd=float(getattr(left, "cost_usd", 0.0) or 0.0)
+            + float(getattr(right, "cost_usd", 0.0) or 0.0),
         )
     except Exception:
         logger.debug("usage sum failed", exc_info=True)
@@ -575,8 +1229,10 @@ def provider_last_turn_usage(provider: Any, *, since: Any = _NO_PRIOR_STATS) -> 
     next caller preserving that pairing. A fresh turn installs fresh stats, so a
     stale total simply fails the identity check and the live read takes over.
 
-    On the ACP backend the only non-zero per-turn billing signal is ``credits``;
-    the token fields stay 0, matching the real usage record. Providers that expose
+    On the kiro (acp) seam the only non-zero per-turn billing signal is
+    ``credits``; on the claude seam the token counts, cache fields, and
+    ``cost_usd`` are filled instead. Whichever dimensions the turn's stats
+    carried come through :meth:`to_turn_usage` intact. Providers that expose
     no stats (non-ACP backends, test doubles) yield an empty ``TurnUsage``
     (credits=0). Never raises.
     """
@@ -743,8 +1399,10 @@ async def background_turn(
 
                 # A turn that never reached the provider bills nothing and has no
                 # row to write; the same guard the chat path applies keeps
-                # acquire-time failures from landing as zero-credit noise.
-                if usage.credits or usage.input_tokens or usage.output_tokens:
+                # acquire-time failures from landing as zero-credit noise. The
+                # shared predicate covers the claude seam's cost and cache
+                # dimensions alongside the kiro credits/token signals.
+                if usage_has_billing(usage):
                     await persist_token_record_async(
                         BACKGROUND_KEY,
                         "",
@@ -780,6 +1438,7 @@ async def stream_and_collect(
     agent: str = "",
     app: str = "",
     model_fallback: bool = False,
+    fallback_models: Sequence[str] = (),
 ) -> str:
     """Stream a message through an LLM provider and collect the full response.
 
@@ -833,6 +1492,14 @@ async def stream_and_collect(
             was silently not enforced for tools this helper approved. Callers
             using ``REJECT_ALL`` or ``AUTO_APPROVE`` are unaffected — the first
             runs no tools, the second never consults the gate.
+        fallback_models: Ordered chain of model ids tried when the same-model
+            transient budget exhausts on a throttle/capacity error (Case 2.75).
+            Empty (the default) disables the chain — behavior is byte-for-byte
+            today's fail-loudly. Requires ``retry_transient=True`` (a caller
+            that owns the outer transient loop also owns any fallback policy).
+            Every swap is logged at warning and published on the provider via
+            :data:`TURN_FALLBACK_ATTR`; the swap is sticky for the session and
+            a later call on the same provider probes one primary restore.
 
     Returns:
         The complete response text.
@@ -840,6 +1507,25 @@ async def stream_and_collect(
     transient_attempts = 0
     _model_fallback_attempted = False
     attempt = 0
+    _fb_chain = tuple(
+        m.strip() for m in (fallback_models or ()) if isinstance(m, str) and m.strip()
+    )
+    _fb_state = FallbackState(_fb_chain) if _fb_chain else None
+    # Cross-attempt tool-activity flag for the fallback chain ONLY. Case 2's
+    # same-model retry keys off ``result_text`` alone (pre-existing behavior,
+    # pinned byte-for-byte by the empty-chain regression tests), but the chain
+    # replays the ORIGINAL prompt up to FALLBACK_CANDIDATE_ATTEMPTS × len(chain)
+    # more times — a tool that completed an external mutation before any text
+    # streamed would be re-run on every one of them. Same activity predicate as
+    # the sub-agent ladder and the dashboard's ``_turn_emitted``: any fired
+    # tool call blocks the replay, text or no text.
+    _fb_tool_activity = False
+    # Sticky-restore probe (§restore policy): if an earlier turn on this
+    # provider fell back, try ONCE to move back to the primary before this
+    # turn streams. Quiet on success (log only); a still-throttled primary
+    # keeps the fallback for this turn.
+    if getattr(provider, TURN_FALLBACK_ATTR, None) is not None:
+        await probe_fallback_restore(provider, surface="stream_and_collect")
     # Accumulates across attempts, so it lives OUTSIDE the retry loop: a turn that
     # was billed and then retried must report the sum, not the last attempt.
     turn_billed = TurnUsage()
@@ -904,6 +1590,10 @@ async def stream_and_collect(
                         continue
                 elif event.kind == EVENT_TOOL_CALL:
                     tool_call_count += 1
+                    # Sticky across attempts (never reset in the retry loop):
+                    # once ANY attempt fired a tool, the fallback chain must
+                    # not replay the original prompt — see _fb_tool_activity.
+                    _fb_tool_activity = True
                     if on_tool_gate:
                         executed_calls.append((event.tool_call_id or "", event.title or ""))
                     if max_turns is not None and tool_call_count > max_turns:
@@ -1013,6 +1703,75 @@ async def stream_and_collect(
                 await asyncio.sleep(delay)
                 retrying = True
                 continue
+
+            # ── Case 2.75: throttle-exhaustion fallback chain ──
+            # The same-model budget (Case 2) is spent and the error is still
+            # transient (throttle/capacity — a throttle carries no rejection
+            # metadata, so Case 2.5 can never fire for it). Walk the configured
+            # chain: substitute set_model, then re-prompt. Two attempts per
+            # candidate (initial + one ~2s retry — see FALLBACK_CANDIDATE_
+            # ATTEMPTS), advance on transient failure, propagate non-transient
+            # immediately (the classifier gate above already ensures that).
+            # Empty chain ⇒ this block is inert and Case 3 surfaces the error
+            # exactly as before this feature existed.
+            #
+            # ``not _fb_tool_activity`` is load-bearing over and above
+            # ``not result_text``: a tool call can complete an EXTERNAL
+            # MUTATION before any text streams, and unlike Case 2's bounded
+            # same-model retry (pre-existing semantics, deliberately
+            # untouched), the chain replays the original prompt on every
+            # candidate — re-running that mutation each time. Any fired tool
+            # across ANY attempt disables the chain for this call; the error
+            # then surfaces exactly as it did before this feature.
+            if (
+                retry_transient
+                and not result_text
+                and not _fb_tool_activity
+                and _fb_state is not None
+                and acp_error_is_transient(exc)
+                and transient_attempts >= _TRANSIENT_RETRIES
+            ):
+                if _fb_state.should_retry_active():
+                    # Final attempt on the current candidate — the shared
+                    # budget body already recorded it.
+                    delay = transient_retry_delay(1)
+                    logger.warning(
+                        "model fallback: candidate %s still failing (attempt %d/%d), "
+                        "retrying in %.1fs: %s",
+                        _fb_state.active,
+                        _fb_state.attempts,
+                        FALLBACK_CANDIDATE_ATTEMPTS,
+                        delay,
+                        exc,
+                    )
+                    await asyncio.sleep(delay)
+                    retrying = True
+                    continue
+                # Advance to the next usable candidate via the shared walk
+                # step (marker-seeded primary, skip-active, substitute
+                # set_model, sticky-marker publish, greppable warning).
+                _cand = await advance_fallback_candidate(
+                    provider, _fb_state, surface="stream_and_collect"
+                )
+                if _cand is not None:
+                    await asyncio.sleep(transient_retry_delay(1))
+                    retrying = True
+                    continue
+                _story = _fb_state.exhaustion_story()
+                if _story:
+                    # Chain exhausted: surface the ORIGINAL error class with the
+                    # chain's story attached for the delivering surface, and
+                    # keep the incident greppable.
+                    logger.warning(
+                        "model fallback: chain exhausted (%s); surfacing original error: %s",
+                        _story,
+                        exc,
+                    )
+                    try:
+                        setattr(exc, FALLBACK_STORY_ATTR, _story)
+                    except Exception:
+                        pass
+                # Fall through to Case 2.5 / Case 3.
 
             # ── Case 2.5: model rejected (e.g. "auto" on GovCloud) — retry once
             # with the first advertised model. ──
@@ -1309,9 +2068,41 @@ async def _resolve_permission(
             )
             return False
         if tool_result.action == TOOL_AUTO_APPROVE:
-            await provider.approve_tool(event.request_id)
-            _log("auto_approved", metadata={"reason": "hook_auto_approve"})
-            return True
+            # The hook granted this by NAME (its `auto_approve_tools` globs, or
+            # the read-only allowlist). Verify it UNCONDITIONALLY: this helper
+            # serves unattended callers (cron / autonudge / heartbeat / Meetings
+            # transcript turns), some of which pass no approver, and the shell
+            # resolves the command's program names again through a PATH that can
+            # lead with agent-writable directories. A refusal DOWNGRADES to the
+            # caller's normal path — the interactive approver when one is
+            # present, else deny-by-default (reject) below — never a
+            # silent auto-approve of a shadowed name on an unwatched turn.
+            _ng_refusal = await name_grant.refusal_for_event(event)
+            if _ng_refusal is None:
+                await provider.approve_tool(event.request_id)
+                _log("auto_approved", metadata={"reason": "hook_auto_approve"})
+                return True
+            logger.warning(
+                "declining a hook auto-approve: %s; the request falls through "
+                "to this caller's approval path",
+                _ng_refusal.log_text,
+            )
+            name_grant.log_decline(
+                source="",
+                session_key=session_key,
+                agent=agent,
+                event=event,
+                refusal=_ng_refusal,
+                tier="hook_auto_approve",
+                sel_factory=sel,
+            )
+            # No interactive approver on this caller: the hook grant was the
+            # only positive authorization and it was withheld, so fall through
+            # to deny-by-default rather than the caller-less auto-approve below.
+            if on_tool_approval is None:
+                await provider.reject_tool(event.request_id)
+                _log("rejected", metadata={"reason": "name_grant_headless_reject"})
+                return False
 
     # Interactive approval if callback provided
     if on_tool_approval:
@@ -1333,7 +2124,11 @@ async def _resolve_permission(
 _JSON_DECODER = json.JSONDecoder()
 
 
-def _extract_json_of_type(text: str, expected_type: type) -> dict | list | None:
+def _extract_json_of_type(
+    text: str,
+    expected_type: type | tuple[type, ...],
+    prefer: Callable[[Any], bool] | None = None,
+) -> dict | list | None:
     """Extract the first top-level JSON value of *expected_type* embedded in prose.
 
     Scans successive ``{`` (dict) or ``[`` (list) offsets and uses the stdlib
@@ -1347,7 +2142,17 @@ def _extract_json_of_type(text: str, expected_type: type) -> dict | list | None:
     ``{`` nested inside an earlier-starting ``[ ... ]`` is consumed by that
     array's decode, so a dict request never digs a nested object out of a
     surrounding array.
+
+    When *prefer* is given, a preferred value is returned only when the choice
+    is UNAMBIGUOUS: all preferred matches in the text must be equal (a model
+    restating the same payload twice is not ambiguity). Two or more DIFFERENT
+    preferred matches return None — the caller cannot know which one is the
+    real payload, and guessing (e.g. executing a worked example that precedes
+    the actual plan) is worse than failing. When no preferred match exists,
+    the first type-matching value is returned as a fallback.
     """
+    preferred: list[dict | list] = []
+    fallback: dict | list | None = None
     i = 0
     n = len(text)
     while i < n:
@@ -1363,14 +2168,38 @@ def _extract_json_of_type(text: str, expected_type: type) -> dict | list | None:
             continue
         try:
             data, end = _JSON_DECODER.raw_decode(text, i)
+        except RecursionError:
+            # Adversarially deep nesting (e.g. "[" * 100_000 in prose): the
+            # stdlib decoder recurses per nesting level and overflows long
+            # before any structural bound. This text is untrusted model output,
+            # and callers handle only JSONDecodeError (parse_json's ValueError
+            # contract, the spine extractor's never-raises contract) — so the
+            # error must not escape. Fail the WHOLE scan closed: a truncated
+            # scan cannot certify a preferred match as unambiguous, so keeping
+            # candidates collected before the bomb would let a worked example
+            # launder past the ambiguity refusal (GPT review, #4974 round 4).
+            # Callers already have recovery paths for None (schema retry loop,
+            # the spine's forcing re-emit); salvaging a prefix of a reply that
+            # contains a nesting bomb is not worth defeating them.
+            return None
         except json.JSONDecodeError:
             i += 1
             continue
         if isinstance(data, expected_type):
-            return data  # type: ignore[return-value]
-        # Valid JSON of the wrong type — skip past its full extent.
+            if prefer is None:
+                return data  # type: ignore[return-value]
+            if prefer(data):
+                preferred.append(data)
+            elif fallback is None:
+                fallback = data  # type: ignore[assignment]
+        # Valid JSON that is not an immediate result — skip past its full extent.
         i = end
-    return None
+    if preferred:
+        first = preferred[0]
+        if all(candidate == first for candidate in preferred[1:]):
+            return first
+        return None
+    return fallback
 
 
 def _parse_llm(text: str, expected_type: type) -> dict | list | None:

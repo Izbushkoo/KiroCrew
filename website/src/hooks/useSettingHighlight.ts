@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useLocation, useSearchParams } from 'react-router-dom'
 import { SETTINGS_REGISTRY } from '../components/commandPalette/settingsRegistry.gen'
 import { i18nT } from '../i18n/t'
 
@@ -15,6 +15,8 @@ import { i18nT } from '../i18n/t'
  *   again when the qualifier was corrected to the service's real name,
  *   Amazon Polly — so BOTH the positional id and the short-form id have to
  *   land on the current one.
+ * - `chat.fallback-model` — the row was relabeled from "Fallback Model" to
+ *   "Default Model", the tier it actually is.
  */
 const LEGACY_ID_EXACT: Record<string, string> = {
   'voice.aws-profile': 'voice.aws-profile-transcribe',
@@ -23,16 +25,30 @@ const LEGACY_ID_EXACT: Record<string, string> = {
   'voice.aws-region-2': 'voice.aws-region-amazon-polly',
   'voice.aws-profile-polly': 'voice.aws-profile-amazon-polly',
   'voice.aws-region-polly': 'voice.aws-region-amazon-polly',
-  // The "Default Model" row is labeled "Fallback Model", and registry ids
+  // The "Default Model" row was labeled "Fallback Model", and registry ids
   // derive from the label — without this, links saved or bookmarked against
   // the old id silently lose their highlight.
-  'chat.default-model': 'chat.fallback-model',
+  'chat.fallback-model': 'chat.default-model',
+  // The pin toggle's label moved from "prompt" to "turn" vocabulary, shifting
+  // the derived id with it.
+  'chat.pin-the-latest-prompt': 'chat.pin-the-latest-turn',
 }
+
+/** Current registry ids, for fail-safe legacy rewrites below. */
+const REGISTRY_IDS = new Set(SETTINGS_REGISTRY.map(e => e.id))
 
 /** Rewrite a legacy highlight id to its current form (identity for current ids). */
 export function resolveLegacyHighlightId(id: string): string {
   if (LEGACY_ID_EXACT[id]) return LEGACY_ID_EXACT[id]
-  if (id.startsWith('slack.')) return `channels.${id.slice('slack.'.length)}`
+  if (id.startsWith('slack.')) id = `channels.${id.slice('slack.'.length)}`
+  // Per-channel rows gained a "(<Channel>)" label suffix so their ids are
+  // channel-qualified and order-stable. Every pre-suffix `channels.*` id in a
+  // bookmark was a SlackPanel row (the only channels panel the extractor
+  // mapped before the fan-out), so retarget those to the `-slack` form —
+  // fail-safe: only when the bare id no longer resolves and the slack form does.
+  if (id.startsWith('channels.') && !REGISTRY_IDS.has(id) && REGISTRY_IDS.has(`${id}-slack`)) {
+    return `${id}-slack`
+  }
   return id
 }
 
@@ -45,7 +61,7 @@ export function resolveLegacyHighlightId(id: string): string {
  * `ModelEffortDropdown.defaultLink.test.tsx` asserts it still resolves in
  * SETTINGS_REGISTRY — so a rename fails a test instead of shipping a dead link.
  */
-export const SETTINGS_DEFAULT_MODEL_ID = 'chat.fallback-model'
+export const SETTINGS_DEFAULT_MODEL_ID = 'chat.default-model'
 
 /**
  * useSettingHighlight — deep-link + highlight hook for Settings.
@@ -62,6 +78,7 @@ export const SETTINGS_DEFAULT_MODEL_ID = 'chat.fallback-model'
  */
 export function useSettingHighlight(): void {
   const [params, setParams] = useSearchParams()
+  const location = useLocation()
   const rawHighlightId = params.get('highlight')
 
   // Resolve key: prefix to a registry id via configKey lookup
@@ -163,5 +180,12 @@ export function useSettingHighlight(): void {
     }, 100)
 
     return () => clearTimeout(timer)
-  }, [highlightId, directConfigKey, setParams])
+    // location.key: every navigation re-arms the probe. Without it, the
+    // legacy-URL translation (SettingsPage replace-navigates ?tab=X onto the
+    // path form, mounting the target panel one commit LATER) would race this
+    // effect's 100ms timer, which strips the param even when no element was
+    // found — the re-run today only happens because react-router's
+    // setParams identity churns with the search string, an implementation
+    // detail nothing pins.
+  }, [highlightId, directConfigKey, setParams, location.key])
 }

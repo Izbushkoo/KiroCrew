@@ -41,6 +41,8 @@ def single_completion_meta(
     agent_name: str = "",
     task: str = "",
     note: str = "",
+    requested_model: str = "",
+    resolved_model: str = "",
 ) -> dict:
     """Structured facts for a per-agent completion card.
 
@@ -49,6 +51,15 @@ def single_completion_meta(
     gateway restart") — the ONLY explanation those messages carry — so the card
     can fold it into the payload without re-reading the header line. Empty on the
     ordinary completion path, where the status word is redundant with the chip.
+
+    ``requested_model`` is the model the spawn PINNED (``"auto"`` ⇒ unpinned,
+    deferring to the provider default; ``""`` means not yet populated by legacy
+    callers); ``resolved_model`` is the model the session
+    ACTUALLY served (``""`` ⇒ unknown/inconclusive, never a wildcard). The card
+    shows the resolved model and flags a mismatch when both are known and differ
+    — making a model-pinned review's real model auditable (issue #3582). Both
+    default to ``""`` so existing callers are unchanged and the key is simply
+    absent-equivalent when a provider cannot report a model.
     """
     return {
         "kind": "single",
@@ -57,6 +68,8 @@ def single_completion_meta(
         "outcome": outcome,
         "task": task,
         "note": note,
+        "requestedModel": requested_model,
+        "resolvedModel": resolved_model,
     }
 
 
@@ -72,7 +85,13 @@ def wave_final_meta(
     """Structured facts for the FINAL chunk of a wave digest — the only chunk
     that carries terminal tallies. ``delivered``/``running`` are implied
     (``delivered == total``, ``running == 0``) and left for the frontend to fill,
-    exactly as the regex path does."""
+    exactly as the regex path does.
+
+    Per-member model provenance (issue #5337) is surfaced inline in the digest
+    text (``ok_lines``/``fail_lines``), which both the parent LLM and the human
+    read, rather than in a structured field here — the card renders the digest
+    body verbatim and no consumer reads a per-member meta list.
+    """
     return {
         "kind": "batch",
         "final": True,
@@ -93,7 +112,11 @@ def wave_chunk_meta(
     total: int,
     running: int,
 ) -> dict:
-    """Structured facts for a MID-wave digest chunk — progress, no tallies."""
+    """Structured facts for a MID-wave digest chunk — progress, no tallies.
+
+    Per-member model provenance (issue #5337) is surfaced inline in the digest
+    text, not here — see ``wave_final_meta``.
+    """
     return {
         "kind": "batch",
         "final": False,

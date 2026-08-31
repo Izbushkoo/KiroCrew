@@ -40,11 +40,27 @@ document.documentElement.setAttribute('data-theme', theme === 'light' ? 'kiro-li
 
 /** Paths the fake backend reports as directories / files; everything else 404s
  *  as missing, mirroring the real endpoint's three outcomes. */
-const DIRS = new Set(['/Users/diwm/.kiro/crew/workspace/KiroCrew', '/Users/diwm/.kiro/crew'])
+const WORKSPACE = '/Demo Workspace'
+const PROJECT = `${WORKSPACE}/Product Guide`
+const RELEASE_NOTES = `${PROJECT}/release-notes.md`
+const OVERVIEW = `${PROJECT}/src/overview.md`
+
+const DIRS = new Set([PROJECT, WORKSPACE])
+
+/** Unicode paths — issue #6483: none of these classified before PATH_SHAPE_RE
+ *  gained `\p{L}\p{M}\p{N}` + the `u` flag, so the probe was never issued. The
+ *  NFD constant is written with escapes (e + U+0301) exactly as macOS returns
+ *  decomposed filenames. */
+const CJK_DOC = `${PROJECT}/产品文档/发布说明.md`
+const NFD_NOTES = `${PROJECT}/cafe\u0301-menu\u0308/notes.md`
+const DEVANAGARI_REPORT = '~/दस्तावेज़/रिपोर्ट.md'
 const FILES = new Set([
-  '/Users/diwm/.kiro/crew/workspace/KiroCrew/README.md',
-  '/Users/diwm/.kiro/crew/workspace/KiroCrew/src/kiro_crew/acp/_dispatch.py',
-  '/Users/diwm/.kiro/crew/workspace/blue-angels-seattle-2026.md',
+  `${PROJECT}/README.md`,
+  OVERVIEW,
+  RELEASE_NOTES,
+  CJK_DOC,
+  NFD_NOTES,
+  DEVANAGARI_REPORT,
 ])
 
 const realFetch = globalThis.fetch.bind(globalThis)
@@ -66,8 +82,8 @@ globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
 // The folder scene reads the directory listing through the api client, so stub
 // that method rather than the transport — it is the seam FolderPanel owns.
 api.browseFiles = (async (p?: string) => ({
-  path: p || '/Users/diwm/.kiro/crew/workspace/KiroCrew',
-  parent: '/Users/diwm/.kiro/crew/workspace',
+  path: p || PROJECT,
+  parent: WORKSPACE,
   dirs: [
     { name: 'src', path: '/x/src', mtime: 0 },
     { name: 'website', path: '/x/website', mtime: 0 },
@@ -80,20 +96,35 @@ api.browseFiles = (async (p?: string) => ({
   ],
 })) as typeof api.browseFiles
 
+// A project-root folder tab uses the same real Pierre tree as the dashboard.
+// Only the transport is stubbed; expand/collapse and row rendering stay real.
+api.projectTree = (async () => ({
+  root: PROJECT,
+  paths: [
+    'README.md',
+    'docs/getting-started.md',
+    'src/overview.md',
+    'src/components/Header.tsx',
+    'website/package.json',
+  ],
+  repo: false,
+})) as typeof api.projectTree
+api.projectGitStatus = (async () => ({ repo: false, files: [] })) as typeof api.projectGitStatus
+
 // The reveal scene mounts the real MarkdownPanel, which asks whether this path is
 // already tracked as an artifact. Answer "no" rather than let it hit the dev
 // server and render an error state over the editor we are trying to photograph.
 api.artifacts = (async () => ({ artifacts: [] })) as unknown as typeof api.artifacts
 
-/** The exact message from the bug report: two directory chips and a git ref. */
+/** A neutral sample message: two directory chips and a git ref. */
 const TRANSCRIPT = [
-  'The worktree is a linked worktree of `/Users/diwm/.kiro/crew/workspace/KiroCrew`.',
+  'The sample project is a linked worktree at `/Demo Workspace/Product Guide`.',
   'Its `HEAD` points at `refs/heads/fix/investigation-record-403`',
   '= `4a72aec5f04d3f44ba8042931226db051242d48a` — based on cached `origin/main`.',
   '',
-  'Config lives under `/Users/diwm/.kiro/crew` and the readme is at',
-  '`/Users/diwm/.kiro/crew/workspace/KiroCrew/README.md`.',
-  'A path that is gone: `/Users/diwm/.kiro/crew/deleted-notes.md`.',
+  'Shared resources live under `/Demo Workspace` and the readme is at',
+  '`/Demo Workspace/Product Guide/README.md`.',
+  'A path that is gone: `/Demo Workspace/deleted-notes.md`.',
 ].join('\n')
 
 /**
@@ -104,14 +135,28 @@ const TRANSCRIPT = [
  * exists. The bare `:493` must STAY inert, since no file is named.
  */
 const CITED = [
-  'Kiro Crew resolves `purpose` in two places:',
+  'The release guide resolves `purpose` in two places:',
   '',
-  '- `/Users/diwm/.kiro/crew/workspace/KiroCrew/src/kiro_crew/acp/_dispatch.py:447` — the guard',
+  '- `/Demo Workspace/Product Guide/src/overview.md:447` — the guard',
   '- same file `:493` — no file is named here, so it stays plain text',
-  '- `/Users/diwm/.kiro/crew/workspace/KiroCrew/src/kiro_crew/acp/_dispatch.py:504:12` — line and column',
-  '- gone: `/Users/diwm/.kiro/crew/workspace/KiroCrew/src/kiro_crew/acp/missing.py:12`',
-  '- a passage, not a statement: `/Users/diwm/.kiro/crew/workspace/blue-angels-seattle-2026.md:10-16`',
+  '- `/Demo Workspace/Product Guide/src/overview.md:504:12` — line and column',
+  '- gone: `/Demo Workspace/Product Guide/src/missing.md:12`',
+  '- a passage, not a statement: `/Demo Workspace/Product Guide/release-notes.md:10-16`',
 ].join('\n')
+
+const LINKED_RELEASE_NOTES = [
+  '## Release review',
+  '',
+  'Open [the release notes](/Demo%20Workspace/Product%20Guide/release-notes.md:12) to inspect the decision.',
+  '',
+  'The [release checklist](/artifacts/release-checklist) remains an artifact link.',
+].join('\n')
+
+const RELEASE_NOTES_SOURCE = Array.from({ length: 30 }, (_, i) => {
+  const n = i + 1
+  if (n === 12) return 'Decision: approve the release candidate.'
+  return `Release note ${n}`
+}).join('\n')
 
 /**
  * Synthetic source for the reveal scene, long enough that line 447 is well off
@@ -145,7 +190,7 @@ function RangeScene() {
       >reveal again</button>
       <MarkdownPanel
         embedded
-        filePath="/Users/diwm/.kiro/crew/workspace/blue-angels-seattle-2026.md"
+        filePath={RELEASE_NOTES}
         content={MD_SOURCE}
         onContentChange={() => {}}
         onSave={async () => {}}
@@ -156,7 +201,99 @@ function RangeScene() {
   )
 }
 
+function MarkdownLinkScene() {
+  const [opened, setOpened] = useState<{ path: string; line?: number } | null>(null)
+  return (
+    <div data-capture-root style={{ width: 900, height: 460 }} className="flex gap-4 bg-bg p-5">
+      <section className="min-w-0 flex-1" aria-label="Rendered markdown">
+        <MarkdownRenderer
+          content={LINKED_RELEASE_NOTES}
+          onArtifactOpen={() => {}}
+          onFileOpen={(path, opts) => setOpened({ path, line: opts?.line })}
+        />
+      </section>
+      {opened && (
+        <section className="w-[440px] overflow-hidden rounded border border-border" aria-label="Opened file panel">
+          <MarkdownPanel
+            embedded
+            filePath={opened.path}
+            content={RELEASE_NOTES_SOURCE}
+            onContentChange={() => {}}
+            onSave={async () => {}}
+            onClose={() => {}}
+            revealLine={opened.line ? { line: opened.line, nonce: 1 } : undefined}
+          />
+        </section>
+      )}
+    </div>
+  )
+}
+
+function FolderFlowScene() {
+  const [active, setActive] = useState<'tree' | 'file'>('tree')
+  const [opened, setOpened] = useState<string | null>(null)
+  const openFile = (path: string) => {
+    setOpened(path)
+    setActive('file')
+  }
+  return (
+    <div data-capture-root style={{ width: 720, height: 420 }} className="flex flex-col bg-bg">
+      <div className="flex items-center gap-1 h-[38px] px-2 shrink-0 border-b border-border" role="tablist">
+        <button
+          role="tab"
+          aria-selected={active === 'tree'}
+          onClick={() => setActive('tree')}
+          className={`h-7 px-2 rounded-md text-[12px] border-none cursor-pointer ${active === 'tree' ? 'bg-border text-accent' : 'bg-transparent text-muted'}`}
+        >Project tree</button>
+        {opened && (
+          <button
+            role="tab"
+            aria-selected={active === 'file'}
+            onClick={() => setActive('file')}
+            className={`h-7 px-2 rounded-md text-[12px] border-none cursor-pointer ${active === 'file' ? 'bg-border text-accent' : 'bg-transparent text-muted'}`}
+          >{opened.split('/').pop()}</button>
+        )}
+      </div>
+      <div className="relative flex-1 min-h-0">
+        <div className="absolute inset-0" style={{ display: active === 'tree' ? 'block' : 'none' }}>
+          <FolderPanel
+            path={PROJECT}
+            projectDir={PROJECT}
+            onClose={() => {}}
+            onFileOpen={openFile}
+          />
+        </div>
+        {opened && (
+          <div className="absolute inset-0" style={{ display: active === 'file' ? 'block' : 'none' }}>
+            <MarkdownPanel
+              embedded
+              filePath={opened}
+              content={'# Project overview\n\nThis file opened in a separate tab. The Project tree stays intact.'}
+              onContentChange={() => {}}
+              onSave={async () => {}}
+              onClose={() => setActive('tree')}
+            />
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/** Unicode transcript for issue #6483: rooted CJK, NFD-decomposed accented,
+ *  and home-relative Devanagari paths must classify; slash-separated prose
+ *  must stay plain. */
+const UNICODE = [
+  'The launch doc lives at `' + CJK_DOC + '`,',
+  'the macOS notes folder holds `' + NFD_NOTES + '` (NFD-decomposed),',
+  'and the report is at `' + DEVANAGARI_REPORT + '`.',
+  '',
+  'Prose stays plain: `要么这样/要么那样` and `и/или` are not paths.',
+].join('\n')
+
 function Scene() {
+  if (scene === 'folder-flow') return <FolderFlowScene />
+  if (scene === 'markdown-link') return <MarkdownLinkScene />
   if (scene === 'range') return <RangeScene />
   if (scene === 'reveal') {
     // The other half of the feature: the panel a `file.py:447` chip opens must
@@ -167,7 +304,7 @@ function Scene() {
       <div data-capture-root style={{ width: 720, height: 420 }} className="bg-bg">
         <MarkdownPanel
           embedded
-          filePath="/Users/diwm/.kiro/crew/workspace/KiroCrew/src/kiro_crew/acp/_dispatch.py"
+          filePath={OVERVIEW}
           content={PY_SOURCE}
           onContentChange={() => {}}
           onSave={async () => {}}
@@ -181,7 +318,8 @@ function Scene() {
     return (
       <div data-capture-root style={{ width: 420, height: 340 }} className="bg-bg">
         <FolderPanel
-          path="/Users/diwm/.kiro/crew/workspace/KiroCrew"
+          path={PROJECT}
+          projectDir={PROJECT}
           onClose={() => {}}
           onFileOpen={() => {}}
         />
@@ -190,7 +328,11 @@ function Scene() {
   }
   return (
     <div data-capture-root className="bg-bg p-5" style={{ width: 720 }}>
-      <MarkdownRenderer content={scene === 'cited' ? CITED : TRANSCRIPT} />
+      <MarkdownRenderer
+        content={scene === 'cited' ? CITED : scene === 'unicode' ? UNICODE : TRANSCRIPT}
+        onFileOpen={() => {}}
+        onFolderOpen={() => {}}
+      />
     </div>
   )
 }

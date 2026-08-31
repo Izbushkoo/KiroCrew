@@ -16,7 +16,7 @@ from aiohttp import web
 
 from kiro_crew import model_registry
 from kiro_crew.config.loader import config_dir
-from kiro_crew.cron import CronStoreBusy, is_valid_timezone
+from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable, is_valid_timezone
 from kiro_crew.cron_script import resolve_script_path
 from kiro_crew.dashboard.cron_inject import (
     hydrate_slot_from_history,
@@ -27,6 +27,7 @@ from kiro_crew.executors import discovery_executor
 from kiro_crew.history import is_incognito_transcript
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
 from kiro_crew.llm_helpers import run_bg_oneliner
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.validation import (
@@ -61,6 +62,47 @@ logger = logging.getLogger(__name__)
 # should retry rather than treat it as a hard failure. See CronService mutators.
 _CRON_BUSY_STATUS = 409
 _CRON_BUSY_BODY = {"error": "cron store busy, please retry", "retryable": True}
+
+# Returned when the store cannot be WRITTEN because the last read of it failed
+# (CronStoreUnreadable). 409 for the same reason as busy above -- the request
+# conflicts with the current state of the resource -- but explicitly
+# `retryable: False`: an unreadable file does not heal on its own, so a client
+# that retries on busy must NOT retry on this. The exception already carries the
+# one action that resolves it (move the file aside), so its message is surfaced
+# verbatim rather than restated.
+#
+# The status and the code are written as LITERALS at the json_response call
+# rather than hoisted into module constants, because `test_error_code_contract`
+# buckets a computed `status=` as `dynamic_status` and caps that bucket
+# deliberately -- a named constant is indistinguishable, to a static scan, from
+# computing the status to evade the gate. Literals make this response decidable:
+# it scores `compliant` instead of consuming cap.
+
+
+def _cron_unreadable_response(exc: CronStoreUnreadable) -> web.Response:
+    """Translate a refused write into a structured, non-retryable 409."""
+    return web.json_response(
+        {"error": str(exc), "code": "cron_store_unreadable", "retryable": False},
+        status=409,
+    )
+
+
+def _invalid_path_id_response(value: str, name: str) -> web.Response | None:
+    """Guard a URL path id (job_id/run_id/folder_id) for non-empty, bounded length.
+
+    Returns a 400 ``invalid_<name>`` response when ``value`` is empty or longer
+    than ``MAX_SHORT_STRING``, else ``None``. This is the single validator the
+    cron routes apply to every path-param id — the job/run routes and both
+    cron-folder routes — so a malformed id is rejected before any lock
+    acquisition, thread dispatch, or state lookup (the asymmetric-perimeter gap
+    #5789/#5808 closed). These ids are server-minted, so an over-long value only
+    arrives from a malformed/hostile client.
+    """
+    if not value or len(value) > MAX_SHORT_STRING:
+        return web.json_response(
+            {"error": f"invalid {name} format", "code": f"invalid_{name}"}, status=400
+        )
+    return None
 
 
 def _sel():
@@ -284,6 +326,8 @@ async def api_crons_create(request: web.Request) -> web.Response:
             job = await state.crons.add_job_async(name, message, every_secs=every, **add_kwargs)
         except CronStoreBusy:
             return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
+        except CronStoreUnreadable as exc:
+            return _cron_unreadable_response(exc)
     elif cron_expr:
         try:
             job = await state.crons.add_job_async(
@@ -291,6 +335,8 @@ async def api_crons_create(request: web.Request) -> web.Response:
             )
         except CronStoreBusy:
             return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
+        except CronStoreUnreadable as exc:
+            return _cron_unreadable_response(exc)
     else:
         return web.json_response({"error": "schedule, every, or cron required"}, status=400)
     state.push_refresh("crons")
@@ -301,10 +347,16 @@ async def api_cron_delete(request: web.Request) -> web.Response:
     """DELETE /api/crons/{id} — remove a cron job."""
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
     try:
-        ok = await state.crons.remove_job_async(job_id)
+        ok = await state.crons.remove_job_async(
+            job_id, actor="dashboard", source="api_cron_delete"
+        )
     except CronStoreBusy:
         return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
+    except CronStoreUnreadable as exc:
+        return _cron_unreadable_response(exc)
     if ok:
         await state.crons.get_history().delete_job_history(job_id)
         state.push_refresh("crons")
@@ -354,7 +406,9 @@ async def api_cron_batch_delete(request: web.Request) -> web.Response:
         # back on the loop (asyncio.create_task needs it): moving it off-loop
         # would raise AFTER the on-disk delete and leave the scheduler timer
         # cancelled.
-        deleted, failed = await state.crons.remove_jobs(unique_ids)
+        deleted, failed = await state.crons.remove_jobs(
+            unique_ids, actor="dashboard", source="api_cron_batch_delete"
+        )
     except Exception:
         # The batch itself raised (unexpected) — report everything as failed.
         logger.warning("Batch delete failed", exc_info=True)
@@ -372,16 +426,6 @@ async def api_cron_batch_delete(request: web.Request) -> web.Response:
                 "History cleanup failed for cron %s (job already removed)",
                 job_id, exc_info=True,
             )
-    # SEL audit: a destructive batch action must record who/what/when + the
-    # affected resources and outcome. Cron IDs are non-sensitive (no
-    # creds/PII), so logging them is compliant.
-    _sel().log_api_access(
-        caller="dashboard",
-        operation="cron.batch_delete",
-        outcome="ok" if deleted else "failed",
-        source="api_cron_batch_delete",
-        resources=f"requested={unique_ids} deleted={deleted} failed={failed}",
-    )
     if deleted:
         state.push_refresh("crons")
     # ok reflects whether anything was actually deleted — consistent with the
@@ -395,10 +439,20 @@ async def api_cron_update(request: web.Request) -> web.Response:
     """PATCH /api/crons/{id} — update a cron job (partial)."""
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
     try:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
+    # A syntactically valid scalar or array parses fine and then has no .get,
+    # so the field reads below would raise AttributeError and surface as a 500.
+    # This route already refuses an unparseable body; a non-object is refused
+    # the same way rather than by crashing.
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "request body must be a JSON object", "code": "invalid_json"}, status=400
+        )
     kwargs: dict[str, Any] = {}
     for key in (
         "name",
@@ -497,6 +551,8 @@ async def api_cron_update(request: web.Request) -> web.Response:
         job = await state.crons.update_job_async(job_id, **kwargs)
     except CronStoreBusy:
         return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
+    except CronStoreUnreadable as exc:
+        return _cron_unreadable_response(exc)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
     if not job:
@@ -509,6 +565,8 @@ async def api_cron_run(request: web.Request) -> web.Response:
     """POST /api/crons/{id}/run — trigger immediate execution."""
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
     # Freshness-guaranteed lookup: this endpoint is handed a job id minted by
     # ANOTHER process (`kirocrew cron add`, the MCP cron_add tool), which writes
     # crons.json directly. The cache-only `list_jobs()` would not see that job
@@ -546,6 +604,8 @@ async def api_cron_cancel(request: web.Request) -> web.Response:
     """POST /api/crons/{id}/cancel — cancel a running execution."""
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
     jobs = state.crons.list_jobs(include_disabled=True)
     job = next((j for j in jobs if j.id == job_id), None)
     if not job:
@@ -562,6 +622,8 @@ async def api_cron_to_chat(request: web.Request) -> web.Response:
     """POST /api/crons/{id}/to-chat — open last result in a chat session."""
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
     slot_name = f"cron-{job_id}"
     jobs = state.crons.list_jobs(include_disabled=True)
     job = next((j for j in jobs if j.id == job_id), None)
@@ -610,15 +672,25 @@ async def api_cron_enable(request: web.Request) -> web.Response:
     """POST /api/crons/{id}/enable — toggle enable/disable."""
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
     try:
         body = await request.json()
     except Exception:
+        body = {}
+    # This route tolerates a missing or unreadable body and falls back to its
+    # defaults. A scalar or array parses but carries no fields, so it gets the
+    # same tolerance -- reading .get off it would raise AttributeError -> 500,
+    # which is a harsher answer than the one an unparseable body already gets.
+    if not isinstance(body, dict):
         body = {}
     enabled = body.get("enabled", True)
     try:
         ok = await state.crons.enable_job_async(job_id, enabled=enabled)
     except CronStoreBusy:
         return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
+    except CronStoreUnreadable as exc:
+        return _cron_unreadable_response(exc)
     if ok:
         state.push_refresh("crons")
     return web.json_response({"ok": ok})
@@ -628,16 +700,22 @@ async def api_cron_ack(request: web.Request) -> web.Response:
     """POST /api/crons/{id}/ack — acknowledge a cron notification."""
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
     try:
         body = await request.json()
     except Exception:
         body = {}
+    if not isinstance(body, dict):
+        body = {}  # same tolerance as an unparseable body; see api_cron_enable
     summary = body.get("summary", "acknowledged")
     notification_ts = body.get("ts", "")
     try:
         ok = await state.crons.ack_job_async(job_id, summary)
     except CronStoreBusy:
         return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
+    except CronStoreUnreadable as exc:
+        return _cron_unreadable_response(exc)
     if notification_ts:
         await state.ack_notification(notification_ts)
     return web.json_response({"ok": ok})
@@ -647,6 +725,8 @@ async def api_cron_history(request: web.Request) -> web.Response:
     """GET /api/crons/{id}/history — paginated execution history (no trace)."""
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
     try:
         limit = int(request.query.get("limit", "20"))
     except (ValueError, TypeError):
@@ -667,7 +747,11 @@ async def api_cron_history_detail(request: web.Request) -> web.Response:
     """GET /api/crons/{id}/history/{run_id} — full run detail with trace."""
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
     run_id = request.match_info["run_id"]
+    if (_e := _invalid_path_id_response(run_id, "run_id")) is not None:
+        return _e
     detail = await state.crons.get_history().get_run_detail(job_id, run_id)
     if not detail:
         return web.json_response({"error": "run not found"}, status=404)
@@ -775,6 +859,8 @@ async def api_cron_script_source(request: web.Request) -> web.Response:
     """
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
     # Freshness-guaranteed lookup, same rationale as api_cron_run: the job may
     # have been minted by another process and not yet be in the cache snapshot.
     job = await state.crons.get_job_async(job_id)
@@ -1070,6 +1156,10 @@ async def api_lessons_create(request: web.Request) -> web.Response:
     # omitted the kwarg -- so every NOT-clause sent to this route, from the
     # learn_add MCP tool, the dashboard, or the CLI, was silently lost.
     negative = cleaned.get("negative") or None
+    # Restricts the lesson to one repository; absent means it applies everywhere.
+    # Both write paths carry it, so the JSONL fallback store gates identically to
+    # the vector store rather than injecting a scoped lesson the other withholds.
+    repo_scope = cleaned.get("repo_scope") or None
     # Write to vector store if available, else JSONL
     vs = _get_memory(state).vector_store
     if vs:
@@ -1091,7 +1181,7 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         # for a lesson that was actually saved (and re-saved on every retry).
         # Writing first, then sweeping in the background, keeps the slow LLM call
         # off the request path.
-        wrote = await asyncio.to_thread(
+        result = await asyncio.to_thread(
             vs.write_lesson,
             rule,
             category,
@@ -1099,19 +1189,23 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             "user_explicit",
             rule_emb,
             rule_emb_generation,
+            repo_scope,
         )
-        # Sweep ONLY when the lesson actually landed. write_lesson returns False
-        # for a value its preflight refuses (reachable now that ``negative`` is
-        # forwarded here at all -- this call site passed a literal None before) and
-        # for a dedup refusal. The return value used to be discarded, so a refused
-        # write still ran the sweep below, and _resolve_and_supersede would
-        # delete_semantic an older contradicted lesson whose "replacement" was never
-        # stored -- destroying a lesson on a request that persisted nothing, under
-        # HTTP 200. Superseding on the authority of a write that did not happen is
-        # wrong for BOTH False cases, so gate on the result rather than the cause.
-        if wrote:
+        # Sweep ONLY when the lesson actually landed. The write declines for a value
+        # its preflight refuses (reachable now that ``negative`` is forwarded here at
+        # all -- this call site passed a literal None before) and for a dedup refusal.
+        # The result used to be discarded, so a refused write still ran the sweep
+        # below, and _resolve_and_supersede would delete_semantic an older
+        # contradicted lesson whose "replacement" was never stored -- destroying a
+        # lesson on a request that persisted nothing, under HTTP 200. Superseding on
+        # the authority of a write that did not happen is wrong for every declining
+        # outcome, so gate on ``wrote`` rather than on the cause.
+        outcome = result.outcome.value
+        reason = result.reason
+        stored = result.stored
+        if result.wrote:
             candidates = await asyncio.to_thread(
-                vs.find_contradiction_candidates, rule, 0.4, 0.85, rule_emb
+                vs.find_contradiction_candidates, rule, 0.4, 0.85, rule_emb, repo_scope
             )
             if candidates:
                 # Fire-and-forget via this module's _background_tasks
@@ -1129,6 +1223,7 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             rule=rule,
             category=category,
             negative=negative,
+            repo_scope=repo_scope,
             ts=datetime.now(timezone.utc).isoformat(),
         )
         store = _get_lessons(state, cleaned.get("workspace")) if scope == "workspace" else (
@@ -1138,9 +1233,39 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         # NOT-clause has to attach it rather than be skipped as a duplicate.
         # Off the loop because it reads the file and rewrites it whole -- the
         # same reason dashboard/ws.py offloads load_all.
-        await asyncio.to_thread(store.save_or_enrich, lesson)
+        #
+        # This store answers with the same three words the vector store's outcome uses
+        # (inserted / enriched / unchanged) and validates no content, so it has no
+        # refusing outcome to report. Its value is echoed as-is: ``state.lessons`` is a
+        # real ``LessonStore`` at every construction site, and its ``save_or_enrich``
+        # is annotated ``-> str`` with three string-literal returns, so there is
+        # nothing here for a filter to catch. ``test_lesson_write_outcome`` pins
+        # LessonWriteOutcome's wire values against those three words, so the two
+        # stores cannot drift apart in silence.
+        outcome = await asyncio.to_thread(store.save_or_enrich, lesson)
+        reason = None
+        stored = True
+    # Refreshed unconditionally, and deliberately so. An earlier revision of this
+    # change gated the push on the write having landed, which is wrong: a DECLINING
+    # outcome can still have mutated the store. ``write_lesson``'s second pass
+    # DELETES a row it supersedes and keeps scanning, so with a containment chain
+    # (A inside R inside B) whose rows are visited A-first -- and the scan order is
+    # effectively random, since get_lessons orders by md5 key -- A is removed and the
+    # call then returns ``deduped`` for B. The store changed while ``wrote`` is False,
+    # so gating on it left connected dashboards showing a lesson that is gone.
+    # Reporting mutation separately would buy nothing over refreshing always: an extra
+    # refresh on a no-op re-submit costs a redundant list fetch, a missed one shows
+    # deleted data.
     state.push_refresh("lessons")
-    return web.json_response({"ok": True})
+    # ``ok`` answers the question the caller actually asked -- is the lesson I
+    # submitted in the store -- so it stays true for a no-op re-submit (it is stored,
+    # there was simply nothing to write) and turns false when a dedup rule or
+    # validation kept it out. It used to be an unconditional true, which told the
+    # caller its lesson was saved even when the store had refused the value; the
+    # ``learn_add`` tool and the CLI both reported "Saved" on that response.
+    # ``outcome`` and ``reason`` are additive, so a client that only reads ``ok``
+    # keeps working.
+    return web.json_response({"ok": stored, "outcome": outcome, "reason": reason})
 
 
 async def api_lessons_delete(request: web.Request) -> web.Response:
@@ -1185,6 +1310,10 @@ async def api_lessons_delete(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "request body must be a JSON object", "code": "invalid_json"}, status=400
+        )
     rule_sub = body.get("rule", "").strip()
     if not rule_sub:
         return web.json_response({"error": "rule substring required"}, status=400)
@@ -1246,6 +1375,14 @@ async def api_crons(request: web.Request) -> web.Response:
                 0
             ]
             or None,
+            # The chat session that owns this job. Ownership decides chat-side
+            # reachability: cron_list only shows a session its own jobs, so a job
+            # whose key is empty (None here) is invisible to every chat session
+            # and manageable only from this page or the CLI. Raw value on
+            # purpose — the frontend decides presentation, and a derived
+            # "reachable" boolean would be a second encoding of the same fact.
+            "session_key": redact_credentials(redact_exfiltration_urls(j.session_key or "")[0])[0]
+            or None,
             "silent": j.silent,
             "strict_schedule": j.strict_schedule,
             "hide_in_chat": j.hide_in_chat,
@@ -1283,19 +1420,13 @@ async def api_crons(request: web.Request) -> web.Response:
 # Serializes all cron-folder mutations (create/rename/delete) so concurrent
 # requests cannot race on the in-memory list + disk persist cycle. The lock is
 # created lazily and re-created if the running event loop changes (Python 3.10
-# binds a Lock to the loop it first waits on) — mirrors _get_config_lock in
-# agents.py.
-_cron_folders_lock: asyncio.Lock | None = None
-_cron_folders_lock_loop: asyncio.AbstractEventLoop | None = None
+# binds a Lock to the loop it first waits on) — loop-bound via the shared
+# LoopBoundLock (#4800).
+_cron_folders_lock = LoopBoundLock()
 
 
-def _get_cron_folders_lock() -> asyncio.Lock:
-    """Return a cron-folders lock bound to the current event loop."""
-    global _cron_folders_lock, _cron_folders_lock_loop
-    loop = asyncio.get_running_loop()
-    if _cron_folders_lock is None or _cron_folders_lock_loop is not loop:
-        _cron_folders_lock = asyncio.Lock()
-        _cron_folders_lock_loop = loop
+def _get_cron_folders_lock() -> LoopBoundLock:
+    """Return the cron-folders lock (loop-bound; rebinds per running loop)."""
     return _cron_folders_lock
 
 
@@ -1340,6 +1471,8 @@ async def api_cron_folders_update(request: web.Request) -> web.Response:
     """PATCH /api/cron-folders/{folder_id} — rename a cron folder."""
     state: DashboardState = request.app["state"]
     folder_id = request.match_info["folder_id"]
+    if (_e := _invalid_path_id_response(folder_id, "folder_id")) is not None:
+        return _e
     try:
         body = await request.json()
     except Exception:
@@ -1374,6 +1507,8 @@ async def api_cron_folders_delete(request: web.Request) -> web.Response:
     """DELETE /api/cron-folders/{folder_id} — delete folder and clear assignments."""
     state: DashboardState = request.app["state"]
     folder_id = request.match_info["folder_id"]
+    if (_e := _invalid_path_id_response(folder_id, "folder_id")) is not None:
+        return _e
     async with _get_cron_folders_lock():
         try:
             found = await asyncio.to_thread(state.delete_cron_folder, folder_id)

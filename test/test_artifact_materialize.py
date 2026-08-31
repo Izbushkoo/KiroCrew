@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import requires_symlinks
 from kiro_crew import artifacts as art_mod
 from kiro_crew.artifacts import ArtifactStore, ArtifactValidationError
 from kiro_crew.dashboard.handlers import artifacts as h
@@ -96,6 +97,7 @@ def test_materialize_symlinked_request_resolves_to_recorded_inode(isolated_store
     assert isolated_store.get(art.slug).content == "# real\n"
 
 
+@requires_symlinks
 def test_materialize_symlink_to_unrecorded_file_refused(isolated_store, tmp_path):
     """A symlink whose target is not a recorded document is refused by inode."""
     recorded = _write_doc(tmp_path, "recorded.md")
@@ -142,6 +144,30 @@ def test_scan_session_docs_survives_malformed_history():
     out = h._scan_session_docs(_MalformedLog(), {})
     # Only the single well-formed document path survives.
     assert [e["path"] for e in out] == ["/tmp/doc.md"]
+
+
+def test_scan_session_docs_prefers_lightweight_history_projection():
+    """The production projection must bypass the full transcript reader."""
+
+    class _ProjectedLog:
+        def list_sessions(self):
+            return [{"key": "dashboard_ok", "modified": 5.0, "title": "ok"}]
+
+        def read_file_change_messages(self, key):
+            assert key == "dashboard_ok"
+            return [
+                {
+                    "ts": "2026-08-25T18:00:00Z",
+                    "meta": {"file_changes": [{"path": "/tmp/projected.md"}]},
+                }
+            ]
+
+        def read_messages(self, key):
+            raise AssertionError(f"full transcript read for {key}")
+
+    assert [e["path"] for e in h._collect_session_docs(_ProjectedLog(), {})] == [
+        "/tmp/projected.md"
+    ]
 
 
 def test_recorded_doc_identities_skips_missing_and_relative(tmp_path):

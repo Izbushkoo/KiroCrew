@@ -86,6 +86,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Verify exact candidate SHA
         run: |
@@ -100,12 +101,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      # cache disabled: published artifacts must not restore a cache writable from
+      # lower-trust branches (zizmor cache-poisoning)
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          enable-cache: true
-          cache-dependency-glob: |
-            pyproject.toml
-            setup.cfg
+          enable-cache: false
 
       - name: Install pinned test dependencies
         run: uv pip install --system -e ".[voice,desktop]" --group dev
@@ -155,6 +155,8 @@ jobs:
       artifact_digest: ${{ steps.resolve.outputs.artifact_digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Resolve and verify immutable candidate bundle
         id: resolve
@@ -222,6 +224,7 @@ jobs:
           # Full history so the stable tag resolves unambiguously, and so the
           # CHANGELOG read is of the tagged commit rather than a partial tree.
           fetch-depth: 0
+          persist-credentials: false
       - name: Verify stable publication preconditions
         env:
           CHANNEL: ${{ needs.version.outputs.channel }}
@@ -353,7 +356,11 @@ jobs:
       version: ${{ needs.version.outputs.version }}
       soft_fail: true
       use_prod_environment: true
-    secrets: inherit
+    # Explicit passthrough, not `secrets: inherit`: the callee declares
+    # the secret it consumes, so this hands over that one and nothing
+    # else. Pinned by test_workflow_permissions.py.
+    secrets:
+      AWS_WINDOWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_WINDOWS_SIGNING_ROLE_ARN }}
 
   # ── CLI channel publish ───────────────────────────────────────────────
   # Publishes the release wheel to the insider/stable CLI channel (cli/ +
@@ -380,7 +387,11 @@ jobs:
       wheel_artifact: ${{ needs.version.outputs.channel == 'stable' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || 'cli-wheel' }}
       promote: ${{ needs.version.outputs.channel == 'stable' }}
       promotion_base_version: ${{ needs.version.outputs.base_version }}
-    secrets: inherit
+    # Explicit passthrough, not `secrets: inherit`: the callee declares
+    # the secret it consumes, so this hands over that one and nothing
+    # else. Pinned by test_workflow_permissions.py.
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
 
   # ── Linux desktop publish ─────────────────────────────────────────────
   # Publishes the release AppImages to the distribution CDN (versioned key +
@@ -500,7 +511,14 @@ jobs:
       contents: read
       attestations: write
     uses: ./.github/workflows/sign-and-notarize.yml
-    secrets: inherit
+    # Explicit passthrough, not `secrets: inherit`: the callee declares
+    # the secrets it consumes, so this hands over those and nothing
+    # else. Pinned by test_workflow_permissions.py.
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
+      AWS_SIGNING_BUCKET: ${{ secrets.AWS_SIGNING_BUCKET }}
+      AWS_SIGNER_ACCESS_ROLE_ARN: ${{ secrets.AWS_SIGNER_ACCESS_ROLE_ARN }}
+      CDSIGNER_API_ENDPOINT: ${{ secrets.CDSIGNER_API_ENDPOINT }}
     with:
       channel: ${{ needs.version.outputs.channel }}
       version: ${{ needs.version.outputs.channel == 'stable' && needs.resolve-promotion.outputs.source_version || needs.version.outputs.version }}
@@ -509,15 +527,32 @@ jobs:
       promotion_artifact: ${{ needs.version.outputs.channel == 'stable' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || '' }}
       promotion_base_version: ${{ needs.version.outputs.base_version }}
 
+  # `needs` alone is not enough here. With no `if:`, the default condition is
+  # success(), which is false when ANY job in the needs closure was SKIPPED --
+  # and that verdict propagates THROUGH an always()-guarded job that itself
+  # succeeded (actions/runner#2205). sign-and-notarize is always()-guarded and
+  # every release graph skips something upstream by design: resolve-promotion on
+  # insider, the build jobs on stable. So this job silently skipped on every
+  # release after immutable-digest promotion landed, and nothing went red --
+  # a skip is not a failure, so the run still concluded success. v0.3.0 shipped
+  # to Stable with no GitHub Release page and no assets. Naming each dependency
+  # explicitly is the documented workaround and the pattern every other lane in
+  # this file already uses.
   github-release:
     name: Create GitHub Release
     needs: [version, stable-gate, sign-and-notarize]
+    if: >-
+      ${{ always() && needs.version.result == 'success' &&
+          needs.stable-gate.result == 'success' &&
+          needs.sign-and-notarize.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -603,9 +638,44 @@ jobs:
           cp "$NOTARIZED_DMG" "release/KiroCrew-${{ needs.version.outputs.version }}-universal.dmg"
           ls -la release/
 
+      # Only a stable release has a CHANGELOG.md section to show (the stable
+      # gate above already requires one). Insider and nightly tags have no
+      # matching `## [X.Y.Z]` heading -- their base version is still a draft --
+      # so this writes an EMPTY release-notes.md for them: `body_path` is
+      # always set below (an empty file, not an absent input), which sidesteps
+      # relying on undocumented empty-string-vs-unset behavior in the action.
+      # softprops/action-gh-release pre-pends `body`/`body_path` to the
+      # `generate_release_notes` output rather than replacing it, so the
+      # native "New Contributors" block (rendered from this repository's own
+      # commit history, per commit range) still appears after our section --
+      # do not hand-write a contributors list here, see AGENTS.md's changelog
+      # rule for why a hand-written list would duplicate that block.
+      - name: Extract CHANGELOG section for the release body
+        run: |
+          python3 - "${{ needs.version.outputs.channel }}" "${{ needs.version.outputs.base_version }}" <<'PY_EXTRACT'
+          import sys
+          sys.path.insert(0, "src")
+          from kiro_crew.changelog import parse_sections
+
+          channel, base_version = sys.argv[1], sys.argv[2]
+          notes = ""
+          if channel == "stable":
+              markdown = open("CHANGELOG.md", encoding="utf-8").read()
+              sections = [body for version, _date, body in parse_sections(markdown) if version == base_version]
+              if not sections:
+                  raise SystemExit(
+                      f"::error::CHANGELOG.md has no '## [{base_version}]' section; "
+                      "the stable gate should have caught this earlier."
+                  )
+              notes = sections[0] + "\n"
+          with open("release-notes.md", "w", encoding="utf-8") as out:
+              out.write(notes)
+          PY_EXTRACT
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
+          body_path: release-notes.md
           generate_release_notes: true
           prerelease: ${{ needs.version.outputs.channel == 'insider' }}
           files: release/*
@@ -630,6 +700,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Download this run's immutable artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1

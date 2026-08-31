@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -295,6 +296,98 @@ class TestReadTailMessages:
         path = log._path("k")
         with patch("builtins.open", side_effect=OSError("locked")):
             assert log._read_tail_messages(path, 5, None) == []
+
+
+class TestReadFileChangeMessages:
+    def test_skips_large_irrelevant_rows_and_never_warms_message_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        log = _log(tmp_path)
+        path = log._path("large")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        change = {
+            "role": "assistant",
+            "content": "done",
+            "ts": "2026-08-25T18:00:00Z",
+            "meta": {"file_changes": [{"path": "/tmp/report.md"}]},
+        }
+        _write(
+            path,
+            _jsonl(
+                {"_type": "metadata"},
+                {"role": "assistant", "content": "x" * 1_000_000},
+                change,
+            ),
+        )
+
+        real_loads = H.json.loads
+        parsed_sizes: list[int] = []
+
+        def tracking_loads(value, *args, **kwargs):
+            parsed_sizes.append(len(value))
+            return real_loads(value, *args, **kwargs)
+
+        monkeypatch.setattr(H.json, "loads", tracking_loads)
+        rows = log.read_file_change_messages("large")
+
+        assert rows == [
+            {
+                "ts": "2026-08-25T18:00:00Z",
+                "meta": {"file_changes": [{"path": "/tmp/report.md"}]},
+            }
+        ]
+        assert len(parsed_sizes) == 1
+        assert parsed_sizes[0] < 1_000
+        assert len(log._msg_cache) == 0
+
+        def unexpected_parse(*_args, **_kwargs):
+            pytest.fail("unchanged projection should come from its lightweight cache")
+
+        monkeypatch.setattr(H.json, "loads", unexpected_parse)
+        assert log.read_file_change_messages("large") is rows
+
+    def test_changed_file_replaces_cached_projection(self, tmp_path: Path) -> None:
+        log = _log(tmp_path)
+        path = log._path("changed")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        first = {
+            "role": "assistant",
+            "ts": "2026-08-25T18:00:00Z",
+            "meta": {"file_changes": [{"path": "/tmp/old.md"}]},
+        }
+        second = {
+            "role": "assistant",
+            "ts": "2026-08-25T18:01:00Z",
+            "meta": {"file_changes": [{"path": "/tmp/new-report.md"}]},
+        }
+        _write(path, _jsonl({"_type": "metadata"}, first))
+        assert log.read_file_change_messages("changed")[0]["meta"] == first["meta"]
+
+        _write(path, _jsonl({"_type": "metadata"}, second))
+
+        assert log.read_file_change_messages("changed") == [
+            {"ts": second["ts"], "meta": second["meta"]}
+        ]
+
+    def test_session_write_invalidates_cached_projection(self, tmp_path: Path) -> None:
+        log = _log(tmp_path)
+        _write(
+            log._path("written"),
+            _jsonl(
+                {"_type": "metadata"},
+                {
+                    "role": "assistant",
+                    "content": "first",
+                    "meta": {"file_changes": [{"path": "/tmp/first.md"}]},
+                },
+            ),
+        )
+        assert log.read_file_change_messages("written")
+        assert "written" in log._file_change_cache
+
+        log.append("written", "assistant", "no document change")
+
+        assert "written" not in log._file_change_cache
 
 
 class TestLastMessagePreview:
@@ -1430,8 +1523,21 @@ class TestSidecarSummariesSurviveMtimePreservingRewrites:
         log.append(key, "user", "first message")
         log.append(key, "assistant", "first reply")
         log.append(key, "user", "second message")
+        # Age the transcript BEFORE stamping the sidecars against its mtime.
+        # Filesystem mtime resolution is not the clock's: tmpfs and ext4 stamp from
+        # the kernel's cached wall time, which advances on a timer tick rather than
+        # per write, so these appends and a later one can share a single
+        # ``st_mtime_ns`` (measured: 200 rapid writes to /tmp on a 6.12 kernel
+        # produced ONE distinct value). Every test in this class turns on telling
+        # "the mtime moved" apart from "the mtime was preserved", so that gap has to
+        # be REPRESENTABLE. Backdating states the precondition outright; a sleep
+        # would express the same thing by guessing how long a tick is.
+        now = log.session_mtime(key)
+        assert now is not None
+        aged = now - 60.0
+        os.utime(log._path(key), (aged, aged))
         sig = log.session_mtime(key)
-        assert sig is not None
+        assert sig == aged
         log.set_cached_summary(key, "describes the PRE-rewrite conversation", sig)
         log.set_cached_intent_summary(key, {"intents": [{"text": "pre-rewrite"}]}, sig)
         assert log.get_cached_summary(key) == "describes the PRE-rewrite conversation"

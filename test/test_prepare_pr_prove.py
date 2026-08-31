@@ -22,6 +22,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from skill_script_helpers import no_bytecode
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PROVE = str(
     REPO_ROOT
@@ -44,12 +46,10 @@ def _load_prove():
     dir, which the blocking no-test-side-effects rule forbids.
     """
     sys.path.insert(0, str(Path(PROVE).parent))
-    previous = sys.dont_write_bytecode
-    sys.dont_write_bytecode = True
     try:
-        return importlib.import_module("prove")
+        with no_bytecode():
+            return importlib.import_module("prove")
     finally:
-        sys.dont_write_bytecode = previous
         sys.path.pop(0)
 
 
@@ -394,16 +394,45 @@ def test_an_option_like_base_cannot_suppress_the_diff(tmp_path: Path) -> None:
 
 
 def test_importing_prove_leaves_no_bytecode_in_the_checkout() -> None:
-    """The helper import must not write __pycache__ into the skill tree.
+    """``_load_prove`` must not write ``__pycache__`` into the skill tree.
 
     prove.py sits in the checked-out source tree, so an ordinary import drops a
     .pyc beside it that outlives the run -- the same bytecode pollution the
     script itself guards against when it launches pytest.
+
+    The two lines of setup are load-bearing, and both come from this test having
+    failed the release gate. Asserting only that the file is ABSENT measures the
+    ambient filesystem rather than this loader: the gate runs all 59k tests in
+    one process tree, and anything else that imports from that directory leaves
+    residue this would then blame on ``_load_prove``. And because ``sys.modules``
+    caches ``prove``, a run where something imported it first makes
+    ``_load_prove`` a no-op -- the assertion then passes while exercising
+    nothing, which is the worse of the two failure directions. Evicting the
+    module and removing the cache file first makes the import real and the
+    verdict this loader's own.
+
+    Removing it is net-zero, and that matters: the same no-test-side-effects rule
+    this test enforces also binds the test. The file is restored byte-for-byte on
+    every exit path, so a working copy that had a stale .pyc still has it
+    afterwards, and one that did not is not given one by a failing assertion.
     """
-    module = _load_prove()
-    cached = getattr(module, "__cached__", None)
-    assert cached, "expected __cached__ to be set"
-    assert not Path(cached).exists(), f"import wrote bytecode to {cached}"
+    cache = Path(importlib.util.cache_from_source(PROVE))
+    existing = cache.read_bytes() if cache.exists() else None
+    sys.modules.pop("prove", None)
+    cache.unlink(missing_ok=True)
+    try:
+        module = _load_prove()
+
+        cached = getattr(module, "__cached__", None)
+        assert cached, "expected __cached__ to be set"
+        assert Path(cached) == cache, f"cache path moved: {cached} is not {cache}"
+        assert not cache.exists(), f"import wrote bytecode to {cached}"
+    finally:
+        if existing is None:
+            cache.unlink(missing_ok=True)
+        else:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_bytes(existing)
 
 
 def test_a_call_phase_exception_is_not_proof(tmp_path: Path) -> None:

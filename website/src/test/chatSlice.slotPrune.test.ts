@@ -138,9 +138,12 @@ describe('slot teardown parity', () => {
       slotContextTokens: Object.fromEntries(keys.map(k => [k, { used: 1234, window: 200000 }])),
       stopPressedAt: Object.fromEntries(keys.map(k => [k, 999])),
       followups: Object.fromEntries(keys.map(k => [k, { items: [], ts: 1 }])),
-      folderSuggestions: Object.fromEntries(keys.map(k => [k, { folderId: 'f', folderName: 'F', breadcrumb: 'F', ts: 1 }])),
+      folderSuggestions: Object.fromEntries(keys.map(k => [k, { folderId: 'f', folderName: 'F', breadcrumb: 'F', ts: 1, turns: 0 }])),
       subagentQueued: Object.fromEntries(keys.map(k => [k, 2])),
       goalLoops: Object.fromEntries(keys.map(k => [k, { cycle_count: 1, max_cycles: 5 }])),
+      slotPaneHasMore: Object.fromEntries(keys.map(k => [k, true])),
+      slotPaneBounded: Object.fromEntries(keys.map(k => [k, 50])),
+      thinkingOrphans: Object.fromEntries(keys.map(k => [k, [{ msg: { role: 'thinking', content: `reasoning for ${k}`, cls: '' } as ChatMessage, anchor: { text: 'OLD ANSWER' } }]])),
     }
   }
 
@@ -148,6 +151,9 @@ describe('slot teardown parity', () => {
     'slotMessages', 'slotActivity', 'slotRun', 'slotHydrated', 'slotSide',
     'slotSideClosed', 'slotStatusDetail', 'slotContextPct', 'slotContextTokens',
     'stopPressedAt', 'followups', 'folderSuggestions', 'subagentQueued', 'goalLoops',
+    'slotPaneHasMore', 'slotPaneBounded',
+    // Client-only and unrecoverable, so a slot that leaves has to take it with it.
+    'thinkingOrphans',
   ] as const
 
   const keysOf = (state: unknown, map: string) =>
@@ -181,6 +187,15 @@ describe('slot teardown parity', () => {
     const state = { ...seeded(['chat-1']), subagentQueued: { ghost: 3 }, goalLoops: {}, pendingQuestions: {} }
     const next = chatReducer(state, sseSlots([slot('chat-1')]))
     expect(next.subagentQueued['ghost']).toBeUndefined()
+  })
+
+  it('the reconcile evicts a slot whose only residue is parked reasoning', () => {
+    // Reasoning is client-only, so a departed slot's copy is unrecoverable AND
+    // unowned: the re-seat matches on answer text, never on slot identity.
+    const parked = [{ msg: { role: 'thinking', content: 'old reasoning', cls: '' } as ChatMessage, anchor: { text: 'OLD ANSWER' } }]
+    const state = { ...seeded(['chat-1']), thinkingOrphans: { ghost: parked } }
+    const next = chatReducer(state, sseSlots([slot('chat-1')]))
+    expect(next.thinkingOrphans['ghost']).toBeUndefined()
   })
 
   it('the reconcile evicts a slot whose only residue is an MCP app payload', () => {

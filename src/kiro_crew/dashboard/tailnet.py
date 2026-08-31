@@ -34,9 +34,11 @@ import subprocess
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from contextlib import suppress
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
+from kiro_crew import github_runner
 from kiro_crew.dashboard.urls import is_loopback
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.platform.governance_profiles import (
@@ -56,6 +58,13 @@ logger = logging.getLogger(__name__)
 #: waits through — it must be short, and it must be a real timeout rather than a
 #: hope, because `tailscale status` blocks while the daemon is starting up.
 _CLI_TIMEOUT_SECS = 3.0
+
+#: Background recovery stays cheap even when an explicitly enabled daemon is
+#: unavailable for hours.  The first retry covers the common Windows service /
+#: daemon boot race quickly; the ceiling limits steady-state subprocess work.
+_ORIGIN_RECOVERY_INITIAL_SECS = 2.0
+_ORIGIN_RECOVERY_MAX_SECS = 60.0
+_ORIGIN_RUNTIME_STATE_KEY = "tailnet_origin_state"
 
 #: Where the CLI is accepted from — **vetted absolute paths only, never ``PATH``**.
 #: A ``PATH`` lookup would make the binary itself attacker-selectable: an agent
@@ -97,31 +106,40 @@ def _cli_path() -> str | None:
 
     Deliberately does **not** consult ``PATH`` — see ``_CLI_CANDIDATE_PATHS``.
 
-    A candidate is additionally refused when the binary or its directory is
-    writable by the gateway user (checked on POSIX; the Windows entry needs
-    elevation to write). The pinned list mostly needs root, but two entries do
-    not everywhere: Homebrew chowns ``/opt/homebrew/bin`` (and sometimes
-    ``/usr/local/bin``) to the console user, and identity resolution makes
-    this a request-triggered execution on the auth path — an agent that can
-    write there must not be able to plant a ``tailscale`` the next
-    credential-bearing request executes. A refused Homebrew install degrades
-    exactly like a missing binary: the feature contributes nothing and the
-    documented ``dashboard.url`` fallback still works.
+    A candidate is additionally refused when its platform's ownership policy
+    cannot establish trusted provenance. POSIX keeps the stricter local check
+    below; Windows reuses the shared executable validator, which reads the
+    binary and parent ACLs because mode bits carry no useful signal there. A
+    refusal degrades exactly like a missing binary: the feature contributes
+    nothing and the documented ``dashboard.url`` fallback still works.
     """
     # getattr: os.geteuid does not exist on Windows, and tests exercise this
     # path with IS_POSIX patched True on every platform.
     for candidate in _CLI_CANDIDATE_PATHS:
         if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
             continue
-        if IS_POSIX and not _posix_candidate_trusted(candidate):
-            logger.debug(
-                "tailscale CLI at %s is in a location this deployment cannot "
-                "trust; refusing to execute it (planted-binary defence). Use "
-                "an explicit dashboard.url instead.",
-                candidate,
-            )
-            continue
-        return candidate
+        validated = candidate
+        if IS_POSIX:
+            if not _posix_candidate_trusted(candidate):
+                logger.debug(
+                    "tailscale CLI at %s is in a location this deployment cannot "
+                    "trust; refusing to execute it (planted-binary defence). Use "
+                    "an explicit dashboard.url instead.",
+                    candidate,
+                )
+                continue
+        else:
+            try:
+                validated = github_runner.validate_provider_executable(candidate)
+            except ValueError as exc:
+                logger.debug(
+                    "tailscale CLI at %s failed executable trust validation: %s. "
+                    "Use an explicit dashboard.url instead.",
+                    candidate,
+                    exc,
+                )
+                continue
+        return validated
     return None
 
 
@@ -205,7 +223,7 @@ def _run_json_detail(args: list[str]) -> tuple[Any | None, bool]:
         return None, False
     try:
         return json.loads(proc.stdout or ""), False
-    except (json.JSONDecodeError, ValueError) as exc:
+    except ValueError as exc:
         logger.debug("tailscale %s produced non-JSON output: %s", " ".join(args), exc)
         return None, False
 
@@ -292,6 +310,160 @@ def tailnet_origin() -> str | None:
     """
     name = self_dns_name()
     return f"https://{name}" if name else None
+
+
+#: ``BackendState`` values that mean the daemon is running but this machine is
+#: not signed in to a tailnet. Upstream's own enum (``ipn.State``); only the
+#: not-signed-in half is listed because that is the one an operator fixes by
+#: signing in, and treating an unknown future value as "signed in" would send
+#: them to the wrong remedy.
+_BACKEND_STATES_NEEDING_LOGIN = frozenset({"NeedsLogin", "NoState", "NeedsMachineAuth"})
+
+
+@dataclass(frozen=True)
+class DaemonProbe:
+    """Why this machine does or does not have a usable tailnet name.
+
+    Exists because :func:`self_dns_name` deliberately collapses every failure to
+    ``None`` — right for its caller (which only wants "a name or nothing") and
+    useless for an onboarding UI, which has to tell the operator WHICH thing to
+    go fix. The three negatives have three different remedies and must not be
+    rendered as one "Tailscale not working":
+
+    * ``installed=False`` — install Tailscale.
+    * ``reachable=False`` — the daemon is not answering; start it.
+    * ``logged_in=False`` — signed out; sign in.
+    * all true but ``name=""`` — signed in, but MagicDNS is off for the tailnet.
+    * ``https_enabled=False`` — the tailnet has not granted certificate
+      provisioning for this machine's MagicDNS name yet.
+
+    ``peer_count`` / ``peers_online`` describe the OTHER devices on this tailnet,
+    and they answer a question no amount of local state can: whether there is a
+    phone to reach this dashboard FROM. Publishing succeeds and the QR renders
+    perfectly on a tailnet of one, and then the scan fails in the browser with an
+    unexplained "cannot connect" — the single most likely way a new operator gets
+    stuck, because nothing on this machine is wrong.
+
+    Keeps this module's "nothing here raises" invariant: every failure lands in
+    a field, never in an exception.
+    """
+
+    name: str
+    installed: bool
+    reachable: bool
+    logged_in: bool
+    detail: str
+    #: Login owning this machine, validated from ``Self.UserID`` -> ``User``.
+    #: Kept server-side; the status API does not expose it to the renderer.
+    login: str = ""
+    peer_count: int = 0
+    peers_online: int = 0
+    #: ``None`` means this older/unexpected status document did not expose the
+    #: field. It must not be treated as ``False``: older clients may still be
+    #: able to publish, and the authoritative ``tailscale serve`` write will
+    #: report any unmet requirement. ``False`` is reserved for an explicit
+    #: ``CertDomains`` list that does not contain this host.
+    https_enabled: bool | None = None
+
+
+def _count_peers(status: dict) -> tuple[int, int]:
+    """``(peers, online)`` for the tailnet's OTHER devices. Never raises.
+
+    Counted from the status document already parsed by the caller rather than by
+    a second daemon call. A malformed or absent ``Peer`` map counts as zero, which
+    is the same reading as a tailnet of one — both mean "we cannot show that a
+    second device exists", and the advisory that follows is phrased as an absence
+    of evidence rather than as a certainty.
+    """
+    raw = status.get("Peer")
+    if not isinstance(raw, dict):
+        return 0, 0
+    peers = [p for p in raw.values() if isinstance(p, dict)]
+    online = sum(1 for p in peers if p.get("Online") is True)
+    return len(peers), online
+
+
+def probe_daemon() -> DaemonProbe:
+    """Diagnose the local daemon for the onboarding card. Never raises.
+
+    A LIVE read, unlike the startup value ``GET /api/tailnet/status`` reports.
+    The two are deliberately different questions — "what can this machine do
+    next" versus "what does the running server already trust" — and conflating
+    them is how a resolvable name gets rendered as an origin that is actually in
+    the allowlist.
+    """
+    if _cli_path() is None:
+        return DaemonProbe(
+            name="",
+            installed=False,
+            reachable=False,
+            logged_in=False,
+            detail="Tailscale is not installed in a standard location.",
+        )
+    status, _transient = _run_json_detail(["status", "--json"])
+    if not isinstance(status, dict):
+        return DaemonProbe(
+            name="",
+            installed=True,
+            reachable=False,
+            logged_in=False,
+            detail="Tailscale is installed, but its daemon did not answer.",
+        )
+    backend_state = status.get("BackendState")
+    logged_in = not (
+        isinstance(backend_state, str) and backend_state in _BACKEND_STATES_NEEDING_LOGIN
+    )
+    if not logged_in:
+        return DaemonProbe(
+            name="",
+            installed=True,
+            reachable=True,
+            logged_in=False,
+            detail="Tailscale is running but this machine is not signed in.",
+        )
+    peer_count, peers_online = _count_peers(status)
+    login = _self_login(status)
+    name = self_dns_name() or ""
+    if not name:
+        return DaemonProbe(
+            name="",
+            installed=True,
+            reachable=True,
+            logged_in=True,
+            detail=(
+                "Signed in, but no MagicDNS name is available for this machine — "
+                "MagicDNS may be disabled for this tailnet."
+            ),
+            login=login,
+            peer_count=peer_count,
+            peers_online=peers_online,
+        )
+    # Tailscale's public ``ipnstate.Status`` contract defines CertDomains as the
+    # DNS names for which the control plane will help provision TLS certificates.
+    # An explicit empty/mismatching list is therefore a reliable first-use HTTPS
+    # prerequisite; an absent or malformed field stays unknown so an older CLI is
+    # allowed to reach the authoritative Serve attempt instead of being blocked
+    # forever by a field it never emitted.
+    raw_cert_domains = status.get("CertDomains")
+    https_enabled: bool | None = None
+    if isinstance(raw_cert_domains, list):
+        cert_domains = {
+            value.strip().rstrip(".").lower()
+            for value in raw_cert_domains
+            if isinstance(value, str) and value.strip()
+        }
+        https_enabled = name in cert_domains
+    return DaemonProbe(
+        name=name,
+        installed=True,
+        reachable=True,
+        logged_in=True,
+        detail="",
+        login=login,
+        peer_count=peer_count,
+        peers_online=peers_online,
+        https_enabled=https_enabled,
+    )
 
 
 def is_governance_pinned_off(*, audit_tool: str = "") -> bool:
@@ -428,17 +600,220 @@ async def resolve_tailnet_host(enabled: bool) -> str:
         # Debug-level silence is right for a host that never opted in, but the
         # operator who set ``dashboard.tailscale.enabled`` gets the same bare 403
         # this feature exists to remove, with nothing above debug saying why.
-        # The common cause is a boot race: the gateway resolves once at startup
-        # and tailscaled has not answered yet.
+        # The common cause is a boot race: tailscaled has not answered yet.  The
+        # server owns a bounded background retry after this startup probe.
         logger.warning(
             "dashboard.tailscale.enabled is on, but no tailnet name could be "
             "resolved, so no tailnet origin was added and `tailscale serve` will "
-            "still fail the Origin/Host check. Check `tailscale status`; if the "
-            "daemon was still starting, restart the gateway once it reports "
-            "Running."
+            "still fail the Origin/Host check for now. Background recovery will "
+            "retry without delaying gateway startup; check `tailscale status` if "
+            "it does not become active after the daemon reports Running."
         )
         return ""
     return name
+
+
+# ---------------------------------------------------------------------------
+# Runtime origin recovery — the startup probe above remains the fast path.  An
+# explicitly enabled gateway that loses a boot race can add one validated
+# origin later without mutating aiohttp's frozen application mapping.
+# ---------------------------------------------------------------------------
+
+
+def _origin_resolved_now() -> int:
+    """Epoch timestamp for a successful runtime activation."""
+
+    return int(time.time())
+
+
+@dataclass
+class TailnetOriginState:
+    """Mutable tailnet state stored before aiohttp freezes the app mapping."""
+
+    host: str = ""
+    resolved_at: int = 0
+    load_enabled: Callable[[], bool] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    task: asyncio.Task[None] | None = field(default=None, repr=False, compare=False)
+
+
+def running_tailnet_origin(
+    app: web.Application | Mapping[str, object],
+) -> tuple[str, int]:
+    """Return the origin the running gateway currently trusts.
+
+    The legacy scalar keys remain as an initial snapshot for compatibility with
+    integrations that inspect the app. Runtime-aware callers use the mutable
+    value object so recovery never mutates aiohttp's frozen application mapping.
+    """
+
+    state = app.get(_ORIGIN_RUNTIME_STATE_KEY)
+    if isinstance(state, TailnetOriginState):
+        return state.host, state.resolved_at
+    host = str(app.get("tailnet_host") or "")
+    raw_resolved_at = app.get("tailnet_resolved_at")
+    try:
+        resolved_at = int(raw_resolved_at) if isinstance(raw_resolved_at, (str, int, float)) else 0
+    except (TypeError, ValueError):
+        resolved_at = 0
+    return host, resolved_at
+
+
+async def _origin_configured_enabled(load_enabled: Callable[[], bool]) -> bool | None:
+    """Read the live opt-in off-loop; ``None`` means fail closed and retry."""
+
+    try:
+        return bool(await asyncio.to_thread(load_enabled))
+    except Exception:
+        logger.debug("tailnet origin recovery: config unreadable", exc_info=True)
+        return None
+
+
+async def _origin_governance_pinned(*, audit_tool: str = "") -> bool:
+    """Evaluate the live governance ceiling off-loop, failing closed."""
+
+    try:
+        return await asyncio.to_thread(
+            is_governance_pinned_off,
+            audit_tool=audit_tool,
+        )
+    except Exception:  # pragma: no cover - the underlying probe is itself guarded
+        logger.debug("tailnet origin recovery: governance probe failed", exc_info=True)
+        return True
+
+
+async def _recover_tailnet_origin(app: web.Application, state: TailnetOriginState) -> None:
+    """Retry until one validated origin is activated or the opt-in is removed."""
+
+    load_enabled = state.load_enabled
+    if load_enabled is None:
+        logger.error(
+            "tailnet origin recovery stopped: config loader is unavailable; "
+            "the request boundary remains unchanged"
+        )
+        return
+
+    delay = _ORIGIN_RECOVERY_INITIAL_SECS
+    while True:
+        await asyncio.sleep(delay)
+
+        enabled = await _origin_configured_enabled(load_enabled)
+        if enabled is False:
+            logger.info("tailnet origin recovery stopped because the setting is off")
+            return
+        if enabled is None or await _origin_governance_pinned(audit_tool="tailnet_origin_recover"):
+            delay = min(delay * 2, _ORIGIN_RECOVERY_MAX_SECS)
+            continue
+
+        host = await asyncio.to_thread(self_dns_name)
+        if not host:
+            delay = min(delay * 2, _ORIGIN_RECOVERY_MAX_SECS)
+            continue
+
+        # Re-check both controls immediately before widening the request boundary.
+        # No await occurs between the final decision and the set/state update.
+        enabled = await _origin_configured_enabled(load_enabled)
+        if enabled is False:
+            return
+        if enabled is None or await _origin_governance_pinned(audit_tool="tailnet_origin_recover"):
+            delay = min(delay * 2, _ORIGIN_RECOVERY_MAX_SECS)
+            continue
+
+        allowed_origins = app.get("allowed_origins")
+        if not isinstance(allowed_origins, set):
+            logger.error(
+                "tailnet origin recovery stopped: allowed_origins is unavailable; "
+                "the request boundary remains unchanged"
+            )
+            return
+
+        allowed_origins.add(f"https://{host}")
+        state.host = host
+        state.resolved_at = _origin_resolved_now()
+        logger.info(
+            "tailnet origin recovered in background: trusting https://%s "
+            "(bind and auth unchanged)",
+            host,
+        )
+        return
+
+
+async def _run_origin_recovery_guarded(
+    app: web.Application,
+    state: TailnetOriginState,
+) -> None:
+    """Keep an unexpected recovery failure from becoming an orphaned task error."""
+
+    try:
+        await _recover_tailnet_origin(app, state)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "tailnet origin background recovery stopped unexpectedly; "
+            "the request boundary remains unchanged"
+        )
+
+
+async def _start_origin_recovery(app: web.Application) -> None:
+    """aiohttp startup hook: schedule recovery without delaying listener setup."""
+
+    state = app.get(_ORIGIN_RUNTIME_STATE_KEY)
+    if (
+        not isinstance(state, TailnetOriginState)
+        or state.host
+        or (state.task is not None and not state.task.done())
+    ):
+        return
+    state.task = asyncio.create_task(
+        _run_origin_recovery_guarded(app, state),
+        name="tailnet-origin-recovery",
+    )
+
+
+async def _stop_origin_recovery(app: web.Application) -> None:
+    """aiohttp cleanup hook: leave no background task behind."""
+
+    state = app.get(_ORIGIN_RUNTIME_STATE_KEY)
+    if not isinstance(state, TailnetOriginState) or state.task is None:
+        return
+    state.task.cancel()
+    with suppress(asyncio.CancelledError):
+        await state.task
+    state.task = None
+
+
+def install_tailnet_origin_recovery(
+    app: web.Application,
+    *,
+    enabled: bool,
+    initial_host: str,
+    load_enabled: Callable[[], bool],
+) -> None:
+    """Seed runtime state and register recovery for an unresolved opt-in."""
+
+    try:
+        resolved_at = int(app.get("tailnet_resolved_at") or 0) if initial_host else 0
+    except (TypeError, ValueError):
+        resolved_at = 0
+    if initial_host and not resolved_at:
+        resolved_at = _origin_resolved_now()
+    state = TailnetOriginState(
+        host=initial_host,
+        resolved_at=resolved_at,
+        load_enabled=load_enabled,
+    )
+    app[_ORIGIN_RUNTIME_STATE_KEY] = state
+    # Retain the startup snapshot for compatibility. Runtime consumers call
+    # ``running_tailnet_origin`` instead of mutating these keys after app freeze.
+    app["tailnet_host"] = initial_host
+    app["tailnet_resolved_at"] = resolved_at
+    if enabled and not initial_host:
+        app.on_startup.append(_start_origin_recovery)
+        app.on_cleanup.append(_stop_origin_recovery)
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +919,31 @@ def _valid_identity(raw: object) -> str | None:
     return s
 
 
+def _self_login(status: dict) -> str:
+    """Return the login owning ``Self`` in ``tailscale status --json``.
+
+    Tailscale keys the top-level ``User`` map by ``Self.UserID``. JSON object
+    keys are strings even when the daemon's Go type uses an integer id, so the
+    lookup is normalised instead of relying on one client version's decoded
+    representation. Missing or malformed identity is never guessed: mobile
+    setup then refuses to enable persistent identity trust.
+    """
+    self_node = status.get("Self")
+    users = status.get("User")
+    if not isinstance(self_node, dict) or not isinstance(users, dict):
+        return ""
+    user_id = self_node.get("UserID")
+    if not isinstance(user_id, (str, int)) or isinstance(user_id, bool):
+        return ""
+    profile = users.get(str(user_id))
+    if not isinstance(profile, dict):
+        # Older decoded mappings and test doubles can retain an integer key.
+        profile = users.get(user_id)
+    if not isinstance(profile, dict):
+        return ""
+    return _valid_identity(profile.get("LoginName")) or ""
+
+
 def _whois_node(addr: str) -> tuple[tuple[str, str] | None, bool]:
     """Ask the local daemon who *addr* is. ``((login, node) | None, transient)``.
 
@@ -597,11 +997,6 @@ def _forwarded_peer_candidate(request: web.Request, trust: TailnetTrust) -> str 
     Returns the single forwarded tailnet address worth asking the daemon
     about, or ``None``. No I/O — safe to run inline on the event loop.
     """
-    # Windows daemon/CLI behaviour is unverified (RFC OQ4): resolution is
-    # POSIX-only and everything degrades to the token+IP path there.
-    if not IS_POSIX:
-        logger.debug("tailnet peer resolution is POSIX-only; skipping on this platform")
-        return None
     # (b) explicit opt-in AND a non-empty allowlist. Identity trust is never
     # inferred, and an empty allowlist means trust was refused at config load.
     if not trust.trust_identity or not trust.allowed_logins:
@@ -701,6 +1096,19 @@ def peer_pin_key(peer: ForwardedPeer, pin_scope: str) -> str:
     if pin_scope == PIN_SCOPE_LOGIN:
         return f"ts:login:{peer.login}"
     return f"ts:node:{peer.login}|{peer.node}"
+
+
+def peer_pin_key_for_claim(peer: ForwardedPeer, claimed_key: str) -> str:
+    """Render *peer* in the scope encoded by an existing signed pin claim.
+
+    The claim, not today's config, owns an already-issued session's scope. If
+    the operator later changes ``pin_scope``, silently reinterpreting a
+    node-bound token as login-bound (or the reverse) would either widen it or
+    log the correct device out. Unknown claim shapes default to node scope, the
+    narrower direction; the caller's exact comparison then rejects them.
+    """
+    scope = PIN_SCOPE_LOGIN if claimed_key.startswith("ts:login:") else PIN_SCOPE_NODE
+    return peer_pin_key(peer, scope)
 
 
 def login_allowed(login: str, allowed_logins: tuple[str, ...]) -> bool:

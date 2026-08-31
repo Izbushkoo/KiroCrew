@@ -34,11 +34,14 @@ Three Windows-specific findings shape the capture:
 The spool PATH, the ring trim and the owner-only protection are all shared with
 :mod:`capture_macos` (``shots_dir`` resolves through ``tempfile.gettempdir()``,
 already ``%TEMP%`` here). Both layers of that protection are needed on Windows and
-neither substitutes for the other: ``restrict_to_owner`` emits a NON-inheritable
-ACE, so a directory-only grant leaves each new file with just the inherited
-SYSTEM / Administrators / Owner-Rights entries, while a file-only grant leaves the
-directory itself listable. The directory is tightened once per process and each
-frame is tightened as it is written.
+neither substitutes for the other: the directory grant is inheritable
+(``restrict_dir_to_owner`` emits ``(OI)(CI)``) so files created inside inherit the
+owner-only DACL, but inheritance governs only what is CREATED from here on -- a
+frame that already exists keeps its own DACL, and Windows grants Bypass Traverse
+Checking to Everyone by default, so a permissive pre-existing file stays reachable
+through a tightened parent. A file-only grant, conversely, leaves the directory
+itself listable. The directory is tightened once per process and each frame is
+tightened as it is written.
 """
 
 from __future__ import annotations
@@ -364,7 +367,7 @@ def ensure_shots_dir() -> str:
     every other owner-only directory in the tree uses.
 
     Tightening runs at most once per process (guarded by ``_dir_ready``) because
-    ``restrict_to_owner`` shells out to ``icacls`` on Windows, and a subprocess per
+    ``restrict_to_owner`` rewrites a DACL on Windows, and doing that per
     screenshot would block the pooled worker that also serves chat. A failure is
     logged and tolerated, the posture ``capture_macos`` takes: the files still land
     under a per-user ``%TEMP%``.
@@ -387,11 +390,12 @@ def persist_jpeg(raw: bytes) -> str:
 
     The Windows counterpart of ``capture_macos.persist_jpeg``, and it keeps that
     function's per-file ``restrict_to_owner``. The directory ACL is NOT sufficient
-    on its own: ``restrict_to_owner`` emits a non-inheritable ACE (it was written
-    for files), so the directory's owner grant carries no ``(OI)(CI)`` and a new
-    file lands with only the inherited SYSTEM / Administrators / Owner-Rights
-    entries — never an owner-only DACL. A frame can contain anything that was on
-    screen, so the file itself is locked down.
+    on its own even now that it is inheritable: ``make_owner_only_dir`` routes
+    through ``restrict_dir_to_owner``, whose ``(OI)(CI)`` grants cover files
+    CREATED from that point on, but Windows grants Bypass Traverse Checking to
+    Everyone by default, so a frame that already exists keeps its own DACL and
+    stays reachable through the tightened parent. A frame can contain anything
+    that was on screen, so the file itself is locked down.
 
     The spawn is on the capture path, not the observation path: it runs only when a
     screenshot was actually produced, which is already the expensive branch, and
@@ -410,10 +414,51 @@ def persist_jpeg(raw: bytes) -> str:
         handle_fd, path = tempfile.mkstemp(
             prefix=prefix, suffix=SCREENSHOT_FILE_SUFFIX, dir=directory
         )
-        with os.fdopen(handle_fd, "wb") as handle:
+    except OSError:
+        # Allocation itself failed — ``mkstemp`` raised, so no file exists and
+        # there is nothing to remove.
+        logger.warning("could not persist computer-use screenshot", exc_info=True)
+        return ""
+    try:
+        handle = os.fdopen(handle_fd, "wb")
+    except OSError:
+        logger.warning(
+            "could not write computer-use screenshot; removing the partial frame",
+            exc_info=True,
+        )
+        # ``fdopen`` raised before adopting the descriptor (fd pressure), so
+        # nothing will ever close it — close it here, or the unlink below fails
+        # on Windows, which refuses to remove a file with an open handle. This
+        # is the ONLY branch that may close the raw fd: once ``fdopen`` returns,
+        # the file object owns it, and a second ``os.close`` on the number could
+        # hit an unrelated descriptor another executor thread was just handed.
+        try:
+            os.close(handle_fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return ""
+    try:
+        with handle:
             handle.write(raw)
     except OSError:
-        logger.warning("could not persist computer-use screenshot", exc_info=True)
+        logger.warning(
+            "could not write computer-use screenshot; removing the partial frame",
+            exc_info=True,
+        )
+        # The ``mkstemp`` above succeeded, so this invocation owns *path* and no
+        # caller will ever receive it — without the unlink the partially-written
+        # frame (which can hold sensitive screen pixels) sits in the spool as an
+        # orphan until the ring trim happens to reach it. Best-effort: cleanup
+        # must never mask the original failure. The ``with`` has already closed
+        # the descriptor; do NOT close the fd number again (see above).
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
         return ""
     try:
         platform_compat.restrict_to_owner(path)

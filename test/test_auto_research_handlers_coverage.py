@@ -178,21 +178,23 @@ def _workflow_state(**svc_attrs: Any) -> SimpleNamespace:
     return SimpleNamespace(workflow_service=SimpleNamespace(**svc_attrs))
 
 
-async def _drive_watchdog(app: Any, until, timeout: float = 5.0) -> bool:
+async def _drive_watchdog(app: Any, until, timeout: float = 10.0) -> bool:
     """Run one or more real watchdog iterations, stopping as soon as ``until()``.
 
     The loop is a ``while True`` driven by ``asyncio.sleep(POLL_INTERVAL)``;
     callers shorten POLL_INTERVAL, so this polls the observable side effect and
     always cancels the task (no leaked background work).
+
+    Waiting is delegated to ``_await_until`` so both helpers share ONE budget:
+    two call sites here wait on a status commit made from a worker thread AND
+    the SSE emitted from that thread's ``call_soon_threadsafe`` hook, which is
+    two scheduling hops, and the tighter of two budgets is what made those
+    flake on a loaded shard. The timeout is a deadlock backstop; observable
+    state is what ends a successful wait.
     """
     task = asyncio.ensure_future(h._watchdog_loop(app))
     try:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            await asyncio.sleep(0.01)
-            if until():
-                return True
-        return False
+        return await _await_until(until, timeout=timeout)
     finally:
         task.cancel()
         try:
@@ -1574,6 +1576,39 @@ class TestKnowledgeRoutes:
         pipeline.ingest_file.assert_awaited_once()
         statuses = [c.args[0] for c in store.db.execute.call_args_list]
         assert any("'synced'" in s for s in statuses)
+
+    @pytest.mark.asyncio
+    async def test_ingest_store_statements_run_off_the_event_loop(self, _isolate: Path):
+        """Issue #7020's loop-stall class: every store statement for the
+        to-knowledge flow must run in a worker thread, so a lock wait on the
+        store's busy timeout stalls a thread instead of the event loop (which
+        the watchdog would kill). Pins add_source, the syncing/synced UPDATEs,
+        and their commits to non-loop threads."""
+        import threading
+
+        cid = _campaign()
+        (h._campaign_dir(cid) / "FINDINGS.md").write_text("findings body")
+        loop_thread = threading.get_ident()
+        seen_threads: list[int] = []
+
+        def _record(*_a, **_k):
+            seen_threads.append(threading.get_ident())
+            return MagicMock()
+
+        store = MagicMock()
+        store.get_source_by_uri.side_effect = lambda *_a: (_record(), None)[1]
+        store.add_source.side_effect = lambda **_k: (_record(), 11)[1]
+        store.db.execute.side_effect = _record
+        store.db.commit.side_effect = _record
+        pipeline = SimpleNamespace(ingest_file=AsyncMock())
+        app = _app(state=SimpleNamespace(knowledge_store=store), knowledge_pipeline=pipeline)
+        resp = await h._handle_to_knowledge(_mk("POST", "k", app=app, match={"id": cid}))
+        assert resp.status == 201
+        await _drain_bg_tasks(app)
+        # get_source_by_uri + add_source + 2 UPDATEs + 2 commits all recorded,
+        # none on the loop.
+        assert len(seen_threads) >= 6
+        assert all(t != loop_thread for t in seen_threads)
 
     @pytest.mark.asyncio
     async def test_ingest_failure_marks_the_source_errored(self, _isolate: Path):

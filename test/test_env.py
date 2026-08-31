@@ -17,6 +17,7 @@ from kiro_crew.env import (
     augmented_path,
     ensure_node,
     node_all_bin_dirs,
+    register_mcp_path_dirs,
     resolve_krb5_ccname,
 )
 
@@ -110,6 +111,42 @@ class TestAugmentedPath:
         toolbox_idx = next(i for i, d in enumerate(dirs) if ".toolbox/bin" in d)
         assert local_idx < toolbox_idx
 
+    def test_includes_both_macos_install_prefixes(self) -> None:
+        """``/usr/local/bin`` belongs beside ``/opt/homebrew/bin``, not instead of it.
+
+        The two are different install locations, not alternatives: Homebrew uses
+        ``/opt/homebrew`` on Apple Silicon and ``/usr/local`` on Intel, and macOS
+        ``.pkg`` installers symlink into ``/usr/local/bin`` regardless of
+        architecture. A GUI-launched app inherits launchd's minimal
+        ``/usr/bin:/bin:/usr/sbin:/sbin``, so anything absent here is unresolvable
+        for an in-process ``shutil.which()`` even though it works in a shell.
+
+        Every other bin-dir list in the tree already pairs them -- see
+        ``deploy/engine._AWS_BIN_DIRS``, ``kiro_cli._kiro_cli_dirs`` and
+        ``dashboard/tailnet`` -- so omitting one here made this helper the
+        outlier those call sites had to compensate for locally.
+        """
+        # The declaration is platform-independent, so assert it directly rather
+        # than inferring it from a composed PATH.
+        assert "/opt/homebrew/bin" in env_mod._EXTRA_PATH_DIRS
+        assert "/usr/local/bin" in env_mod._EXTRA_PATH_DIRS
+        # Apple Silicon's prefix stays ahead of the Intel/pkg one, matching the
+        # ordering `_AWS_BIN_DIRS` uses.
+        assert env_mod._EXTRA_PATH_DIRS.index("/opt/homebrew/bin") < env_mod._EXTRA_PATH_DIRS.index(
+            "/usr/local/bin"
+        )
+
+        # Both reach the composed PATH ahead of the inherited base_path -- but only
+        # where they survive `_validated_bin_dir`, whose sole test is absoluteness.
+        # Gating on that same predicate keeps this assertion honest on a host whose
+        # os.path flavour does not consider a POSIX root path absolute, instead of
+        # encoding a Python version or platform name that would go stale.
+        if os.path.isabs("/usr/local/bin"):
+            dirs = augmented_path("/usr/bin").split(os.pathsep)
+            assert dirs.index("/opt/homebrew/bin") < dirs.index("/usr/bin")
+            assert dirs.index("/usr/local/bin") < dirs.index("/usr/bin")
+            assert dirs.index("/opt/homebrew/bin") < dirs.index("/usr/local/bin")
+
     def test_empty_base(self) -> None:
         result = augmented_path("")
         assert result  # not empty
@@ -173,6 +210,266 @@ class TestAugmentedPath:
             env_mod._node_all_bin_dirs.cache_clear()
         for d in dirs:
             assert os.path.isabs(d), f"relative PATH entry leaked: {d!r}"
+
+
+class TestExtraMcpPathDirs:
+    """The MCP binary search path must be extensible (issue #5083).
+
+    A launcher installed into a directory ``_EXTRA_PATH_DIRS`` does not guess
+    resolves nowhere on a systemd gateway's PATH, so the server never starts and
+    the session merely comes up short of tools. Both seams -- the
+    ``mcp.extra_path_dirs`` setting and :func:`register_mcp_path_dirs` -- are
+    merged in ``mcp_search_path``, the path the MCP probe, the agent-config
+    resolver and gatewayd's rewriter all RESOLVE against, so one contributed
+    directory reaches all three. It is deliberately NOT ``spec_env_path``, whose
+    result is persisted -- see ``TestContributedDirsAreNeverPersisted``.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self, monkeypatch):
+        # Module-global snapshots + warn-once memo: isolate all three so ordering
+        # between tests cannot leak a directory or swallow an expected warning.
+        monkeypatch.setattr(env_mod, "_registered_path_dirs", ())
+        monkeypatch.setattr(env_mod, "_config_path_dirs", ())
+        monkeypatch.setattr(env_mod, "_warned_bad_bin_dirs", set())
+        yield
+
+    @staticmethod
+    def _set_configured(monkeypatch, value):
+        """Publish *value* as the config's ``mcp.extra_path_dirs``.
+
+        Goes through the real publish entry point rather than assigning the
+        global, so a rename or a change of stored shape breaks these tests
+        instead of silently passing against a stale field.
+        """
+        env_mod.publish_config_path_dirs(value)
+
+    @staticmethod
+    def _mcp_dirs(declared: str = "") -> list[str]:
+        """The search path an MCP server's command is resolved against."""
+        return env_mod.mcp_search_path(declared).split(os.pathsep)
+
+    def test_configured_dir_outranks_builtin_guesses(self, monkeypatch) -> None:
+        """An explicitly named directory must win over a built-in guess.
+
+        Ordering is the whole point: when the same command name exists in both,
+        the directory the operator named is the one they meant.
+        """
+        self._set_configured(monkeypatch, ["/opt/pixi/bin"])
+        dirs = self._mcp_dirs()
+        local_idx = next(i for i, d in enumerate(dirs) if ".local/bin" in d)
+        assert dirs.index("/opt/pixi/bin") < local_idx
+
+    def test_spec_declared_path_still_outranks_a_configured_dir(self, monkeypatch) -> None:
+        """An operator pin on the spec must not be displaceable by this setting."""
+        self._set_configured(monkeypatch, ["/opt/pixi/bin"])
+        dirs = self._mcp_dirs("/opt/pinned/bin")
+        assert dirs.index("/opt/pinned/bin") < dirs.index("/opt/pixi/bin")
+
+    def test_configured_dir_expands_tilde(self, monkeypatch, tmp_path) -> None:
+        """``~/x/bin`` is what a human writes in a config file."""
+        monkeypatch.setattr(os.path, "expanduser", lambda p: p.replace("~", str(tmp_path), 1))
+        self._set_configured(monkeypatch, ["~/pixi/bin"])
+        dirs = self._mcp_dirs()
+        assert str(tmp_path / "pixi" / "bin") in dirs
+        assert "~/pixi/bin" not in dirs
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "relative/bin",  # re-resolved against the CHILD's cwd
+            f"/opt/a{os.pathsep}/opt/b",  # smuggles two entries into one
+            "/opt/\0bin",  # cannot survive exec
+            "",
+            42,  # hand-edited config / a caller passing junk
+            None,
+        ],
+    )
+    def test_bad_entry_is_dropped_not_fatal(self, monkeypatch, bad, caplog) -> None:
+        """One bad entry must cost only itself -- never the whole list.
+
+        Failing the list would take out every other directory the operator
+        declared; failing the call would take out every MCP probe and rewrite.
+        """
+        self._set_configured(monkeypatch, [bad, "/opt/good/bin"])
+        with caplog.at_level("WARNING"):
+            dirs = self._mcp_dirs()
+        assert "/opt/good/bin" in dirs
+        assert all(os.path.isabs(d) and os.pathsep not in d for d in dirs)
+        assert any("mcp.extra_path_dirs" in r.message for r in caplog.records)
+
+    def test_rejected_entry_is_warned_once(self, monkeypatch, caplog) -> None:
+        """This runs once per candidate per rebuild; warning every time is spam."""
+        self._set_configured(monkeypatch, ["relative/bin"])
+        with caplog.at_level("WARNING"):
+            self._mcp_dirs()
+            self._mcp_dirs()
+        warnings = [r for r in caplog.records if "mcp.extra_path_dirs" in r.message]
+        assert len(warnings) == 1
+
+    def test_non_list_setting_is_ignored(self, monkeypatch) -> None:
+        self._set_configured(monkeypatch, "/opt/pixi/bin")  # a bare string, not a list
+        dirs = self._mcp_dirs()
+        assert "/opt/pixi/bin" not in dirs
+        assert any(".local/bin" in d for d in dirs)  # the rest still built
+
+    def test_reads_no_config(self, monkeypatch) -> None:
+        """The whole reason the value is pushed: this composition is reached from
+        the event loop by every MCP probe (probe_server), so it must not
+        stat/read/validate config.json."""
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        def _boom(cls):
+            raise AssertionError("the search path must not load the config")
+
+        monkeypatch.setattr(KiroCrewConfig, "load", classmethod(_boom))
+        self._set_configured(monkeypatch, ["/opt/pixi/bin"])
+        assert "/opt/pixi/bin" in self._mcp_dirs()
+
+    def test_publish_clears_a_removed_setting(self, monkeypatch) -> None:
+        """Every load republishes, so deleting the setting must take effect too --
+        not leave the last value pinned for the process lifetime."""
+        self._set_configured(monkeypatch, ["/opt/pixi/bin"])
+        assert "/opt/pixi/bin" in self._mcp_dirs()
+        self._set_configured(monkeypatch, [])
+        assert "/opt/pixi/bin" not in self._mcp_dirs()
+
+    def test_register_contributes_and_is_idempotent(self) -> None:
+        """A packaged build's installer hook may run more than once."""
+        assert register_mcp_path_dirs("/opt/dist/bin") == ("/opt/dist/bin",)
+        register_mcp_path_dirs("/opt/dist/bin")
+        assert self._mcp_dirs().count("/opt/dist/bin") == 1
+
+    def test_register_returns_only_accepted_entries(self) -> None:
+        """The caller needs to see that a value was rejected."""
+        assert register_mcp_path_dirs("relative/bin", "/opt/dist/bin") == ("/opt/dist/bin",)
+        assert "relative/bin" not in self._mcp_dirs()
+
+    def test_config_outranks_registered(self, monkeypatch) -> None:
+        """An operator's own host setting beats a distribution default."""
+        self._set_configured(monkeypatch, ["/opt/operator/bin"])
+        register_mcp_path_dirs("/opt/dist/bin")
+        dirs = self._mcp_dirs()
+        assert dirs.index("/opt/operator/bin") < dirs.index("/opt/dist/bin")
+
+    def test_registration_order_is_precedence_order(self) -> None:
+        register_mcp_path_dirs("/opt/first/bin")
+        register_mcp_path_dirs("/opt/second/bin")
+        dirs = self._mcp_dirs()
+        assert dirs.index("/opt/first/bin") < dirs.index("/opt/second/bin")
+
+    def test_contributed_duplicate_of_builtin_appears_once(self, monkeypatch, tmp_path) -> None:
+        """Contributing a directory the built-in list already covers must not
+        lengthen every child's PATH with a second copy of it."""
+        monkeypatch.setattr(os.path, "expanduser", lambda p: str(tmp_path) if p == "~" else p)
+        local_bin = str(tmp_path / ".local" / "bin")
+        self._set_configured(monkeypatch, [local_bin])
+        env_mod._node_all_bin_dirs.cache_clear()
+        try:
+            dirs = self._mcp_dirs()
+        finally:
+            env_mod._node_all_bin_dirs.cache_clear()
+        assert dirs.count(local_bin) == 1
+        assert dirs.index(local_bin) == 0
+
+    def test_default_config_changes_nothing(self, monkeypatch) -> None:
+        """With the setting untouched the emitted PATH is byte-identical to before,
+        so the seam cannot perturb an install that never uses it."""
+        self._set_configured(monkeypatch, [])
+        assert env_mod.mcp_search_path("/opt/pinned/bin") == env_mod.spec_env_path(
+            "/opt/pinned/bin"
+        )
+
+
+class TestContributedDirsAreNeverPersisted:
+    """A contributed directory must never be written into a consumed config file.
+
+    ``emit_env`` writes ``spec_env_path``'s result into the agent config, the
+    kiro-global ``mcp.json`` and the Claude Code sidecar, and those files are read
+    back as a spec's AUTHORED ``env.PATH`` on the next rebuild -- which is why
+    ``spec_env_path`` documents being idempotent under re-expansion. A contributed
+    directory rendered there would become indistinguishable from an authored
+    entry, so clearing ``mcp.extra_path_dirs`` could never remove it again.
+    Resolution is recomputed every time and stored nowhere, which is why the
+    contribution lives only on ``mcp_search_path``.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _contributed(self, monkeypatch):
+        monkeypatch.setattr(env_mod, "_registered_path_dirs", ())
+        monkeypatch.setattr(env_mod, "_config_path_dirs", ())
+        monkeypatch.setattr(env_mod, "_warned_bad_bin_dirs", set())
+        env_mod.publish_config_path_dirs(["/opt/contributed/bin"])
+        register_mcp_path_dirs("/opt/contributed-registered/bin")
+        yield
+
+    def test_spec_env_path_excludes_contributed_dirs(self) -> None:
+        entries = env_mod.spec_env_path("/opt/pinned/bin").split(os.pathsep)
+        assert "/opt/contributed/bin" not in entries
+        assert "/opt/contributed-registered/bin" not in entries
+
+    def test_emit_env_excludes_contributed_dirs(self) -> None:
+        """The persisted surface. ``emit_env`` is the single writer for every
+        consumed config file, so excluding it here covers all of them."""
+        emitted = env_mod.emit_env({"PATH": "/opt/pinned/bin"})["PATH"]
+        assert "/opt/contributed/bin" not in emitted.split(os.pathsep)
+        assert "/opt/contributed-registered/bin" not in emitted.split(os.pathsep)
+
+    def test_a_removed_setting_stops_being_searched(self) -> None:
+        """The consequence the exclusion buys: clearing the setting takes effect
+        even for a spec whose PATH was rendered while it was set."""
+        rendered = env_mod.emit_env({"PATH": "/opt/pinned/bin"})["PATH"]
+        env_mod.publish_config_path_dirs([])
+        monkeyed = env_mod.mcp_search_path(rendered).split(os.pathsep)
+        assert "/opt/contributed/bin" not in monkeyed
+
+    def test_contributed_dir_still_reaches_the_mcp_search_path(self) -> None:
+        """The negative assertions above must not pass by the feature being broken."""
+        entries = env_mod.mcp_search_path("").split(os.pathsep)
+        assert "/opt/contributed/bin" in entries
+        assert "/opt/contributed-registered/bin" in entries
+
+
+class TestContributedDirsNeverReachTheTrustedRuntime:
+    """A contributed MCP directory must not be able to shadow the agent runtime.
+
+    ``kiro_cli.known_kiro_cli_dirs`` appends ``augmented_path`` when looking for
+    ``kiro-cli`` itself, and ``resolve_kiro_cli`` takes the FIRST executable
+    candidate. On an install whose CLI is reachable only that way -- a toolbox
+    install, found via ``~/.toolbox/bin`` -- a contributed directory ranked ahead
+    of it would let a forged ``kiro-cli`` win. Where ``agent.sandbox="off"``
+    delegates confinement to the CLI's own sandbox, that forged binary IS the
+    sandbox, so this is a credential-exposure path and not merely a wrong
+    binary. The contribution therefore lives on the MCP-only composition; these
+    tests are the ratchet on that boundary.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _contributed(self, monkeypatch):
+        monkeypatch.setattr(env_mod, "_registered_path_dirs", ())
+        monkeypatch.setattr(env_mod, "_config_path_dirs", ())
+        monkeypatch.setattr(env_mod, "_warned_bad_bin_dirs", set())
+        env_mod.publish_config_path_dirs(["/opt/attacker/bin"])
+        register_mcp_path_dirs("/opt/attacker-registered/bin")
+        yield
+
+    def test_augmented_path_excludes_contributed_dirs(self) -> None:
+        dirs = augmented_path("/usr/bin").split(os.pathsep)
+        assert "/opt/attacker/bin" not in dirs
+        assert "/opt/attacker-registered/bin" not in dirs
+
+    def test_kiro_cli_search_dirs_exclude_contributed_dirs(self, tmp_path) -> None:
+        from kiro_crew.kiro_cli import known_kiro_cli_dirs
+
+        dirs = known_kiro_cli_dirs("linux", tmp_path, {"PATH": "/usr/bin"})
+        assert "/opt/attacker/bin" not in dirs
+        assert "/opt/attacker-registered/bin" not in dirs
+
+    def test_contributed_dir_still_reaches_the_mcp_search_path(self) -> None:
+        """The negative tests above must not pass by the feature being broken."""
+        dirs = env_mod.mcp_search_path("").split(os.pathsep)
+        assert "/opt/attacker/bin" in dirs
+        assert "/opt/attacker-registered/bin" in dirs
 
 
 class TestNodeAllBinDirs:
@@ -888,6 +1185,30 @@ class TestSanitizeSpecEnv:
         )
         assert out == {"TOKEN": "t"}
 
+    def test_pythonuserbase_is_dropped(self) -> None:
+        """User-site relocation is the same startup-execution channel.
+
+        ``PYTHONUSERBASE`` moves user-site, and ``site.py`` EXECUTES ``.pth`` lines
+        found there during interpreter startup. The launcher now also runs ``-I
+        -S`` (which is what truly closes this), but the sanitizer is the primary
+        control for any future launcher that forgets those flags, so it must cover
+        the key in its own right.
+        """
+        out = env_mod.sanitize_spec_env(
+            [("PYTHONUSERBASE", "/tmp/evil"), ("pythonuserbase", "/tmp/evil2"), ("OK", "1")]
+        )
+        assert out == {"OK": "1"}
+
+    def test_home_is_deliberately_not_dropped(self) -> None:
+        """Documents a deliberate boundary, so a future reader does not "fix" it.
+
+        ``HOME`` also derives user-site when ``PYTHONUSERBASE`` is unset, but many
+        servers legitimately need it, so stripping it would break real configs. The
+        launcher's ``-I -S`` closes that path instead: with site processing off, no
+        ``.pth`` runs regardless of where the paths point.
+        """
+        assert env_mod.sanitize_spec_env([("HOME", "/home/u")]) == {"HOME": "/home/u"}
+
     def test_benign_env_passes_untouched(self) -> None:
         pairs = [("TOKEN", "t"), ("MODE", "prod"), ("LANG", "C")]
         assert env_mod.sanitize_spec_env(pairs) == dict(pairs)
@@ -916,6 +1237,96 @@ class TestSanitizeSpecEnv:
         assert out["LD_PRELOAD"] == "/x.so"
 
 
+class TestSanitizeSpecEnvReservedNamespace:
+    """SECURITY: a config-declared ``env`` may not author the ``KIROCREW_``
+    namespace, because that namespace carries the caller identity our own
+    authorization checks read.
+
+    Distinct class from the loader prefixes: confinement does not mitigate it.
+    A sandbox bounds what the child may touch, not whose scheduled jobs Kiro
+    Crew believes the child is entitled to delete.
+    """
+
+    def test_caller_identity_keys_are_dropped(self) -> None:
+        """The four vouched-for identity channels, and the shared secret.
+
+        ``KIROCREW_CLI`` is the admin-bypass flag (``_caller_is_cli``);
+        ``KIROCREW_SESSION_KEY``/``KIROCREW_HOST_PID`` are two of the three
+        sources ``_resolve_session_key_strict`` accepts *on the grounds that an
+        agent cannot write them*; ``KIROCREW_OWNER_ID`` is the Slack owner.
+        """
+        out = env_mod.sanitize_spec_env(
+            [
+                ("KIROCREW_CLI", "1"),
+                ("KIROCREW_SESSION_KEY", "victim-session"),
+                ("KIROCREW_HOST_PID", "4242"),
+                ("KIROCREW_CHANNEL_ID", "C0DEADBEEF"),
+                ("KIROCREW_OWNER_ID", "UATTACKER"),
+                ("KIROCREW_INTERNAL_SECRET", "s3cret"),
+                ("MCP_TOKEN", "keep-me"),
+                ("PATH", "/opt/helper/bin"),
+            ]
+        )
+        assert out == {"MCP_TOKEN": "keep-me", "PATH": "/opt/helper/bin"}
+
+    def test_whole_namespace_is_denied_not_a_key_list(self) -> None:
+        """The point of the prefix: a variable nobody has invented yet is
+        already covered.
+
+        A key-by-key denylist fails open for the next identity variable someone
+        adds, which is why the control is stated as "a config cannot author our
+        namespace" instead.
+        """
+        out = env_mod.sanitize_spec_env(
+            [
+                ("KIROCREW_SANDBOX_LEVEL", "none"),
+                ("KIROCREW_APPROVAL_MODE", "yolo"),
+                ("KIROCREW_NOT_A_REAL_VAR_YET", "x"),
+                ("OK", "1"),
+            ]
+        )
+        assert out == {"OK": "1"}
+
+    def test_matching_is_case_insensitive(self) -> None:
+        """Windows env names are case-insensitive, so ``kirocrew_cli`` reaches
+        ``os.environ.get("KIROCREW_CLI")`` there exactly like the upper spelling.
+        """
+        out = env_mod.sanitize_spec_env(
+            [("kirocrew_cli", "1"), ("KiroCrew_Session_Key", "v"), ("OK", "1")]
+        )
+        assert out == {"OK": "1"}
+
+    def test_unrelated_namespaces_are_untouched(self) -> None:
+        """Scoped deliberately: only OUR namespace is reserved.
+
+        ``MC_*`` is the legacy prefix and carries no identity variable (only
+        ``MC_MCP_SOCKET``/``MC_MCP_LOG``/``MC_GATEWAYD_LOG`` diagnostics), and a
+        server's own ``KIRO*`` settings are its business.
+        """
+        pairs = [
+            ("MC_MCP_LOG", "/tmp/x.log"),
+            ("KIRO_SOMETHING", "1"),
+            ("MY_KIROCREW_VAR", "1"),
+        ]
+        assert env_mod.sanitize_spec_env(pairs) == dict(pairs)
+
+    def test_denying_the_overlay_cannot_strip_an_inherited_value(self) -> None:
+        """Why the namespace deny is safe, stated as a test.
+
+        Callers build the child env from ``os.environ`` FIRST and overlay the
+        spec on top, so a gateway-authored ``KIROCREW_*`` value is inherited
+        regardless. The sanitizer only decides whether a config may OVERRIDE
+        one — so filtering the overlay removes the forgery and keeps the real
+        value.
+        """
+        inherited = {"KIROCREW_HOME": "/real/home", "KIROCREW_CLI": ""}
+        child = dict(inherited)
+        child.update(env_mod.sanitize_spec_env([("KIROCREW_CLI", "1"), ("OK", "1")]))
+        assert child["KIROCREW_HOME"] == "/real/home"
+        assert child["KIROCREW_CLI"] == ""
+        assert child["OK"] == "1"
+
+
 class TestDeniedSpecEnvKeys:
     """The reporting counterpart of the sanitizer: what did policy remove?"""
 
@@ -937,3 +1348,21 @@ class TestDeniedSpecEnvKeys:
     def test_non_string_keys_are_ignored(self) -> None:
         """Config JSON is unvalidated; a malformed key must not raise here."""
         assert env_mod.denied_spec_env_keys({1: "x"}) == []  # type: ignore[dict-item]
+
+    def test_reserved_namespace_is_deliberately_not_reported(self) -> None:
+        """Pinned so a future change does not "align" the two and make the
+        dashboard lie.
+
+        This function feeds ``_note_denied_env``, whose message says the key
+        "execute[s] in the sandbox launcher before confinement, so the probe
+        cannot honour them — a session still does". Every clause of that is false
+        for ``KIROCREW_CLI``: it is not a launcher-execution channel, and a
+        session must not honour a forged caller identity either. The sanitizer
+        still drops it (log-only); only the user-facing explanation is scoped to
+        the loader class.
+        """
+        env = {"KIROCREW_CLI": "1", "PYTHONPATH": "/srv", "TOKEN": "t"}
+        assert env_mod.denied_spec_env_keys(env) == ["PYTHONPATH"]
+        assert "KIROCREW_CLI" not in env_mod.sanitize_spec_env(
+            [(k, v) for k, v in env.items()]
+        )

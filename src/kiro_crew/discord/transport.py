@@ -17,16 +17,20 @@ new thread; turns never run directly in a normal guild channel.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Iterable
+import logging
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from kiro_crew.discord.client import (
     DISCORD_CHUNK_LIMIT,
+    DISCORD_MAX_FILES_PER_MESSAGE,
     DiscordClient,
     DiscordInbound,
 )
 from kiro_crew.messaging.identity import channel_inbound_permitted
+from kiro_crew.messaging.outbound_files import OutboundFile
+from kiro_crew.messaging.tables import TABLE_POLICY_AUTO
 from kiro_crew.messaging.transport import (
     ConfiguredChannelTarget,
     InboundMessage,
@@ -34,6 +38,8 @@ from kiro_crew.messaging.transport import (
     TransportCapabilities,
 )
 from kiro_crew.sel import sel
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -53,21 +59,29 @@ class DiscordInboundMessage(InboundMessage):
 DispatchFn = Callable[[InboundMessage], Awaitable[None]]
 
 # Discord's capabilities: edit-based streaming, a 2000-char cap (we chunk at
-# 1900 for headroom), up to 5 buttons per action row, emoji reactions (used
-# for steer-ack receipts), native markdown rendering, and allow-listed server
+# 1900 for headroom), up to 5 buttons per action row, emoji reactions (steer-ack
+# receipts and the phase ladder), native markdown rendering, and allow-listed server
 # threads (represented by Discord as channels). Single source of truth for the
 # renderer's degradation decisions.
 DISCORD_CAPABILITIES = TransportCapabilities(
     streaming=True,
     edit=True,
-    reactions=True,  # add_reaction — used for the steer-ack receipt
-    # Inbound only: attachments are ingested (discord/attachments.py), but no
-    # upload path exists — file_send reaches Slack alone. The old single
-    # files=True conflated the two directions and over-promised outbound.
+    # Two readers: the mid-turn steer-ack receipt (add_reaction on the user's own
+    # message) and the renderer's phase ladder, which checks this flag before it
+    # arms. A capability is a claim other code trusts, so both are named here.
+    reactions=True,
+    # Both directions are wired: attachments are ingested
+    # (discord/attachments.py), and a sealed segment's local images are uploaded
+    # as multipart attachments (renderer -> client.send_message_with_files). The
+    # renderer READS files_outbound before extracting, so this flag is the switch
+    # rather than a description of one.
     files_inbound=True,
-    files_outbound=False,
+    files_outbound=True,
     rich_blocks=False,
     threads=True,
+    # Discord renders pipe tables literally. ``auto`` keeps grids only when
+    # they fit a phone-sized monospace viewport and cards wider tables.
+    table_mode=TABLE_POLICY_AUTO,
     max_message_chars=DISCORD_CHUNK_LIMIT,
     # 25 = TOTAL interactive choices (5 buttons/row x 5 action rows -- the
     # platform max the renderer actually ships). The previous 5 was the
@@ -143,6 +157,68 @@ class DiscordTransport(MessagingTransport):
         mid = await self._client.send_message(conversation_id, content)
         return str(mid or "")
 
+    async def send_message_with_files(
+        self,
+        conversation_id: str,
+        content: str,
+        files: Sequence[OutboundFile],
+        thread_id: str | None = None,
+    ) -> str:
+        """Send ``content`` with ``files`` attached. Returns the message id.
+
+        The transport-level upload verb: :meth:`send_message` plus attachments,
+        same return contract, so a caller holding a transport does not reach past
+        it into the client. ``files`` carry the validated bytes from
+        ``messaging/outbound_files.py``; this path uploads exactly those and never
+        re-opens ``OutboundFile.path``.
+
+        Discord's ceilings are budgets the CALLER feeds to extraction, because a
+        file refused before it is read keeps its markdown in the text -- refusing
+        here would drop it after the reference was already cut out. Anything still
+        over the count cap is a caller bug, dropped with a warning rather than
+        failing the whole send.
+        """
+        if len(files) > DISCORD_MAX_FILES_PER_MESSAGE:
+            logger.warning(
+                "discord: %d attachments exceeds the %d-per-message cap; sending the first %d",
+                len(files),
+                DISCORD_MAX_FILES_PER_MESSAGE,
+                DISCORD_MAX_FILES_PER_MESSAGE,
+            )
+            files = list(files)[:DISCORD_MAX_FILES_PER_MESSAGE]
+        mid = await self._client.send_message_with_files(conversation_id, content, files)
+        return str(mid or "")
+
+    async def send_document(
+        self,
+        conversation_id: str,
+        file: OutboundFile,
+        *,
+        caption: str = "",
+        thread_id: str | None = None,
+    ) -> str:
+        """Send one validated file, keeping its admitted name. Returns the message id.
+
+        The name-preserving counterpart of :meth:`send_message_with_files`, whose
+        sanitizer is aimed at LLM-authored reference paths and would deliver
+        ``report.pdf`` as ``report.bin``. A caller here has already gated the name
+        (``file_send``), so the real basename is pinned onto the multipart part.
+        ``file`` carries validated bytes (the ``OutboundFile`` contract — the path
+        is provenance, never re-opened).
+
+        ``thread_id``, when present, IS the destination: a Discord thread's
+        snowflake is its channel id, which is why the persisted link is built as
+        ``ChannelLink("discord", channel_id=...)`` with no thread id at all (see
+        :meth:`may_send_to`). The parameter exists for cross-transport parity, and
+        honouring it costs nothing because the value it would carry is a channel.
+        """
+        mid = await self._client.send_document(
+            thread_id or conversation_id,
+            file,
+            caption=caption or None,
+        )
+        return str(mid or "")
+
     async def resolve_conversation(self, user_id: str) -> str:
         # Proactive sends need a DM channel; the client's create_dm_channel
         # POSTs /users/@me/channels to create (or return) it for a user id.
@@ -178,6 +254,55 @@ class DiscordTransport(MessagingTransport):
             if await self._client.is_thread_channel(value):
                 return value, None
         return None
+
+    # -- Outbound authorization --------------------------------------------
+    def may_send_to(
+        self, conversation_id: str, thread_id: str | None = None, *, principal: str = ""
+    ) -> bool:
+        """Re-check the roster the ROUTE belongs to. Fails closed on both.
+
+        Discord keeps two rosters because it has two audiences, so this dispatches
+        on the route rather than testing one id against the wrong set.
+
+        A **thread** route is recognised by its conversation id being in
+        ``_allowed_threads``, the same set ``receive`` gates inbound on. Matched on
+        the conversation id and NOT on ``thread_id``: a Discord thread's snowflake IS
+        its channel id, and the persisted link is built as
+        ``ChannelLink("discord", channel_id=...)`` with no thread id at all, so a
+        check keyed on ``thread_id`` never fires and every thread would fall to the
+        DM arm and be refused for want of a principal. Snowflakes are unique, so a
+        DM channel id cannot collide into this set.
+
+        Consulting the thread set keeps outbound exactly as tight as inbound, which
+        also settles the auto-created case: those ids are registered in memory only,
+        so after a restart such a thread can no longer drive a turn either, and
+        continuing to post into it would make outbound the more permissive of the two.
+        A thread REMOVED from the roster falls through to the DM arm, where a forum
+        session key names no principal, so revocation still refuses it.
+
+        A **DM** route is checked against ``_allowed`` via *principal*, and refuses
+        when there is none. The conversation id cannot answer that one: a DM link
+        persists the channel id returned by ``create_dm_channel``, which is
+        unrelated to the user snowflake the roster holds, and re-deriving the
+        pairing is a POST a synchronous per-send seam cannot make. So with no
+        principal there is nothing left to consult, and an unidentifiable DM
+        recipient is exactly the case that must not be waved through: this is a
+        network egress boundary, and the caller audits the refusal.
+
+        The one route that reaches that refusal is a ``unified`` DM bucket, whose
+        key names no peer by design. Refusing costs an unattended notice there and
+        is the correct trade: that bucket deliberately collapses SEVERAL peers into
+        one session, so nothing available to this seam establishes which of them the
+        link currently points at. Sessions under the default ``per-channel-peer``
+        scope carry their peer in the key and are unaffected. Serving it needs a
+        ``dm_channel_id -> user_id`` pairing persisted when the DM is opened, which
+        is a Discord-owned schema change.
+        """
+        if not conversation_id:
+            return False
+        if conversation_id in self._allowed_threads:
+            return True
+        return bool(principal) and principal in self._allowed
 
     # -- Lifecycle ----------------------------------------------------------
     async def connect(self) -> None:
@@ -272,7 +397,28 @@ class DiscordTransport(MessagingTransport):
                 # (`elif inbound.channel_id not in self._allowed_threads` below).
                 # The dispatcher's own copy (button interactions) is updated via
                 # the callback right after.
+                #
+                # Audited because this is a GRANT, not a denial: a new authorized
+                # disclosure boundary appears at runtime, readable by every member
+                # who can view the thread, and every refusal on this path already
+                # leaves a record. Without it the audit log shows the turns that
+                # ran in the thread but never the decision that admitted it, so
+                # reconstructing which surfaces the agent was reachable in means
+                # inferring it from traffic.
+                #
+                # The set is deliberately unbounded: each entry is a thread an
+                # ALREADY-approved user created, and evicting one would silently
+                # stop answering in a conversation they are still holding: worse
+                # than the memory, which is bounded in practice by that user's
+                # own thread count.
                 self._allowed_threads.add(created)
+                sel().log_api_access(
+                    caller=inbound.user_id,
+                    operation="discord_transport.auto_thread",
+                    outcome="thread_authorized",
+                    source="discord",
+                    resources=f"channel={inbound.channel_id},thread={created}",
+                )
                 if self._on_thread_created is not None:
                     self._on_thread_created(created)
             elif inbound.channel_id not in self._allowed_threads:

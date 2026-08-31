@@ -11,11 +11,13 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 from collections.abc import Iterable, Mapping, MutableMapping
 from pathlib import Path
 
 from kiro_crew import platform_compat
 from kiro_crew.config.paths import data_home
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +34,163 @@ _EXTRA_PATH_DIRS = (
     "{mise_data}/shims",
     "{home}/.volta/bin",
     "/opt/homebrew/bin",  # Apple Silicon Homebrew node / global npm bins
+    "/usr/local/bin",  # Intel Homebrew + pkg-installer symlink dir
 )
+
+
+# --- extending the MCP binary search path -------------------------------------
+#
+# ``_EXTRA_PATH_DIRS`` above is a fixed set of guesses and can never be
+# complete: WHICH directory a package manager drops an MCP launcher into is
+# ecosystem-, distribution- and site-specific. A launcher installed outside that
+# list is invisible to every consumer of :func:`augmented_path` — the MCP probe,
+# the agent-config command resolver, and gatewayd's rewriter — so a server
+# declared by bare name never launches and the session simply comes up short of
+# tools, which reads as a missing capability rather than a launch failure.
+#
+# So the list is extensible from two sides, merged in :func:`mcp_search_path`
+# (issue #5083). Fixing it at that one function is deliberate: it is the path all
+# three of those consumers resolve against, so one contributed directory reaches
+# all of them without any of them knowing it exists.
+#
+# * ``mcp.extra_path_dirs`` in the config — an operator on one host.
+# * :func:`register_mcp_path_dirs` — a packaged/downstream build or an embedding
+#   runtime, which has no per-user config file to edit.
+#
+# Both go through the same absolute-only :func:`_validated_bin_dir` gate as this
+# module's own entries, and both rank ahead of :func:`augmented_path`'s guesses:
+# a directory somebody named explicitly is more specific than a built-in guess,
+# so it must win when the same command name exists in both. A spec's own
+# ``env.PATH`` still outranks everything -- an operator pin cannot be displaced.
+#
+# The contribution reaches ONLY the resolution path, never
+# :func:`spec_env_path` (whose result :func:`emit_env` persists into consumed
+# config files) and never :func:`augmented_path` (the generic composition). Both
+# exclusions are load-bearing and are argued at :func:`mcp_search_path`.
+#
+# The config value is PUSHED here by the loader (:func:`publish_config_path_dirs`,
+# called from ``KiroCrewConfig.load``) rather than read here. That is not
+# indirection for its own sake: :func:`mcp_search_path` is reached from the event
+# loop by every MCP probe (``probe_server``) and by the agent-config resolver, so
+# pulling the config here would stat/read/validate ``config.json`` on the loop.
+# Pushing keeps this module's whole search-path construction free of IO, and
+# costs nothing: every process that spawns an MCP server loads the config at
+# startup, and each later ``load()`` refreshes the snapshot, so an edited setting
+# takes effect without a restart.
+_registered_path_dirs: tuple[str, ...] = ()
+_config_path_dirs: object = ()
+_path_dirs_lock = threading.Lock()
+
+#: Rejected operator-supplied bin dirs already logged, so a per-spawn call site
+#: does not re-log the same bad entry on every subprocess launch. Bounded by the
+#: number of distinct bad values an operator authored.
+_warned_bad_bin_dirs: set[str] = set()
+
+
+def _warn_rejected_bin_dir(raw: object, source: str) -> None:
+    """Log a rejected bin dir once per distinct value.
+
+    Silently dropping it would reproduce the failure this seam exists to fix:
+    a directory that looks configured but contributes nothing, with no trace.
+    """
+    key = f"{source}\0{raw!r}"
+    if key in _warned_bad_bin_dirs:
+        return
+    _warned_bad_bin_dirs.add(key)
+    logger.warning(
+        "%s: ignoring %r — expected a single absolute directory path",
+        source,
+        raw,
+    )
+
+
+def _validated_bin_dirs(values: object, source: str) -> list[str]:
+    """Validate an operator-supplied LIST of bin directories, dropping bad ones.
+
+    ``~`` is expanded first (a config file is where a human writes
+    ``~/.pixi/bin``), then each entry passes the same
+    :func:`_validated_bin_dir` gate as this module's own well-known dirs — one
+    absolute directory, no path separator, no NUL. A rejected entry is dropped
+    rather than failing the whole list: one typo must not cost an operator every
+    other directory they declared, nor abort PATH construction for every spawn.
+
+    *values* is typed ``object`` because both sources are hand-editable and can
+    legally parse as something other than a list of strings.
+    """
+    if not isinstance(values, (list, tuple)):
+        if values not in (None, ""):
+            _warn_rejected_bin_dir(values, source)
+        return []
+    out: list[str] = []
+    for raw in values:
+        entry = _validated_bin_dir(os.path.expanduser(raw)) if isinstance(raw, str) else None
+        if entry is None:
+            _warn_rejected_bin_dir(raw, source)
+            continue
+        out.append(entry)
+    return out
+
+
+def register_mcp_path_dirs(*dirs: str) -> tuple[str, ...]:
+    """Contribute directories to the MCP binary search path. Returns the accepted ones.
+
+    The programmatic half of the seam described above: a downstream build, a
+    packaged distribution, or a host embedding Kiro Crew can name the directories
+    ITS package manager installs MCP launchers into, without forking this module
+    and without a per-user config file. Call it during startup, before the first
+    session or MCP probe; :func:`augmented_path` reads the registry on every
+    call, so a later registration still takes effect (nothing is cached).
+
+    Entries are validated (:func:`_validated_bin_dirs`) and deduped, so calling
+    this twice with the same directory is a no-op rather than a doubled PATH
+    entry — an idempotent installer hook can just call it again. Registration
+    order is precedence order, and the whole registry ranks behind
+    ``mcp.extra_path_dirs``: an operator's own host setting outranks a
+    distribution default.
+    """
+    global _registered_path_dirs
+    accepted = _validated_bin_dirs(list(dirs), "register_mcp_path_dirs")
+    with _path_dirs_lock:
+        merged = _dedup_dirs([*_registered_path_dirs, *accepted])
+        _registered_path_dirs = tuple(merged)
+    return tuple(accepted)
+
+
+def publish_config_path_dirs(values: object) -> None:
+    """Record ``mcp.extra_path_dirs`` for :func:`augmented_path` to merge.
+
+    Called by ``KiroCrewConfig.load`` on every load, which is what keeps the
+    snapshot current without this module ever reading the config -- see the
+    section comment above for why the direction matters. Stores the value AS
+    AUTHORED and validates it at use: validation is pure string work, so keeping
+    it out of here keeps the load path's cost to one tuple assignment.
+
+    Idempotent and safe from any thread; a load that reports no setting clears
+    the snapshot, so removing the setting takes effect too. A malformed value is
+    stored as-is and rejected (with a warning) at use, so this cannot turn a
+    scalar into a directory entry.
+    """
+    global _config_path_dirs
+    # Copied to a tuple so a caller mutating its list afterwards cannot mutate
+    # the search path; a non-sequence is kept as-is for _validated_bin_dirs to
+    # reject and report.
+    snapshot: object = tuple(values) if isinstance(values, (list, tuple)) else values
+    with _path_dirs_lock:
+        _config_path_dirs = snapshot
+
+
+def _extra_mcp_path_dirs() -> list[str]:
+    """Operator/downstream-contributed MCP bin dirs, highest precedence first.
+
+    Pure: no IO and no config read, so it is safe on the event loop (the MCP
+    probe and the agent-config resolver both reach it from there). Validation of
+    the config-supplied entries happens here rather than at publish time because
+    it is string-only work.
+    """
+    return [
+        *_validated_bin_dirs(_config_path_dirs, "mcp.extra_path_dirs"),
+        *_registered_path_dirs,
+    ]
 
 
 # --- node build toolchain -----------------------------------------------------
@@ -453,8 +611,8 @@ def git_build_info() -> tuple[str, str]:
                 ["git", *args],
                 cwd=proj,
                 capture_output=True,
-                text=True,
                 timeout=5,
+                **UTF8_TEXT,
             )
         except (OSError, subprocess.SubprocessError):
             return ""
@@ -468,8 +626,11 @@ def git_build_info() -> tuple[str, str]:
     )
 
 
-def augmented_path(base_path: str = "") -> str:
+def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
     """Return *base_path* prepended with well-known MCP binary directories.
+
+    ``home`` pins user-relative candidates for callers already resolving a
+    specific account instead of whichever account owns the current process.
 
     When KiroCrew runs under systemd or another non-login shell the
     inherited ``$PATH`` rarely includes directories like
@@ -489,9 +650,16 @@ def augmented_path(base_path: str = "") -> str:
     agent's own ``python``/``pip`` shell calls) to the gateway's venv
     interpreter. As a pure fallback it resolves only names found nowhere
     else — exactly the console-script-wrapper case.
+
+    Deliberately NOT extended by ``mcp.extra_path_dirs`` /
+    :func:`register_mcp_path_dirs`: callers here include the resolvers for the
+    trusted agent runtime (``kiro_cli.known_kiro_cli_dirs``,
+    ``acp.client``'s claude-backend resolvers), which must not consume a
+    contributed directory. That contribution lives on :func:`mcp_search_path` —
+    see the section comment near ``_registered_path_dirs``.
     """
-    home = os.path.expanduser("~")
-    mise_data = mise_data_dir(home)
+    resolved_home = home or os.path.expanduser("~")
+    mise_data = mise_data_dir(resolved_home)
     # Filter each formatted entry through the same absolute-only validation as
     # the other PATH sources (_validated_bin_dir): a relative MISE_DATA_DIR
     # would otherwise put a relative "{mise_data}/shims" entry on every spawned
@@ -500,33 +668,62 @@ def augmented_path(base_path: str = "") -> str:
     extra = [
         e
         for d in _EXTRA_PATH_DIRS
-        if (e := _validated_bin_dir(d.format(home=home, mise_data=mise_data)))
+        if (e := _validated_bin_dir(d.format(home=resolved_home, mise_data=mise_data)))
     ]
-    extra += node_all_bin_dirs()
+    extra += _node_all_bin_dirs(resolved_home, mise_data)
     parts = extra + ([base_path] if base_path else [])
     parts.append(str(Path(sys.executable).parent))
     return os.pathsep.join(parts)
 
 
-def dedup_path(path: str) -> str:
-    """Drop repeated entries from a ``PATH`` string, keeping the first of each.
+#: How many directories :func:`describe_search_path` names before truncating.
+#: The effective search path carries a bin dir per installed Node version, so an
+#: unbounded dump would push the actionable first entries out of a log reader's
+#: view.
+_SEARCH_PATH_REPORT_LIMIT = 40
 
-    First-wins so precedence is preserved, and so :func:`spec_env_path` is
-    idempotent: feeding an already-expanded value back in contributes only
-    duplicates, which collapse to the same string.
+#: Appended to "MCP command not found" warnings. Naming the directories searched
+#: tells a reader the binary is installed somewhere uncovered; this tells them
+#: what to do about it, so the diagnosis and the remedy arrive together instead
+#: of the remedy living only in the source (issue #5083).
+MCP_PATH_HINT = "if it is installed elsewhere, add that directory to mcp.extra_path_dirs"
+
+
+def describe_search_path(path: str) -> str:
+    """Render *path* as a human-readable list of searched directories.
+
+    ``command not found: <name>`` never said WHERE it looked, so a reader could
+    not tell "this install directory is not covered by the search path" from
+    "this binary is not installed" -- two different problems with two different
+    fixes -- without reading the source. Every caller formats the search path
+    through here so the two failures read differently everywhere they are
+    reported.
+
+    Truncated at :data:`_SEARCH_PATH_REPORT_LIMIT`; the count is always stated,
+    so a truncated tail is visible rather than silent.
+    """
+    dirs = [d for d in path.split(os.pathsep) if d]
+    if not dirs:
+        return "searched no directories (empty PATH)"
+    shown = dirs[:_SEARCH_PATH_REPORT_LIMIT]
+    suffix = f" (+{len(dirs) - len(shown)} more)" if len(dirs) > len(shown) else ""
+    return f"searched {len(dirs)} directories: {', '.join(shown)}{suffix}"
+
+
+def _dedup_dirs(dirs: Iterable[str]) -> list[str]:
+    """Drop repeated (and empty) directory entries, keeping the first of each.
 
     Entries are compared through ``normcase(normpath(...))`` but emitted in
-    their original spelling. On Windows ``os.path`` IS ``ntpath``, so that
-    folds case and separator flavour together -- ``C:\\Tools`` and
-    ``C:/tools`` name one directory, and emitting both would put two spellings
-    of it on the child's PATH. Matches the normalization
-    :func:`node_bin_dirs` applies for the same reason. The original spelling is
-    kept rather than the normalized one so the value stays byte-comparable
-    against what a caller authored.
+    their original spelling. On Windows ``os.path`` IS ``ntpath``, so that folds
+    case and separator flavour together -- ``C:\\Tools`` and ``C:/tools`` name
+    one directory, and emitting both would put two spellings of it on the
+    child's PATH. Matches the normalization :func:`node_bin_dirs` applies for
+    the same reason. The original spelling is kept rather than the normalized
+    one so the value stays byte-comparable against what a caller authored.
     """
     seen: set[str] = set()
     out: list[str] = []
-    for entry in path.split(os.pathsep):
+    for entry in dirs:
         if not entry:
             continue
         key = os.path.normcase(os.path.normpath(entry))
@@ -534,7 +731,18 @@ def dedup_path(path: str) -> str:
             continue
         seen.add(key)
         out.append(entry)
-    return os.pathsep.join(out)
+    return out
+
+
+def dedup_path(path: str) -> str:
+    """Drop repeated entries from a ``PATH`` string, keeping the first of each.
+
+    First-wins so precedence is preserved, and so :func:`spec_env_path` is
+    idempotent: feeding an already-expanded value back in contributes only
+    duplicates, which collapse to the same string. Comparison rules are
+    :func:`_dedup_dirs`'.
+    """
+    return os.pathsep.join(_dedup_dirs(path.split(os.pathsep)))
 
 
 def _spec_path_entries(env_path: str) -> list[str]:
@@ -584,7 +792,7 @@ def spec_env_path(env_path: str) -> str:
     Expanding the value before it is written into the agent config closes the
     gap: the child is launched with the PATH the probe validates and the command
     resolves against, so "probes healthy" and "works in a session" cannot
-    diverge. The spec's own entries stay FIRST, ahead of both the inherited PATH
+    diverge.     The spec's own entries stay FIRST, ahead of both the inherited PATH
     and the augmentation, so a spec that pins a toolchain still wins.
 
     Idempotent: re-expanding an already-expanded value contributes only
@@ -616,6 +824,49 @@ def spec_env_path(env_path: str) -> str:
     return dedup_path(os.pathsep.join(filter(None, parts)))
 
 
+def mcp_search_path(env_path: str) -> str:
+    """:func:`spec_env_path` plus the contributed MCP directories (issue #5083).
+
+    The path an MCP command is RESOLVED against -- the probe, the agent-config
+    command resolver, and gatewayd's rewriter all use this one. Separate from
+    :func:`spec_env_path` on purpose, and the separation is the whole safety
+    argument for the feature, on two counts:
+
+    * :func:`spec_env_path`'s result is PERSISTED. :func:`emit_env` writes it into
+      consumed config files (the agent config, the kiro-global ``mcp.json``, the
+      Claude Code sidecar), and those files are read back as a spec's authored
+      ``env.PATH`` on the next rebuild -- which is why that function documents
+      being idempotent under re-expansion. A contributed directory written there
+      would become indistinguishable from an authored entry, so clearing
+      ``mcp.extra_path_dirs`` could never remove it again. Resolution is
+      recomputed every time and stored nowhere, so a removed directory stops
+      being searched immediately.
+    * It also keeps the contribution off :func:`augmented_path`, whose callers
+      include the resolvers for the trusted agent runtime -- see the section
+      comment near ``_registered_path_dirs``.
+
+    Contributed dirs sit BETWEEN the spec's own entries and the generic
+    augmentation: a spec that pins a toolchain still wins, while a directory an
+    operator or a packaged build named explicitly outranks this module's built-in
+    guesses. ``dedup_path`` collapses the overlap a contributed directory has
+    with the built-in list.
+    """
+    extra = _extra_mcp_path_dirs()
+    if not extra:
+        # Byte-identical to the unextended path when nothing is contributed, so
+        # an install that never uses the setting cannot be perturbed by it.
+        return spec_env_path(env_path)
+    if not isinstance(env_path, str):
+        logger.debug("ignoring non-string MCP spec PATH: %s", type(env_path).__name__)
+        env_path = ""
+    parts = [
+        *_spec_path_entries(env_path),
+        *extra,
+        augmented_path(os.environ.get("PATH", "")),
+    ]
+    return dedup_path(os.pathsep.join(filter(None, parts)))
+
+
 # Env keys a spec's declared ``env`` must never set on a process WE spawn.
 #
 # Both families execute attacker-controlled code in the LAUNCHER — the process
@@ -623,13 +874,23 @@ def spec_env_path(env_path: str) -> str:
 #
 # * ``LD_*`` / ``DYLD_*`` are dynamic-loader channels honoured by every
 #   ELF/Mach-O binary in the spawn chain, the sandbox wrapper included.
-# * ``PYTHON*`` matters because Kiro Crew's Linux sandbox launcher IS a Python
-#   process: ``sandbox._python_launcher_argv`` returns
-#   ``[sys.executable, <generated script>, *argv]`` (sandbox.py), and that
-#   interpreter starts with the env we hand ``Popen``. A declared
+# * The listed ``PYTHON*`` keys matter because Kiro Crew's Linux sandbox launcher
+#   IS a Python process: ``sandbox.namespace_argv`` returns
+#   ``[sys.executable, "-I", "-S", <generated script>, *argv]`` (sandbox.py), and
+#   that interpreter starts with the env we hand ``Popen``. A declared
 #   ``PYTHONPATH`` carrying ``sitecustomize.py`` — or a shadowing ``os.py`` —
-#   is imported at interpreter startup, i.e. before ``unshare`` and before the
-#   target is exec'd. ``PYTHONSTARTUP``/``PYTHONHOME`` are the same channel.
+#   would be imported at interpreter startup, i.e. before ``unshare`` and before
+#   the target is exec'd. ``PYTHONSTARTUP``/``PYTHONHOME`` are the same channel.
+#   ``PYTHONUSERBASE`` is too: it relocates user-site, whose ``.pth`` files are
+#   EXECUTED during startup.
+#
+# NOTE this list is a prefix set, not the glob ``PYTHON*`` — do not describe it as
+# such. It does not cover ``HOME``, which also derives the user-site path when
+# ``PYTHONUSERBASE`` is unset, and stripping ``HOME`` from a spec overlay would
+# break servers that legitimately need it. The launcher's ``-I -S`` is what
+# actually closes that class (site processing never happens, so no ``.pth`` runs
+# whatever the paths point at); these prefixes are defense in depth for it and the
+# primary control for any future launcher that forgets those flags.
 #
 # Prefix-matched, case-insensitively (Windows env is case-insensitive).
 #
@@ -648,17 +909,81 @@ _SPEC_ENV_DENIED_PREFIXES: tuple[str, ...] = (
     "PYTHONPATH",
     "PYTHONHOME",
     "PYTHONSTARTUP",
+    "PYTHONUSERBASE",
 )
+
+# The env namespace Kiro Crew reserves for ITSELF. A spec-declared ``env`` may
+# not set any key in it.
+#
+# This is an AUTHORIZATION boundary, and it is a different class from the loader
+# prefixes above — not a variant of them. Several ``KIROCREW_*`` variables are
+# how the gateway tells a process it spawns WHO IS CALLING, and the consumers
+# treat them as vouched-for:
+#
+# * ``KIROCREW_CLI`` — ``mcp_cron._caller_is_cli()`` is exactly
+#   ``os.environ.get("KIROCREW_CLI") == "1"``, and a true return makes the cron
+#   tools skip per-session ownership entirely. Forged, it turns
+#   ``cron_remove_all`` into "delete every session's jobs" and ``cron_list``
+#   into the cross-principal disclosure ``mcp_cron`` explicitly refuses (see its
+#   ownerless-row note: an allowlisted Slack participant is not the operator).
+# * ``KIROCREW_SESSION_KEY`` / ``KIROCREW_HOST_PID`` — two of the three sources
+#   ``mcp_core._resolve_session_key_strict()`` accepts, chosen precisely because
+#   they are, in its own words, sources "the gateway authors and an agent cannot
+#   write". A spec overlay authoring one makes that claim false, which is worse
+#   than the loader class: it corrupts the resolver the ownership checks are
+#   built on rather than the process that hosts them.
+# * ``KIROCREW_OWNER_ID`` / ``KIROCREW_INTERNAL_SECRET`` — the Slack owner
+#   identity and the loopback shared secret. ``cron_script`` already denies these
+#   two on its own path; putting them here extends the same control to the probe,
+#   which had no such deny.
+#
+# Denying the NAMESPACE rather than those five keys is deliberate. Dozens of
+# ``KIROCREW_*`` variables are read across the tree today, several of them
+# security-relevant beyond identity (sandbox level, approval mode, admission
+# policy), and a key-by-key list fails open for the next one somebody adds —
+# the reviewable property we want is "a config cannot author our namespace",
+# which a prefix states and a list only approximates.
+#
+# Nothing legitimately needs the namespace in a spec overlay. Every caller of
+# this sanitizer builds its child env from ``os.environ`` FIRST and overlays the
+# spec on top (``cron_script._clean_cron_env()``, ``mcp_discovery``'s
+# ``dict(os.environ)``), so a gateway-authored ``KIROCREW_*`` value is INHERITED
+# either way. Denying it here removes only a config file's ability to OVERRIDE
+# one — exactly the capability being abused, and nothing else. Kiro Crew's own
+# spawn paths set these variables directly on the child env
+# (``apps.backend``'s ``KIROCREW_APP_NAME``, the gateway's
+# ``KIROCREW_MCP_TARGET_*``), never by declaring them in an ``mcpServers``
+# ``env`` block, so no first-party surface depends on the overlay either.
+#
+# Prefix-matched case-insensitively, like the loader set above.
+_SPEC_ENV_RESERVED_PREFIXES: tuple[str, ...] = ("KIROCREW_",)
 
 
 def sanitize_spec_env(pairs: Iterable[tuple[str, str]]) -> dict[str, str]:
-    """Drop loader/interpreter-injection keys from a spec-declared env.
+    """Drop loader-injection and reserved-namespace keys from a spec env.
 
     For spawn paths that apply a config-declared ``env`` to a child THEY
     launch (the probe). The declared env is config-file
     text — the same trust level as the command itself, which those paths
     already refuse to run unsandboxed — so a key that executes code in the
     launcher before confinement is established must not pass through.
+
+    Two independent classes are dropped, for two different reasons:
+
+    * ``_SPEC_ENV_DENIED_PREFIXES`` — loader/interpreter channels that execute
+      code in the launcher before confinement exists.
+    * ``_SPEC_ENV_RESERVED_PREFIXES`` — Kiro Crew's own namespace, which carries
+      the caller identity our authorization checks read. Sandboxing does not
+      mitigate this one at all: confinement bounds what the child may touch, not
+      whose jobs Kiro Crew believes the child is entitled to. That is why "the
+      command is equally config-authored, and it runs sandboxed" does not settle
+      this class the way it settles the command itself. This prefix set is
+      interim depth, not the authorization control: it stops the ``env`` block
+      from spelling an identity key, while the same config's ``command`` field
+      reaches the identical consumer (``sh -c 'KIROCREW_CLI=1 exec ...'``). The
+      real fix is consumer-side vouching so the claim is one a config cannot
+      author -- tracked in #6624. Keep this set when that lands; it also covers
+      KIROCREW_SESSION_KEY / KIROCREW_HOST_PID.
 
     Matching is case-INSENSITIVE on purpose: Windows environment variables
     are case-insensitive, so ``pythonpath`` reaches Python exactly like
@@ -677,6 +1002,17 @@ def sanitize_spec_env(pairs: Iterable[tuple[str, str]]) -> dict[str, str]:
                 "dropping spec env key %r: loader/interpreter injection channel", key
             )
             continue
+        if any(folded.startswith(p) for p in _SPEC_ENV_RESERVED_PREFIXES):
+            # Distinct message on purpose: reporting a forged KIROCREW_CLI as a
+            # "loader injection channel" would send the next reader looking for a
+            # sandbox-escape that is not there, and hide the one that is.
+            logger.warning(
+                "dropping spec env key %r: the KIROCREW_ namespace is reserved for "
+                "the gateway's own caller-identity channel and cannot be declared "
+                "by a config",
+                key,
+            )
+            continue
         out[key] = value
     return out
 
@@ -689,6 +1025,18 @@ def denied_spec_env_keys(env: "Mapping[str, object]") -> list[str]:
     looking: a Python server configured through ``env.PYTHONPATH`` probes as an
     error while working fine in a session, and without naming the dropped key
     that reads as a probe bug rather than a policy decision.
+
+    Deliberately covers the LOADER prefixes only, not
+    ``_SPEC_ENV_RESERVED_PREFIXES``. The consumer
+    (``mcp_discovery._note_denied_env``) tells the reader the drop happens
+    because the key "execute[s] in the sandbox launcher before confinement, so
+    the probe cannot honour them — a session still does", and every clause of
+    that is false for a reserved key: it is not a launcher-execution channel, and
+    a session must not honour a forged caller identity either. Reserved-namespace
+    drops are therefore log-only. A spec declaring one is a policy violation to
+    be recorded, not a working server to be apologised to — so this stays the
+    "here is why your legitimate config was refused" surface, and does not become
+    a hint sheet for the identity boundary.
     """
     return [
         k

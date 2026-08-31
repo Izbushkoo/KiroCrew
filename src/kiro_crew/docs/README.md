@@ -33,6 +33,7 @@ organized for someone browsing the repository.
 | [agent-questions.md](agent-questions.md) | Letting an agent pause mid-turn to ask a clickable question. |
 | [followup-suggestions.md](followup-suggestions.md) | Agent-proposed next steps above the composer. |
 | [feature-tips.md](feature-tips.md) | Personalized tips pointing at features you have not used. |
+| [inbound-webhooks.md](inbound-webhooks.md) | Letting external systems trigger an agent turn over HTTP. |
 | [deploy-web.md](deploy-web.md) | Publishing artifacts to a public HTTPS URL on your own AWS. |
 | [snapshot-and-restore.md](snapshot-and-restore.md) | Backing up and restoring Kiro Crew state. |
 
@@ -47,6 +48,8 @@ organized for someone browsing the repository.
 | [webex-integration.md](webex-integration.md) | Webex setup and behavior. |
 | [wecom-integration.md](wecom-integration.md) | WeCom setup and behavior. |
 | [weixin-integration.md](weixin-integration.md) | Weixin setup, and the risks to read first. |
+| [whatsapp-integration.md](whatsapp-integration.md) | WhatsApp (QR-linked personal account) setup, and the risks to read first. |
+| [feishu-integration.md](feishu-integration.md) | Feishu (Lark/飞书) setup and behavior. |
 | [messaging-transport.md](messaging-transport.md) | The channel-neutral contracts every transport shares. |
 
 ## Platform

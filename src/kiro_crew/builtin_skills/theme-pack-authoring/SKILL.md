@@ -8,8 +8,8 @@ triggers: theme pack, custom theme, theme.json, variables.json, overrides.css, i
 
 House rules for building theme packs. The authoritative contract is
 [`website/docs/theming-contract.md`](https://github.com/kirodotdev/KiroCrew/blob/main/website/docs/theming-contract.md);
-this skill is the task-oriented digest, plus the traps that cost real
-debugging time.
+this skill is the self-contained task-oriented digest, plus the traps that cost
+real debugging time.
 
 ## Pack anatomy
 
@@ -63,15 +63,18 @@ a level-0 pack shipping a font is refused.
   are rejected at install and dropped at runtime (CSS-escape evasions included).
   A `font-family` on ONE allowlisted surface (e.g. `.topbar`) is fine.
 - Ship the font's license file in the pack source (OFL/Apache/MIT).
-- KNOWN TRAP: a wrong role *string* (e.g. `"monospace"`) silently coerces to
-  `sans` — the mono face lands on the Sans option.
+- Only `"sans"` and `"mono"` are valid; a wrong role *string* (e.g. the CSS
+  keyword `"monospace"`) is **rejected at install** with an error naming the
+  font and the bad value. An already-installed pack whose role predates this
+  check keeps loading — the coercion-to-`sans` behavior only remains on that
+  read path, never on a fresh install.
 
 ## variables.json — the palette
 
 Two blocks, `dark` and `light`, each holding up to **54 allowlisted variables**.
 Required minimum per block: `--bg`, `--text`, `--accent`. Unknown keys are
 REJECTED (install fails), so do not invent variables; the allowlist is
-`_THEME_CSS_VARS` in `src/kiro_crew/dashboard/theme_validate.py`.
+`_THEME_CSS_VARS` in `kiro_crew/dashboard/theme_validate.py`.
 
 - To clone a built-in theme's palette, transcribe its block from
   `website/src/index.css` (e.g. `[data-theme="kiro-dark"]`), keeping only

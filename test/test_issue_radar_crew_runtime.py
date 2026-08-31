@@ -21,9 +21,11 @@ with nobody watching:
     trace, which is exactly what the sweep exists to prevent.
 """
 
+import ast
 import asyncio
 import contextlib
 import inspect
+import os
 import re
 import tempfile
 import threading
@@ -32,9 +34,14 @@ from pathlib import Path
 from typing import Any, cast
 from unittest import mock
 
+import pytest
+
+import kiro_crew.sel as sel_mod
+from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.issue_radar.backend import crew_runtime as cr
 from kiro_crew.apps.builtins.issue_radar.backend import crew_store as cs
 from kiro_crew.apps.builtins.issue_radar.backend import provider
+from kiro_crew.apps.builtins.issue_radar.backend import store as store_mod
 from kiro_crew.apps.builtins.issue_radar.backend import watch as watch_mod
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.safety_override import reset_singleton, safety_override
@@ -52,6 +59,25 @@ def _effectively_trusted(slot: Any) -> bool:
     this module must never write. So the tests below ask the real consumer.
     """
     return chat_runner._slot_is_trusted(slot)
+
+
+@pytest.fixture(autouse=True)
+def _private_sel_root_per_test(sel_private_root):
+    """Every test in this module gets its OWN SEL root (issue #7029).
+
+    The trust assertions here transitively depend on a fail-closed critical SEL
+    audit WINNING the chain lock: ``sync_trust`` → ``activate_scoped`` audits
+    before it grants, and on the event-loop thread the lock acquire is a single
+    non-blocking attempt that refuses rather than stall the loop — correct
+    product behaviour that must not be loosened. On a SHARED root that turns
+    every trust assertion into a lock race against writers this module never
+    created (another test's still-flushing events, another xdist worker on the
+    same path). ``sel_private_root`` (rootdir conftest) removes the concurrent
+    writer instead of coping with it: a fresh per-test, per-worker directory
+    that nothing else writes. ``TestSelRootIsolation`` below pins the property
+    differentially.
+    """
+    yield
 
 
 # ── fakes ───────────────────────────────────────────────────────────────────
@@ -403,6 +429,202 @@ class TestNudge(unittest.TestCase):
         _item(self.root, crew["id"], 7, phase="claimed")
         nudge = cr.compose_nudge(cr.build_snapshot(OWNER, REPO, crew, self.root))
         self.assertIn("no next step recorded", nudge)
+
+
+# ── provider vocabulary in the prompt ───────────────────────────────────────
+
+
+class TestProviderVocabulary(unittest.TestCase):
+    """The nudge and the Never block must speak the repo's forge, not GitHub's.
+
+    ``provider.terms`` existed with no callers, so every crew on every provider was
+    told GitHub's vocabulary. Two of those are not cosmetic:
+
+      * ``#12`` and ``!12`` address DIFFERENT items on GitLab and Azure DevOps, so a
+        crew that quotes the nudge back into a comment points at an unrelated item.
+      * "Never merge a PR" is the prohibition a crew is most likely to reason
+        around, and one phrased in a vocabulary its forge does not use reads as
+        being about something else.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def _nudge(self, provider_name: str) -> str:
+        key = provider.key_from_parts(OWNER, REPO, provider_name, "gitlab.example")
+        # Crew names are unique per repo, and these fixtures share one root.
+        crew = _crew(self.root, name=f"Andromeda-{provider_name}-{len(self.root.name)}", labels=[])
+        _item(self.root, crew["id"], 2201, phase="awaiting-ci", pr_number=88, next="round 3")
+        return cr.compose_nudge(cr.build_snapshot(OWNER, REPO, crew, self.root, key))
+
+    def test_github_rendering_is_unchanged(self):
+        nudge = self._nudge("github")
+        self.assertIn("(PR #88)", nudge)
+        self.assertIn("merge a PR yourself", nudge)
+        self.assertIn("every open issue", nudge)
+
+    def test_gitlab_says_merge_request_with_its_own_sigil(self):
+        nudge = self._nudge("gitlab")
+        self.assertIn("(MR !88)", nudge)
+        self.assertIn("merge a MR yourself", nudge)
+        self.assertNotIn("(PR #88)", nudge)
+        # The tracked item keeps `#` on every provider — only the change-request
+        # sequence diverges — so the item's own number must NOT gain a `!`.
+        self.assertIn("- #2201 awaiting-ci", nudge)
+
+    def test_azure_says_work_item_and_uses_its_pull_request_sigil(self):
+        nudge = self._nudge("azure")
+        self.assertIn("(PR !88)", nudge)
+        self.assertIn("every open work item", nudge)
+        # Azure DevOps has no `issue` primitive, so naming one sends the crew
+        # looking for a work item TYPE it was never told to filter on.
+        self.assertNotIn("every open issue", nudge)
+        self.assertIn("- #2201 awaiting-ci", nudge)
+
+    def test_the_ci_clause_names_no_provider_path(self):
+        """``.github/`` was wrong on two of three providers, and a per-provider path
+        would still be wrong: a GitHub repo can be gated from outside ``.github/``
+        and an Azure pipeline file can be named anything. The prohibition is about
+        the files the gates run from, not a location."""
+        for name in ("github", "gitlab", "azure"):
+            nudge = self._nudge(name)
+            self.assertIn("CI or gate configuration", nudge)
+            self.assertNotIn(".github", nudge)
+            self.assertNotIn("azure-pipelines", nudge)
+            self.assertNotIn(".gitlab-ci", nudge)
+
+    def test_an_unknown_or_absent_provider_falls_back_to_github(self):
+        """A snapshot built before this field existed, or a corrupted record, must
+        still render a complete prompt rather than raising mid-turn."""
+        self.assertEqual(cr.vocabulary(), provider.terms(provider.RepoKey()))
+        crew = _crew(self.root)
+        snapshot = cr.build_snapshot(OWNER, REPO, crew, self.root)
+        snapshot.pop("provider")
+        self.assertIn("merge a PR yourself", cr.compose_nudge(snapshot))
+
+    def test_the_snapshot_carries_the_provider(self):
+        crew = _crew(self.root)
+        key = provider.key_from_parts(OWNER, REPO, "azure")
+        self.assertEqual(
+            cr.build_snapshot(OWNER, REPO, crew, self.root, key)["provider"], "azure"
+        )
+
+    def test_every_prompt_path_forwards_the_key(self):
+        """A path that drops ``key`` silently renders GitHub's vocabulary, which is
+        indistinguishable from a correctly-rendered GitHub repo — so the seam is
+        pinned by signature rather than by output."""
+        for fn in (
+            cr.build_snapshot,
+            cr.compose_turn_prompt,
+            cr.compose_turn_prompt_async,
+            cr.launch_crew,
+            cr.wake_crew,
+            cr.watchdog_cycle,
+        ):
+            self.assertIn("key", inspect.signature(fn).parameters, fn.__name__)
+        # The sweep is the only production caller, and it holds the real key.
+        source = inspect.getsource(cr.sweep_repo)
+        self.assertIn("watchdog_cycle(state, key.owner, key.repo, crews, scope, key)", source)
+        self.assertRegex(source, r"wake_crew\(\s*state,\s*key\.owner,\s*key\.repo,[\s\S]*?\bkey,")
+
+
+# ── provider scoping of the crew ledger ─────────────────────────────────────
+
+
+class TestCrewStoreScoping(unittest.TestCase):
+    """Every crew-ledger path is provider-separated ONLY by its ``root=``.
+
+    ``crew_store.crews_dir(owner, repo, root)`` is the base of the crew records, the
+    events log and the repo-wide shared skip index, and no signature in that module
+    carries a provider or a host. So the separation is entirely a CALLER discipline:
+    a call that forgets the scoped root writes one provider's skip decisions into
+    another's index, and ``crew_store`` cannot detect it — on public GitHub the
+    scoped root IS the base data dir (``store.provider_root`` returns it unchanged
+    for the legacy layout), so "unscoped" and "correctly scoped for GitHub" are the
+    same value.
+
+    That is why the guard lives here, at the call sites, where the question is
+    decidable, rather than inside the store where it is not.
+    """
+
+    #: ``crew_store`` members that are not per-repo and take no ``root``.
+    _ROOTLESS = frozenset({"is_crew_id"})
+
+    def _offenders(self, module: Any) -> list[str]:
+        tree = ast.parse(Path(inspect.getfile(module)).read_text(encoding="utf-8"))
+        bad: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            if not (
+                isinstance(fn, ast.Attribute)
+                and isinstance(fn.value, ast.Name)
+                and fn.value.id == "crew_store"
+            ):
+                continue
+            if fn.attr in self._ROOTLESS:
+                continue
+            scoped = any(
+                self._is_scope(arg) for arg in node.args
+            ) or any(
+                kw.arg in {"root", "scope"} for kw in node.keywords
+            )
+            if not scoped:
+                bad.append(f"{fn.attr} at line {node.lineno}")
+        return bad
+
+    @staticmethod
+    def _is_scope(arg: Any) -> bool:
+        """Whether an argument is plausibly the provider-scoped root.
+
+        A NAME (``root`` / ``scope``) or a call to the scope helper. Deliberately
+        syntactic: what this gate can prove is that the scope was passed at all,
+        which is the mistake with no symptom. Whether the name holds the right value
+        is what ``routes._scope`` and ``store.provider_root`` are tested for.
+        """
+        if isinstance(arg, ast.Name):
+            return arg.id in {"root", "scope"}
+        if isinstance(arg, ast.Attribute):
+            return arg.attr in {"root", "scope"}
+        if isinstance(arg, ast.Call):
+            fn = arg.func
+            return isinstance(fn, ast.Attribute) and fn.attr in {"_scope", "provider_root"}
+        return False
+
+    def test_no_unscoped_crew_store_call_survives(self):
+        from kiro_crew.apps.builtins.issue_radar.backend import crew_routes
+
+        for module in (crew_routes, cr):
+            offenders = self._offenders(module)
+            self.assertEqual(
+                offenders, [], f"unscoped crew_store calls in {module.__name__}: {offenders}"
+            )
+
+    def test_the_skip_index_is_separated_only_by_the_scoped_root(self):
+        """The property the gate protects, demonstrated rather than asserted about.
+
+        Two providers, same ``owner/repo`` — which is entirely ordinary, the same
+        slug exists on github.com and on a self-managed GitLab. Scoped, their skip
+        indexes are independent; handed the same root they are ONE index, and the
+        second crew reads the first's decision as its own repository's.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            gh = store_mod.provider_root(root=base, provider="github", host="github.com")
+            gl = store_mod.provider_root(root=base, provider="gitlab", host="gitlab.example")
+            self.assertNotEqual(cs.skips_path(OWNER, REPO, gh), cs.skips_path(OWNER, REPO, gl))
+
+            cs.record_skip(OWNER, REPO, 7, "architecture call", "architecture", "c_11111111", gh)
+            self.assertEqual(cs.read_skips(OWNER, REPO, gl), {})
+            self.assertIn("7", cs.read_skips(OWNER, REPO, gh))
+
+            # The same call with the scope forgotten. It cannot raise and cannot be
+            # detected downstream: for public GitHub the scoped root and the base
+            # data dir are the same path.
+            self.assertEqual(cs.skips_path(OWNER, REPO, base), cs.skips_path(OWNER, REPO, gh))
 
 
 # ── session launch / trust ──────────────────────────────────────────────────
@@ -855,15 +1077,24 @@ class TestTurnDispatch(unittest.IsolatedAsyncioTestCase):
         state = _FakeState()
         slot = _FakeSlot()
         ran: list[str] = []
+        origins: list[bool | None] = []
 
-        async def _turn(_state: Any, _slot: Any, prompt: str) -> None:
+        async def _turn(
+            _state: Any,
+            _slot: Any,
+            prompt: str,
+            *,
+            _directive_user_origin: bool | None = None,
+        ) -> None:
             ran.append(prompt)
+            origins.append(_directive_user_origin)
 
         with mock.patch.object(cr, "_run_chat", _turn):
             self.assertTrue(cr.dispatch_crew_turn(state, slot, "advance one item"))
             await slot.runners[-1](state, slot, slot.prompts[-1])
         self.assertEqual(state.capped, [slot.key])
         self.assertEqual(ran, ["advance one item"])
+        self.assertEqual(origins, [False])
 
     async def test_a_turn_that_never_got_a_permit_says_so_in_the_transcript(self):
         """A refused turn and a finished one must not look the same.
@@ -876,7 +1107,13 @@ class TestTurnDispatch(unittest.IsolatedAsyncioTestCase):
         state.permit_timeout = True
         slot = _FakeSlot()
 
-        async def _turn(_state: Any, _slot: Any, prompt: str) -> None:
+        async def _turn(
+            _state: Any,
+            _slot: Any,
+            prompt: str,
+            *,
+            _directive_user_origin: bool | None = None,
+        ) -> None:
             raise AssertionError("the turn must not run without a permit")
 
         with mock.patch.object(cr, "_run_chat", _turn):
@@ -982,6 +1219,14 @@ class TestDetectUnblocks(unittest.TestCase):
             seen.update(self._detect(**changes))
         prev = {**self.BASE, "merged": True}
         seen.update(cr.detect_unblocks(prev, {**prev, "pr_comments": 99}))
+        # The dependency-unblocked signal fires on a >0 → 0 blocker transition,
+        # which BASE cannot express (it has no blockers), so it gets its own pair.
+        seen.update(
+            cr.detect_unblocks(
+                {**self.BASE, "open_blockers": 1},
+                {**self.BASE, "open_blockers": 0},
+            )
+        )
         self.assertEqual(seen, set(cr.UNBLOCK_SIGNALS))
 
 
@@ -1912,6 +2157,129 @@ class TestAutoApproveProvenance(unittest.TestCase):
         slot = _FakeSlot("chat-1")
         slot._trust = True
         self.assertEqual(chat_runner._auto_approve_reason(slot, False), "trust")
+
+
+#: SEL roots already claimed by a test in this module, on this worker. Uniqueness
+#: across workers needs no bookkeeping: the roots are ``tmp_path_factory`` dirs
+#: under per-worker basetemps, so two workers cannot mint the same path. The
+#: REUSE assertion below therefore only bites when both claim tests land on one
+#: worker (``--dist load`` may split them); the not-the-shared-default leg holds
+#: per test on every worker regardless.
+_CLAIMED_SEL_ROOTS: set[str] = set()
+
+
+class TestSelRootIsolation(unittest.IsolatedAsyncioTestCase):
+    """The per-test SEL root that closes issue #7029, pinned differentially.
+
+    Every trust assertion in this file requires a fail-closed critical SEL
+    audit to WIN the chain lock, and on the event-loop thread that acquire is a
+    single non-blocking attempt (``sel.py``) with a fail-closed refusal behind
+    it (``safety_override.py``) — both correct product behaviour, pinned by
+    their own tests, and deliberately not touched here. What THESE tests pin is
+    the test-isolation property that makes depending on that lock safe: the
+    root the audit writes through belongs to this test alone, so no sibling
+    test's writer can ever hold this test's lock.
+
+    Written to FAIL on the shared-root arrangement this module had before
+    (one session-scoped SEL directory per worker), not merely to pass on the
+    private one — see each test's body for which leg is the differential.
+    """
+
+    def setUp(self):
+        if getattr(sel_mod._default_dir, "__module__", "") == "kiro_crew.sel":
+            # The rootdir conftest displaces ``_default_dir`` with a
+            # session-scoped closure; the ORIGINAL still installed means that
+            # isolation never ran (raw ``python -m unittest``, or pytest from
+            # a foreign rootdir). In that world ``_default_dir()`` — and the
+            # ``sel()`` the tests below touch — would resolve, CREATE, and
+            # initialize against the operator's REAL data home before any
+            # assertion could fail. Probe the seam by identity: even calling
+            # ``config_dir()`` to compare paths would itself create the home
+            # on first use, so the check must not invoke anything.
+            self.skipTest("requires the rootdir conftest SEL isolation")
+        reset_singleton()
+        self.addCleanup(reset_singleton)
+
+    async def test_a_holder_of_the_shared_default_root_cannot_refuse_trust(self):
+        """A concurrent writer on the SHARED root no longer reaches this module.
+
+        The holder below stands in for the writer the flake needed: it takes
+        the chain lock of the DEFAULT SEL root — the directory ``sel()`` would
+        resolve WITHOUT this module's per-test isolation, and the one a sibling
+        test's writer would actually hold — through its own file description,
+        which is how a foreign holder looks to ``flock``. On the shared-root
+        arrangement the fail-closed trust audit loses its single-shot acquire
+        against exactly this and the grant is refused (the #7029 failure
+        verbatim); with a private per-test root the holder is a stranger to the
+        audit, and trust must be granted.
+        """
+        # setUp already skipped when the isolation seam is absent, so this is
+        # the displaced session directory, never the operator's data home.
+        shared = sel_mod._default_dir()
+        lock_dir = shared / sel_mod._TRUST_SUBDIR
+        lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_file = lock_dir / sel_mod._SEL_LOCK_FILE
+        # Same flags the code under test opens the sidecar with (sel.py), so
+        # the staged holder is byte-faithful on Windows too.
+        fd = os.open(
+            lock_file,
+            os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        try:
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")  # Windows locks a byte RANGE; give it a byte
+            # The displaced session singleton's writer may itself be flushing
+            # to this root right now (its holds span one append batch), so a
+            # single-shot acquire here would inherit the very flake this
+            # commit retires. Retry non-blocking attempts — never a blocking
+            # acquire on the event-loop thread — until the transient hold
+            # clears; the budget is generous because a miss fails the test.
+            for _ in range(200):
+                if platform_compat.try_acquire_lock(fd, exclusive=True):
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                self.fail("could not stage the foreign holder on the shared root")
+            try:
+                slot = _FakeSlot("crew-c_7029iso")
+                slot._app = cr.APP_NAME
+                granted = cr.sync_trust(
+                    slot, {"id": "c_7029iso", "unattended": True, "enabled": True}
+                )
+                self.assertTrue(
+                    granted,
+                    "trust was refused: the audit contended for the SHARED root's "
+                    "chain lock, so this test's SEL root is not private (#7029)",
+                )
+                self.assertTrue(_effectively_trusted(slot))
+            finally:
+                platform_compat.release_lock(fd)
+        finally:
+            os.close(fd)
+        # The audit went somewhere real: fail-closed was not merely bypassed.
+        body = sel_mod.sel()._path.read_text(encoding="utf-8")
+        self.assertIn("safety_override:activate_scoped", body)
+
+    async def test_this_tests_sel_root_is_private_first_claim(self):
+        self._claim_root()
+
+    async def test_this_tests_sel_root_is_private_second_claim(self):
+        """Second claimant: on the pre-#7029 arrangement both tests resolve the
+        one session directory, so whichever of the pair runs second trips the
+        reuse assertion (and both trip the shared-default one)."""
+        self._claim_root()
+
+    def _claim_root(self) -> None:
+        root = str(sel_mod.sel()._dir)
+        self.assertNotEqual(
+            Path(root),
+            sel_mod._default_dir(),
+            "sel() resolved the SHARED default root: tests on this worker would "
+            "contend for one chain lock (#7029)",
+        )
+        self.assertNotIn(root, _CLAIMED_SEL_ROOTS, "SEL root reused across tests (#7029)")
+        _CLAIMED_SEL_ROOTS.add(root)
 
 
 if __name__ == "__main__":  # pragma: no cover

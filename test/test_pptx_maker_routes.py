@@ -37,7 +37,7 @@ from typing import Callable
 from unittest import mock
 
 from aiohttp import web
-from aiohttp.test_utils import AioHTTPTestCase
+from aiohttp.test_utils import AioHTTPTestCase, make_mocked_request
 
 from conftest import make_dir_link
 from kiro_crew.apps.builtins.pptx_maker.backend import engine, paths, provision, routes
@@ -746,6 +746,26 @@ class TestRedactArtifactHelper(unittest.TestCase):
         blob = base64.b64encode(b"\x89PNG\r\n\x1a\n" + _raster_body(64)).decode()
         self.assertIsNotNone(routes._scanned_bitmap_bytes(blob)[0])
 
+    def test_the_signature_check_accepts_every_bitmap_format(self) -> None:
+        # The pre-existing accept-set: PNG/JPEG/GIF/BMP and real WebP via the
+        # shared sniffer, plus the retained offset-4 ftyp check for HEIC/AVIF.
+        for raw in (
+            b"\x89PNG\r\n\x1a\n" + b"\x00" * 8,
+            b"\xff\xd8\xff\xe0" + b"\x00" * 12,
+            b"GIF87a" + b"\x00" * 10,
+            b"GIF89a" + b"\x00" * 10,
+            b"BM" + b"\x00" * 14,
+            b"RIFF\x10\x00\x00\x00WEBPVP8 ",
+            b"\x00\x00\x00\x18ftypheic" + b"\x00" * 8,
+        ):
+            self.assertTrue(routes._has_bitmap_signature(raw), raw)
+
+    def test_a_bare_riff_container_is_no_longer_a_bitmap(self) -> None:
+        # The old local table matched any RIFF container, so a WAVE audio blob
+        # counted as a bitmap. The shared sniffer requires WebP's form tag at
+        # offset 8 — this tightening is the intended fix, not a regression.
+        self.assertFalse(routes._has_bitmap_signature(b"RIFF\x24\x00\x00\x00WAVEfmt "))
+
 
 class TestConfigRoutes(_RoutesFixture):
     async def test_get_reports_the_resolved_deck_root(self) -> None:
@@ -1326,6 +1346,45 @@ class TestWorkerResponseContract(unittest.TestCase):
         string rather than an absent key that throws in the client."""
         resp = routes._worker_response(500, {})
         self.assertEqual(json.loads(resp.body), {"error": "", "code": ""})
+
+
+def _json_req_raising(exc: Exception) -> web.Request:
+    """A real ``web.Request`` whose ``.json()`` raises *exc*.
+
+    ``_json_body`` only calls ``request.json``, so overriding it exercises the
+    catch directly without wiring a full transport.
+    """
+    request = make_mocked_request("POST", "/api/apps/pptx-maker/decks")
+
+    async def _json(*_args: object, **_kwargs: object) -> object:
+        raise exc
+
+    request.json = _json  # type: ignore[method-assign]
+    return request
+
+
+class TestJsonBodyCatchWidth(unittest.IsolatedAsyncioTestCase):
+    """The catch must span the client-input failure set.
+
+    ``UnicodeDecodeError`` is a ``ValueError`` subclass, so the old
+    ``(ValueError, UnicodeDecodeError)`` tuple never covered ``LookupError`` from an
+    unknown ``charset=`` codec — that escaped as a 500. The widened catch turns it
+    into the 400 it always was."""
+
+    async def test_an_unknown_charset_codec_is_a_400_not_a_500(self) -> None:
+        body, err = await routes._json_body(
+            _json_req_raising(LookupError("unknown encoding: bogus-codec"))
+        )
+        self.assertIsNone(body)
+        assert err is not None
+        self.assertEqual(err.status, 400)
+        self.assertEqual(json.loads(err.body)["code"], "body_not_json")
+
+    async def test_a_recursion_error_from_a_deep_body_is_a_400(self) -> None:
+        body, err = await routes._json_body(_json_req_raising(RecursionError()))
+        self.assertIsNone(body)
+        assert err is not None
+        self.assertEqual(err.status, 400)
 
 
 class TestIconProvisionedMarker(unittest.TestCase):

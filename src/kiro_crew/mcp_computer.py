@@ -17,10 +17,15 @@ auditing happen IN THE GATEWAY (``computer_use/tools.py`` →
   ``hooks._governance_denial`` — the PreToolUse gate — is fail-**OPEN** by
   deliberate repo policy (a governance glitch must not wedge every tool call on
   every surface), so it cannot be the sole authorization point for a surface that
-  can read a password field's ``AXValue``. The authoritative gate
-  (``gate.require_computer_use``) fails CLOSED and needs the OS-resolved app
-  identity and the addressed element's role — which only the gateway-side tool
-  body has.
+  can read a password field's ``AXValue``. The fail-CLOSED gate is the keystone
+  primary enable, read at the top of ``computer_use/tools.py``'s ordered
+  chokepoint: a keystone that is missing, unreadable or disabled refuses the call
+  outright. ``gate.require_computer_use`` is audit-only — it unconditionally
+  permits and records the call, retained as the one place a future edition can
+  reintroduce a decision without touching every call site — and the refusals
+  downstream of the enable (the operator's target policy, the element and pointer
+  shape checks) need the OS-resolved app identity and the addressed element's
+  role, which only the gateway-side tool body has.
 * **Governance and the audit trail live where the platform context is composed.**
   The ceiling, the profile store and the SEL trust root are all gateway state.
 * **No native code in this process.** This module imports no ctypes, loads no
@@ -28,11 +33,15 @@ auditing happen IN THE GATEWAY (``computer_use/tools.py`` →
   down the process kiro-cli is talking to, and this file is byte-identical in
   behavior on macOS, Linux and Windows.
 
-Identity is resolved with :func:`mcp_core._resolve_session_key_strict` — the env
-var, or ``KIROCREW_HOST_PID`` plus the HMAC sidecar signed with the
-keystone-protected ``sel_hmac.key``. The lenient resolver is deliberately NOT
-used: it walks ``/proc`` ancestors over ``session_pid_<pid>.txt``, which
-``mcp_core`` itself documents as "agent-writable and therefore forgeable".
+Identity is resolved with :func:`mcp_core._resolve_session_key_strict` — the
+gateway-injected per-call caller block first (this server advertises
+``kirocrew.caller-identity``, so gatewayd injects one whenever it can name the
+caller — the only identity source that works on a pooled backend serving many
+sessions), then the env var, then ``KIROCREW_HOST_PID`` plus the HMAC sidecar
+signed with the keystone-protected ``sel_hmac.key``. The lenient resolver is
+deliberately NOT used: it walks ``/proc`` ancestors over
+``session_pid_<pid>.txt``, which ``mcp_core`` itself documents as
+"agent-writable and therefore forgeable".
 
 **An unresolved key is NOT a refusal.** It is forwarded empty and the call proceeds.
 Neither accepted source exists for a GUI-launched kiro-cli on macOS —
@@ -66,11 +75,16 @@ from kiro_crew.computer_use.types import (
     CLICK_METHOD_AUTO,
     CLICK_METHOD_GLOBAL,
     CLICK_METHODS,
+    DRAG_PATH_CURVED,
+    DRAG_PATH_STRAIGHT,
+    DRAG_PATHS,
     ERROR_PREFIX,
     MAX_ACTION_LEN,
     MAX_CLICK_COUNT,
+    MAX_DRAG_STEPS,
     MAX_ELEMENT_INDEX,
     MAX_KEY_LEN,
+    MAX_LAUNCH_QUERY_LEN,
     MAX_SCREEN_COORD,
     MAX_SCROLL_PAGES,
     MAX_TEXT_LIMIT,
@@ -78,6 +92,7 @@ from kiro_crew.computer_use.types import (
     MAX_TREE_NODES_LIMIT,
     MAX_TYPE_TEXT_LEN,
     MIN_CLICK_COUNT,
+    MIN_DRAG_STEPS,
     MIN_SCREEN_COORD,
     MIN_SCROLL_PAGES,
     MOUSE_BUTTONS,
@@ -87,6 +102,7 @@ from kiro_crew.computer_use.types import (
     TOOL_DRAG,
     TOOL_END_TURN,
     TOOL_GET_STATE,
+    TOOL_LAUNCH_APP,
     TOOL_LIST_APPS,
     TOOL_PERFORM_ACTION,
     TOOL_PRESS_KEY,
@@ -95,12 +111,12 @@ from kiro_crew.computer_use.types import (
     TOOL_TYPE_TEXT,
 )
 from kiro_crew.loopback_http import loopback_urlopen
+from kiro_crew.mcp_caller import current_tenant_nonce
 from kiro_crew.mcp_core import (
-    _api_base,
     _http_error_body,
     _internal_secret,
-    _invalidate_api_base,
-    _resolve_api_port,
+    _replay_target,
+    _resolve_api_target,
     _resolve_session_key_strict,
     _session_key_header_error,
 )
@@ -148,32 +164,59 @@ ERR_GATEWAY_UNREACHABLE = (
 # class this feature can produce.
 #
 # The fix is a per-PROCESS identity, not a refusal. kiro-cli spawns one shim process
-# per session, so the shim's own pid separates the namespaces exactly as far as the
-# sessions are actually separate — and it does so without reinstating the
-# unattended-surface refusal that was removed by product decision. It is
+# per session, so in the 1:1 shim topology the pid separates the namespaces exactly
+# as far as the sessions are actually separate — and it does so without reinstating
+# the unattended-surface refusal that was removed by product decision. On a POOLED
+# backend one process serves many sessions, so the pid alone separates only what the
+# injected caller block does not already name: co-tenants gatewayd can name get real
+# per-session keys, and the unnamed ones USED to collapse onto one
+# ``unresolved:<pid>`` namespace (#5322). They no longer do — gatewayd injects a
+# per-CONNECTION nonce on every forwarded call, which is appended here, so two
+# unnamed co-tenants of one pooled process hold separate namespaces. It is
 # deliberately NOT presented as trustworthy attribution: the prefix names it as
-# unresolved so an audit reader cannot mistake a pid for a session identity.
+# unresolved so an audit reader cannot mistake a pid (or a nonce) for a session
+# identity.
 UNRESOLVED_SESSION_PREFIX = "unresolved:"
+
+#: Separates the process half from the connection half of an unresolved key.
+#: Not ``:``, which already separates the prefix from the pid — a distinct
+#: character keeps the two halves legible in an audit line.
+UNRESOLVED_TENANT_SEPARATOR = "#"
 
 
 def _unresolved_session_key() -> str:
-    """A per-PROCESS session identity for a session we could not name.
+    """A per-CONNECTION session identity for a session we could not name.
 
-    ``unresolved:<pid>`` of THIS shim process. kiro-cli spawns one shim per session,
-    so the pid separates two unresolved sessions exactly as far as they really are
-    separate — which is what keeps ``SnapshotIndex``'s ``(session_key, window_key)``
-    namespace from aliasing them onto one entry and letting one session's action
-    resolve against another's element indices.
+    ``unresolved:<pid>`` of THIS shim process, plus ``#<nonce>`` of the calling
+    CONNECTION when the gateway supplied one. Together they separate two
+    unresolved sessions exactly as far as they really are separate, in both
+    topologies:
 
-    Read at CALL time rather than captured at import: a ``fork``ed child would
-    otherwise inherit the parent's string and re-alias with it, which is the exact
-    failure this is here to prevent.
+    * 1:1 shim (no gateway, no nonce) — kiro-cli spawns one shim per session, so
+      the pid is already the separator and the key is unchanged.
+    * Pooled backend — one process serves N connections, so the pid separates
+      nothing; the gateway-minted per-connection nonce does (#5322).
+
+    Without the nonce half, two unnamed co-tenants of a pooled backend shared one
+    key, which is what let ``SnapshotIndex``'s ``(session_key, window_key)``
+    namespace alias them onto one entry and let one session's action resolve
+    against another's element indices — while each session's own fingerprint
+    check still passed, because both trees describe the same window.
+
+    Both halves are read at CALL time rather than captured at import: a ``fork``ed
+    child would otherwise inherit the parent's pid string and re-alias with it,
+    and the nonce belongs to the call in flight, not to the process.
 
     Never presented as trustworthy attribution — the prefix says so. This is a
     namespace separator, not an authenticated identity; a genuine identity still
-    comes only from the two sources ``_resolve_session_key_strict`` accepts.
+    comes only from the two sources ``_resolve_session_key_strict`` accepts, and
+    the nonce is not one of them (it names a connection, not a principal).
     """
-    return f"{UNRESOLVED_SESSION_PREFIX}{os.getpid()}"
+    key = f"{UNRESOLVED_SESSION_PREFIX}{os.getpid()}"
+    nonce = current_tenant_nonce()
+    if nonce:
+        return f"{key}{UNRESOLVED_TENANT_SEPARATOR}{nonce}"
+    return key
 
 
 def _list_tools() -> list[dict[str, Any]]:
@@ -212,7 +255,7 @@ def _coord_prop(description: str) -> dict[str, Any]:
 
 
 def _tool_definitions() -> list[dict[str, Any]]:
-    """The ten tool definitions.
+    """The eleven tool definitions.
 
     Bounds mirror ``validation.MCP_COMPUTER_SCHEMAS`` (which is the enforcement
     point — this is advertisement, so a mismatch would only produce a confusing
@@ -253,6 +296,35 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "you do not already know how the user names the app."
             ),
             "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": TOOL_LAUNCH_APP,
+            "description": (
+                "Open an installed application that is not running yet, so the "
+                "other tools have a window to drive. Give the app's NAME as the "
+                "operating system knows it ('Paint', 'Notepad', 'Preview') — a "
+                "filesystem path, a command line and a document are all refused, "
+                "because this opens an application and nothing else. Returns the "
+                "new window's element tree, so you can act on it without a "
+                f"separate {TOOL_GET_STATE} call. If the app already has a window "
+                f"this is refused: call {TOOL_GET_STATE} instead of opening a "
+                "second copy. A cold start can take ten seconds; the result says "
+                "how long it took, so do NOT call this twice for one app."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "app": {
+                        "type": "string",
+                        "maxLength": MAX_LAUNCH_QUERY_LEN,
+                        "description": (
+                            "The application's name, as it appears in the Start "
+                            "menu or Applications folder. Not a path."
+                        ),
+                    },
+                },
+                "required": ["app"],
+            },
         },
         {
             "name": TOOL_GET_STATE,
@@ -384,6 +456,30 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "to_x": _coord_prop("End X screen coordinate."),
                     "to_y": _coord_prop("End Y screen coordinate."),
                     "mouse_button": button_prop,
+                    "steps": {
+                        "type": "integer",
+                        "minimum": MIN_DRAG_STEPS,
+                        "maximum": MAX_DRAG_STEPS,
+                        "description": (
+                            "How many segments the path is divided into. 1 (the "
+                            "default) is a plain two-point sweep — correct for a "
+                            "slider, a range selection or a reorder. TO DRAW a "
+                            "stroke you need many: an app samples the pointer as "
+                            "it moves, so a 1-step drag can only ever produce a "
+                            "straight line. 32-64 draws a smooth curve."
+                        ),
+                    },
+                    "path": {
+                        "type": "string",
+                        "enum": list(DRAG_PATHS),
+                        "description": (
+                            f"The shape between the two points. "
+                            f"'{DRAG_PATH_STRAIGHT}' (default) interpolates the "
+                            f"straight line; '{DRAG_PATH_CURVED}' bows it sideways, "
+                            "which is what a hand-drawn stroke looks like. Only "
+                            "meaningful with steps > 1."
+                        ),
+                    },
                     "click_method": {
                         "type": "string",
                         "enum": list(CLICK_METHODS),
@@ -660,42 +756,45 @@ def _invoke(session_key: str, name: str, args: dict[str, Any]) -> dict[str, Any]
         "X-Session-Key": session_key,
     }
 
-    def _send_once(base: str):
+    def _send_once(target: tuple[str, str]):
+        base, socket_path = target
         request = urllib.request.Request(
             f"{base}{INVOKE_PATH}", data=body, headers=headers, method="POST"
         )
-        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- URL is the loopback gateway (_api_base(): 127.0.0.1 plus a port from config/env or a run-marker whose ownership is re-verified per request) + a fixed internal path; never agent-controlled  # noqa: E501
-        with loopback_urlopen(request, timeout=INVOKE_TIMEOUT_SECS) as response:
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- URL is the loopback gateway (_resolve_api_target(): 127.0.0.1 plus a port from config/env or a run-marker whose ownership is re-verified per request) + a fixed internal path; never agent-controlled  # noqa: E501
+        with loopback_urlopen(
+            request, timeout=INVOKE_TIMEOUT_SECS, unix_socket_path=socket_path or None
+        ) as response:
             return json.loads(response.read())
 
-    api_base = _api_base()
+    # ONE resolution for this attempt, both transports derived from it — the
+    # unix socket lets the gateway kernel-verify this process against the
+    # session key it declares, and pairing it with the base from the SAME
+    # resolution keeps the two from naming different gateways.
+    target = _resolve_api_target()
     try:
-        decoded = _send_once(api_base)
+        decoded = _send_once(target)
     except urllib.error.HTTPError as exc:
         return _http_error_body(exc)
     except urllib.error.URLError as exc:
         detail = str(exc.reason) if isinstance(exc.reason, OSError) else str(exc)
         # The resolved base can predate the gateway: its port is recorded only in
-        # the run marker, so a refusal is worth one re-resolution before giving up.
+        # the run marker, so a refusal is worth one re-resolution before giving
+        # up. Whether that replay is ALLOWED is not restated here — it is
+        # mcp_core._replay_target's rule, shared with mcp_core._send, and None
+        # means do not replay. The wording of the refusal stays this shim's own.
         if isinstance(exc.reason, (ConnectionRefusedError, socket.gaierror)):
-            _invalidate_api_base()
-            retry_port, retry_source = _resolve_api_port()
-            # A default-source fall-through carries NO evidence: a listener on
-            # the default port could be any local process, and replaying would
-            # hand it the internal secret. Replay only chases positive
-            # evidence of a moved gateway. Same rule as mcp_core._send.
-            retry_base = f"http://127.0.0.1:{retry_port}"
-            if retry_source != "default" and retry_base != api_base:
-                try:
-                    decoded = _send_once(retry_base)
-                except urllib.error.HTTPError as retry_exc:
-                    # The replay REACHED the (moved) gateway and it answered with
-                    # a normal HTTP error — surface the structured body exactly
-                    # like a first-attempt HTTPError, not a stale "unreachable".
-                    return _http_error_body(retry_exc)
-                except Exception:
-                    return {"error": ERR_GATEWAY_UNREACHABLE.format(detail=detail)}
-            else:
+            retry_target = _replay_target(target[0])
+            if retry_target is None:
+                return {"error": ERR_GATEWAY_UNREACHABLE.format(detail=detail)}
+            try:
+                decoded = _send_once(retry_target)
+            except urllib.error.HTTPError as retry_exc:
+                # The replay REACHED the (moved) gateway and it answered with
+                # a normal HTTP error — surface the structured body exactly
+                # like a first-attempt HTTPError, not a stale "unreachable".
+                return _http_error_body(retry_exc)
+            except Exception:
                 return {"error": ERR_GATEWAY_UNREACHABLE.format(detail=detail)}
         else:
             return {"error": ERR_GATEWAY_UNREACHABLE.format(detail=detail)}
@@ -708,6 +807,37 @@ def _invoke(session_key: str, name: str, args: dict[str, Any]) -> dict[str, Any]
     return decoded
 
 
+#: Whether this server advertises ``kirocrew.caller-identity`` — i.e. whether it
+#: consumes the per-call caller block gatewayd injects instead of reading identity
+#: from its own process. True here because it does: the session key forwarded to
+#: the gateway comes from :func:`mcp_core._resolve_session_key_strict`, whose
+#: first source is that block.
+#:
+#: Advertising is not cosmetic. ``mcp_gateway/backend.py`` strips any client-forged
+#: caller block from EVERY forwarded request and re-injects its own only when the
+#: backend advertised this capability — so without the advertisement the block
+#: never arrives, and this server's resolver reads an empty identity no matter how
+#: correctly it is written. Nothing declines to POOL an unadvertised backend
+#: (``rewriter.UNPOOLABLE_SERVERS`` is empty and documents that the capability is
+#: read only to decide injection), so the unadvertised state was not "per-session
+#: spawn" — it was pooled AND identity-blind. For this server that silently
+#: degraded every pooled call to the unresolved-identity path: the call still
+#: proceeds (by product decision), but the audit trail loses attribution it was
+#: built to carry.
+#:
+#: A module-level constant rather than a bare argument below so the value is
+#: readable without executing :func:`run_mcp_server`, and so
+#: ``test/test_mcp_managed_caller_identity.py`` can assert it against the argument
+#: actually handed to the shim.
+ADVERTISE_CALLER_IDENTITY = True
+
+
 def run_mcp_server() -> None:
     """Run the MCP stdio server — reads JSON-RPC from stdin, writes to stdout."""
-    run_mcp_stdio_loop(SERVER_NAME, SERVER_VERSION, _list_tools, _call_tool)
+    run_mcp_stdio_loop(
+        SERVER_NAME,
+        SERVER_VERSION,
+        _list_tools,
+        _call_tool,
+        advertise_caller_identity=ADVERTISE_CALLER_IDENTITY,
+    )

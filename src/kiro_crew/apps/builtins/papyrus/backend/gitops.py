@@ -21,6 +21,7 @@ push commits back. Every git invocation here follows the same three rules as
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import re
@@ -35,10 +36,12 @@ from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.papyrus.backend import procio, store
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.git_divergence import divergence_count_args, parse_divergence_counts
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
     create_subprocess_limited,
     sandboxed_spawn_argv,
+    shielded_prepare_off_loop,
 )
 from kiro_crew.sel import sel
 
@@ -425,8 +428,9 @@ async def _git(
     # heartbeat — for up to five seconds. Same form and reason as `latex._run` and
     # `apps/builtins/dev_fleet/server.py`.
     try:
-        wrapped, env, cleanup = await asyncio.get_running_loop().run_in_executor(
-            subprocess_executor(), sandboxed_spawn_argv, argv
+        wrapped, env, cleanup = await shielded_prepare_off_loop(
+            functools.partial(sandboxed_spawn_argv, argv),
+            executor=subprocess_executor(),
         )
     except SandboxUnavailableError as exc:
         # Translated, not bypassed. See `GitSandboxUnavailable` — the wrap is what
@@ -585,13 +589,14 @@ async def status(project: Path) -> GitStatus:
     _c, remote_out, _e = await _git(["remote"], cwd=project)
 
     ahead = behind = 0
-    code, counts, _e = await _git(
-        ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"], cwd=project
-    )
+    code, counts_out, _e = await _git(divergence_count_args("@{upstream}"), cwd=project)
     if code == 0:
-        parts = counts.strip().split()
-        if len(parts) == 2 and all(p.isdigit() for p in parts):
-            ahead, behind = int(parts[0]), int(parts[1])
+        # Display surface, not a gate: an unreadable count folds to 0/0 so the
+        # status panel still renders. The refusal policy for unreadable counts
+        # lives at the update gates, which act on the numbers.
+        parsed = parse_divergence_counts(counts_out)
+        if parsed is not None:
+            ahead, behind = parsed.ahead, parsed.behind
 
     changed = [line for line in porcelain.strip().splitlines() if line]
     return GitStatus(

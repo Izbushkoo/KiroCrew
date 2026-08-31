@@ -36,21 +36,19 @@ Security model (all LLM-influenceable inputs re-validated at serve time):
 - Responses carry ``Content-Security-Policy: sandbox allow-scripts`` which
   forces an opaque origin even if the document is opened OUTSIDE the
   sandboxed iframe — the previewed app can never reach dashboard cookies,
-  storage, or same-origin APIs. ``frame-ancestors 'self'`` keeps third-party
-  sites from embedding the preview.
+  storage, or same-origin APIs. ``frame-ancestors`` keeps third-party
+  sites from embedding the preview; it is ``'self'`` plus the ancestors
+  ``'self'`` cannot express (see ``origin.frame_ancestors_value``).
 - Dotfiles (and thus ``.kirocrew-deploy.json`` style manifests / VCS dirs)
   are never served.
 """
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import logging
 import mimetypes
 import os
 import re
-import secrets as _secrets
 import sys
 import time
 from pathlib import Path
@@ -60,11 +58,13 @@ import aiohttp
 from aiohttp import web
 
 from kiro_crew.artifacts import ArtifactNotFoundError, ArtifactValidationError, get_default_store
-from kiro_crew.dashboard.origin import is_direct_local_request
+from kiro_crew.dashboard.origin import frame_ancestors_value, is_direct_local_request
 from kiro_crew.deploy.handlers import _allowed_local_roots
 from kiro_crew.hooks import safe_read_file_bytes_nolink
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+
+from .path_token import PathTokenSigner
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +88,9 @@ _MAX_FILE_BYTES = 32 * 1024 * 1024  # single-file cap; previews are static build
 # Per-process token secret. Tokens are minted per page-load by the SPA, so
 # gateway restarts invalidating outstanding tokens is fine (the card simply
 # re-mints on its next query).
-_TOKEN_SECRET = _secrets.token_bytes(32)
+# Its own signer, hence its own independent secret. See path_token for why a
+# shared key across channels would be the wrong shape.
+_signer = PathTokenSigner("webapp-preview", _TOKEN_TTL_SECS)
 
 # safe_read_file_bytes_nolink's fd-realpath containment check is
 # implemented for Linux (/proc/self/fd) and macOS (F_GETPATH) only; elsewhere
@@ -96,39 +98,6 @@ _TOKEN_SECRET = _secrets.token_bytes(32)
 # claiming the preview is available — suppressing the working remote
 # fallback. Gate the whole channel on platform support instead.
 _PLATFORM_SUPPORTED = sys.platform.startswith(("linux", "darwin"))
-
-
-def _mac(slug: str, webroot: str, exp: int, client: str) -> str:
-    # The bearer token rides in the iframe's own location, so
-    # previewed (LLM-authored) script can read it and self-navigate it to an
-    # attacker. Binding the MAC to the requesting client address makes an
-    # exfiltrated token useless from anywhere but the minting browser's
-    # connection path.
-    msg = f"{slug}\x00{webroot}\x00{exp}\x00{client}".encode()
-    return hmac.new(_TOKEN_SECRET, msg, hashlib.sha256).hexdigest()[:43]
-
-
-def _make_token(slug: str, webroot: str, client: str = "") -> str:
-    exp = int(time.time()) + _TOKEN_TTL_SECS
-    return f"{exp}.{_mac(slug, webroot, exp, client)}"
-
-
-def _check_token(slug: str, webroot: str, token: str, client: str = "") -> bool:
-    # Bound the token before parsing — a multi-thousand-digit
-    # expiry passes isdigit() but blows past the int conversion digit limit
-    # (ValueError → 500). Real tokens are ~55 chars.
-    if len(token) > 128:
-        return False
-    exp_s, _, mac = token.partition(".")
-    if not exp_s.isdigit() or not mac:
-        return False
-    try:
-        exp = int(exp_s)
-    except ValueError:
-        return False
-    if exp < time.time():
-        return False
-    return hmac.compare_digest(_mac(slug, webroot, exp, client), mac)
 
 
 def _resolve_webroot(slug: str) -> Path | None:
@@ -283,7 +252,7 @@ async def api_artifact_app_preview(request: web.Request) -> web.Response:
             "remote_framable": await _remote_framable(public_url),
         })
     _audit("webapp_preview.mint", "allowed", slug)
-    token = _make_token(slug, str(webroot), client=request.remote or "")
+    token = _signer.mint(slug, str(webroot), request.remote or "")
     return web.json_response({
         "available": True,
         "base": f"{APP_PREVIEW_PREFIX}{slug}/{token}/",
@@ -321,10 +290,20 @@ async def serve_artifact_app_file(request: web.Request) -> web.Response:
     # destination to the serving origin — a malicious app tree can render,
     # but its scripts cannot exfiltrate file contents to an external host
     # (connect/img/script/style all fall under default-src 'self').
+    #
+    # `frame-ancestors` is `'self'` PLUS the ancestors `'self'` cannot express.
+    # `'self'` is resolved by the browser against the frame's real URL, so it survives
+    # a tunnel that rewrites Host; a server-derived origin does not. It is not enough
+    # on its own because the directive is matched against EVERY ancestor and the
+    # Instances embed nests one dashboard inside another. Imported here rather than at
+    # module scope because `server` imports this handler to register its routes.
+    from kiro_crew.dashboard.server import _extra_frame_ancestors
+
+    ancestors = frame_ancestors_value(_extra_frame_ancestors(request, request.app))
     resp.headers["Content-Security-Policy"] = (
         "sandbox allow-scripts; "
         "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; "
-        "frame-ancestors 'self'"
+        f"frame-ancestors {ancestors}"
     )
     # The sandboxed document runs with an OPAQUE
     # origin, so its module-script loads are cross-origin and need CORS —
@@ -362,7 +341,7 @@ def _resolve_and_read(
     Returns (None, None) for every rejection (single 404 shape, no oracle).
     """
     webroot = _resolve_webroot(slug)
-    if webroot is None or not _check_token(slug, str(webroot), token, client):
+    if webroot is None or not _signer.verify(token, slug, str(webroot), client):
         return None, None
     if not rel or rel.endswith("/"):
         rel = rel + "index.html"

@@ -1,12 +1,14 @@
 /**
- * Issue #3689, part 2: one installed-app card whose render throws must NOT
- * unmount the whole /apps route. Each card in the Library list is wrapped in
+ * Issue #3689, part 2: one installed-app tile whose render throws must NOT
+ * unmount the whole /apps/library route (PR1 split: the Library list moved
+ * from the old AppsPage tab to LibraryPage; PR3 turned the card list into
+ * the launchpad grid of LaunchpadTile). Each tile in the grid is wrapped in
  * an ErrorBoundary that renders a compact degraded placeholder (app name +
- * i18n'd notice) in place of the broken card, while sibling cards and the
+ * i18n'd notice) in place of the broken tile, while sibling tiles and the
  * page chrome keep rendering.
  *
- * InstalledAppCard is mocked to throw for one specific app so the test stays
- * deterministic even after the card's own null-guards are fixed.
+ * LaunchpadTile is mocked to throw for one specific app so the test stays
+ * deterministic even after the tile's own null-guards are fixed.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, act } from '@testing-library/react'
@@ -53,14 +55,14 @@ vi.mock('../components/SegmentedControl', () => ({
   ),
 }))
 
-// Throw from ONE card's render. Driven by app identity (not a mutable
+// Throw from ONE tile's render. Driven by app identity (not a mutable
 // counter): React re-invokes a throwing render to rebuild the component
 // stack, so a "throw once" mock would silently pass on the retry.
-// Every other card records the `app` prop it received, so tests can assert
-// on the record AppsPage actually hands the card (e.g. that the query
+// Every other tile records the `app` prop it received, so tests can assert
+// on the record LibraryPage actually hands the tile (e.g. that the query
 // boundary normalized it).
 const cardMock = vi.hoisted(() => ({ apps: [] as { name: string; manifest?: Record<string, unknown> }[] }))
-vi.mock('../components/appstore/InstalledAppCard', () => ({
+vi.mock('../pages/apps/LaunchpadTile', () => ({
   default: ({ app }: { app: { name: string; manifest?: Record<string, unknown>; _newVersion?: string } }) => {
     if (app.name === 'zzq-broken' || (app.manifest as { description?: string })?.description === 'zzq-crash') {
       throw new Error('zzq-card-render-broke')
@@ -70,7 +72,7 @@ vi.mock('../components/appstore/InstalledAppCard', () => ({
   },
 }))
 
-import AppsPage from '../pages/AppsPage'
+import LibraryPage from '../pages/apps/LibraryPage'
 
 function installed(name: string) {
   return {
@@ -89,9 +91,9 @@ function renderPage(qc?: QueryClient) {
   const client = qc ?? new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={['/apps']}>
+      <MemoryRouter initialEntries={['/apps/library']}>
         <Routes>
-          <Route path="/apps" element={<AppsPage />} />
+          <Route path="/apps/library" element={<LibraryPage />} />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -102,7 +104,6 @@ describe('AppsPage per-card error boundary (#3689)', () => {
   let consoleError: ReturnType<typeof vi.spyOn>
 
   beforeEach(() => {
-    sessionStorage.setItem('appstore-tab', 'library')
     listApps.mockResolvedValue([installed('zzq-healthy'), installed('zzq-broken')])
     listRegistry.mockResolvedValue({ apps: [], categoryOrder: [], editorialSections: [] })
     listRegistries.mockResolvedValue([])
@@ -169,7 +170,6 @@ describe('AppsPage per-card error boundary (#3689)', () => {
 
 describe('AppsPage normalizes installed apps at the query boundary (#3706)', () => {
   beforeEach(() => {
-    sessionStorage.setItem('appstore-tab', 'library')
     listRegistry.mockResolvedValue({ apps: [], categoryOrder: [], editorialSections: [] })
     listRegistries.mockResolvedValue([])
     cardMock.apps.length = 0

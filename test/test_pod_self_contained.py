@@ -204,7 +204,7 @@ def test_host_scoped_verbs_are_refused(verb):
         rt.require_pod_safe_verb([verb], "wt-feature")
 
 
-def test_app_is_refused_because_it_rewrites_the_host_agent_registry():
+def test_app_is_refused_because_it_rewrites_the_host_agent_registry(unpinned_agent_spec_home):
     """`apps/bridges.py` symlinks app agents into `Path.home()/.kiro/agents` and
     edits `~/.kiro/settings/mcp.json` — the HOST registry. A pod install/uninstall
     would replace or delete symlinks the live gateway depends on."""
@@ -215,6 +215,10 @@ def test_app_is_refused_because_it_rewrites_the_host_agent_registry():
     # directly would assert the override rather than the path bridges actually
     # writes to. The claim under test is unchanged -- bridges targets the
     # machine-wide HOST registry, which is why a pod may not run `app`.
+    #
+    # ``unpinned_agent_spec_home`` because that override is exactly what the rootdir
+    # floor now sets for every test: leaving it pinned would assert that bridges
+    # targets a per-test tmp dir, which is the opposite of the claim.
     assert bridges._kiro_agents_dir() == Path.home() / ".kiro" / "agents"
     assert "app" not in rt._POD_SAFE_VERBS
 
@@ -348,7 +352,7 @@ def test_logs_is_refused_and_points_at_the_pod_journal():
 def test_snapshot_is_refused_because_its_destination_is_configurable():
     """`snapshot_dir` is a config field and `--keep N` DELETES older archives, so a
     pod seeded from the live config could prune the user's real backups —
-    `sanitized_seed_config` only forces tunnel/telegram/wecom off."""
+    `sanitized_seed_config` only forces the tunnel and the channel enables off."""
     from kiro_crew.config.loader import KiroCrewConfig
 
     assert hasattr(KiroCrewConfig, "__dataclass_fields__")
@@ -434,17 +438,18 @@ def test_run_is_refused_because_it_writes_beside_the_spec():
         rt.require_pod_safe_verb(["run", "/host/TASK.md"], "wt-feature")
 
 
-def test_chat_is_refused_because_chat_tui_reaches_the_live_port():
-    """`cli_chat._tui` resolves the CONFIG dashboard port with a literal 5476
-    fallback and never reads KIROCREW_PORT, and `chat --tui` branches into it — so
-    excluding only `tui` left the hole open."""
-    import inspect
+def test_chat_and_tui_verbs_stay_refused_in_a_pod():
+    """Both verbs stay on the exclusion list.
 
-    from kiro_crew import cli_chat
-
-    src = inspect.getsource(cli_chat)
-    assert "5476" in src, "premise: _tui carries a hardcoded live-port fallback"
-    assert "resolve_client_port" not in src, "premise: _tui bypasses the port resolver"
+    The original premise was `cli_chat._tui`: it resolved the CONFIG dashboard
+    port with a literal 5476 fallback, never `KIROCREW_PORT`, so a pod landed on
+    the LIVE gateway — and `chat` was excluded with it because `chat --tui`
+    branched into the same function. `_tui` has since been deleted as dead code
+    (the `tui` subcommand and its Ink bundle were already gone), so that source
+    premise can no longer be asserted. The exclusion is kept in force rather
+    than relaxed: admitting either verb is a pod-safety decision on its own
+    evidence, not a side effect of removing an unreachable function.
+    """
     for verb in ("chat", "tui"):
         with pytest.raises(rt.PodError, match=f"refusing `{verb}`"):
             rt.require_pod_safe_verb([verb], "wt-feature")

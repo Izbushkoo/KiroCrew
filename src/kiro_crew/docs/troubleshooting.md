@@ -17,7 +17,7 @@ check fails it prints a specific fix command.
 
 ## Common Issues
 
-### "kiro-cli not found in PATH"
+### kiro-cli is not on PATH
 
 `kiro-cli` is the agent backend and is required: `agent.provider` is fixed to
 `acp`, and the gateway spawns `kiro-cli acp --agent <name>` for every session.
@@ -36,6 +36,13 @@ kiro-cli login
 `kirocrew doctor` reports the binary and the login state on separate lines, so
 check both.
 
+**macOS desktop app:** if a command resolves in Terminal but not inside the
+app, the cause is usually launchd's minimal `PATH`, which a shell rc file
+never changes. The fix is `launchctl setenv PATH "$PATH"` plus a full quit and
+relaunch — see the
+[macOS troubleshooting guide](https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/macos-troubleshooting.md)
+for the recipe and how to persist it across reboots.
+
 ### Dashboard asks for sign-in but `kiro-cli` is already authenticated
 
 Typical on a headless host that authenticates `kiro-cli` with an API key rather
@@ -52,7 +59,7 @@ shell's environment to the service. Put it where the gateway reads it at boot:
 P=~/.kiro/crew/.env
 touch "$P" && chmod 600 "$P"
 printf '%s\n' "KIRO_API_KEY=$KIRO_API_KEY" >> "$P"
-kirocrew service restart   # or restart however you run the gateway
+kirocrew restart           # or restart however you run the gateway
 ```
 
 The `chmod` comes first on purpose: under a standard `022` umask a file created
@@ -160,8 +167,11 @@ on another port with `KIROCREW_PORT`.
 
 ### Context window filling up
 
-Kiro Crew auto-compacts at `session.autocompact_pct` context usage (90% by
-default). If compaction fires often:
+Kiro Crew auto-compacts at `session.autocompact_pct` context usage (70% by
+default for a new install — an existing `config.json` keeps whatever value it
+already stores, which for installs created before this default changed is
+`90.0`; check with `kirocrew config get session.autocompact_pct`). If
+compaction fires often:
 
 - Reduce always-on skills, which consume context in every session
 - Check memory size: large preferences and project files eat into the budget
@@ -261,10 +271,7 @@ Common problems:
   model: doing so would silently swap your vector space and re-embed your whole
   corpus because of a typo. Embeddings stay unavailable (keyword search still
   works) until the path is fixed.
-- **A log line says the model produces N-dim vectors but `embedding_dim` is M,
-  and refuses to load.** Set `memory.embedding_dim` to the number in the message.
-  The width is checked at load precisely so a mismatch is a loud refusal rather
-  than an unexplained loss of semantic search.
+- **Embedding-model dimension mismatch.** Set `memory.embedding_dim` to the output width named in the error. The width is checked at load so a mismatch is a loud refusal rather than an unexplained loss of semantic search.
 - **You swapped models but nothing re-embedded.** The default vector-space
   identity is derived from the file's name and size, so two different models of
   identical byte size look the same. Set `memory.embed_model_id` explicitly to

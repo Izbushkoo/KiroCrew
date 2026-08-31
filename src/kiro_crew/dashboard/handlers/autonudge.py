@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import asdict
 from typing import Any
@@ -19,7 +20,9 @@ from kiro_crew.autonudge_authz import (  # noqa: F401 - re-exported
     resolve_stop_sentinel,
 )
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.platform import redact_via_context
 from kiro_crew.sel import sel
+from kiro_crew.session_ledger import ledger_key, render_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +32,51 @@ def render_nudge_message(message: str, stop_sentinel_path: str | None) -> str:
     return message.replace("{{STOP_FILE}}", stop_sentinel_path or "")
 
 
-def _serialize(loop: Any) -> dict:
-    return asdict(loop)
+async def compose_nudge_body(
+    message: str, stop_sentinel_path: str | None, slot_key: str | None
+) -> str:
+    """Compose one nudge cycle's full body text — the shared fire-path composer.
+
+    Applies :func:`render_nudge_message`'s template substitution and, when the
+    loop's session has a non-empty, non-terminal work ledger, prefixes a
+    compact snapshot of it so every cycle starts from the durable state
+    instead of from transcript memory. Derived server-side at fire time;
+    sessions without a ledger render exactly as before.
+
+    The ledger read is filesystem I/O, so it runs in a worker thread — a slow
+    or wedged filesystem costs this loop's snapshot, never the event loop.
+    Best-effort throughout: a snapshot failure must not cost the nudge itself.
+    """
+    body = render_nudge_message(message, stop_sentinel_path)
+    if slot_key:
+        try:
+            snapshot = await asyncio.to_thread(render_snapshot, ledger_key(slot_key))
+        except Exception:
+            logger.debug("nudge: ledger snapshot failed for %s", slot_key, exc_info=True)
+            snapshot = ""
+        if snapshot:
+            return f"{snapshot}\n\n{body}"
+    return body
+
+
+def _redact_monitor_value(value: Any) -> Any:
+    """Redact every string in provider-controlled monitor evidence."""
+    if isinstance(value, str):
+        return redact_via_context(value)
+    if isinstance(value, dict):
+        return {
+            _redact_monitor_value(key): _redact_monitor_value(item) for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_monitor_value(item) for item in value]
+    return value
+
+
+def _serialize(loop: Any) -> dict[str, Any]:
+    payload = asdict(loop)
+    if payload.get("monitor") is not None:
+        payload["monitor"] = _redact_monitor_value(payload["monitor"])
+    return payload
 
 
 async def api_autonudge_list(request: web.Request) -> web.Response:
@@ -106,7 +152,7 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
         caller=request.remote or "",
     )
     if error is not None:
-        return web.json_response({"error": error}, status=status)
+        return web.json_response({"error": error, "code": "autonudge_not_armed"}, status=status)
     return web.json_response({"ok": True, "loop": _serialize(loop)})
 
 

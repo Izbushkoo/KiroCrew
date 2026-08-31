@@ -108,12 +108,13 @@ export interface DashboardConfig {
   merge_queued_messages: boolean
   widget_density: 'more' | 'less'
   use_builtin_browser: boolean
-  verbosity: 'default' | 'concise' | 'ultra'
+  verbosity: 'default' | 'concise' | 'ultra' | 'answer_only'
   quick_send: boolean
   session_grid: boolean
   tail_fork_enabled: boolean
   link_previews: boolean
   mcp_app_panel: boolean
   auto_open_git_panel: boolean
+  session_card_source_links: boolean
   folder_suggestions_enabled: boolean
 }

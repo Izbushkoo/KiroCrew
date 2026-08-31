@@ -61,10 +61,7 @@ class TestOnCycleEndCallback:
             order.append("cycle_end")
 
         heartbeat_file.write_text(
-            "# Heartbeat Tasks\n\n"
-            "- [ ] task A\n"
-            "- [ ] task B\n"
-            "- [ ] task C\n",
+            "# Heartbeat Tasks\n\n" "- [ ] task A\n" "- [ ] task B\n" "- [ ] task C\n",
             encoding="utf-8",
         )
 
@@ -107,9 +104,73 @@ class TestOnCycleEndCallback:
         assert cycle_end_called == [True]
 
     @pytest.mark.asyncio
+    async def test_failure_log_carries_the_fallback_story(self, heartbeat_file, caplog):
+        """#5447 item 1: the heartbeat's terminal error text (its failure log
+        line — heartbeat failures are kept + retried, never delivered) names
+        the WHOLE fallback walk carried on the exception, not just the last
+        candidate's error."""
+        import logging
+
+        from kiro_crew.llm_helpers import FALLBACK_STORY_ATTR
+
+        async def _on_task(text, deliver):
+            exc = RuntimeError("backend throttle 500")
+            setattr(
+                exc,
+                FALLBACK_STORY_ATTR,
+                "primary-m throttled; fallbacks fb-1, fb-2 also unavailable",
+            )
+            raise exc
+
+        heartbeat_file.write_text(
+            "# Heartbeat Tasks\n\n- [ ] some task\n",
+            encoding="utf-8",
+        )
+
+        svc = HeartbeatService(
+            memory=MagicMock(),
+            on_task=_on_task,
+        )
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.heartbeat"):
+            await svc._process_heartbeat_file()
+
+        failed = [
+            r.getMessage() for r in caplog.records if "Heartbeat task failed" in r.getMessage()
+        ]
+        assert failed, "expected the failure log line"
+        assert any("fb-1, fb-2 also unavailable" in m for m in failed)
+
+    @pytest.mark.asyncio
+    async def test_storyless_failure_log_is_unchanged(self, heartbeat_file, caplog):
+        """No story on the exception ⇒ the log line is exactly the task text
+        (byte-for-byte pre-#5447 shape)."""
+        import logging
+
+        async def _on_task(text, deliver):
+            raise RuntimeError("plain boom")
+
+        heartbeat_file.write_text(
+            "# Heartbeat Tasks\n\n- [ ] some task\n",
+            encoding="utf-8",
+        )
+
+        svc = HeartbeatService(
+            memory=MagicMock(),
+            on_task=_on_task,
+        )
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.heartbeat"):
+            await svc._process_heartbeat_file()
+
+        failed = [
+            r.getMessage() for r in caplog.records if "Heartbeat task failed" in r.getMessage()
+        ]
+        assert failed == ["Heartbeat task failed: some task"]
+
+    @pytest.mark.asyncio
     async def test_callback_failure_does_not_crash_loop(self, heartbeat_file):
         """A raising on_cycle_end must NOT propagate — the cycle is over,
         and the periodic loop must keep ticking."""
+
         async def _on_task(text, deliver):
             return None
 
@@ -179,13 +240,13 @@ class TestRecycleHeartbeat:
         change: previously a session under 70% context and under 40 prompts
         was preserved, which is what let the heartbeat transcript accumulate
         across cycles while the docs promised fresh context."""
-        from kiro_crew.session import SessionManager, _Session
+        from kiro_crew.session import FirstTurnState, SessionManager, _Session
 
         mgr = SessionManager(cfg=_make_cfg(), provider_factory=MagicMock())
         provider = MagicMock()
         provider.context_usage_pct = MagicMock(return_value=15.0)
         provider.shutdown = AsyncMock()
-        sess = _Session(provider=provider, is_new=False)
+        sess = _Session(provider=provider, first_turn=FirstTurnState.NOTHING_ARMED)
         sess.prompt_count = 5
         mgr._sessions[HEARTBEAT_KEY] = sess
 
@@ -198,13 +259,13 @@ class TestRecycleHeartbeat:
     async def test_recycles_at_pct_threshold(self):
         """A full session is recycled too — the next ``get_or_create``
         creates a fresh one on demand."""
-        from kiro_crew.session import SessionManager, _Session
+        from kiro_crew.session import FirstTurnState, SessionManager, _Session
 
         mgr = SessionManager(cfg=_make_cfg(), provider_factory=MagicMock())
         provider = MagicMock()
         provider.context_usage_pct = MagicMock(return_value=72.0)
         provider.shutdown = AsyncMock()
-        sess = _Session(provider=provider, is_new=False)
+        sess = _Session(provider=provider, first_turn=FirstTurnState.NOTHING_ARMED)
         sess.prompt_count = 10
         mgr._sessions[HEARTBEAT_KEY] = sess
 
@@ -220,13 +281,13 @@ class TestRecycleHeartbeat:
     async def test_recycles_when_context_pct_unavailable(self):
         """A provider that can't report context% is recycled all the same —
         there is no threshold left to fall back on."""
-        from kiro_crew.session import SessionManager, _Session
+        from kiro_crew.session import FirstTurnState, SessionManager, _Session
 
         mgr = SessionManager(cfg=_make_cfg(), provider_factory=MagicMock())
         provider = MagicMock()
         provider.context_usage_pct = MagicMock(return_value=0.0)
         provider.shutdown = AsyncMock()
-        sess = _Session(provider=provider, is_new=False)
+        sess = _Session(provider=provider, first_turn=FirstTurnState.NOTHING_ARMED)
         sess.prompt_count = 1
         mgr._sessions[HEARTBEAT_KEY] = sess
 

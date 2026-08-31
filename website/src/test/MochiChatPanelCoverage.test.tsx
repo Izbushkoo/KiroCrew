@@ -384,9 +384,9 @@ describe('ChatPanel reset confirmation', () => {
     await screen.findByText('kept turn')
     fireEvent.contextMenu(container.firstChild as HTMLElement, { clientX: 5, clientY: 5 })
     await userEvent.click(await screen.findByRole('menuitem', { name: 'Reset Mochi' }))
-    await screen.findByText('Reset Mochi?')
+    await screen.findByText('Reset \u201cMochi\u201d?')
     await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
-    await waitFor(() => expect(screen.queryByText('Reset Mochi?')).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByText('Reset \u201cMochi\u201d?')).not.toBeInTheDocument())
     expect(resetMochi).not.toHaveBeenCalled()
     expect(screen.getByText('kept turn')).toBeInTheDocument()
   })
@@ -708,11 +708,11 @@ describe('ChatPanel trust scopes', () => {
     await renderPanel()
     emit('onApprovalRequest', {
       id: 'req-9', tool: 'execute_bash', toolInput: 'cat x',
-      fullCommand: 'cat x', baseCommand: 'cat',
+      fullCommand: 'cat x', baseCommand: 'cat', trustGrantable: true,
     })
     await userEvent.click(await screen.findByRole('button', { name: 'Trust' }))
     await userEvent.click(screen.getByRole('button', { name: 'Trust all tools' }))
-    expect(respondApproval).toHaveBeenCalledWith('req-9', 'trust', undefined)
+    expect(respondApproval).toHaveBeenCalledWith('req-9', 'trust', undefined, true)
     expect(await screen.findByText('Trusted')).toBeInTheDocument()
   })
 })

@@ -1,64 +1,24 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
-import { FileDiff, ChevronDown, ChevronUp, ChevronRight } from 'lucide-react'
+import { FileDiff, ChevronDown, ChevronUp, ChevronRight, Columns2 } from 'lucide-react'
 import type { FileChipStyle } from '../pages/chat/ChatSettings'
 import { useRowDisclosure } from '../pages/chat/rowDisclosure'
 import { PierreFilePair } from '../pierre'
 import { ROW_ANIM_MS, ROW_CSS_CLICKABLE_TITLE, ROW_CSS_CLOSING, ROW_CSS_OPEN } from './fileChangeChipsCss'
+import { countLines } from '../utils/diffLineCounts'
+import { usePersistedBool } from '../hooks/usePersistedBool'
 
 import { i18nT } from '../i18n/t'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 export interface FileChangeEntry {
   path: string
   before: string
   after: string
 }
 
-/**
- * Line-level diff count via LCS — correctly attributes moves as +N/-N
- * (a moved line shows up as a removal at the old position and an addition
- * at the new). Falls back to a cheap multiset count for huge files to bound
- * cost; that fallback can under-report pure moves but only on files we
- * already cap at 200KB, so the cap is rarely hit in practice.
- */
-export function countLines(before: string, after: string): { added: number; removed: number } {
-  if (before === after) return { added: 0, removed: 0 }
-  // Guard empty strings: ''.split('\n') yields [''] (1 phantom line), which would
-  // mis-count a new file as +1/-1 instead of +1, and a fully cleared file as
-  // +1/-2 instead of -2. Treat empty content as zero lines.
-  const a = before ? before.split('\n') : []
-  const b = after ? after.split('\n') : []
-  const m = a.length, n = b.length
-  // LCS with rolling rows: O(mn) time, O(min(m,n)) space.
-  // 1M cell cap = ~1000x1000 lines which covers anything inside our 200KB snapshot cap comfortably.
-  if (m * n <= 1_000_000) {
-    let prev = new Int32Array(n + 1)
-    let curr = new Int32Array(n + 1)
-    for (let i = 1; i <= m; i++) {
-      for (let j = 1; j <= n; j++) {
-        if (a[i - 1] === b[j - 1]) curr[j] = prev[j - 1] + 1
-        else curr[j] = prev[j] >= curr[j - 1] ? prev[j] : curr[j - 1]
-      }
-      const tmp = prev; prev = curr; curr = tmp
-      curr.fill(0)
-    }
-    const lcs = prev[n]
-    return { added: n - lcs, removed: m - lcs }
-  }
-  // Huge-file fallback: multiset count. Cheap but doesn't detect pure moves.
-  const aMap = new Map<string, number>()
-  const bMap = new Map<string, number>()
-  for (const line of a) aMap.set(line, (aMap.get(line) || 0) + 1)
-  for (const line of b) bMap.set(line, (bMap.get(line) || 0) + 1)
-  let added = 0, removed = 0
-  for (const [line, count] of bMap) {
-    const aCount = aMap.get(line) || 0
-    if (count > aCount) added += count - aCount
-  }
-  for (const [line, count] of aMap) {
-    const bCount = bMap.get(line) || 0
-    if (count > bCount) removed += count - bCount
-  }
-  return { added, removed }
-}
+/** Re-exported for this component's existing importers; defined in
+ *  `utils/diffLineCounts` so a pure test need not import this module (and with
+ *  it the Pierre diff runtime). */
+export { countLines }
 
 const basename = (p: string) => p.split('/').pop() || p
 
@@ -113,13 +73,15 @@ export function headerClickAction(path: readonly EventTarget[]): 'open' | 'toggl
   return has('[data-title]') ? 'open' : 'toggle'
 }
 
-function ExpandedRow({ fc, added, removed, isArtifact, onFileOpen, disclosureKey }: {
+function ExpandedRow({ fc, added, removed, isArtifact, onFileOpen, disclosureKey, sideBySide }: {
   fc: FileChangeEntry
   added: number
   removed: number
   isArtifact?: boolean
   onFileOpen?: (path: string) => void
   disclosureKey?: string
+  /** Split vs unified layout — owned by the card so every row flips together. */
+  sideBySide?: boolean
 }) {
   const [open, setOpen] = useRowDisclosure(disclosureKey, false)
   // Held mounted for one animation after `open` goes false, so collapsing has
@@ -135,11 +97,12 @@ function ExpandedRow({ fc, added, removed, isArtifact, onFileOpen, disclosureKey
   const options = useMemo(
     () => ({
       collapsed: !open && !closing,
+      diffStyle: (sideBySide ? 'split' : 'unified') as 'split' | 'unified',
       overflow: 'wrap' as const,
       disableFileHeader: false,
       unsafeCSS: (closing ? ROW_CSS_CLOSING : ROW_CSS_OPEN) + (onFileOpen ? ROW_CSS_CLICKABLE_TITLE : ''),
     }),
-    [open, closing, onFileOpen],
+    [open, closing, onFileOpen, sideBySide],
   )
   useEffect(() => {
     if (!closing) return
@@ -262,6 +225,10 @@ function ExpandedList({ fileChanges, onFileOpen, artifactPaths, disclosureKey }:
   disclosureKey?: string
 }) {
   const [expanded, setExpanded] = useRowDisclosure(disclosureKey, false)
+  // Shares the app-wide `mc-diff-split` preference with the other diff
+  // surfaces (#6024). Owned by the card, not the rows, so toggling flips
+  // every file in the card at once (same-key hook instances don't live-sync).
+  const [sideBySide, setSideBySide] = usePersistedBool('mc-diff-split', true)
   const n = fileChanges.length
   // Count once per file: reused by each row AND the header roll-up.
   const stats = fileChanges.map(fc => countLines(fc.before, fc.after))
@@ -277,8 +244,11 @@ function ExpandedList({ fileChanges, onFileOpen, artifactPaths, disclosureKey }:
           13px/20px header font — which `.pierre-surface` maps to var(--mono),
           so `font-mono` here is Pierre's face, not an unrelated pin.
           The roll-up is spelled out inline rather than repeated as a ±pair on
-          the right, so the row carries one summary instead of two. */}
-      <div className="flex items-center gap-2 px-[10px] min-h-[36px] bg-[color-mix(in_srgb,var(--bg-elevated)_50%,var(--bg))] border-b border-border font-mono text-[12px] leading-[18px] text-muted">
+          the right, so the row carries one summary instead of two.
+          flex-wrap + py-1.5 let the toggle wrap below the summary on narrow
+          viewports (~320px with long i18n labels) instead of being clipped by
+          the card's overflow-hidden; min-h keeps the desktop render identical. */}
+      <div className="flex flex-wrap items-center gap-2 px-[10px] py-1.5 min-h-[36px] bg-[color-mix(in_srgb,var(--bg-elevated)_50%,var(--bg))] border-b border-border font-mono text-[12px] leading-[18px] text-muted">
         <FileDiff size={14} className="text-muted shrink-0" />
         <span className="font-medium">{i18nT('components.fileChangeChips.file', { count: n })} {i18nT('components.fileChangeChips.changed')}</span>
         {(totalAdded > 0 || totalRemoved > 0) && (
@@ -292,6 +262,11 @@ function ExpandedList({ fileChanges, onFileOpen, artifactPaths, disclosureKey }:
             )}
           </>
         )}
+        {/* Split/unified toggle for the whole card — same active styling as the
+            side panel's toggle (lit in split mode; diffSplitToggles.test.ts
+            asserts the gate is not inverted). Always visible: the header bar
+            has no hover reveal, unlike DiffBlock's slotted controls. */}
+        <button onClick={() => setSideBySide(v => !v)} className={`ml-auto flex items-center justify-center w-[22px] h-[22px] rounded-md cursor-pointer transition-colors border-none shrink-0 ${sideBySide ? 'text-accent bg-accent-subtle' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'}`} title={sideBySide ? i18nT('components.fileChangeChips.switch_to_unified_view') : i18nT('components.fileChangeChips.switch_to_split_view')} aria-label={sideBySide ? i18nT('components.fileChangeChips.switch_to_unified_view') : i18nT('components.fileChangeChips.switch_to_split_view')}><Columns2 size={13} /></button>
       </div>
       <div className="flex flex-col">
         {fileChanges.slice(0, visibleCount).map((fc, i) => (
@@ -302,6 +277,7 @@ function ExpandedList({ fileChanges, onFileOpen, artifactPaths, disclosureKey }:
             removed={stats[i].removed}
             isArtifact={artifactPaths?.has(fc.path)}
             onFileOpen={onFileOpen}
+            sideBySide={sideBySide}
             // Per-file key so each row's open/closed state survives a
             // re-render (and a scroll-out remount) independently.
             disclosureKey={disclosureKey ? `${disclosureKey}-${fc.path}` : undefined}
@@ -359,6 +335,7 @@ const FileChangeChips = memo(function FileChangeChips({ fileChanges, onOpenDiff,
   artifactPaths?: Set<string>
   disclosureKey?: string
 }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   if (!fileChanges?.length) return null
   // Minimal keeps the wrapping pill row; anything else uses the grouped card.
   if (style === 'minimal') {

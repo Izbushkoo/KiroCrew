@@ -9,14 +9,18 @@ import re
 import subprocess
 import sys
 import tempfile
+import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from aiohttp import web
 
+from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.artifacts import get_default_store
 from kiro_crew.config.loader import KiroCrewConfig, config_dir, data_home
+from kiro_crew.dashboard import part_stream
+from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.handlers.files import (
     _ZIP_CONTAINER_EXTS,
     _content_matches_ext,
@@ -52,10 +56,12 @@ from kiro_crew.knowledge.llm_pool import DEFAULT_EXTRACTION_EFFORT, LLMPool
 from kiro_crew.knowledge.readers import FileReader
 from kiro_crew.knowledge.retrieval import HybridRetriever
 from kiro_crew.knowledge.spend import source_spend
+from kiro_crew.knowledge.store import KnowledgeBundleError
 from kiro_crew.knowledge.sync import SyncScheduler
 from kiro_crew.knowledge.watcher import KnowledgeWatcher
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
+from kiro_crew.zip_vet import ZipInventoryRejected, vet_zip_inventory
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +76,77 @@ def _sel_log(tool: str, **kwargs: object) -> None:
         tool_name=f"knowledge.{tool}", outcome=str(kwargs.pop("outcome", "completed")),
         resources=str(kwargs) if kwargs else "",
     )
+
+
+_BUNDLE_LIST_FIELDS = ("items", "entities", "relations", "sources", "source_locations", "mentions")
+# The fields import_bundle's redaction loops pass to _redact(); each has to be
+# a string or null before it reaches _redact() -> redact_exfiltration_urls(),
+# whose regex .finditer() raises an unhandled TypeError on anything else.
+_BUNDLE_REDACTED_FIELDS = {
+    "items": ("title", "summary", "content"),
+    "entities": ("name", "description"),
+    "relations": ("relation_type", "description"),
+}
+
+
+def _validate_knowledge_bundle(body: object) -> str | None:
+    """Return an error string if body isn't an importable bundle shape, else None.
+
+    Runs before the redaction loops and the store call so a malformed bundle
+    fails with a clean 400 instead of an unhandled AttributeError/TypeError
+    (non-dict body or entries) or a silently-committed corrupt row (non-JSON
+    sources.properties / entities.aliases, which every reader parses with
+    json.loads()).
+    """
+    if not isinstance(body, dict):
+        return "bundle must be a JSON object"
+    for field in _BUNDLE_LIST_FIELDS:
+        value = body.get(field, [])
+        if not isinstance(value, list):
+            return f"'{field}' must be a list"
+        for entry in value:
+            if not isinstance(entry, dict):
+                return f"'{field}' entries must be objects"
+    for field, keys in _BUNDLE_REDACTED_FIELDS.items():
+        for entry in body.get(field, []):
+            for key in keys:
+                value = entry.get(key)
+                if value is not None and not isinstance(value, str):
+                    return f"'{field}.{key}' must be a string or null"
+    # store.import_bundle() writes these two columns through unparsed (with
+    # '{}'/'[]' defaults when ABSENT), so anything present must already be the
+    # JSON text every reader json.loads() back: readers such as the source
+    # detail handlers parse the raw column with no empty-string guard, and
+    # find_entity() calls .lower() on each parsed alias.  Only absent/null
+    # falls through to the store defaults; a present non-string (1 -> TEXT
+    # "1"), an empty string, or the wrong parsed shape would commit a row
+    # that crashes a later, unrelated read.  json.loads raises RecursionError
+    # (not ValueError) on deeply-nested input, so catch it here too.
+    for src in body.get("sources", []):
+        props = src.get("properties")
+        if props is None:
+            continue
+        if not isinstance(props, str):
+            return "'sources.properties' must be a JSON object string or null"
+        try:
+            parsed = json.loads(props)
+        except (ValueError, RecursionError):
+            return "'sources.properties' must be valid JSON"
+        if not isinstance(parsed, dict):
+            return "'sources.properties' must be a JSON object"
+    for ent in body.get("entities", []):
+        aliases = ent.get("aliases")
+        if aliases is None:
+            continue
+        if not isinstance(aliases, str):
+            return "'entities.aliases' must be a JSON array string or null"
+        try:
+            parsed = json.loads(aliases)
+        except (ValueError, RecursionError):
+            return "'entities.aliases' must be valid JSON"
+        if not isinstance(parsed, list) or not all(isinstance(a, str) for a in parsed):
+            return "'entities.aliases' must be a JSON array of strings"
+    return None
 
 
 def _store(request: web.Request):
@@ -417,10 +494,10 @@ async def update_item(request: web.Request) -> web.Response:
     item_id = request.match_info["id"]
     if not store.get_item(item_id):
         return web.json_response({"error": "not found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     allowed = {"tags", "item_type", "status", "title", "summary", "namespace"}
     fields = {k: v for k, v in body.items() if k in allowed}
     if not fields:
@@ -537,18 +614,59 @@ async def get_related_items(request: web.Request) -> web.Response:
 
 
 async def get_full_graph(request: web.Request) -> web.Response:
-    """GET /api/knowledge/graph -- full entity graph (top N by connections)."""
+    """GET /api/knowledge/graph -- full entity graph (top N by connections).
+
+    Optional query params:
+      limit: max nodes (1-200, default 100)
+      source_id: comma-separated source IDs to filter entities by. When set,
+        only entities mentioned in items belonging to those sources are included.
+    """
     store = _store(request)
     try:
         limit = min(200, max(1, int(request.query.get("limit", 100) or 100)))
     except ValueError:
         return web.json_response({"error": "invalid limit"}, status=400)
-    nodes_by_degree = sorted(store.graph.nodes, key=lambda n: store.graph.degree(n), reverse=True)[:limit]
+
+    # Source filter: restrict to entities mentioned in items from specific sources
+    source_id_param = request.query.get("source_id", "").strip()
+    if source_id_param:
+        source_ids = [s.strip() for s in source_id_param.split(",") if s.strip()]
+        if not source_ids:
+            return web.json_response({"nodes": [], "edges": []})
+        placeholders = ",".join("?" * len(source_ids))
+        # Find entity IDs mentioned in items belonging to the given sources.
+        # Items belong to a source via items.source_id (ownership) OR via
+        # source_locations.source_id (deduplication — item survives in another
+        # source after a duplicate collapse).
+        rows = await asyncio.to_thread(
+            lambda: store.db.execute(
+                f"SELECT DISTINCT m.entity_id FROM mentions m "  # noqa: S608
+                f"JOIN items i ON m.item_id = i.id "
+                f"WHERE i.status = 'active' AND ("
+                f"  i.source_id IN ({placeholders})"
+                f"  OR i.id IN ("
+                f"    SELECT sl.item_id FROM source_locations sl"
+                f"    WHERE sl.source_id IN ({placeholders})"
+                f"  )"
+                f")",
+                source_ids + source_ids,
+            ).fetchall()
+        )
+        allowed_entities = {row["entity_id"] for row in rows}
+        if not allowed_entities:
+            return web.json_response({"nodes": [], "edges": []})
+        # Rank allowed entities by degree, take top N
+        nodes_by_degree = sorted(
+            allowed_entities, key=lambda n: store.graph.degree(n) if store.graph.has_node(n) else 0, reverse=True
+        )[:limit]
+    else:
+        nodes_by_degree = sorted(store.graph.nodes, key=lambda n: store.graph.degree(n), reverse=True)[:limit]
+
     if not nodes_by_degree:
         return web.json_response({"nodes": [], "edges": []})
     node_set = set(nodes_by_degree)
     nodes = [{"id": n, "name": store.graph.nodes[n].get("name"), "type": store.graph.nodes[n].get("entity_type")}
-             for n in node_set]
+             for n in node_set if store.graph.has_node(n)]
     edges = [{"source": u, "target": v, "type": d.get("relation_type"), "weight": d.get("weight")}
              for u, v, d in store.graph.edges(data=True) if u in node_set and v in node_set]
     return web.json_response({"nodes": nodes, "edges": edges})
@@ -709,10 +827,10 @@ async def pick_folder(request: web.Request) -> web.Response:
 async def add_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources -- add a remote source."""
     store = _store(request)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     name = body.get("name", "")
     source_type = body.get("source_type", "")
     uri = body.get("uri", "")
@@ -1058,10 +1176,10 @@ async def rename_source(request: web.Request) -> web.Response:
     source_id = request.match_info["id"]
     if not store.db.execute("SELECT 1 FROM sources WHERE id = ?", (source_id,)).fetchone():
         return web.json_response({"error": "not found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     name = body.get("name")
     if not isinstance(name, str):
         return web.json_response({"error": "name must be a string"}, status=400)
@@ -1186,7 +1304,10 @@ async def retry_file(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/files/retry -- reset file to pending."""
     store = _store(request)
     source_id = request.match_info["id"]
-    body = await request.json()
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     file_path = body.get("file_path", "")
     if not file_path:
         return web.json_response({"error": "file_path required"}, status=400)
@@ -1205,7 +1326,10 @@ async def skip_file(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/files/skip -- mark file as skipped."""
     store = _store(request)
     source_id = request.match_info["id"]
-    body = await request.json()
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     file_path = body.get("file_path", "")
     if not file_path:
         return web.json_response({"error": "file_path required"}, status=400)
@@ -1230,10 +1354,10 @@ async def ingest_text(request: web.Request) -> web.Response:
     pipeline = _pipeline(request)
     if not pipeline:
         return web.json_response({"error": "pipeline not configured"}, status=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     text = body.get("text", "")
     if not text:
         return web.json_response({"error": "no text provided"}, status=400)
@@ -1324,7 +1448,24 @@ def _inspect_zip_archive(path: str) -> str | None:
     synchronous zip I/O, so callers MUST run it off the event loop (via
     ``asyncio.to_thread``) — a large/hostile central directory would otherwise
     stall the gateway loop and heartbeat.
+
+    The member cap runs TWICE, deliberately. The shared vet (kiro_crew.zip_vet)
+    reads the archive tail first, so the declared central-directory size — the
+    field ZipFile's construction loop actually reads and allocates from — is
+    bounded BEFORE ZipFile exists. The infolist() pass below then bounds the
+    aggregate declared expansion, which only the parsed records can answer. The
+    rejection reasons are unchanged: an archive that the preflight refuses would
+    have been refused by the count check anyway, just after the allocation.
     """
+    try:
+        vet_zip_inventory(path, max_members=_MAX_INGEST_ARCHIVE_MEMBERS)
+    except ZipInventoryRejected as exc:
+        # Same reasons this function already returns, so the API error body and
+        # the SEL outcome do not change shape: a tail we cannot parse is a bad
+        # archive, an over-cap inventory is too many members.
+        if exc.reason in ("missing_eocd", "truncated_eocd", "unreadable"):
+            return "bad_archive"
+        return "too_many_members"
     try:
         with zipfile.ZipFile(path) as zf:
             infos = zf.infolist()
@@ -1355,39 +1496,32 @@ async def ingest_file(request: web.Request) -> web.Response:
     filename = getattr(field, "filename", None) or "upload"
     suffix = Path(filename).suffix
     ext = suffix.lower()
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix, prefix="kn_")
+    staged = Path(tempfile.gettempdir()) / f"kn_{uuid.uuid4().hex}{suffix}"
     try:
-        total_size = 0
-        # Capture the leading bytes so the claimed extension can be verified
-        # against the file signature; 16 bytes covers every prefix in the
-        # sibling gate (PNG magic is 8, WEBP needs bytes 8:12, zip/PDF fewer).
-        head = bytearray()
-        while True:
-            chunk = await field.read_chunk()  # type: ignore[union-attr]
-            if not chunk:
-                break
-            total_size += len(chunk)
-            if total_size > _MAX_INGEST_FILE_SIZE:
-                tmp.close()
-                Path(tmp.name).unlink(missing_ok=True)
-                return web.json_response(
-                    {"error": f"file too large (max {_MAX_INGEST_FILE_SIZE // (1024 * 1024)} MB)"}, status=413)
-            if len(head) < 16:
-                head.extend(chunk[: 16 - len(head)])
-            tmp.write(chunk)
-        tmp.close()
+        # The signature gate (CWE-434) and the byte ceiling are both enforced by
+        # the shared streaming path, which judges the leading bytes while they
+        # are still in memory. That is stricter than this call site used to be:
+        # it wrote the whole file first and only then sniffed, so rejected
+        # content did reach the filesystem. Cleanup on cancellation is the
+        # helper's, not this function's -- see part_stream's docstring.
+        await part_stream.stream_part_to_file(
+            field,  # type: ignore[arg-type]
+            staged,
+            max_bytes=_MAX_INGEST_FILE_SIZE,
+            accepts=lambda head: _content_matches_ext(ext, head),
+        )
+    except part_stream.PartTooLarge:
+        return web.json_response(
+            {"error": f"file too large (max {_MAX_INGEST_FILE_SIZE // (1024 * 1024)} MB)"},
+            status=413,
+        )
+    except part_stream.PartContentMismatch:
+        _sel_log("ingest", filename=filename, outcome="rejected")
+        return web.json_response(
+            {"error": f"file content does not match its type: {ext}"}, status=400
+        )
 
-        # Content-signature gate (CWE-434): the extension is attacker-controlled
-        # and FileReader dispatches to binary parsers (.pdf/.docx) purely by
-        # extension, so verify the magic bytes match the claimed type BEFORE the
-        # file is handed to a parser. Text formats have no reliable signature and
-        # pass through, matching the sibling upload gate in handlers/files.py.
-        if not _content_matches_ext(ext, bytes(head)):
-            Path(tmp.name).unlink(missing_ok=True)
-            _sel_log("ingest", filename=filename, outcome="rejected")
-            return web.json_response(
-                {"error": f"file content does not match its type: {ext}"}, status=400)
-
+    try:
         # Decompression-bomb guard (CWE-770): a valid-signature OOXML/zip can
         # still be a bomb whose members expand unbounded once python-docx / the
         # zip parser opens it. Bound the declared member count and aggregate
@@ -1396,9 +1530,9 @@ async def ingest_file(request: web.Request) -> web.Response:
         # corrupt/lying archive. Run off the event loop so a hostile central
         # directory can't stall the gateway loop/heartbeat.
         if ext in _ZIP_CONTAINER_EXTS:
-            reason = await asyncio.to_thread(_inspect_zip_archive, tmp.name)
+            reason = await asyncio.to_thread(_inspect_zip_archive, str(staged))
             if reason is not None:
-                Path(tmp.name).unlink(missing_ok=True)
+                staged.unlink(missing_ok=True)
                 _sel_log("ingest", filename=filename, outcome="rejected", reason=reason)
                 return web.json_response(
                     {"error": f"{ext} archive rejected ({reason})"}, status=400)
@@ -1428,7 +1562,7 @@ async def ingest_file(request: web.Request) -> web.Response:
             finally:
                 Path(tmp_path).unlink(missing_ok=True)
 
-        task = asyncio.create_task(_bg_ingest(tmp.name, source_id))
+        task = asyncio.create_task(_bg_ingest(str(staged), source_id))
         app_tasks = request.app.setdefault("_bg_tasks", set())
         app_tasks.add(task)
         task.add_done_callback(app_tasks.discard)
@@ -1437,7 +1571,7 @@ async def ingest_file(request: web.Request) -> web.Response:
         return web.json_response({"source_id": source_id, "status": "processing"})
     except Exception:
         logger.exception("Ingestion failed for %s", filename)
-        Path(tmp.name).unlink(missing_ok=True)
+        staged.unlink(missing_ok=True)
         return web.json_response({"error": "internal server error"}, status=500)
 
 
@@ -1478,10 +1612,17 @@ async def export_all(request: web.Request) -> web.Response:
 
 async def import_bundle(request: web.Request) -> web.Response:
     """POST /api/knowledge/import -- accept .knowledge JSON bundle."""
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
+    shape_error = _validate_knowledge_bundle(body)
+    if shape_error is not None:
+        _sel_log("import", outcome="rejected", reason=shape_error)
+        return web.json_response(
+            {"error": f"malformed bundle: {shape_error}", "code": "malformed_knowledge_bundle"},
+            status=400,
+        )
     # Redact imported text fields (may contain LLM-derived content from another instance)
     for item in body.get("items", []):
         redacted_title = _redact(item.get("title"))
@@ -1497,7 +1638,48 @@ async def import_bundle(request: web.Request) -> web.Response:
         redacted_type = _redact(rel.get("relation_type"))
         rel["relation_type"] = redacted_type if redacted_type is not None else ""
         rel["description"] = _redact(rel.get("description"))
-    result = _store(request).import_bundle(body)
+    try:
+        result = _store(request).import_bundle(body)
+    except KnowledgeBundleError as exc:
+        # The store enforces the JSON-column well-formedness invariant
+        # (sources.properties / entities.aliases) at the writer; surface its
+        # typed rejection as a clean 400.  Unlike the driver errors below,
+        # its message is validator-crafted (the same class as the handler's
+        # own shape errors above), so it is safe to render verbatim.
+        _sel_log("import", outcome="rejected", reason=str(exc))
+        return web.json_response(
+            {"error": f"malformed bundle: {exc}", "code": "malformed_knowledge_bundle"},
+            status=400,
+        )
+    except (KeyError, OverflowError, sqlite3.IntegrityError,
+            sqlite3.ProgrammingError, sqlite3.DataError) as exc:
+        # Only failures that genuinely mean a bad bundle earn a 400:
+        # IntegrityError (constraint/FK violations), ProgrammingError and
+        # DataError (bad values reaching the SQL layer), KeyError (missing
+        # required field), and OverflowError (a bundle integer field, e.g.
+        # chunk_index, too large for SQLite's 64-bit INTEGER, raised at bind
+        # time inside the store call -- neither a KeyError nor a
+        # sqlite3.Error, so it needs its own arm).  The exception detail
+        # stays server-side: the dashboard renders ``error`` verbatim, so
+        # raw driver text must not reach the client.
+        logger.warning("Knowledge bundle import rejected: %s", exc)
+        _sel_log("import", outcome="rejected", reason=str(exc))
+        return web.json_response(
+            {"error": "malformed bundle", "code": "malformed_knowledge_bundle"},
+            status=400,
+        )
+    except sqlite3.Error as exc:
+        # Operational store failures -- OperationalError from a locked DB
+        # past busy_timeout or a full disk, and every other sqlite3.Error --
+        # are not the client's fault: a 400 "malformed bundle" for a valid
+        # file sends the user off debugging their export.  Surface them as a
+        # 5xx with a generic body; the detail is logged server-side only.
+        logger.exception("Knowledge bundle import failed in the store")
+        _sel_log("import", outcome="error", reason=str(exc))
+        return web.json_response(
+            {"error": "internal server error", "code": "knowledge_import_failed"},
+            status=500,
+        )
     _sel_log("import", **result)
     return web.json_response(result)
 
@@ -1576,7 +1758,10 @@ async def batch_embed_items(request: web.Request) -> web.Response:
     if not await embedder.is_available_async():
         return web.json_response({"error": "Embedding model not available"}, status=503)
 
-    body = await request.json() if request.can_read_body else {}
+    body, body_err = await read_bounded_json(request, max_bytes=None, allow_absent=True)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     rebuild = body.get("rebuild", False)
     force = body.get("force", False)
 
@@ -1747,11 +1932,10 @@ async def add_agent_document_route(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "pipeline not configured",
              "code": "pipeline_unavailable"}, status=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response(
-            {"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     result = await add_agent_document(
         pipeline,
         title=str(body.get("title") or ""),

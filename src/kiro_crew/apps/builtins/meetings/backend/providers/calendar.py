@@ -54,7 +54,7 @@ import aiohttp
 from aiohttp.abc import AbstractResolver, ResolveResult
 from yarl import URL
 
-from kiro_crew import hooks
+from kiro_crew import hooks, link_unfurl
 from kiro_crew.apps.builtins.meetings.backend import constants as k
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.security import redact
@@ -185,6 +185,165 @@ def _unescape(value: str) -> str:
 _TZID_RE = re.compile(r"TZID=([^;:]+)", re.IGNORECASE)
 
 
+#: Windows (CLDR ``windowsZones``) display names -> the IANA key ``zoneinfo``
+#: understands.
+#:
+#: Microsoft Exchange and Outlook -- among the most common ``.ics`` producers --
+#: stamp ``DTSTART;TZID=Romance Standard Time:...`` rather than an IANA key like
+#: ``Europe/Paris``. ``ZoneInfo("Romance Standard Time")`` raises, so without this
+#: table :func:`_tzid_of` returned ``None`` and :func:`_parse_dt` read the local
+#: wall-clock time AS UTC -- a whole-timezone shift (a 16:00 Paris meeting stored
+#: as 16:00Z instead of 14:00Z, DST included). Mapping to the CLDR primary-territory
+#: IANA zone resolves the instant correctly, because the offset then comes from the
+#: IANA rules for the event's actual date. Matched case-insensitively (see
+#: :func:`_tzid_of`); an unmapped name still degrades to UTC-visible rather than
+#: dropping the event, per the module's never-drop convention. This is the full
+#: CLDR ``windowsZones`` 001-territory (primary) mapping, with deprecated IANA
+#: aliases modernised to their current canonical keys (``Asia/Kolkata``, not
+#: ``Asia/Calcutta``).
+_WINDOWS_TO_IANA: dict[str, str] = {
+    "dateline standard time": "Etc/GMT+12",
+    "utc-11": "Etc/GMT+11",
+    "aleutian standard time": "America/Adak",
+    "hawaiian standard time": "Pacific/Honolulu",
+    "marquesas standard time": "Pacific/Marquesas",
+    "alaskan standard time": "America/Anchorage",
+    "utc-09": "Etc/GMT+9",
+    "pacific standard time (mexico)": "America/Tijuana",
+    "utc-08": "Etc/GMT+8",
+    "pacific standard time": "America/Los_Angeles",
+    "us mountain standard time": "America/Phoenix",
+    "mountain standard time (mexico)": "America/Mazatlan",
+    "mountain standard time": "America/Denver",
+    "yukon standard time": "America/Whitehorse",
+    "central america standard time": "America/Guatemala",
+    "central standard time": "America/Chicago",
+    "easter island standard time": "Pacific/Easter",
+    "central standard time (mexico)": "America/Mexico_City",
+    "canada central standard time": "America/Regina",
+    "sa pacific standard time": "America/Bogota",
+    "eastern standard time (mexico)": "America/Cancun",
+    "eastern standard time": "America/New_York",
+    "haiti standard time": "America/Port-au-Prince",
+    "cuba standard time": "America/Havana",
+    "us eastern standard time": "America/Indianapolis",
+    "turks and caicos standard time": "America/Grand_Turk",
+    "paraguay standard time": "America/Asuncion",
+    "atlantic standard time": "America/Halifax",
+    "venezuela standard time": "America/Caracas",
+    "central brazilian standard time": "America/Cuiaba",
+    "sa western standard time": "America/La_Paz",
+    "pacific sa standard time": "America/Santiago",
+    "newfoundland standard time": "America/St_Johns",
+    "tocantins standard time": "America/Araguaina",
+    "e. south america standard time": "America/Sao_Paulo",
+    "sa eastern standard time": "America/Cayenne",
+    "argentina standard time": "America/Argentina/Buenos_Aires",
+    "greenland standard time": "America/Nuuk",
+    "montevideo standard time": "America/Montevideo",
+    "magallanes standard time": "America/Punta_Arenas",
+    "saint pierre standard time": "America/Miquelon",
+    "bahia standard time": "America/Bahia",
+    "utc-02": "Etc/GMT+2",
+    "azores standard time": "Atlantic/Azores",
+    "cape verde standard time": "Atlantic/Cape_Verde",
+    "utc": "UTC",
+    "gmt standard time": "Europe/London",
+    "greenwich standard time": "Atlantic/Reykjavik",
+    "sao tome standard time": "Africa/Sao_Tome",
+    "morocco standard time": "Africa/Casablanca",
+    "w. europe standard time": "Europe/Berlin",
+    "central europe standard time": "Europe/Budapest",
+    "romance standard time": "Europe/Paris",
+    "central european standard time": "Europe/Warsaw",
+    "w. central africa standard time": "Africa/Lagos",
+    "jordan standard time": "Asia/Amman",
+    "gtb standard time": "Europe/Bucharest",
+    "middle east standard time": "Asia/Beirut",
+    "egypt standard time": "Africa/Cairo",
+    "e. europe standard time": "Europe/Chisinau",
+    "syria standard time": "Asia/Damascus",
+    "west bank standard time": "Asia/Hebron",
+    "south africa standard time": "Africa/Johannesburg",
+    "fle standard time": "Europe/Kyiv",
+    "israel standard time": "Asia/Jerusalem",
+    "south sudan standard time": "Africa/Juba",
+    "kaliningrad standard time": "Europe/Kaliningrad",
+    "sudan standard time": "Africa/Khartoum",
+    "libya standard time": "Africa/Tripoli",
+    "namibia standard time": "Africa/Windhoek",
+    "arabic standard time": "Asia/Baghdad",
+    "turkey standard time": "Europe/Istanbul",
+    "arab standard time": "Asia/Riyadh",
+    "belarus standard time": "Europe/Minsk",
+    "russian standard time": "Europe/Moscow",
+    "e. africa standard time": "Africa/Nairobi",
+    "iran standard time": "Asia/Tehran",
+    "arabian standard time": "Asia/Dubai",
+    "astrakhan standard time": "Europe/Astrakhan",
+    "azerbaijan standard time": "Asia/Baku",
+    "russia time zone 3": "Europe/Samara",
+    "mauritius standard time": "Indian/Mauritius",
+    "saratov standard time": "Europe/Saratov",
+    "georgian standard time": "Asia/Tbilisi",
+    "volgograd standard time": "Europe/Volgograd",
+    "caucasus standard time": "Asia/Yerevan",
+    "afghanistan standard time": "Asia/Kabul",
+    "west asia standard time": "Asia/Tashkent",
+    "ekaterinburg standard time": "Asia/Yekaterinburg",
+    "pakistan standard time": "Asia/Karachi",
+    "qyzylorda standard time": "Asia/Qyzylorda",
+    "india standard time": "Asia/Kolkata",
+    "sri lanka standard time": "Asia/Colombo",
+    "nepal standard time": "Asia/Kathmandu",
+    "central asia standard time": "Asia/Bishkek",
+    "bangladesh standard time": "Asia/Dhaka",
+    "omsk standard time": "Asia/Omsk",
+    "myanmar standard time": "Asia/Yangon",
+    "se asia standard time": "Asia/Bangkok",
+    "altai standard time": "Asia/Barnaul",
+    "w. mongolia standard time": "Asia/Hovd",
+    "north asia standard time": "Asia/Krasnoyarsk",
+    "n. central asia standard time": "Asia/Novosibirsk",
+    "tomsk standard time": "Asia/Tomsk",
+    "china standard time": "Asia/Shanghai",
+    "north asia east standard time": "Asia/Irkutsk",
+    "singapore standard time": "Asia/Singapore",
+    "w. australia standard time": "Australia/Perth",
+    "taipei standard time": "Asia/Taipei",
+    "ulaanbaatar standard time": "Asia/Ulaanbaatar",
+    "aus central w. standard time": "Australia/Eucla",
+    "transbaikal standard time": "Asia/Chita",
+    "tokyo standard time": "Asia/Tokyo",
+    "north korea standard time": "Asia/Pyongyang",
+    "korea standard time": "Asia/Seoul",
+    "yakutsk standard time": "Asia/Yakutsk",
+    "cen. australia standard time": "Australia/Adelaide",
+    "aus central standard time": "Australia/Darwin",
+    "e. australia standard time": "Australia/Brisbane",
+    "aus eastern standard time": "Australia/Sydney",
+    "west pacific standard time": "Pacific/Port_Moresby",
+    "tasmania standard time": "Australia/Hobart",
+    "vladivostok standard time": "Asia/Vladivostok",
+    "lord howe standard time": "Australia/Lord_Howe",
+    "bougainville standard time": "Pacific/Bougainville",
+    "russia time zone 10": "Asia/Srednekolymsk",
+    "magadan standard time": "Asia/Magadan",
+    "norfolk standard time": "Pacific/Norfolk",
+    "sakhalin standard time": "Asia/Sakhalin",
+    "central pacific standard time": "Pacific/Guadalcanal",
+    "russia time zone 11": "Asia/Kamchatka",
+    "new zealand standard time": "Pacific/Auckland",
+    "utc+12": "Etc/GMT-12",
+    "fiji standard time": "Pacific/Fiji",
+    "chatham islands standard time": "Pacific/Chatham",
+    "utc+13": "Etc/GMT-13",
+    "tonga standard time": "Pacific/Tongatapu",
+    "samoa standard time": "Pacific/Apia",
+    "line islands standard time": "Pacific/Kiritimati",
+}
+
+
 def _tzid_of(params: str) -> ZoneInfo | None:
     """The ``TZID`` parameter as a tzinfo, or ``None`` when absent/unresolvable.
 
@@ -196,13 +355,23 @@ def _tzid_of(params: str) -> ZoneInfo | None:
     if not match:
         return None
     name = match.group(1).strip().strip('"')
-    # Some exporters emit a Windows zone name or a custom VTIMEZONE id, neither of
-    # which is an IANA key.
+    # An IANA key resolves directly. A Windows/CLDR display name -- what Exchange
+    # and Outlook emit (`Romance Standard Time`) -- is not an IANA key, so map it
+    # before giving up; otherwise ``ZoneInfo`` raises and the caller silently reads
+    # the wall-clock time as UTC, a whole-timezone error. A custom VTIMEZONE id that
+    # is neither still degrades to UTC-visible.
     try:
         return ZoneInfo(name)
     except (ZoneInfoNotFoundError, ValueError, OSError):
-        logger.debug("meetings: unknown calendar TZID %r; reading the time as UTC", name)
-        return None
+        pass
+    mapped = _WINDOWS_TO_IANA.get(name.lower())
+    if mapped is not None:
+        try:
+            return ZoneInfo(mapped)
+        except (ZoneInfoNotFoundError, ValueError, OSError):
+            pass
+    logger.debug("meetings: unknown calendar TZID %r; reading the time as UTC", name)
+    return None
 
 
 #: Length of the disambiguating digest appended to a sanitized event id.
@@ -484,6 +653,21 @@ _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 #: Port assumed when a URL omits one. https is the only scheme that reaches the
 #: fetch, so this is the only default needed.
 _DEFAULT_HTTPS_PORT = 443
+#: :class:`link_unfurl.UnfurlRejected` codes in the words this app shows the
+#: operator. Those codes are wire codes for the unfurl endpoint; someone who just
+#: typed a calendar URL needs to know which of the two things is wrong with it,
+#: and "blocked" has to name the port rule as well as the address rule because
+#: the vet refuses anything off 80/443.
+_REJECTION_MESSAGES = {
+    "invalid_url": "calendar URL is malformed",
+    "blocked_url": (
+        "calendar URL was refused: it must resolve to a public address and use "
+        "the standard https port"
+    ),
+}
+#: Used if that module ever grows a third code — a rejection must stay a
+#: rejection, with a message, rather than becoming a KeyError and a 500.
+_UNKNOWN_REJECTION = "calendar URL was refused"
 
 
 @dataclass(frozen=True)
@@ -516,6 +700,10 @@ def _normalize_url(source: str) -> VettedTarget:
     value from turning the sync into a local-file read (``file://``), a
     plaintext hop (``http://``), or an arbitrary-protocol request.
 
+    The scheme rules are this app's; the ADDRESS vet is
+    :func:`link_unfurl.vet_unfurl_url`, reused rather than reimplemented — see the
+    comment at the delegation for what the local copy let through.
+
     Returns a :class:`VettedTarget` carrying the resolved, approved addresses so
     the caller can pin the connection to them — see that class for why the
     address must travel with the URL rather than be re-derived later.
@@ -540,102 +728,86 @@ def _normalize_url(source: str) -> VettedTarget:
         raise CalendarError(
             f"calendar URL must use https:// (got {scheme or 'no'} scheme)"
         )
-    if not parts.hostname:
-        raise CalendarError("calendar URL has no host")
-    url = parts.geturl()
-    # The connector keys its resolution off yarl's `raw_host`/`port` (IDNA-encoded,
-    # lowercased, default port filled in), so the pin must be keyed the same way —
-    # a pin recorded under urlsplit's Unicode hostname would simply never match,
-    # and the connector would fall through to a fresh lookup.
+    # The address vet is `link_unfurl`'s, not a local copy. That module already
+    # owns this problem for the unfurl endpoint, and it is not merely equivalent
+    # to a hand-rolled check here — a local one written for this file missed four
+    # things it covers:
+    #
+    # * `100.64.0.0/10`, the CGNAT range a tailnet and most carrier NAT hand out.
+    #   `is_private` does not cover it; only `is_global` does. On a machine on a
+    #   tailnet, that range IS the private network. Measured: the local check
+    #   approved it.
+    # * `fec0::/10`, deprecated IPv6 site-local, which reports `is_global=True`,
+    #   so an `is_private`-only check approves it. Measured: it did.
+    # * `.local` and `.onion`, which resolve through mDNS or not at all. The local
+    #   check had no suffix rule.
+    # * The alternate IPv4 encodings (`0177.0.0.1`, `0x7f000001`, `2130706433`,
+    #   `127.1`) that the OS resolver accepts but `ipaddress` rejects. These were
+    #   NOT reachable before — getaddrinfo folded them to loopback and the
+    #   private-address rule then caught them — but only because the resolver's
+    #   reading happened to agree with the vet. `canonicalize_ip` makes them
+    #   literals, so the decision stops riding on getaddrinfo's interpretation of
+    #   a string the vet declined to parse.
+    #
+    # Its `test_vet_rejects_every_special_purpose_range` pins the refusal set
+    # against a table of IANA special-purpose prefixes, so the next gap is found
+    # by the suite rather than by a reviewer — which a second implementation here
+    # would not inherit.
+    #
+    # `resolve` is injected for one reason: to KEEP the addresses the vet
+    # approved. `VettedUrl` reports a single `ip`, while the pin below serves
+    # every vetted address so a multi-homed calendar host keeps its fallbacks.
+    # Every address recorded here is one `vet_unfurl_url` checked — it vets the
+    # whole answer, not just the address it keeps.
+    approved: list[str] = []
+
+    def _resolve_and_record(hostname: str, port: int) -> list[str]:
+        infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+        addresses = [str(info[4][0]) for info in infos]
+        for address in addresses:
+            # Refused, not skipped. `_reject_if_internal_ip` returns SILENTLY for
+            # anything that is not an IP literal, because for it a non-literal is
+            # a hostname still to be resolved. Here the list is already a
+            # resolution result, so an unreadable entry is an address that would
+            # reach the pin unchecked. getaddrinfo should never produce one; if it
+            # does, fail closed rather than trust it.
+            try:
+                ipaddress.ip_address(address)
+            except ValueError:
+                raise CalendarError(
+                    "calendar URL resolved to an address that could not be parsed"
+                ) from None
+        approved.extend(addresses)
+        return addresses
+
     try:
-        parsed = URL(url)
-    except ValueError as exc:
-        raise CalendarError("calendar URL is malformed") from exc
-    host = parsed.raw_host
-    if not host:
-        raise CalendarError("calendar URL has no host")
-    addresses = _vet_host_addresses(host)
+        vetted = link_unfurl.vet_unfurl_url(parts.geturl(), resolve=_resolve_and_record)
+    except link_unfurl.UnfurlRejected as exc:
+        raise CalendarError(_REJECTION_MESSAGES.get(exc.code, _UNKNOWN_REJECTION)) from None
+    # The shared vet allows {80, 443} because it also serves plain-http link
+    # unfurling. THIS caller is https-only (``_ALLOWED_SCHEMES``), so the stated
+    # scope is 443 alone — ``https://host:80`` would pass the vet and then fail
+    # the TLS handshake with a message that does not name the cause. Refuse it
+    # here with the same words as the vet's own port rejection. Keyed on the
+    # scheme allow-list rather than hardcoded, because the 443-narrowing is a
+    # CONSEQUENCE of https-only: the rebinding tests that stand up a real local
+    # server widen ``_ALLOWED_SCHEMES`` to http on an ephemeral port, and the
+    # consequence disengages with its cause.
+    if _ALLOWED_SCHEMES == ("https",) and vetted.port != _DEFAULT_HTTPS_PORT:
+        raise CalendarError(_REJECTION_MESSAGES["blocked_url"])
+    # An IP literal never reaches the injected resolver, so fall back to the
+    # canonical form the vet resolved it to.
+    addresses = tuple(dict.fromkeys(approved)) or (vetted.ip,)
     return VettedTarget(
-        url=url,
-        host=host,
-        port=parsed.port or _DEFAULT_HTTPS_PORT,
+        url=vetted.url,
+        # `wire_host`, not `host`: the connector asks its resolver with the
+        # IDNA-encoded form, so that is what the pin must be keyed on. Deriving it
+        # here rather than re-parsing keeps "the pinned host is exactly what the
+        # client asks for" true in one place.
+        host=vetted.wire_host,
+        port=vetted.port,
         addresses=addresses,
     )
-
-
-def _vet_host_addresses(hostname: str) -> tuple[str, ...]:
-    """Resolve *hostname* and return its addresses, or refuse the lot.
-
-    ``calendar.source`` reaches this from a dashboard ``PUT /config`` request and
-    is *fetched by the gateway*, so an internal-only address would make this
-    endpoint a server-side request-forgery hop into the user's own network. A
-    literal IP is checked directly; a name is checked against its resolved
-    addresses.
-
-    **All-or-nothing across a multi-record answer.** A host that answers with a
-    mix of public and private addresses is refused outright rather than filtered
-    down to the public ones: that mix is not a legitimate calendar host, it is
-    the exact signature of a rebinding attempt, and keeping the public record
-    would let an attacker retry until the connector happened to pick the private
-    one. The same rule covers IPv4 and IPv6 — every address in the answer must
-    pass, and the surviving set is what gets pinned.
-    """
-    try:
-        ipaddress.ip_address(hostname)
-        candidates: list[str] = [hostname]
-    except ValueError:
-        try:
-            infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
-        except OSError as exc:
-            raise CalendarError(f"cannot resolve calendar host: {hostname}") from exc
-        candidates = [str(info[4][0]) for info in infos]
-    vetted: list[str] = []
-    for candidate in candidates:
-        # An unparseable address is refused rather than skipped. The old code
-        # `continue`d here, which meant anything getaddrinfo returned in a shape
-        # ipaddress could not read went UNCHECKED — a skipped candidate is an
-        # unvetted one, and it could still have been connected to.
-        #
-        # A scoped link-local ("fe80::1%en0") parses and keeps its scope in `str()`,
-        # so it never reaches the pin: `_refuse_private_address` rejects it as
-        # link-local first.
-        try:
-            addr = ipaddress.ip_address(candidate)
-        except ValueError:
-            raise CalendarError(
-                "calendar URL resolved to an address that could not be parsed"
-            ) from None
-        _refuse_private_address(addr)
-        text = str(addr)
-        if text not in vetted:
-            vetted.append(text)
-    if not vetted:
-        raise CalendarError(f"cannot resolve calendar host: {hostname}")
-    return tuple(vetted)
-
-
-def _refuse_private_address(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> None:
-    """Refuse a loopback/private/link-local/reserved/multicast/unspecified address.
-
-    An IPv4 address embedded in IPv6 — ``::ffff:10.0.0.1`` (v4-mapped) or
-    ``2002:a00:1::`` (6to4) — is judged by the address it embeds, because that is
-    the address the packet ultimately reaches. Without unwrapping, ``is_private``
-    on the v6 form can read as public while the traffic lands inside the network.
-    """
-    for embedded in (getattr(addr, "ipv4_mapped", None), getattr(addr, "sixtofour", None)):
-        if embedded is not None:
-            _refuse_private_address(embedded)
-    if (
-        addr.is_loopback
-        or addr.is_private
-        or addr.is_link_local
-        or addr.is_reserved
-        or addr.is_multicast
-        or addr.is_unspecified
-    ):
-        raise CalendarError(
-            "calendar URL resolves to a private or loopback address, which is not allowed"
-        )
 
 
 class _PinnedResolver(AbstractResolver):
@@ -660,8 +832,8 @@ class _PinnedResolver(AbstractResolver):
     One case never reaches here: aiohttp short-circuits a **literal-IP** URL and
     connects without consulting any resolver. That is sound rather than a gap —
     there is no name to re-resolve, so there is no rebinding window, and
-    :func:`_vet_host_addresses` checked that exact literal against the
-    private-address rules before the request was made.
+    :func:`link_unfurl.vet_unfurl_url` checked that literal, in its canonical
+    form, against the private-address rules before the request was made.
     """
 
     def __init__(self) -> None:

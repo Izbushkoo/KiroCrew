@@ -10,11 +10,14 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import pr_recipe as pr
-from kiro_crew.apps.builtins.auto_improvement.spine.profile import PRRecipe
+from kiro_crew.apps.builtins.auto_improvement.spine.pr_pipeline import CrPipeline
+from kiro_crew.apps.builtins.auto_improvement.spine.profile import PRRecipe, StubPRRecipe
 
 
 def _broken_scanner(_text: str) -> str:
@@ -31,6 +34,144 @@ def _recipe(tmp_path: Path, **kw) -> pr.GitHubPRRecipe:
         base_ref=kw.pop("base_ref", "origin/main"),
         **kw,
     )
+
+
+def test_push_refuses_before_git_when_repository_safety_changed(tmp_path: Path) -> None:
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "init", "-q", str(clone)], check=True)
+    subprocess.run(
+        ["git", "-C", str(clone), "config", "diff.external", "/attacker/host-code"],
+        check=True,
+    )
+    recipe = _recipe(tmp_path)
+    recipe._git = MagicMock()  # type: ignore[method-assign]
+
+    ok, note = recipe._push_fix_branch(branch="auto-improvement/bug-abc")
+
+    assert ok is False
+    assert "isolation changed" in note
+    recipe._git.assert_not_called()
+
+
+def _simulate_legacy_locale(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make omitted ``Path.write_text`` encodings deterministic on every host."""
+    original = Path.write_text
+
+    def write_text(
+        path: Path,
+        data: str,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> int:
+        return original(
+            path,
+            data,
+            encoding="cp1252" if encoding is None else encoding,
+            errors=errors,
+            newline=newline,
+        )
+
+    monkeypatch.setattr(Path, "write_text", write_text)
+
+
+class TestQueueEncoding:
+    """Queue artifacts must preserve agent-authored Unicode on legacy Windows locales."""
+
+    _summary = "fix: 保存候選 🚀"
+    _description = "說明 🧪"
+    _diff = "+新增 🛠️\n"
+
+    def test_github_recipe_writes_utf8(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _simulate_legacy_locale(monkeypatch)
+        monkeypatch.setattr(pr.shutil, "which", lambda _name: None)
+        recipe = _recipe(tmp_path)
+
+        assert (
+            recipe.draft(
+                summary=self._summary,
+                description=self._description,
+                diff=self._diff,
+                fingerprint="github",
+            )
+            == "QUEUED:github"
+        )
+        assert (recipe.pr_queue_dir / "github.diff").read_text(encoding="utf-8") == self._diff
+        assert self._description in (recipe.pr_queue_dir / "github.pr.md").read_text(
+            encoding="utf-8"
+        )
+
+    def test_direct_commit_copy_writes_utf8(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _simulate_legacy_locale(monkeypatch)
+        queue = tmp_path / "direct"
+        pipeline = CrPipeline(ledger=MagicMock(), measurer=MagicMock())
+        profile = SimpleNamespace(pr_recipe=SimpleNamespace(pr_queue_dir=queue))
+
+        pipeline._write_queue_copy(
+            profile=profile,
+            fp="direct",
+            summary=self._summary,
+            description=self._description,
+            diff=self._diff,
+        )
+
+        assert (queue / "direct.diff").read_text(encoding="utf-8") == self._diff
+        assert self._description in (queue / "direct.pr.md").read_text(encoding="utf-8")
+
+    def test_dry_run_recipe_writes_utf8(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _simulate_legacy_locale(monkeypatch)
+        recipe = StubPRRecipe(tmp_path / "stub")
+
+        assert (
+            recipe.draft(
+                summary=self._summary,
+                description=self._description,
+                diff=self._diff,
+                fingerprint="stub",
+            )
+            == "QUEUED:stub"
+        )
+        assert (recipe.queue_dir / "stub.diff").read_text(encoding="utf-8") == self._diff
+        assert self._description in (recipe.queue_dir / "stub.pr.md").read_text(encoding="utf-8")
+
+
+class TestReproduceRepositorySafety:
+    @pytest.mark.parametrize("raises", [False, True])
+    def test_retirement_precedes_reproduce_verdict_or_error(self, raises: bool) -> None:
+        ledger = MagicMock()
+        ledger.status_of.return_value = None
+        measurer = MagicMock()
+        if raises:
+            measurer.reproduce.side_effect = RuntimeError("gate failed")
+        else:
+            measurer.reproduce.return_value = MagicMock()
+        retire = MagicMock(return_value=True)
+        pipeline = CrPipeline(
+            ledger=ledger,
+            measurer=measurer,
+            retire_if_unsafe=retire,
+        )
+        winner = SimpleNamespace(candidate=SimpleNamespace(kind="perf", target="parser"))
+
+        outcome = pipeline.emit_perf(
+            profile=MagicMock(),
+            winner=winner,  # type: ignore[arg-type]
+            verify=MagicMock(),
+            cycle=1,
+            gated_commit_sha="abc",
+            diff_ref="diff",
+            base_anchor="main @ abc",
+        )
+
+        assert outcome.repository_retired is True
+        assert outcome.filed is False and outcome.committed_ready is False
+        retire.assert_called_once_with("reproduce")
 
 
 class TestProtocolConformance:
@@ -341,6 +482,7 @@ class TestPushedContentIsScanned:
         from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import pr_recipe as PR
 
         recipe = _recipe(tmp_path)
+        _simulate_legacy_locale(monkeypatch)
 
         gh_calls: list[list[str]] = []
         monkeypatch.setattr(PR.subprocess, "run", lambda argv, **kw: gh_calls.append(argv))
@@ -351,16 +493,20 @@ class TestPushedContentIsScanned:
         monkeypatch.setattr(security_mod, "redact", _broken_scanner)
         out = recipe.draft(
             fingerprint="fp-unscannable",
-            summary="fix: something",
-            description="body with aws_access_key_id=AKIAIOSFODNN7EXAMPLE",
-            diff="--- a\n+++ b\n",
+            summary="fix: 保存候選 🚀",
+            description="說明 🧪 with aws_access_key_id=AKIAIOSFODNN7EXAMPLE",
+            diff="--- a\n+++ b\n+新增 🛠️\n",
         )
 
         assert out == "QUEUED:fp-unscannable", f"it published anyway: {out!r}"
         assert gh_calls == [], "gh was invoked with unscanned prose"
         # The evidence still survives on disk for the human.
-        assert (recipe.pr_queue_dir / "fp-unscannable.pr.md").is_file()
-        assert (recipe.pr_queue_dir / "fp-unscannable.diff").is_file()
+        assert "說明 🧪" in (recipe.pr_queue_dir / "fp-unscannable.pr.md").read_text(
+            encoding="utf-8"
+        )
+        assert "新增 🛠️" in (recipe.pr_queue_dir / "fp-unscannable.diff").read_text(
+            encoding="utf-8"
+        )
 
 
 class TestEveryPushPathScansContent:
@@ -384,6 +530,8 @@ class TestEveryPushPathScansContent:
         ):
             src = (root / rel).read_text(encoding="utf-8")
             assert "scan_content_for_secrets" in src, f"{rel} does not scan pushed content"
+            assert "--no-ext-diff" in src, f"{rel} permits external diff execution"
+            assert "diff.external=" in src, f"{rel} does not clear the external diff helper"
             # No path may re-import the raw scanners and hand-roll the decision.
             assert "redact_credentials" not in src, f"{rel} should delegate, not re-implement"
 
@@ -862,6 +1010,7 @@ class TestTrustedPublisherStillWorksAfterNeutralizing:
         assert recipe._resolve_fetch_url() is None, "a neutralized clone must not yield a target"
 
 
+@pytest.mark.usefixtures("_public_dns")
 class TestOriginUrlMigratesOldConfigs:
     """Neutralizing BOTH clone urls means the trusted publishers can no longer read the
     remote out of git — they take it from config's ``origin_url``. A config written before
@@ -870,6 +1019,11 @@ class TestOriginUrlMigratesOldConfigs:
     Found by inspecting the live dogfood configs on this host: both had ``clone`` set and
     no ``origin_url``. Without a migration they would silently degrade to queue-only after
     an upgrade, so the resolver falls back to the retained ``target_url``.
+
+    Every case runs through ``resolve_origin_url`` -> ``validate_target_url``, whose
+    SSRF screen resolves the host live and fails closed on resolver errors — so DNS is
+    pinned (the shared ``_public_dns`` fixture) and the refusal cases below fail for
+    the allowlist/identity reason they assert, never for a resolver hiccup.
     """
 
     def test_a_config_without_origin_url_still_resolves_a_target(self) -> None:

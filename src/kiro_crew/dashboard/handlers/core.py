@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import hmac
-import importlib.util
 import json
 import logging
 import math
@@ -14,43 +13,93 @@ import platform
 import re
 import shlex
 import shutil
-import subprocess
-import sys
-import sysconfig
+from collections.abc import Coroutine
 from pathlib import Path
+from typing import Any
 
 from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 
 import kiro_crew
-from kiro_crew import beacon, platform_compat
+from kiro_crew import beacon, platform_compat, stt
+from kiro_crew.acp_backends import selectable_backend_values
 from kiro_crew.computer_use.types import MAX_SCREENSHOT_MAX_PX as _CU_MAX_SCREENSHOT_MAX_PX
 from kiro_crew.computer_use.types import MAX_TREE_NODES_LIMIT as _CU_MAX_TREE_NODES_LIMIT
 from kiro_crew.computer_use.types import MIN_SCREENSHOT_MAX_PX as _CU_MIN_SCREENSHOT_MAX_PX
 from kiro_crew.config.loader import (
     _VALID_STT_PROVIDERS,
+    AUTO_INGEST_CHUNK_BUDGET_MAX,
+    AUTOCOMPACT_PCT_MAX,
+    AUTOCOMPACT_PCT_MIN,
+    COMPLETION_KEEP_CHARS_MIN,
+    DEDUP_EVERY_N_SWEEPS_MAX,
+    EMBED_RATE_LIMIT_MAX,
+    EXTRACTION_POOL_SIZE_MAX,
+    EXTRACTION_POOL_SIZE_MIN,
+    FOLDER_INGEST_CHUNK_BUDGET_MAX,
+    KNOWLEDGE_MAX_SOURCES_MAX,
     MAX_SUBAGENTS_FIXED_FLOOR,
+    MCP_PROBE_TIMEOUT_MAX,
+    MCP_PROBE_TIMEOUT_MIN,
+    POOL_TTL_SECS_MAX,
+    POOL_TTL_SECS_MIN,
+    RECENT_TINT_COUNT_MAX,
+    RECENT_TINT_COUNT_MIN,
+    SESSION_TIMEOUT_MAX,
+    SESSION_TIMEOUT_MIN,
+    SOFT_STOP_BUDGET_MAX,
+    SOFT_STOP_BUDGET_MIN,
     SUBAGENT_AUTO_MAX_CEILING,
     SUBAGENT_MAX_TURNS_CEILING,
+    SWEEP_CHUNK_BUDGET_MAX,
     KiroCrewConfig,
     config_path,
 )
 from kiro_crew.context_management import RESULT_FILE_MAX_BYTES
+from kiro_crew.dashboard.handlers._shared import (
+    _pip_install_channel_available,
+    pip_extra_install_command,
+)
 from kiro_crew.dashboard.origin import check_host, is_direct_local_request
 from kiro_crew.dashboard.state import DashboardState
-from kiro_crew.dashboard.stt_stream import _STREAMING_PROVIDERS
+from kiro_crew.dashboard.stt_stream import _STREAMING_PROVIDERS, PROVIDER_LOCAL
 from kiro_crew.dashboard.token_auth import MAX_SESSION_TTL_SECS, generate_token, parse_duration
 from kiro_crew.effort import EFFORT_LEVELS
 from kiro_crew.executors import discovery_executor
 from kiro_crew.metrics import provider as _metrics_provider
 from kiro_crew.security_posture import build_posture_snapshot_async, posture_counts_async
-from kiro_crew.transcribe import BREW_PATH_DIRS, ensure_ffmpeg_in_path, find_brew, is_available
+from kiro_crew.stt import models as stt_models
+from kiro_crew.stt.limits import (
+    MAX_IDLE_EVICT_SECS,
+    MAX_INTERVAL_MS,
+    MIN_IDLE_EVICT_SECS,
+    MIN_PARTIAL_INTERVAL_MS,
+    MIN_SILENCE_MS,
+)
+from kiro_crew.transcribe import (
+    _find_ffmpeg,
+    _whisper_language,
+    availability_detail,
+    ensure_ffmpeg_in_path,
+    is_available,
+)
 
 logger = logging.getLogger(__name__)
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
 _DIST_DIR = _STATIC_DIR / "dist"
 _DIST_INDEX = _DIST_DIR / "index.html"
+# mtime-keyed cache of the SPA shell HTML.  Each request stat()s _DIST_INDEX
+# (cheap) and re-reads the file only when its mtime_ns differs from the cached
+# key, so a Vite rebuild that rewrites index.html (new hashed asset refs) is
+# picked up on the very next request WITHOUT a gateway restart — the cache
+# never pins a pre-rebuild shell.  A missing-then-present bundle also self-heals
+# because a FileNotFoundError is never cached.  The stat replaces a full
+# read_text of the bundle on the hot path, which is the win.
+# SECURITY CONTRACT: the cached value must stay ``None`` or equal the static,
+# secret-free bundle — never inject per-request/dynamic data.  Pinned by
+# test_served_shell_is_auth_independent.
+_INDEX_HTML_CACHE: tuple[int, str] | None = None
 _SSE_INTERVAL_SECS = 5
 
 # Sentinel returned in place of sensitive config values in API responses. Kept
@@ -144,6 +193,29 @@ def _sel():
 # ── Page ──
 
 
+def _resolve_index_html() -> str:
+    """Return the SPA shell HTML, using the mtime-keyed cache.
+
+    Runs entirely in a worker thread (see ``index``): performs the blocking
+    ``stat()`` and, only on first load or after a rebuild changed the mtime, the
+    blocking ``read_text()``. A ``FileNotFoundError`` returns the static fallback
+    and is never cached, so a transiently-absent dist self-heals on the next
+    request (e.g. after a dev build). SECURITY CONTRACT: the cached value is
+    solely the on-disk bundle — never per-request/dynamic data.
+    """
+    global _INDEX_HTML_CACHE
+    try:
+        mtime = _DIST_INDEX.stat().st_mtime_ns
+        cached = _INDEX_HTML_CACHE
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        html = _DIST_INDEX.read_text(encoding="utf-8")
+        _INDEX_HTML_CACHE = (mtime, html)
+        return html
+    except FileNotFoundError:
+        return _DASHBOARD_HTML_NOT_FOUND
+
+
 async def index(request: web.Request) -> web.Response:
     """Serve the React dashboard SPA shell (``static/dist/index.html``).
 
@@ -162,10 +234,16 @@ async def index(request: web.Request) -> web.Response:
     would leak it across the auth boundary. Keep dynamic data behind gated
     ``/api/*`` routes. Pinned by test_served_shell_is_auth_independent.
     """
-    try:
-        html = _DIST_INDEX.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        html = _DASHBOARD_HTML_NOT_FOUND
+    # Resolve the shell entirely off the event loop: the stat() + conditional
+    # read_text() are the only blocking calls, and even a bare stat() can stall
+    # the loop on slow/network-backed storage. Route through the dedicated
+    # discovery_executor rather than the shared default thread pool: index() is
+    # served UNAUTHENTICATED on the cold-start path, so a remote SPA GET flood on
+    # slow storage must not be able to saturate the pool other gateway work
+    # (DNS, etc.) depends on. The mtime cache still serves repeat requests
+    # without a read.
+    loop = asyncio.get_running_loop()
+    html = await loop.run_in_executor(discovery_executor(), _resolve_index_html)
     return web.Response(text=html, content_type="text/html")
 
 
@@ -434,71 +512,25 @@ async def pwa_file(request: web.Request) -> web.StreamResponse:
 # ── STT (Speech-to-Text) ──
 
 
-_STT_MODEL_SIZES: dict[str, str] = {
-    "turbo": "~1.6 GB",
-}
-
-# Curated MLX model repos surfaced in the STT picker and accepted on PUT.
-# Maps Hugging Face repo -> approximate on-disk download size.
-_STT_MLX_MODELS: dict[str, str] = {
-    "mlx-community/whisper-large-v3-turbo": "~809 MB",
-}
-
-# Curated parakeet-mlx model repos surfaced in the STT picker and accepted on
-# PUT. Maps Hugging Face repo -> approximate on-disk download size. Parakeet TDT
-# 0.6b v3 is multilingual (25 languages) and streams far faster than Whisper for
-# a fraction of the RAM, which is why it is the default.
-_STT_PARAKEET_MODELS: dict[str, str] = {
-    "mlx-community/parakeet-tdt-0.6b-v3": "~600 MB",
-}
-
-
-def _is_apple_silicon() -> bool:
-    """True if running on Apple Silicon hardware.
-
-    ``platform.machine()`` reports ``x86_64`` when the interpreter runs under
-    Rosetta 2 — which KiroCrew's bundled Python does — so it cannot be used to
-    detect the host CPU. The ``hw.optional.arm64`` sysctl reports the true
-    hardware capability regardless of translation.
-    """
-    if platform.system() != "Darwin":
-        return False
-    if platform.machine() == "arm64":
-        return True
-    try:
-        out = subprocess.run(
-            ["sysctl", "-n", "hw.optional.arm64"],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-        return out.stdout.strip() == "1"
-    except (OSError, subprocess.SubprocessError):
-        return False
+#: Speech models accepted on PUT, mapped to their download size in BYTES — the
+#: number that actually decides the choice on a laptop. DERIVED from the
+#: sha256-pinned catalog rather than restated, so a model the recogniser can fetch
+#: cannot be rejected by the API (or the reverse). Bytes rather than a formatted
+#: label because the dashboard is translated into 12 languages: a server-side
+#: "~148 MB" cannot follow the reader's locale, and the frontend formats it.
+_STT_MODEL_SIZES: dict[str, int] = {m.name: m.size_bytes for m in stt_models.CATALOG}
 
 
 def _stt_providers() -> list[str]:
     """STT provider values offered to the UI.
 
-    ``mlx`` (Whisper on Apple's MLX framework) only runs on Apple Silicon, and
-    ``apple`` (the on-device SpeechAnalyzer framework) needs macOS 26 or later plus
-    a Swift toolchain — both are omitted entirely elsewhere rather than being shown
-    as unusable options. ``parakeet`` (NVIDIA Parakeet via parakeet-mlx) is likewise
-    Apple-Silicon-only and gated the same way as ``mlx``. This is the single source
-    of truth for which providers are advertised (GET) and accepted (PUT).
+    ``local`` (the resident whisper.cpp recogniser) and ``transcribe`` (paid AWS)
+    run everywhere. ``apple`` (the on-device SpeechAnalyzer framework) needs
+    macOS 26 or later plus a Swift toolchain, so it is omitted entirely rather
+    than shown as an option that cannot be selected. This is the single source of
+    truth for which providers are advertised (GET) and accepted (PUT).
     """
     providers = list(_VALID_STT_PROVIDERS)
-    is_apple_silicon = _is_apple_silicon()
-    if not is_apple_silicon and "mlx" in providers:
-        providers.remove("mlx")
-    # `parakeet` shares the exact same Apple-Silicon gate as `mlx`. Reuse the
-    # result computed above rather than calling `_is_apple_silicon()` again —
-    # off Apple Silicon (e.g. under Rosetta) that call shells out to `sysctl`
-    # synchronously, and `_stt_providers()` runs on the dashboard's event loop
-    # (GET/PUT /api/config/stt), so a second call doubles that blocking cost
-    # on every request.
-    if not is_apple_silicon and "parakeet" in providers:
-        providers.remove("parakeet")
     if "apple" in providers:
         from kiro_crew import apple_speech
 
@@ -526,7 +558,80 @@ _STT_LANGUAGE_CODES: tuple[str, ...] = (
 )
 
 
-_stt_install_status: dict[str, str] = {"step": "idle", "detail": "", "error": ""}
+#: Machine-readable reasons on the STT endpoints' non-2xx bodies. The dashboard
+#: renders localised text and cannot key off an English sentence, so the prose is
+#: advisory and these are the contract. Codes the stt package already owns
+#: (``stt_extra_missing``, ``stt_model_missing``, …) are forwarded unchanged.
+_CODE_DASHBOARD_USER_REQUIRED = "dashboard_user_required"
+_CODE_STT_UNAVAILABLE = "stt_unavailable"
+_CODE_STT_MISSING_AUDIO = "stt_missing_audio_field"
+_CODE_STT_AUDIO_TOO_LARGE = "stt_audio_too_large"
+_CODE_STT_FAILED = "stt_transcription_failed"
+
+#: Background model-download and prewarm tasks, held ONLY so the loop keeps a
+#: strong reference: a task nobody references can be collected mid-await. Both
+#: endpoints answer 202 and let the caller poll ``GET /api/stt/status``, because
+#: the whole point of the pair is that a 148 MB fetch is not on the request the
+#: user is waiting behind.
+_stt_background_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _spawn_stt_background(coro: Coroutine[Any, Any, Any]) -> None:
+    """Run *coro* detached, keeping a reference until it finishes."""
+    task = asyncio.create_task(coro)
+    _stt_background_tasks.add(task)
+    task.add_done_callback(_stt_background_tasks.discard)
+
+
+def _deny_app_token(request: web.Request, operation: str) -> web.Response | None:
+    """Refuse an app token on the dashboard-only STT endpoints. 403 or None.
+
+    ``request["user"]`` is truthy for an app token too, so a cookie check alone
+    does not separate a browser from an app that declared this path in its
+    manifest's ``permissions.api``. These endpoints start a model download and
+    warm a resident model inside the gateway, which is operator setup rather than
+    something an app earns by naming a path. The live transcription surfaces
+    (``/api/ws/stt``, ``POST /api/stt/transcribe``) are deliberately NOT gated
+    this way: shipped apps reach them on an app token.
+
+    An absent ``app`` key is refused along with a non-empty one, so an
+    unauthenticated route can only ever fail closed here.
+    """
+    if request.get("app") == "":
+        return None
+    # Best-effort: an unwrapped SEL failure here would replace the intended 403
+    # with a 500, which is the one outcome a refusal must never turn into.
+    try:
+        _sel().log_api_access(
+            caller=str(request.get("app") or request.get("user") or "unknown"),
+            operation=operation,
+            outcome="denied",
+            source="dashboard",
+            resources=request.path,
+            error="dashboard user required",
+        )
+    except Exception:
+        logger.warning("SEL logging failed for %s", operation, exc_info=True)
+    return web.json_response(
+        {"error": "dashboard user required", "code": _CODE_DASHBOARD_USER_REQUIRED},
+        status=403,
+    )
+
+
+def _stt_positive_int(body: dict, key: str, *, minimum: int, maximum: int) -> int | None:
+    """*body*'s value for *key* when it is an int inside the range, else None.
+
+    Both ends are required rather than defaulted, because a knob accepted here and
+    then clamped by the config loader is worse than one refused: the value the user
+    reads back would not be the value in force.
+
+    ``bool`` is excluded explicitly because it subclasses ``int``: without the
+    check a client sending a checkbox value would persist ``True`` as ``1``.
+    """
+    value = body.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None
+    return value if minimum <= value <= maximum else None
 
 
 async def api_stt_config(request: web.Request) -> web.Response:
@@ -560,76 +665,102 @@ async def api_stt_config(request: web.Request) -> web.Response:
                 # unparseable config instead of silently resetting it.
                 logger.warning("STT config PUT: config.json is unparseable", exc_info=True)
                 return web.json_response({"error": "failed to read config file"}, status=500)
-            stt = data.setdefault("stt", {})
+            stt_section = data.setdefault("stt", {})
             if "enabled" in body:
-                stt["enabled"] = bool(body["enabled"])
-            if "provider" in body and body["provider"] in _stt_providers():
-                stt["provider"] = body["provider"]
-            if "model" in body and body["model"] in _STT_MODEL_SIZES:
-                stt["model"] = body["model"]
+                stt_section["enabled"] = bool(body["enabled"])
+            # Guard the type before either membership lookup.  The model catalog
+            # is a dict, so a JSON object or array would otherwise raise
+            # ``TypeError: unhashable type`` and turn this partial update into a
+            # 500.  Wrong-typed fields follow the existing config contract: skip
+            # that field while still applying valid siblings.
             if (
-                "mlx_model" in body
-                and isinstance(body["mlx_model"], str)
-                and body["mlx_model"] in _STT_MLX_MODELS
+                "provider" in body
+                and isinstance(body["provider"], str)
+                and body["provider"] in _stt_providers()
             ):
-                stt["mlx_model"] = body["mlx_model"]
+                stt_section["provider"] = body["provider"]
             if (
-                "parakeet_model" in body
-                and isinstance(body["parakeet_model"], str)
-                and body["parakeet_model"] in _STT_PARAKEET_MODELS
+                "model" in body
+                and isinstance(body["model"], str)
+                and body["model"] in _STT_MODEL_SIZES
             ):
-                stt["parakeet_model"] = body["parakeet_model"]
+                stt_section["model"] = body["model"]
             if "transcribe_region" in body and isinstance(body["transcribe_region"], str):
-                stt["transcribe_region"] = body["transcribe_region"]
+                stt_section["transcribe_region"] = body["transcribe_region"]
             if "transcribe_profile" in body and isinstance(body["transcribe_profile"], str):
-                stt["transcribe_profile"] = body["transcribe_profile"]
+                stt_section["transcribe_profile"] = body["transcribe_profile"]
             if "language_code" in body and isinstance(body["language_code"], str):
-                stt["language_code"] = body["language_code"]
+                stt_section["language_code"] = body["language_code"]
             if "streaming" in body and isinstance(body["streaming"], bool):
-                stt["streaming"] = body["streaming"]
+                stt_section["streaming"] = body["streaming"]
             if "endpointing" in body and isinstance(body["endpointing"], bool):
-                stt["endpointing"] = body["endpointing"]
+                stt_section["endpointing"] = body["endpointing"]
             if "dictation_panel" in body and isinstance(body["dictation_panel"], bool):
-                stt["dictation_panel"] = body["dictation_panel"]
+                stt_section["dictation_panel"] = body["dictation_panel"]
             if "openai_api_key" in body and isinstance(body["openai_api_key"], str):
-                stt["openai_api_key"] = body["openai_api_key"]
+                stt_section["openai_api_key"] = body["openai_api_key"]
             if "openai_model" in body and isinstance(body["openai_model"], str):
-                stt["openai_model"] = body["openai_model"]
+                stt_section["openai_model"] = body["openai_model"]
+            silence_ms = _stt_positive_int(
+                body, "silence_ms", minimum=MIN_SILENCE_MS, maximum=MAX_INTERVAL_MS
+            )
+            if silence_ms is not None:
+                stt_section["silence_ms"] = silence_ms
+            partial_interval = _stt_positive_int(
+                body,
+                "partial_interval_ms",
+                minimum=MIN_PARTIAL_INTERVAL_MS,
+                maximum=MAX_INTERVAL_MS,
+            )
+            if partial_interval is not None:
+                stt_section["partial_interval_ms"] = partial_interval
+            idle_evict = _stt_positive_int(
+                body,
+                "idle_evict_secs",
+                minimum=MIN_IDLE_EVICT_SECS,
+                maximum=MAX_IDLE_EVICT_SECS,
+            )
+            if idle_evict is not None:
+                stt_section["idle_evict_secs"] = idle_evict
             await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
             await asyncio.to_thread(_atomic_json_write, path, data)
         cfg = KiroCrewConfig.load()
 
     provider = cfg.stt.provider
-    available = is_available(cfg.stt)
-    # _stt_prereq_commands probes for a system python/brew via subprocess; run it
-    # off the event loop so a slow/again-spawned interpreter check can't stall the
-    # gateway (observed as "event-loop heartbeat: lag" on Windows where the probe
-    # is heavier). The GET is read-only, so threading it is safe. The ffmpeg and
-    # install-channel probes ride in the same thread: ensure_ffmpeg_in_path,
-    # find_spec and the PEP 668 marker check all touch the filesystem, which
-    # does not belong on the loop either.
+    # Every probe below touches the filesystem or imports an optional extra, so
+    # none of them belongs on the event loop, and they ride one thread rather than
+    # several: _stt_prereq_commands resolves ffmpeg and Homebrew, the
+    # install-channel probe reads the PEP 668 marker, and availability_detail
+    # imports the recogniser (`local`) or the AWS client (`transcribe`). Leaving
+    # the availability probe out of the thread would put the heaviest one of the
+    # set outside the thread that exists to hold the lighter ones. Windows was
+    # where this first showed up, as "event-loop heartbeat: lag".
 
-    def _prereqs_and_probes() -> tuple[list[str], bool, bool, bool]:
+    def _prereqs_and_probes() -> tuple[list[str], bool, bool, bool, bool]:
         cmds = _stt_prereq_commands(provider)
         ensure_ffmpeg_in_path()
-        no_ffmpeg = shutil.which("ffmpeg") is None
-        unsupported = not _voice_extra_importable() and not _pip_install_channel_available()
+        # `_find_ffmpeg`, not a bare `which`: the settings panel must report on the
+        # binary the transcode path would actually run, and that one ignores PATH.
+        no_ffmpeg = _find_ffmpeg() is None
+        unsupported = not _transcribe_extra_importable() and not _pip_install_channel_available()
         # The bundled desktop app is the one unsupported cause with different
         # user guidance (no Python environment of the user's own to fix), so
         # the UI needs to distinguish it from the pip-less/PEP 668 causes.
         bundled = platform_compat.is_bundled_interpreter()
-        return cmds, no_ffmpeg, unsupported, bundled
+        return cmds, no_ffmpeg, unsupported, bundled, is_available(cfg.stt)
 
-    prereqs, ffmpeg_missing, transcribe_unsupported, bundled_app = await asyncio.to_thread(
-        _prereqs_and_probes
-    )
+    (
+        prereqs,
+        ffmpeg_missing,
+        transcribe_unsupported,
+        bundled_app,
+        available,
+    ) = await asyncio.to_thread(_prereqs_and_probes)
     return web.json_response(
         {
             "enabled": cfg.stt.enabled,
             "provider": provider,
             "model": cfg.stt.model,
-            "mlx_model": cfg.stt.mlx_model,
-            "parakeet_model": cfg.stt.parakeet_model,
             "available": available,
             "streaming": cfg.stt.streaming,
             "endpointing": cfg.stt.endpointing,
@@ -639,9 +770,10 @@ async def api_stt_config(request: web.Request) -> web.Response:
             "language_code": cfg.stt.language_code,
             "openai_api_key": cfg.stt.openai_api_key,
             "openai_model": cfg.stt.openai_model,
+            "silence_ms": cfg.stt.silence_ms,
+            "partial_interval_ms": cfg.stt.partial_interval_ms,
+            "idle_evict_secs": cfg.stt.idle_evict_secs,
             "models": _STT_MODEL_SIZES,
-            "mlx_models": _STT_MLX_MODELS,
-            "parakeet_models": _STT_PARAKEET_MODELS,
             "providers": _stt_providers(),
             # Which of those providers can stream partial results. Served from the
             # backend's own `_STREAMING_PROVIDERS` so the Settings UI gates the
@@ -649,9 +781,6 @@ async def api_stt_config(request: web.Request) -> web.Response:
             # name — the latter silently hid the toggle when `apple` was added.
             "streaming_providers": list(_STREAMING_PROVIDERS),
             "language_codes": list(_STT_LANGUAGE_CODES),
-            "install_step": _stt_install_status["step"],
-            "install_detail": _stt_install_status["detail"],
-            "install_error": _stt_install_status["error"],
             "prereqs": prereqs,
             # True when no install channel can make Transcribe's import
             # requirement (`boto3` + `amazon-transcribe`) satisfiable in this
@@ -662,18 +791,138 @@ async def api_stt_config(request: web.Request) -> web.Response:
             # filesystem.
             "transcribe_unsupported": transcribe_unsupported,
             "bundled_interpreter": bundled_app,
-            # ffmpeg is required to remux the browser's .webm for the
-            # non-streaming path, but is_available() only logs a warning when
-            # it is absent — so availability can read "ready" while dictation
-            # would fail. Served separately so the UI can surface the gap even
-            # when the provider is otherwise available.
+            # ffmpeg is required to decode the browser's .webm on the batch upload
+            # path, but is_available() only logs a warning when it is absent — so
+            # availability can read "ready" while an upload would fail. Served
+            # separately so the UI can surface the gap even when the provider is
+            # otherwise available.
             "ffmpeg_missing": ffmpeg_missing,
         }
     )
 
 
-def _voice_extra_importable() -> bool:
-    """True when the ``voice`` extra actually imported in this process.
+async def api_stt_status(request: web.Request) -> web.Response:
+    """GET /api/stt/status — whether speech recognition can run, and what it needs.
+
+    Distinct from ``GET /api/config/stt``, which serves the operator's settings:
+    this is the runtime state a panel polls — the availability reason as a code
+    rather than prose, whether the configured model is on disk, whether a model is
+    resident right now, and the live progress of a transfer started by
+    ``POST /api/stt/prepare``.
+    """
+    denied = _deny_app_token(request, "stt.status")
+    if denied is not None:
+        return denied
+    cfg = KiroCrewConfig.load()
+    model = stt_models.resolve(cfg.stt.model)
+
+    # availability_detail imports the recogniser (or the AWS client), and each
+    # is_present stats a model file: none of it belongs on the loop.
+    def _probe() -> tuple[stt.Availability, list[dict[str, object]], bool]:
+        # kiro_crew.stt.engine is imported HERE rather than at module scope: it
+        # pulls numpy, and this module is imported on the gateway boot path, where
+        # a gateway with speech-to-text switched off would otherwise pay for an
+        # array library before it binds its socket.
+        from kiro_crew.stt import engine as stt_engine
+
+        catalog = [
+            {"name": m.name, "size_bytes": m.size_bytes, "present": stt_models.is_present(m)}
+            for m in stt_models.CATALOG
+        ]
+        return availability_detail(cfg.stt), catalog, stt_engine.shared_engine().loaded
+
+    detail, catalog, engine_loaded = await asyncio.to_thread(_probe)
+    present = {str(row["name"]): bool(row["present"]) for row in catalog}
+    return web.json_response(
+        {
+            "provider": cfg.stt.provider,
+            "available": detail.ok,
+            "code": detail.code,
+            "detail": detail.detail,
+            "model": model.name,
+            "model_present": present.get(model.name, False),
+            "model_bytes": model.size_bytes,
+            # The whole catalog, in the order the picker offers it (smallest
+            # first), with sizes as bytes so the dashboard formats them in the
+            # reader's locale. `present` is why this cannot be a static frontend
+            # table: it is per-host state that changes as models are fetched.
+            "models": catalog,
+            # Whether a model is resident in this process, which is what decides
+            # between a 30 ms transcription and one that pays a load first.
+            "engine_loaded": engine_loaded,
+            "download": dict(stt_models.store().status),
+        }
+    )
+
+
+async def api_stt_prepare(request: web.Request) -> web.Response:
+    """POST /api/stt/prepare — start, or join, the one-time speech-model download.
+
+    Answers 202 immediately with the current transfer state; the caller polls
+    ``GET /api/stt/status`` for progress. Concurrent callers share one transfer:
+    the model store serialises them behind its own lock, so pressing this twice
+    cannot start two downloads of the same file.
+
+    An optional ``{"model": name}`` body fetches a model the operator has not
+    saved yet, so the picker can offer the weights BEFORE the selection is
+    committed. Only catalog names reach the network: an unknown one resolves to
+    the default with a logged reason, the same as the configured value does.
+    """
+    denied = _deny_app_token(request, "stt.prepare")
+    if denied is not None:
+        return denied
+    cfg = KiroCrewConfig.load()
+    try:
+        body = await request.json()
+    except Exception:
+        # No body, or an unparseable one. Both mean "the configured model", which
+        # is the only reading that makes this endpoint useful without a client.
+        body = {}
+    requested = body.get("model") if isinstance(body, dict) else None
+    name = requested if isinstance(requested, str) and requested else cfg.stt.model
+    model = stt_models.resolve(name)
+    if stt_models.store().status.get("step") != "downloading":
+        # Skipped while a transfer is already running purely so a polling panel
+        # cannot accumulate tasks; the store's lock, not this check, is what makes
+        # concurrent callers safe.
+        _spawn_stt_background(stt.ensure_model(name))
+    return web.json_response(
+        {"model": model.name, "download": dict(stt_models.store().status)}, status=202
+    )
+
+
+async def api_stt_prewarm(request: web.Request) -> web.Response:
+    """POST /api/stt/prewarm — load and warm the recogniser ahead of the microphone.
+
+    Fire-and-forget, and called when the user reaches for the mic rather than when
+    they release it: a first-ever model load compiles a GPU pipeline (measured at
+    7.4 s) and the first decode after any load allocates its graph (154-528 ms), so
+    both are paid while the user is still speaking instead of after.
+    """
+    denied = _deny_app_token(request, "stt.prewarm")
+    if denied is not None:
+        return denied
+    cfg = KiroCrewConfig.load()
+    if cfg.stt.provider != PROVIDER_LOCAL:
+        # Prewarming is specific to the resident whisper.cpp model. Running it under
+        # `apple` or `transcribe` loaded — and on a first run DOWNLOADED — 148 MB of
+        # weights the configured provider will never decode with, triggered by
+        # nothing more than the user reaching for the microphone.
+        return web.json_response(
+            {"ok": True, "skipped": "provider_not_local"},
+            status=202,
+        )
+    _spawn_stt_background(
+        stt.prewarm(
+            model_name=cfg.stt.model,
+            language=_whisper_language(cfg.stt.language_code),
+        )
+    )
+    return web.json_response({"ok": True}, status=202)
+
+
+def _transcribe_extra_importable() -> bool:
+    """True when AWS Transcribe's half of the ``voice`` extra imported here.
 
     Reads ``kiro_crew.transcribe``'s own import outcome (its module-level
     try/except sets ``boto3 = None`` on failure) rather than probing specs: a
@@ -693,41 +942,10 @@ def _voice_extra_importable() -> bool:
     return True
 
 
-def _pip_install_channel_available() -> bool:
-    """True when ``<gateway python> -m pip install`` can plausibly succeed.
-
-    Three environments make that command a guaranteed dead end, and surfacing
-    it there recreates the press-and-nothing-changes failure this surface
-    exists to avoid:
-
-    - the desktop app's bundled interpreter (see
-      :func:`platform_compat.is_bundled_interpreter`): pip may exist, but a
-      pip install writes into the code-signed bundle — breaking launches and
-      updates — and is discarded on every app update;
-    - an interpreter without the ``pip`` module (uv tool installs, some
-      pipx layouts);
-    - a PEP 668 externally-managed interpreter (distro/brew pythons), where
-      pip refuses to install. Checked only outside a venv: inside one, pip
-      works and deliberately ignores the marker, so a venv returns True.
-    """
-    if platform_compat.is_bundled_interpreter():
-        return False
-    if importlib.util.find_spec("pip") is None:
-        return False
-    # PEP 668 applies to the environment pip would install into. Inside a venv
-    # pip deliberately ignores the marker, and `sysconfig.get_path("stdlib")`
-    # resolves to the BASE interpreter's directory — where distro/brew pythons
-    # place it — so checking it from a venv would misfire on the recommended
-    # install layout (venv on a Debian/Ubuntu/Homebrew python).
-    if sys.prefix != sys.base_prefix:
-        return True
-    return not (Path(sysconfig.get_path("stdlib")) / "EXTERNALLY-MANAGED").exists()
-
-
 def _ffmpeg_install_commands() -> list[str]:
-    """Platform command(s) that put ffmpeg on PATH, or ``[]`` when it already is."""
+    """System-decoder fallback for source installs without the ``voice`` extra."""
     ensure_ffmpeg_in_path()
-    if shutil.which("ffmpeg"):
+    if _find_ffmpeg():
         return []
     system = platform.system()
     if system == "Darwin":
@@ -749,463 +967,92 @@ def _ffmpeg_install_commands() -> list[str]:
     return ["echo 'Build ffmpeg from source: https://ffmpeg.org/releases/'"]
 
 
-def _stt_prereq_commands(provider: str = "whisper") -> list[str]:
-    """Return shell commands the user must run manually (need sudo/GUI).
+def _stt_prereq_commands(provider: str = "local") -> list[str]:
+    """Shell commands the user has to run themselves (they need sudo, a GUI, or a shell).
 
-    The ``mlx`` and ``parakeet`` providers have their own lightweight prerequisite
-    (``pipx install mlx-whisper`` / ``pipx install parakeet-mlx``) and only need
-    ffmpeg beyond that — they do not require the system-python/whisper toolchain.
+    Deliberately short, and there is no install button behind it any more. Desktop
+    releases already include both runtime pieces. A source install may need the
+    optional ``voice`` extra plus system ffmpeg for batch WebM/voice-memo input,
+    while ``local`` fetches its own model.
+
+    Desktop builds bundle the extra and must never suggest installing a system
+    dependency. A source install using Apple's OS recogniser can still use a
+    system ffmpeg as a fallback when it did not install the voice extra.
+
+    An empty list means "nothing to do", which is the steady state.
     """
-    if provider == "transcribe":
-        # AWS Transcribe's availability is "boto3 + amazon-transcribe importable
-        # by THIS gateway process" (see kiro_crew.transcribe.is_available); the
-        # optional ``voice`` extra provides both, and there is no separate
-        # binary, so the Install button flow does not apply.
-        cmds: list[str] = []
-        if not _voice_extra_importable():
-            if not _pip_install_channel_available():
-                # No install channel can make the extra importable in this
-                # build/interpreter — the Settings page shows an unsupported
-                # notice (`transcribe_unsupported`) instead of a command that
-                # cannot succeed.
-                return []
-            # The command targets the gateway's own interpreter: the import
-            # happens in-process, so a system python or ``--user`` install is
-            # not importable here.
-            if os.name == "nt":
-                # POSIX quoting is wrong for Windows shells; ``&`` is
-                # PowerShell's call operator for a quoted executable path.
-                cmds.append(f'& "{sys.executable}" -m pip install "kirocrew[voice]"')
-            else:
-                cmds.append(f"{shlex.quote(sys.executable)} -m pip install 'kirocrew[voice]'")
-        # The non-streaming path remuxes the browser's .webm through ffmpeg, and
-        # is_available() only logs a warning when ffmpeg is absent — this list
-        # is the one user-visible surface for that gap.
-        cmds.extend(_ffmpeg_install_commands())
-        return cmds
-
-    ensure_ffmpeg_in_path()
-
-    system = platform.system()
-    cmds = []
-    has_ffmpeg = shutil.which("ffmpeg") is not None
-
-    if provider in ("mlx", "parakeet"):
-        # mlx/parakeet are only advertised on Apple Silicon (see _stt_providers);
-        # on any other platform there are no prerequisites to surface.
-        if not _is_apple_silicon():
-            return []
-        # The Install button (see _build_stt_install_script) installs ffmpeg,
-        # pipx, and the mlx-based CLI itself. The only thing it cannot bootstrap
-        # non-interactively is Homebrew, so that is the sole manual prereq —
-        # listing the others here would duplicate the button. ``find_brew``
-        # rather than ``shutil.which``: the desktop app's gateway inherits
-        # PATH=/usr/bin:/bin:/usr/sbin:/sbin, so which() would claim Homebrew is
-        # missing on every DMG install that has it.
-        if not find_brew():
-            return [
-                '/bin/bash -c "$(curl -fsSL'
-                ' https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
-            ]
-        # ffmpeg is still surfaced when missing: the Install button covers it
-        # during setup, but a ready mlx install that later loses ffmpeg has no
-        # button — this list is what the ready-state warning renders.
-        return _ffmpeg_install_commands()
-
-    has_python = _find_suitable_python() is not None
-
-    if system == "Darwin":
-        try:
-            subprocess.run(["/usr/bin/xcrun", "--show-sdk-path"], capture_output=True, timeout=5)
-        except Exception:
-            cmds.append("sudo xcodebuild -license accept")
-        if not find_brew():
-            cmds.append(
-                '/bin/bash -c "$(curl -fsSL'
-                ' https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
-            )
-        pkgs: list[str] = []
-        if not has_python:
-            pkgs.append("python@3.12")
-        if not has_ffmpeg:
-            pkgs.append("ffmpeg")
-        if pkgs:
-            cmds.append("brew install " + " ".join(pkgs))
+    cmds: list[str] = []
+    if provider == PROVIDER_LOCAL:
+        # Only the missing-extra case is actionable by pip. A platform with no
+        # prebuilt wheel needs a C++ toolchain instead, and the availability
+        # `detail` on GET /api/stt/status is what says so.
+        needs_extra = stt.availability().code == stt.CODE_EXTRA_MISSING
+    elif provider == "transcribe":
+        needs_extra = not _transcribe_extra_importable()
     else:
-        is_al2023 = _is_al2023()
-        if not has_python:
-            if shutil.which("apt-get"):
-                cmds.append("sudo apt-get install -y python3 python3-pip python3-dev gcc g++")
-            elif is_al2023:
-                cmds.append(
-                    "sudo dnf install -y python3.11 python3.11-pip python3.11-devel gcc gcc-c++"
-                )
-            else:
-                # AL2: python3.7 is too old for whisper; Docker mode handles it
-                pass
-        if not has_ffmpeg:
-            cmds.extend(_ffmpeg_install_commands())
+        needs_extra = False
+    # Suppressed where no pip channel into this interpreter exists — frozen build,
+    # code-signed app bundle, pip-less or PEP 668 python. The Settings page shows
+    # an unsupported notice there instead of a command that cannot succeed.
+    if needs_extra and _pip_install_channel_available():
+        cmds.append(pip_extra_install_command("voice"))
+    if not platform_compat.is_bundled_interpreter():
+        cmds.extend(_ffmpeg_install_commands())
     return cmds
 
 
-def _is_al2023() -> bool:
-    """Return True if running on Amazon Linux 2023."""
-    try:
-        return "2023" in Path("/etc/system-release").read_text(encoding="utf-8")
-    except Exception:
-        return False
-
-
-def _find_suitable_python() -> str | None:
-    """Find a non-free-threaded python3 >= 3.10 with pip.
-
-    Delegates interpreter resolution to platform_compat.find_python_interpreter,
-    which rejects internal build-system paths and — on Windows — the Microsoft Store alias
-    stub (spawning that stub is what prints "Python was not found" and is why
-    this probe must never touch it). This caller adds two requirements the shared
-    helper does not: the interpreter must NOT be free-threaded (whisper wheels
-    are unavailable) and MUST have pip (this is an install target). Those are
-    passed as the ``reject`` predicate so the resolver FALLS THROUGH to the next
-    candidate when one fails them, rather than giving up: a free-threaded/pip-less
-    interpreter winning the name race must not mask a usable later one.
-    """
-
-    def _unusable(p: str) -> bool:
-        # True => skip this interpreter and keep searching. A probe failure
-        # (can't even run it) also counts as unusable.
-        try:
-            ver = subprocess.check_output(
-                [p, "-c", "import sys; print(sys.version)"], timeout=5, text=True
-            )
-            if "free-threading" in ver:
-                return True
-            subprocess.check_output(
-                [p, "-m", "pip", "--version"],
-                timeout=5,
-                text=True,
-                stderr=subprocess.DEVNULL,
-            )
-            return False
-        except Exception:
-            return True
-
-    return platform_compat.find_python_interpreter(reject=_unusable)
-
-
-async def api_stt_install(request: web.Request) -> web.Response:
-    """POST /api/stt/install — install openai-whisper + ffmpeg."""
-    global _stt_install_status
-    caller = request.get("user", "dashboard")
-    if _stt_install_status["step"] not in ("idle", "done", "error"):
-        _sel().log_api_access(
-            caller=caller,
-            operation="stt.install",
-            outcome="denied",
-            error=f"install already in progress: {_stt_install_status['step']}",
-        )
-        return web.json_response(
-            {"error": f"Install already in progress: {_stt_install_status['step']}"}, status=409
-        )
-
-    # Native install via shell script, tailored to the configured provider.
-    # Transcribe has no local runtime to install (its requirement is the
-    # ``voice`` extra importable by this process, surfaced as a prerequisite
-    # command) — reject rather than installing a Whisper runtime, which cannot
-    # change Transcribe's availability.
-    provider = KiroCrewConfig.load().stt.provider
-    if provider == "transcribe":
-        _sel().log_api_access(
-            caller=caller,
-            operation="stt.install",
-            outcome="denied",
-            error="no local install for provider=transcribe",
-        )
-        return web.json_response(
-            {
-                "code": "stt_no_local_install",
-                "error": (
-                    "AWS Transcribe has no local install;"
-                    " run the prerequisite command to add the 'voice' extra instead"
-                ),
-            },
-            status=400,
-        )
-
-    _stt_install_status = {"step": "starting", "detail": "", "error": ""}
-
-    _sel().log_api_access(
-        caller=caller,
-        operation="stt.install",
-        outcome="started",
-        resources=f"provider={provider}",
-    )
-    script = _build_stt_install_script(provider)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "bash",
-            "-c",
-            script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        # Read output line by line to update progress
-        lines: list[str] = []
-        assert proc.stdout is not None
-        while True:
-            line_bytes = await asyncio.wait_for(proc.stdout.readline(), timeout=600)
-            if not line_bytes:
-                break
-            line = line_bytes.decode(errors="replace").rstrip()
-            lines.append(line)
-            # Update status based on output
-            if "Xcode" in line or "xcode" in line:
-                _stt_install_status = {"step": "installing_xcode", "detail": line, "error": ""}
-            elif ("Homebrew" in line or "brew" in line.lower()) and "Installing" in line:
-                _stt_install_status = {"step": "installing_brew", "detail": line, "error": ""}
-            elif "Installing ffmpeg" in line:
-                _stt_install_status = {"step": "installing_ffmpeg", "detail": line, "error": ""}
-            elif "Installing openai-whisper" in line:
-                _stt_install_status = {"step": "installing_whisper", "detail": line, "error": ""}
-            elif "Installing mlx-whisper" in line:
-                _stt_install_status = {"step": "installing_mlx", "detail": line, "error": ""}
-            elif "Installing parakeet-mlx" in line:
-                # Reuse the mlx progress step: same pipx phase and bar position.
-                # The detail line carries the accurate "parakeet-mlx" text, so a
-                # dedicated step (and its 14-locale i18n key) is not warranted.
-                _stt_install_status = {"step": "installing_mlx", "detail": line, "error": ""}
-            elif "No suitable python3" in line:
-                _stt_install_status = {"step": "installing_python", "detail": line, "error": ""}
-            elif "Using:" in line:
-                _stt_install_status = {"step": "checking", "detail": line, "error": ""}
-            elif "Done." in line:
-                _stt_install_status["detail"] = line
-            elif line.startswith("ERROR:") or line.startswith("error:"):
-                _stt_install_status["detail"] = line
-
-        await proc.wait()
-        output = "\n".join(lines[-20:])
-        if proc.returncode != 0:
-            _stt_install_status = {"step": "error", "detail": "", "error": output[-500:]}
-            _sel().log_api_access(
-                caller=caller,
-                operation="stt.install",
-                outcome="failed",
-                resources=f"provider={provider}",
-                error=output[-500:],
-            )
-            return web.json_response({"ok": False, "error": output[-500:]}, status=500)
-
-        _stt_install_status = {"step": "done", "detail": "Whisper ready", "error": ""}
-        _sel().log_api_access(
-            caller=caller,
-            operation="stt.install",
-            outcome="success",
-            resources=f"provider={provider}",
-        )
-        return web.json_response(
-            {
-                "ok": True,
-                "ffmpeg": (
-                    shutil.which("ffmpeg") is not None
-                    or os.path.isfile(os.path.expanduser("~/ffmpeg/ffmpeg"))
-                ),
-            }
-        )
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-            await proc.communicate()
-        except OSError:
-            pass
-        _stt_install_status = {"step": "error", "detail": "", "error": "Install timed out (10min)"}
-        _sel().log_api_access(
-            caller=caller,
-            operation="stt.install",
-            outcome="failed",
-            resources=f"provider={provider}",
-            error="install timed out",
-        )
-        return web.json_response({"ok": False, "error": "Install timed out"}, status=500)
-    except FileNotFoundError:
-        _stt_install_status = {"step": "error", "detail": "", "error": "bash not found"}
-        _sel().log_api_access(
-            caller=caller,
-            operation="stt.install",
-            outcome="failed",
-            resources=f"provider={provider}",
-            error="bash not found",
-        )
-        return web.json_response({"ok": False, "error": "bash not found"}, status=500)
-
-
-def _stt_install_path_prelude() -> str:
-    """Shell prelude that makes Homebrew (and pipx's bin dir) reachable.
-
-    The install script runs as ``bash -c`` from the gateway process, which is
-    neither a login nor an interactive shell — so the ``eval "$(brew shellenv)"``
-    line in the user's ``~/.zprofile`` never executes. On a desktop-app install
-    the inherited PATH is launchd's ``/usr/bin:/bin:/usr/sbin:/sbin``, which
-    contains no Homebrew prefix at all. Without this prelude the script's first
-    ``command -v brew`` check fails on a machine that HAS Homebrew and the whole
-    install aborts with "ERROR: Homebrew required".
-
-    Prepends the known prefixes (only those that exist), then defers to
-    ``brew shellenv`` for the authoritative prefix once ``brew`` itself resolves.
-    """
-    dirs = " ".join(shlex.quote(d) for d in BREW_PATH_DIRS)
-    return f"""
-for _d in {dirs}; do
-    case ":$PATH:" in
-        *":$_d:"*) ;;
-        *) [ -d "$_d" ] && PATH="$_d:$PATH" ;;
-    esac
-done
-export PATH
-if command -v brew >/dev/null 2>&1; then eval "$(brew shellenv)" 2>/dev/null || true; fi
-"""
-
-
-def _build_stt_install_script(provider: str = "whisper") -> str:
-    """Shell script that installs the runtime for the selected STT provider.
-
-    - ``mlx``: installs mlx-whisper via pipx (Apple Silicon only) plus ffmpeg.
-    - ``parakeet``: installs parakeet-mlx via pipx (Apple Silicon only) plus ffmpeg.
-    - ``whisper`` (default): installs openai-whisper + ffmpeg via brew or pip.
-
-    The pip fallback deliberately targets a SYSTEM python with ``--user`` (never
-    the gateway's own venv, which is replaced on every upgrade). ``--user`` lands
-    in ``~/.local/bin``, which :func:`kiro_crew.transcribe._find_whisper` probes
-    via its ``_WHISPER_SEARCH_PATHS`` (and via ``shutil.which`` when that dir is
-    on PATH). It also constrains the resolve so pip can never drop into a source
-    build — see the ``BINARY_ONLY`` comment in the script for why an incompatible
-    wheel otherwise reports itself as a compiler error.
-    """
-    prelude = _stt_install_path_prelude()
-    if provider in ("mlx", "parakeet"):
-        pipx_pkg = "parakeet-mlx" if provider == "parakeet" else "mlx-whisper"
-        verify_bin = "parakeet-mlx" if provider == "parakeet" else "mlx_whisper"
-        return prelude + rf"""
-[ -d "$HOME/ffmpeg" ] && export PATH="$HOME/ffmpeg:$PATH"
-
-if ! command -v brew >/dev/null 2>&1; then
-    echo "ERROR: Homebrew required. Install from https://brew.sh/"
-    exit 1
-fi
-
-echo "Installing ffmpeg via brew..."
-brew install ffmpeg 2>&1 || true
-
-if ! command -v pipx >/dev/null 2>&1; then
-    echo "Installing pipx via brew..."
-    brew install pipx 2>&1 || {{ echo "ERROR: pipx install failed"; exit 1; }}
-fi
-
-echo "Installing {pipx_pkg} via pipx..."
-pipx install --force {pipx_pkg} 2>&1 || {{ echo "ERROR: pipx install {pipx_pkg} failed"; exit 1; }}
-
-echo "Done. {verify_bin}=$(command -v {verify_bin} 2>/dev/null || echo 'check PATH') ffmpeg=$(command -v ffmpeg 2>/dev/null || echo 'MISSING')"
-"""
-    return prelude + r"""
-# Pick up ffmpeg from ~/ffmpeg if installed there
-[ -d "$HOME/ffmpeg" ] && export PATH="$HOME/ffmpeg:$PATH"
-
-# Prefer brew install (avoids externally-managed-environment errors)
-if command -v brew >/dev/null 2>&1; then
-    echo "Installing openai-whisper via brew..."
-    if brew install openai-whisper 2>&1; then
-        echo "Installing ffmpeg via brew..."
-        brew install ffmpeg 2>&1 || true
-        echo "Done. whisper=$(command -v whisper 2>/dev/null || echo 'check PATH') ffmpeg=$(command -v ffmpeg 2>/dev/null || echo 'MISSING')"
-        exit 0
-    fi
-    echo "brew install failed, falling back to pip..."
-fi
-
-# Fallback: pip install (AL2023 / systems without brew)
-PY=""
-for py in python3.11 python3.12 python3 python3.13 python3.10; do
-    p=$(command -v "$py" 2>/dev/null) || continue
-    "$p" -c "import sys; sys.exit(0 if 'free-threading' not in sys.version else 1)" 2>/dev/null || continue
-    "$p" -m pip --version >/dev/null 2>&1 || continue
-    PY="$p"; break
-done
-
-if [ -z "$PY" ]; then
-    echo "ERROR: python3 with pip not found. Install brew first: https://brew.sh/"
-    exit 1
-fi
-echo "Using: $PY ($($PY --version))"
-
-# openai-whisper itself is a pure-Python sdist, but its dependency tree is not:
-# numpy / numba / llvmlite / torch / triton / tiktoken all ship COMPILED wheels.
-# When pip finds no wheel matching the host it silently falls back to the source
-# tarball and starts a compile — which is why a wheel-compatibility problem
-# surfaces as a toolchain error ("GCC >= 9.3", "metadata-generation-failed")
-# that names numpy and looks unrelated to the missing wheel. Amazon Linux 2 ships
-# glibc 2.26, so pip accepts at most manylinux_2_17, while current numpy publishes
-# manylinux_2_28 only — the default resolve therefore fetches numpy-2.5.1.tar.gz
-# and dies on the system GCC (7.3 on AL2).
-#
-# --only-binary removes sdists from the candidate set for exactly these packages,
-# so the resolver BACKTRACKS to the newest version that does have a compatible
-# wheel instead of compiling (verified on glibc 2.26: numpy 2.5.1 -> 2.2.6
-# manylinux_2_17, exit 0). Deliberately NO pinned version ceiling: a hardcoded cap
-# would rot as hosts and wheel tags move, while letting pip choose the newest
-# wheel-compatible release stays correct on both old and current hosts.
-BINARY_ONLY="numpy,numba,llvmlite,torch,triton,tiktoken,regex"
-
-# torch's default Linux wheels are the CUDA builds, so a plain resolve drags ~2.5 GB
-# of nvidia-* packages onto a machine that has no GPU to use them. --extra-index-url
-# would not help: it only ADDS a source, and pip still prefers the higher-versioned
-# default build. So the CPU wheel gets its own step from the CPU-only index, and the
-# whisper resolve below then sees torch already satisfied and leaves it alone.
-# Non-fatal: if the CPU index is unreachable, fall through and let whisper resolve
-# torch itself rather than failing an install that would otherwise succeed.
-if [ "$(uname -s)" = "Linux" ] && ! command -v nvidia-smi >/dev/null 2>&1; then
-    echo "No NVIDIA GPU detected, installing CPU-only torch..."
-    "$PY" -m pip install -q --user --only-binary=torch \
-        --index-url https://download.pytorch.org/whl/cpu torch 2>&1 \
-        || echo "CPU-only torch unavailable; letting openai-whisper resolve torch"
-fi
-
-echo "Installing openai-whisper..."
-"$PY" -m pip install -q --user --only-binary="$BINARY_ONLY" openai-whisper 2>&1 \
-    || { echo "ERROR: pip install openai-whisper failed"; exit 1; }
-
-echo "Done. whisper=$(command -v whisper 2>/dev/null || echo 'check PATH') ffmpeg=$(command -v ffmpeg 2>/dev/null || echo 'MISSING')"
-"""
-
-
 async def api_stt_transcribe(request: web.Request) -> web.Response:
-    """POST /api/stt/transcribe — transcribe uploaded audio via whisper."""
+    """POST /api/stt/transcribe — transcribe one uploaded recording.
+
+    The batch counterpart to ``/api/ws/stt``, for a client that records first and
+    uploads afterwards. It accepts every provider: ``local`` shares the resident
+    model with live sessions, so a voice memo lands on a model that is already
+    loaded.
+    """
     import tempfile  # noqa: F811
+    import uuid
 
-    from kiro_crew.transcribe import is_available, transcribe_audio  # noqa: F811
+    from kiro_crew.dashboard import part_stream
+    from kiro_crew.transcribe import transcribe_audio  # noqa: F811
 
-    if not is_available():
-        return web.json_response({"error": "STT not available"}, status=503)
+    cfg = KiroCrewConfig.load()
+    # Off the loop: every provider branch of the probe reaches the filesystem, and
+    # `local` and `transcribe` each import an optional extra the first time.
+    detail = await asyncio.to_thread(availability_detail, cfg.stt)
+    if not detail.ok:
+        return web.json_response(
+            {
+                "error": detail.detail or "STT not available",
+                "code": detail.code or _CODE_STT_UNAVAILABLE,
+            },
+            status=503,
+        )
 
     reader = await request.multipart()
     field = await reader.next()
     if field is None or not hasattr(field, "name") or field.name != "audio":  # type: ignore[union-attr]
-        return web.json_response({"error": "missing audio field"}, status=400)
+        return web.json_response(
+            {"error": "missing audio field", "code": _CODE_STT_MISSING_AUDIO}, status=400
+        )
 
     # Use uploaded filename extension (recording.webm / .mp4 / .ogg)
     fname = getattr(field, "filename", None) or "recording.webm"
     ext = os.path.splitext(fname)[1] or ".webm"
-    fd, tmp = tempfile.mkstemp(suffix=ext)
+    # A fresh unpublished path: stream_part_to_file writes to a sibling temp
+    # off the event loop and publishes here atomically, so no exit path (413,
+    # backend failure, cancellation) can leave a partial file at this name.
+    tmp = os.path.join(tempfile.gettempdir(), f"kc_stt_{uuid.uuid4().hex}{ext}")
     try:
-        os.close(fd)
-        size = 0
-        with open(tmp, "wb") as f:
-            while True:
-                chunk = await field.read_chunk(8192)  # type: ignore[union-attr]
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > 25 * 1024 * 1024:  # 25 MB cap
-                    return web.json_response({"error": "audio too large"}, status=413)
-                f.write(chunk)
+        try:
+            await part_stream.stream_part_to_file(
+                field,  # type: ignore[arg-type]
+                Path(tmp),
+                max_bytes=25 * 1024 * 1024,
+            )
+        except part_stream.PartTooLarge:
+            return web.json_response(
+                {"error": "audio too large", "code": _CODE_STT_AUDIO_TOO_LARGE}, status=413
+            )
 
         text = await transcribe_audio(tmp)
         if text:
@@ -1235,7 +1082,9 @@ async def api_stt_transcribe(request: web.Request) -> web.Response:
         return web.json_response({"text": text or ""})
     except Exception:
         logger.exception("STT transcribe failed")
-        return web.json_response({"error": "transcription failed"}, status=500)
+        return web.json_response(
+            {"error": "transcription failed", "code": _CODE_STT_FAILED}, status=500
+        )
     finally:
         try:
             os.unlink(tmp)
@@ -1270,20 +1119,33 @@ async def api_sel_events(request: web.Request) -> web.Response:
 
 
 async def api_sel_verify(request: web.Request) -> web.Response:
-    """GET /api/sel/verify — verify HMAC chain integrity."""
+    """GET /api/sel/verify — verify HMAC chain integrity.
+
+    ``integrity`` is ``unverifiable`` when the segment dir refused to pin (or
+    was swapped mid-verification): the rotated segments were not checked, and
+    the endpoint must not answer ``ok`` over the live log alone (#5051
+    review). ``detail`` carries the reason and is empty when verifiable.
+    """
 
     # Same offload rationale as api_sel_events, including deferring _sel() into
     # the callable: verify_integrity() reads the whole log file to check the HMAC
     # chain end to end and must not run on the event loop.
-    total, valid = await asyncio.get_running_loop().run_in_executor(
-        discovery_executor(), lambda: _sel().verify_integrity()
+    result = await asyncio.get_running_loop().run_in_executor(
+        discovery_executor(), lambda: _sel().verify_integrity(detailed=True)
     )
+    if not result.history_verifiable:
+        integrity = "unverifiable"
+    elif result.total == result.valid:
+        integrity = "ok"
+    else:
+        integrity = "compromised"
     return web.json_response(
         {
-            "total": total,
-            "valid": valid,
-            "integrity": "ok" if total == valid else "compromised",
-            "tampered": total - valid,
+            "total": result.total,
+            "valid": result.valid,
+            "integrity": integrity,
+            "tampered": result.total - result.valid,
+            "detail": result.reason,
         }
     )
 
@@ -1402,132 +1264,185 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
         agent_settings = body.get("agent")
         if not isinstance(agent_settings, dict):
             return _deny("agent must be an object")
-        path = config_path()
+        cfg_path = config_path()
+        # Validate-only (CPU-bound) before acquiring the lock — fail fast on
+        # obviously-bad input so the lock hold is as short as possible.
+        # The actual read-modify-write is serialised under _get_config_lock and
+        # offloaded to a thread so it neither races concurrent writers (lost-write
+        # bug) nor blocks the event loop (event-loop-stall bug).  This mirrors the
+        # pattern used by the sibling PATCH handler (~line 2031).
+        from kiro_crew.config.loader import ConfigReadError, update_config_locked  # noqa: F811
+        from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
+
+        # Carry the validation error and result out of the mutate callback.
+        # Validation that depends on the *persisted* ceiling (max_subagents bound)
+        # runs inside the callback where it can read the current config; the
+        # callback also emits the "no recognized settings provided" 400, so no
+        # pre-lock key-recognition check is needed.
+        _validation_error: list[tuple[str, int]] = []
+        _result: dict[str, object] = {}
+
+        def _mutate_config_put(data: dict) -> dict | None:
+            if not isinstance(data.get("agent"), dict):
+                data["agent"] = {}
+            agent = data["agent"]
+            # Snapshot BEFORE mutation for the restart-hint truthfulness guard.
+            # The dashboard sends all settings on every save so "was applied" !=
+            # "was changed" — see the no-op-save comments in messaging.py.
+            before = dict(agent)
+
+            limits = {"subagent_max_turns": SUBAGENT_MAX_TURNS_CEILING}
+            applied: list[str] = []
+            for key, upper in limits.items():
+                if key in agent_settings:
+                    val = agent_settings[key]
+                    if isinstance(val, bool) or not isinstance(val, int) or val < 1 or val > upper:
+                        _validation_error.append(
+                            (f"{key} must be an integer between 1 and {upper}", 400)
+                        )
+                        return None
+                    agent[key] = val
+                    applied.append(key)
+
+            # Capture the hard cap from the *persisted* config BEFORE applying any
+            # subagent_auto_max from this request — deny-by-default prevents a
+            # same-request ceiling-raise+spend.
+            persisted_hard_cap = agent.get("subagent_auto_max", 16)
+            if (
+                not isinstance(persisted_hard_cap, int)
+                or isinstance(persisted_hard_cap, bool)
+                or persisted_hard_cap < 3
+            ):
+                persisted_hard_cap = 16
+            persisted_hard_cap = min(persisted_hard_cap, SUBAGENT_AUTO_MAX_CEILING)
+
+            if "subagent_auto_max" in agent_settings:
+                val = agent_settings["subagent_auto_max"]
+                if (
+                    isinstance(val, bool)
+                    or not isinstance(val, int)
+                    or val < 3
+                    or val > SUBAGENT_AUTO_MAX_CEILING
+                ):
+                    _validation_error.append(
+                        (
+                            "subagent_auto_max must be an integer between 3 and "
+                            f"{SUBAGENT_AUTO_MAX_CEILING}",
+                            400,
+                        )
+                    )
+                    return None
+                agent["subagent_auto_max"] = val
+                applied.append("subagent_auto_max")
+
+            if "max_subagents" in agent_settings:
+                val = agent_settings["max_subagents"]
+                hard_cap = persisted_hard_cap
+                if (
+                    isinstance(val, bool)
+                    or not isinstance(val, int)
+                    or (val != 0 and not (MAX_SUBAGENTS_FIXED_FLOOR <= val <= hard_cap))
+                ):
+                    _validation_error.append(
+                        (
+                            f"max_subagents must be 0 (auto) or an integer between "
+                            f"{MAX_SUBAGENTS_FIXED_FLOOR} and {hard_cap}",
+                            400,
+                        )
+                    )
+                    return None
+                agent["max_subagents"] = val
+                applied.append("max_subagents")
+
+            for key in ("conductor_skill",):
+                if key in agent_settings:
+                    val = agent_settings[key]
+                    if not isinstance(val, bool):
+                        _validation_error.append((f"{key} must be a boolean", 400))
+                        return None
+                    agent[key] = val
+                    applied.append(key)
+
+            if not applied:
+                _validation_error.append(("no recognized settings provided", 400))
+                return None
+
+            restart_required = any(
+                key in _STARTUP_READ_AGENT_KEYS and agent.get(key) != before.get(key)
+                for key in applied
+            )
+            _result["applied"] = applied
+            _result["restart_required"] = restart_required
+            return data
+
         try:
-            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        except Exception:
+            async with _get_config_lock():
+                try:
+                    # update_config_locked returns the final config dict (after
+                    # mutation); use it directly rather than re-reading from disk
+                    # (a blocking read on the loop, and it writes the callback's
+                    # output verbatim — there is no concurrent merge to observe).
+                    final = await asyncio.to_thread(
+                        update_config_locked, cfg_path, mutate=_mutate_config_put
+                    )
+                except ConfigReadError:
+                    _sel().log_api_access(
+                        caller=caller,
+                        operation="config.update",
+                        outcome="error",
+                        error="config.json is corrupt",
+                    )
+                    return web.json_response(
+                        {"error": "config.json is corrupt", "code": "config_corrupt"},
+                        status=500,
+                    )
+
+                if _validation_error:
+                    msg, status = _validation_error[0]
+                    return _deny(msg, status)
+
+                applied: list[str] = _result["applied"]  # type: ignore[assignment]
+                agent = final.get("agent") or {}
+                _sel().log_api_access(
+                    caller=caller,
+                    operation="config.update",
+                    outcome="ok",
+                    resources=",".join(applied),
+                )
+                # Regenerate or clean up conductor skill on toggle. Held INSIDE
+                # the lock so a concurrent enable/disable cannot interleave and
+                # leave the persisted flag disagreeing with the skill file on
+                # disk (config says enabled while SKILL.md is absent, or vice
+                # versa).
+                if "conductor_skill" in applied:
+                    if agent.get("conductor_skill"):
+                        from kiro_crew.dashboard.handlers.agents import (  # noqa: F811
+                            _regen_conductor,
+                        )
+
+                        _regen_conductor()
+                    else:
+                        try:
+                            from kiro_crew.skills import SkillsLoader  # noqa: F811
+
+                            p = SkillsLoader()._dir / "conductor" / "SKILL.md"
+                            if p.exists():
+                                p.unlink()
+                        except Exception:
+                            logger.exception("Failed to clean up conductor skill")
+        except OSError:
             _sel().log_api_access(
                 caller=caller,
                 operation="config.update",
                 outcome="error",
-                error="config.json is corrupt",
+                error="config.json write failed",
             )
-            return web.json_response({"error": "config.json is corrupt"}, status=500)
-        if not isinstance(data.get("agent"), dict):
-            data["agent"] = {}
-        agent = data["agent"]
-        # Snapshot the persisted values BEFORE any mutation. The dashboard sends
-        # all four settings on every save and enables Save whenever any one is
-        # dirty, so "was applied" is not "was changed" -- keying the restart hint
-        # off the raw applied list would flag a restart for a conductor-only save.
-        # Same truthfulness guard as handlers/messaging.py (see its no-op-save
-        # comments) so the flag stays trustworthy enough to act on.
-        before = dict(agent)
-        # subagent_max_turns keeps the generic 1..N validation; max_subagents is
-        # special — 0 is the "auto-size" sentinel and its upper bound is the
-        # configured hard cap (dynamic-subagent-sizing.md §5.5/§6).
-        limits = {"subagent_max_turns": SUBAGENT_MAX_TURNS_CEILING}
-        applied: list[str] = []
-        for key, upper in limits.items():
-            if key in agent_settings:
-                val = agent_settings[key]
-                if isinstance(val, bool) or not isinstance(val, int) or val < 1 or val > upper:
-                    return _deny(f"{key} must be an integer between 1 and {upper}")
-                agent[key] = val
-                applied.append(key)
-        # Capture the hard cap from the *persisted* config BEFORE applying any
-        # subagent_auto_max from this request. max_subagents is bounded by this
-        # persisted value only: a same-request raise of subagent_auto_max must NOT
-        # widen the bound (deny-by-default — prevents
-        # {subagent_auto_max: 9999, max_subagents: 9999} bypass). A higher ceiling
-        # only takes effect for max_subagents on a *subsequent* request.
-        persisted_hard_cap = agent.get("subagent_auto_max", 16)
-        if (
-            not isinstance(persisted_hard_cap, int)
-            or isinstance(persisted_hard_cap, bool)
-            or persisted_hard_cap < 3
-        ):
-            persisted_hard_cap = 16
-        # Clamp to the absolute ceiling even when read from persisted config: a
-        # corrupt or hand-edited config (e.g. {"subagent_auto_max": 9999}) must not
-        # be trusted to widen the concurrency bound (deny-by-default).
-        persisted_hard_cap = min(persisted_hard_cap, SUBAGENT_AUTO_MAX_CEILING)
-        # subagent_auto_max is now persistable (so the dashboard can raise/lower the
-        # auto-size ceiling), but carries its own absolute upper bound
-        # (SUBAGENT_AUTO_MAX_CEILING) so it can never be set arbitrarily high.
-        if "subagent_auto_max" in agent_settings:
-            val = agent_settings["subagent_auto_max"]
-            if (
-                isinstance(val, bool)
-                or not isinstance(val, int)
-                or val < 3
-                or val > SUBAGENT_AUTO_MAX_CEILING
-            ):
-                return _deny(
-                    "subagent_auto_max must be an integer between 3 and "
-                    f"{SUBAGENT_AUTO_MAX_CEILING}"
-                )
-            agent["subagent_auto_max"] = val
-            applied.append("subagent_auto_max")
-        # max_subagents: 0 = auto-size; otherwise a fixed pin in
-        # [MAX_SUBAGENTS_FIXED_FLOOR, persisted_hard_cap]. The bound is the
-        # persisted ceiling captured above, never this request's value. A pin of
-        # 1 or 2 is rejected — it would disable auto-sizing and run below the
-        # default (0 is the only way to request the host-safe auto cap).
-        if "max_subagents" in agent_settings:
-            val = agent_settings["max_subagents"]
-            hard_cap = persisted_hard_cap
-            if (
-                isinstance(val, bool)
-                or not isinstance(val, int)
-                or (val != 0 and not (MAX_SUBAGENTS_FIXED_FLOOR <= val <= hard_cap))
-            ):
-                return _deny(
-                    f"max_subagents must be 0 (auto) or an integer between "
-                    f"{MAX_SUBAGENTS_FIXED_FLOOR} and {hard_cap}"
-                )
-            agent["max_subagents"] = val
-            applied.append("max_subagents")
-        # Boolean toggles
-        for key in ("conductor_skill",):
-            if key in agent_settings:
-                val = agent_settings[key]
-                if not isinstance(val, bool):
-                    return _deny(f"{key} must be a boolean")
-                agent[key] = val
-                applied.append(key)
-        if not applied:
-            return _deny("no recognized settings provided")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
-        _sel().log_api_access(
-            caller=caller,
-            operation="config.update",
-            outcome="ok",
-            resources=",".join(applied),
-        )
-        # Regenerate or clean up conductor skill on toggle.
-        if "conductor_skill" in applied:
-            if agent.get("conductor_skill"):
-                from kiro_crew.dashboard.handlers.agents import _regen_conductor  # noqa: F811
+            return web.json_response(
+                {"error": "failed to write config file", "code": "config_write_failed"},
+                status=500,
+            )
 
-                _regen_conductor()
-            else:
-                try:
-                    from kiro_crew.skills import SkillsLoader  # noqa: F811
-
-                    p = SkillsLoader()._dir / "conductor" / "SKILL.md"
-                    if p.exists():
-                        p.unlink()
-                except Exception:
-                    logger.exception("Failed to clean up conductor skill")
-        # A startup-read key that was merely re-sent with its existing value did
-        # not change the enforced cap, so it must not raise the hint.
-        restart_required = any(
-            key in _STARTUP_READ_AGENT_KEYS and agent.get(key) != before.get(key) for key in applied
-        )
+        restart_required: bool = _result["restart_required"]  # type: ignore[assignment]
         return web.json_response({"ok": True, "restart_required": restart_required})
 
     cfg = KiroCrewConfig.load()
@@ -1569,7 +1484,9 @@ def _active_advertised_ids(request: web.Request) -> list[str] | None:
     return None
 
 
-def _validate_role_model(value: str, request: web.Request) -> str | None:
+def _validate_role_model(
+    value: str, request: web.Request, provider: str | None = None
+) -> str | None:
     """Reject a per-role model pin the account cannot use; ``None`` = allow.
 
     ``""`` / ``"auto"`` always allow (they defer to the chat default). Otherwise
@@ -1579,13 +1496,17 @@ def _validate_role_model(value: str, request: web.Request) -> str | None:
     (:func:`model_is_unusable`, #1596) so the picker and the wire cannot disagree.
     No advertised set => accept (entitlement unknowable; don't accuse on no
     evidence), matching that predicate's own conservative default.
+
+    *provider* is forwarded to :func:`_model_rejected_reason` so a caller holding
+    an already-loaded config does not pay a second synchronous config read; the
+    remaining work is in-memory. Omit it and the provider is resolved there.
     """
     if not value or value == "auto":
         return None
     from kiro_crew.acp.client import model_is_unusable
     from kiro_crew.dashboard.chat_handlers import _model_rejected_reason
 
-    reason = _model_rejected_reason(value)
+    reason = _model_rejected_reason(value, provider=provider)
     if reason:
         return reason
     advertised = _active_advertised_ids(request)
@@ -1610,8 +1531,33 @@ _MOVED_CONFIG_FIELDS: dict[str, str] = {
 }
 
 
+def _selectable_acp_backends() -> list[str]:
+    """The ``agent.acp_backend`` values this build can actually be switched to.
+
+    A thin alias for ``acp_backends.selectable_backend_values`` so the allowlist
+    entry below reads in this module's vocabulary; the answer itself comes from the
+    one code owner, which the config load path and the schema endpoint also use —
+    three independent derivations is how the old literal list drifted.
+
+    Deployment POLICY needs no second derivation here: the ``agent_backend``
+    governance scope is applied once at boot by narrowing the registry itself
+    (``agent_backend_governance.narrow_selectable_backends``), so a policy-denied
+    harness is already absent from the answer this returns.
+    """
+    return selectable_backend_values()
+
+
 _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.provider": {"type": "enum", "values": ["acp"]},
+    # Which ACP agent drives a session: "" = kiro-cli, "kas" = kiro-agent.
+    # ``values_fn`` rather than a literal, because the set WIDENS after this module
+    # is imported: an edition registers a backend from
+    # ``ProviderRegistry.register_acp_backends`` at boot, and the old literal left
+    # it rejected here with a misleading "invalid value". Resolved per request
+    # against the one code owner, so this can no longer drift from what
+    # ``AcpProvider`` will actually serve — which is what the parity test used to
+    # stand in for.
+    "agent.acp_backend": {"type": "enum", "values_fn": _selectable_acp_backends},
     # Default model for new sessions. Membership can NOT be validated against a
     # fixed list: the real vocabulary is whatever the live kiro-cli advertises
     # (/api/models spawns it to find out), and it spans both canonical registry
@@ -1637,6 +1583,17 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
         "validate_fn": _validate_role_model,
     },
+    # Throttle-exhaustion fallback model. Single value: "auto" (default) defers
+    # to the backend's availability-aware routing; a concrete id is tried first
+    # with "auto" as the final fallthrough; "" disables the feature. Same
+    # grammar + entitlement validation as the role-model pins ("" / "auto"
+    # always allow), so the dropdown and the wire cannot disagree.
+    "agent.fallback_model": {
+        "type": "str",
+        "max_len": 64,
+        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "validate_fn": _validate_role_model,
+    },
     "agent.reasoning_effort": {"type": "enum", "values": ["", *EFFORT_LEVELS]},
     # Per-role reasoning effort, paired with role_models. Same enum as the chat
     # default; "" = inherit. Applies only on reasoning-capable models.
@@ -1655,13 +1612,27 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.sandbox": {"type": "enum", "values": ["auto", "off"]},
     "agent.sandbox_allow_no_isolation": {"type": "bool"},
     "agent.completion_keep": {"type": "enum", "values": ["head", "tail", "both"]},
-    "agent.completion_keep_chars": {"type": "int", "min": 0, "max": RESULT_FILE_MAX_BYTES},
-    "agent.soft_stop_budget_secs": {"type": "float", "min": 0.5, "max": 60.0},
-    "session.timeout_secs": {"type": "int", "min": 0, "max": 86400},
-    "session.autocompact_pct": {"type": "float", "min": 5.0, "max": 90.0},
+    "agent.completion_keep_chars": {
+        "type": "int",
+        "min": COMPLETION_KEEP_CHARS_MIN,
+        "max": RESULT_FILE_MAX_BYTES,
+    },
+    "agent.soft_stop_budget_secs": {
+        "type": "float",
+        "min": SOFT_STOP_BUDGET_MIN,
+        "max": SOFT_STOP_BUDGET_MAX,
+    },
+    "session.timeout_secs": {"type": "int", "min": SESSION_TIMEOUT_MIN, "max": SESSION_TIMEOUT_MAX},
+    # Range shared with the load-time clamp in config/loader.py — one constant
+    # pair, so the write gate and the load path cannot drift (issue #4734).
+    "session.autocompact_pct": {
+        "type": "float",
+        "min": AUTOCOMPACT_PCT_MIN,
+        "max": AUTOCOMPACT_PCT_MAX,
+    },
     "session.pool_size": {"type": "int", "min": 0, "max": 10},
     "session.pool_agent": {"type": "str", "values_fn": _agent_values},
-    "session.pool_ttl_secs": {"type": "int", "min": 0, "max": 7200},
+    "session.pool_ttl_secs": {"type": "int", "min": POOL_TTL_SECS_MIN, "max": POOL_TTL_SECS_MAX},
     # Intent-level session summaries in the chat right panel. Only the boolean
     # enable is editable here: it spends tokens on turns the user did not ask to
     # pay for, so it is off by default and the Settings toggle is the single
@@ -1669,8 +1640,31 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # config-file-only — they are power-user knobs, not first-run choices.
     "session_summary.enabled": {"type": "bool"},
     "auto_update": {"type": "bool"},
-    "dashboard.mcp_probe_timeout_secs": {"type": "int", "min": 5, "max": 120},
-    "dashboard.recent_tint_count": {"type": "int", "min": 0, "max": 10},
+    "dashboard.mcp_probe_timeout_secs": {
+        "type": "int",
+        "min": MCP_PROBE_TIMEOUT_MIN,
+        "max": MCP_PROBE_TIMEOUT_MAX,
+    },
+    "dashboard.recent_tint_count": {
+        "type": "int",
+        "min": RECENT_TINT_COUNT_MIN,
+        "max": RECENT_TINT_COUNT_MAX,
+    },
+    # Per-version snooze/skip verdict for the proactive update popup, written
+    # as ONE atomic record: the three fields only mean anything together, so
+    # per-field writes would open both a crash window (old verdict paired
+    # with a new version) and a two-client interleave that reassembles a
+    # verdict nobody expressed. Persisted in gateway config (not browser
+    # storage) so the decision holds across browsers and the desktop app's
+    # embedded dashboard.
+    "dashboard.update_nudge": {
+        "type": "dict",
+        "keys": {
+            "version": {"type": "str", "max_len": 128},
+            "snoozed_until": {"type": "float", "min": 0.0, "max": 4102444800.0},
+            "skipped": {"type": "bool"},
+        },
+    },
     # Default shell for the built-in terminal panel (Settings → Display →
     # Terminal). "" = unset, use $SHELL / the platform default. The executable
     # check lives as an off-loop special case in the PATCH handler (a PATH
@@ -1729,10 +1723,12 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # Local OTEL metric collection — the Privacy panel's recording switch. Safe
     # to expose where beacon_endpoint is not: turning this on writes JSONL under
     # ~/.kiro/crew/metrics. It is NOT unconditionally local, though —
-    # `_build_recorder` attaches an OTLP reader when `telemetry.otlp_endpoint` is
-    # set — so the gate below refuses the ENABLE on a host that configured an
-    # endpoint, which is what keeps the switch's local-only promise true for every
-    # state it can reach. The endpoint itself stays config-file-only, so a
+    # `_build_recorder` attaches an OTLP reader for every destination the active
+    # telemetry provider supplies (the default provider supplies one when
+    # `telemetry.otlp_endpoint` is set) — so the gate below refuses the ENABLE on a
+    # host where egress would start, which is what keeps the switch's local-only
+    # promise true for every state it can reach. The endpoint itself stays
+    # config-file-only, so a
     # dashboard caller can neither choose a destination nor start sending to one.
     "telemetry.enabled": {"type": "bool"},
     # SSO login flags for an edition that supplies a real sso_login_handler.
@@ -1755,14 +1751,26 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "knowledge.auto_add_documents": {"type": "bool"},
     "knowledge.auto_register_project_docs": {"type": "bool"},
     "knowledge.auto_ingest_artifacts": {"type": "bool"},
-    "knowledge.auto_ingest_chunk_budget": {"type": "int", "min": 0, "max": 10000},
-    "knowledge.folder_ingest_chunk_budget": {"type": "int", "min": 0, "max": 10000},
-    "knowledge.dedup_every_n_sweeps": {"type": "int", "min": 0, "max": 288},
-    "knowledge.sweep_chunk_budget": {"type": "int", "min": 0, "max": 50000},
-    "knowledge.max_sources": {"type": "int", "min": 0, "max": 1000},
-    "knowledge.embed_rate_limit": {"type": "int", "min": 0, "max": 10000},
+    "knowledge.auto_ingest_chunk_budget": {
+        "type": "int",
+        "min": 0,
+        "max": AUTO_INGEST_CHUNK_BUDGET_MAX,
+    },
+    "knowledge.folder_ingest_chunk_budget": {
+        "type": "int",
+        "min": 0,
+        "max": FOLDER_INGEST_CHUNK_BUDGET_MAX,
+    },
+    "knowledge.dedup_every_n_sweeps": {"type": "int", "min": 0, "max": DEDUP_EVERY_N_SWEEPS_MAX},
+    "knowledge.sweep_chunk_budget": {"type": "int", "min": 0, "max": SWEEP_CHUNK_BUDGET_MAX},
+    "knowledge.max_sources": {"type": "int", "min": 0, "max": KNOWLEDGE_MAX_SOURCES_MAX},
+    "knowledge.embed_rate_limit": {"type": "int", "min": 0, "max": EMBED_RATE_LIMIT_MAX},
     "knowledge.extraction_model": {"type": "str"},
-    "knowledge.extraction_pool_size": {"type": "int", "min": 1, "max": 10},
+    "knowledge.extraction_pool_size": {
+        "type": "int",
+        "min": EXTRACTION_POOL_SIZE_MIN,
+        "max": EXTRACTION_POOL_SIZE_MAX,
+    },
     # Computer use — BUDGET KNOBS ONLY. There is deliberately no
     # "computer_use.enabled" key here: the primary enable lives on the keystone
     # ``computer_use.json`` (see config.loader.computer_use_state_path) so the
@@ -1876,8 +1884,13 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
 
     # Validate value
     if spec["type"] == "enum":
-        if value not in spec["values"]:
-            return _deny(f"invalid value, must be one of {spec['values']}", f"{path_key}={value}")
+        # ``values_fn`` (the same hook the ``str`` branch already carries) is for an
+        # enum whose membership is not knowable at import: it can widen after boot
+        # when an edition registers a backend. A static ``values`` list would be
+        # read before that happened.
+        allowed = list(spec["values_fn"]()) if "values_fn" in spec else spec["values"]
+        if value not in allowed:
+            return _deny(f"invalid value, must be one of {allowed}", f"{path_key}={value}")
     elif spec["type"] == "int":
         try:
             value = int(value)
@@ -1918,6 +1931,54 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
             reason = validate_fn(value, request)
             if reason:
                 return _deny(reason, f"{path_key}={value}")
+    elif spec["type"] == "dict":
+        # One-level record written ATOMICALLY as a single value, for settings
+        # where multiple scalar fields form one verdict and a partial write is
+        # itself the bug (e.g. the update popup's version+snooze+skip record).
+        # Strict by design: every declared key present, no undeclared keys,
+        # each value validated against its scalar subspec — so this cannot
+        # become a generic JSON passthrough.
+        if not isinstance(value, dict):
+            return _deny("must be an object", f"{path_key}={value}")
+        keys_spec = spec["keys"]
+        unknown = set(value) - set(keys_spec)
+        if unknown:
+            return _deny(f"unknown key(s): {sorted(unknown)}", f"{path_key}={value}")
+        missing = set(keys_spec) - set(value)
+        if missing:
+            return _deny(f"missing key(s): {sorted(missing)}", f"{path_key}={value}")
+        validated: dict = {}
+        for sub_key, sub_spec in keys_spec.items():
+            sub_val = value[sub_key]
+            if sub_spec["type"] == "str":
+                if not isinstance(sub_val, str):
+                    return _deny(f"{sub_key} must be a string", f"{path_key}={value}")
+                if len(sub_val) > sub_spec.get("max_len", 256):
+                    return _deny(
+                        f"{sub_key} must be at most {sub_spec.get('max_len', 256)} characters",
+                        f"{path_key}={value}",
+                    )
+            elif sub_spec["type"] == "bool":
+                if not isinstance(sub_val, bool):
+                    return _deny(f"{sub_key} must be a boolean", f"{path_key}={value}")
+            elif sub_spec["type"] == "float":
+                # bool is an int subclass; refuse it before coercion so
+                # `true` cannot silently store 1.0.
+                if isinstance(sub_val, bool):
+                    return _deny(f"{sub_key} must be a number", f"{path_key}={value}")
+                try:
+                    sub_val = float(sub_val)
+                except (TypeError, ValueError):
+                    return _deny(f"{sub_key} must be a number", f"{path_key}={value}")
+                if not math.isfinite(sub_val):
+                    return _deny(f"{sub_key} must be a finite number", f"{path_key}={value}")
+                lo, hi = sub_spec.get("min", 0.0), sub_spec.get("max", 999999.0)
+                if sub_val < lo or sub_val > hi:
+                    return _deny(f"{sub_key} must be between {lo} and {hi}", f"{path_key}={value}")
+            else:
+                return _deny("unsupported config type", f"{path_key}={value}", 500)
+            validated[sub_key] = sub_val
+        value = validated
     else:
         return _deny("unsupported config type", f"{path_key}={value}", 500)
 
@@ -1970,9 +2031,11 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
 
     # Local metric collection is offered as local-only ("Nothing is exported"), and
     # that promise has to hold for every state this route can reach. It would not:
-    # `_build_recorder` attaches an OTLP reader whenever `telemetry.otlp_endpoint`
-    # is set (see metrics/provider.py), so on a host that already configured an
-    # endpoint, enabling collection from the dashboard would start network egress
+    # `_build_recorder` attaches an OTLP reader for every destination the active
+    # telemetry provider supplies (see metrics/provider.py), so on a host where
+    # egress is configured — through `telemetry.otlp_endpoint` for the default
+    # provider, or an edition's own collector — enabling collection from the
+    # dashboard would start network egress
     # under a switch that says it does not. Refuse the ENABLE there and let the
     # config file — which is where the endpoint was chosen — be where that decision
     # is made. Disabling stays writable for the same reason as the beacon above: a
@@ -1983,17 +2046,33 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
             # state, but a full read plus schema validation (~14ms) when the file
             # changed — and this handler runs on the event loop.
             cfg = await asyncio.to_thread(KiroCrewConfig.load)
-            endpoint = str(getattr(cfg.telemetry, "otlp_endpoint", "") or "")
+            # Resolved posture, not the raw endpoint string: the DEFAULT provider
+            # derives its one destination from telemetry.otlp_endpoint, but an
+            # edition may supply its own collector with that key empty. Asking the
+            # same resolver _build_recorder uses is what keeps this refusal and
+            # the actual egress from disagreeing. It RAISES when posture cannot be
+            # established, which the handler below turns into a refusal: reading a
+            # transient provider error as "no egress" would permit an enable that
+            # the recovered provider then turns into egress.
+            egress = await asyncio.to_thread(_metrics_provider.otlp_egress_active, cfg.telemetry)
         except Exception:
-            # Unreadable config: fail closed rather than enabling collection whose
-            # egress posture cannot be established.
-            logger.warning("telemetry config unreadable; refusing to enable", exc_info=True)
-            return _deny("could not read the telemetry configuration", f"{path_key}={value}", 409)
-        if endpoint.strip():
+            # Unreadable config, or egress posture that could not be resolved:
+            # fail closed rather than enabling collection whose egress posture
+            # cannot be established.
+            logger.warning(
+                "telemetry config or egress posture unreadable; refusing to enable",
+                exc_info=True,
+            )
             return _deny(
-                "telemetry.otlp_endpoint is set, so enabling collection here would "
-                "also export metrics off this machine. Enable it in the config file "
-                "instead, where the endpoint is configured.",
+                "could not establish the telemetry egress posture",
+                f"{path_key}={value}",
+                409,
+            )
+        if egress:
+            return _deny(
+                "this host is configured to export metrics off the machine, so "
+                "enabling collection here would also start that export. Enable it "
+                "in the config file instead, where the destination is configured.",
                 f"{path_key}={value}",
                 409,
             )
@@ -2076,6 +2155,10 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
         for slot in state._slots.values():
             if slot.model:
                 slot.model = ""
+                # Deliberate model change: bump the pick generation so the
+                # fallback restore probe drops any sticky state instead of
+                # restoring a model id from the previous provider.
+                slot._model_pick_gen += 1
         state.push_slots_update()
         logger.info(
             "Provider switched to %s — config rebuilt, factory reloaded, slot models cleared", value
@@ -2088,9 +2171,17 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
     # reload_provider_factory() must NOT be used here: it clears _sessions and
     # shuts every provider down, which is correct for a provider switch but
     # would kill in-flight turns just because a default changed.
-    if path_key in ("agent.model", "agent.reasoning_effort") or path_key.startswith(
-        "agent.role_efforts."
-    ):
+    if path_key in (
+        "agent.model",
+        "agent.reasoning_effort",
+        # The ACP backend is captured when the provider factory is built, and a
+        # pre-warmed kiro-cli process must not serve a session that asked for
+        # KAS — refresh_defaults() rebuilds the factory and drains the pool.
+        # NOT reload_provider_factory(): switching the default backend must not
+        # kill in-flight turns on live sessions, which keep the backend they
+        # were started on.
+        "agent.acp_backend",
+    ) or path_key.startswith("agent.role_efforts."):
         state = request.app["state"]
         await state.sessions.refresh_defaults()
         logger.info("%s set to %r — session defaults refreshed", path_key, value)

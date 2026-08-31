@@ -31,7 +31,14 @@ from typing import Any
 # no native library is loaded on any platform. Aliased so the schema block below
 # reads as "the computer-use vocabulary" rather than bare names.
 from kiro_crew.computer_use import types as _cu_types
-from kiro_crew.constants import WINDOWS_DEVICE_STEMS
+from kiro_crew.constants import AWS_PROFILE_NAME_RE, WINDOWS_DEVICE_STEMS
+
+# Reasoning-effort vocabulary: ``effort.py`` is the single source of truth for
+# the valid levels; EFFORT_VALUES additionally admits ``""`` ("unset — defer to
+# the role pin / provider default"). Import-safe: ``effort`` pulls in only
+# ``model_registry`` (stdlib-only), so no cycle back into validation.
+from kiro_crew.effort import EFFORT_VALUES
+from kiro_crew.project_scope import SCOPE_FRAGMENT_RE
 
 # ── Constants ──
 
@@ -970,6 +977,10 @@ SPAWN_RUN_SCHEMA = ToolSchema(
         # Optional model override for the subagent (e.g. "deepseek-3.2").
         # When set, the subagent runs on this model instead of the gateway default.
         FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_MODEL_NAME_RE),
+        # Optional per-call reasoning-effort override for the subagent(s).
+        # Batch-wide, like ``model``. ``""`` (in EFFORT_VALUES) means "unset —
+        # defer to the role_efforts['subagent'] pin, else the provider default".
+        FieldSpec("reasoning_effort", str, allowed=EFFORT_VALUES),
         # keep=True makes the run a continuable conversation: its session
         # persists (hibernated on disk) after completion, and spawn_continue
         # can dispatch follow-up turns into it with full prior context.
@@ -1033,9 +1044,18 @@ LEARN_ADD_SCHEMA = ToolSchema(
         FieldSpec("rule", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("category", str, allowed=ALLOWED_LESSON_CATEGORIES, default="knowledge"),
         FieldSpec("negative", str, max_len=MAX_SHORT_STRING),
-        # scope/workspace: the learn_add MCP tool (mcp_core.py) and the
-        # /api/lessons handler support workspace-scoped lessons. The "workspace
-        # required when scope='workspace'" rule is enforced in the handler.
+        # Path fragment naming the repository a correction belongs to; absent means
+        # it applies everywhere. The pattern is the gate's own (imported, not
+        # restated), so a value the gate could never satisfy -- a dot segment,
+        # traversal, an empty segment, a drive-qualified path -- is refused HERE
+        # rather than stored as a lesson that reports success and applies nowhere.
+        # Whether the named path exists is still the gate's business, at injection.
+        FieldSpec("repo_scope", str, max_len=MAX_SHORT_STRING, pattern=SCOPE_FRAGMENT_RE),
+        # scope/workspace: the /api/lessons handler stores and lists
+        # workspace-scoped lessons, but that tier does NOT reach a prompt -- the
+        # context builder gates injected lessons on repo_scope instead. The
+        # "workspace required when scope='workspace'" rule is enforced in the
+        # handler.
         FieldSpec("scope", str, allowed=ALLOWED_LESSON_SCOPES, default="global"),
         FieldSpec("workspace", str, max_len=MAX_SHORT_STRING, pattern=WORKSPACE_NAME_RE),
     ],
@@ -1047,6 +1067,31 @@ LEARN_REMOVE_SCHEMA = ToolSchema(
         FieldSpec("query", str, required=True, max_len=MAX_SHORT_STRING),
     ],
 )
+
+# Session work ledger (session_ledger.py). Field caps mirror the core module's
+# own clamps so the route refuses loudly what the primitive would otherwise
+# truncate silently. ``artifacts`` inner shape (str->str, bounded) is enforced
+# by the core module's merge. No slot-key field on purpose: the backend
+# resolves the calling session's identity from the request, never the body.
+SESSION_LEDGER_RECORD_SCHEMA = ToolSchema(
+    tool_name="session_ledger_record",
+    fields=[
+        FieldSpec("goal", str, max_len=2000),
+        FieldSpec("phase", str, max_len=128),
+        FieldSpec("next", str, max_len=2000),
+        FieldSpec("tried_approach", str, max_len=2000),
+        FieldSpec("tried_rejected_because", str, max_len=2000),
+        FieldSpec("artifacts", dict),
+        FieldSpec("event", str, max_len=2000),
+        FieldSpec("event_kind", str, max_len=32),
+    ],
+)
+# Empty on purpose, and REGISTERED on purpose: with no schema in
+# MCP_CORE_SCHEMAS an unexpected argument passes through unvalidated
+# (the learn_list gap), while an empty registered schema rejects it
+# (the spawn_list / resource_status precedent). The tool takes no
+# arguments; the schema's job is to enforce exactly that.
+SESSION_LEDGER_READ_SCHEMA = ToolSchema(tool_name="session_ledger_read")
 
 SPAWN_STATUS_SCHEMA = ToolSchema(
     tool_name="spawn_status",
@@ -1128,17 +1173,23 @@ _ASK_MAX_DESC_LEN = 500
 # transcript, so an oversized custom answer would consume model context.
 _ASK_MAX_ANSWER_LEN = 2000
 
-# ask_question renders the dashboard question card and blocks the tool call
-# until the user answers. `questions` is only shape-checked here (a bounded
-# list); the per-question/per-option limits are enforced server-side by
-# validate_ask_user_question, which is the single source of truth for the card
-# payload. timeout bounds mirror DashboardState._QUESTION_TIMEOUT_MAX.
+# ask_question requests a NON-BLOCKING dashboard question card: the MCP tool
+# returns a session directive and the agent ends its turn, so no tool call is
+# held open (see mcp_tools.control.ask_question). `questions` is only
+# shape-checked here (a bounded list); the per-question/per-option limits are
+# enforced server-side by validate_ask_user_question, which is the single
+# source of truth for the card payload.
 ASK_QUESTION_SCHEMA = ToolSchema(
     tool_name="ask_question",
     fields=[
         FieldSpec("questions", list, required=True, max_items=_ASK_MAX_QUESTIONS),
-        # 540 not 1800: the ACP tool-stall watchdog (600s) kills the turn
-        # first, and an answer arriving after that has no turn to return to.
+        # Accepted but IGNORED: the directive the tool returns carries only
+        # `questions`, so nothing downstream reads a timeout. The bound still
+        # mirrors DashboardState._QUESTION_TIMEOUT_MAX, which governs the legacy
+        # blocking POST /api/ask-question path. Kept lenient rather than removed
+        # so a caller still passing it gets its card instead of a validation
+        # error, while the tool's inputSchema no longer advertises it — a knob
+        # with no effect should not be offered to a model.
         FieldSpec("timeout_secs", int, min_val=15, max_val=540),
     ],
 )
@@ -1209,6 +1260,17 @@ SET_PROJECT_SCHEMA = ToolSchema(
         FieldSpec("clear", bool),
     ],
     custom_validator=_validate_set_project,
+)
+
+# reset_conversation drops the calling session's model context at the next turn
+# boundary. It takes NO arguments: a caller asking for a clean context always
+# wants a clean one, and replaying the transcript into the fresh conversation
+# returns most of what the reset reclaimed. The HTTP route
+# (POST /api/chat/slots/{slot}/reset-conversation) still carries a replay flag
+# for the rare caller that genuinely wants the provider reset without it.
+RESET_CONVERSATION_SCHEMA = ToolSchema(
+    tool_name="reset_conversation",
+    fields=[],
 )
 
 # suggest_followup renders an agent-authored follow-up card in the calling
@@ -1348,10 +1410,17 @@ WORKFLOW_RUN_SCHEMA = ToolSchema(
         # Either an authored Python script (source) or a NL intent to author one.
         FieldSpec("source", str, max_len=MAX_LONG_STRING),
         FieldSpec("intent", str, max_len=MAX_MEDIUM_STRING),
+        FieldSpec("workflow", str, max_len=MAX_SHORT_STRING, pattern=_WF_RUN_ID_RE),
+        FieldSpec("input", str, max_len=MAX_MEDIUM_STRING),
         FieldSpec("name", str, max_len=MAX_SHORT_STRING),
         FieldSpec("args", dict),
         FieldSpec("budget_total", int, min_val=0, max_val=100_000_000),
     ],
+)
+
+WORKFLOW_LIBRARY_LIST_SCHEMA = ToolSchema(
+    tool_name="workflow_library_list",
+    fields=[FieldSpec("search", str, max_len=MAX_MEDIUM_STRING)],
 )
 
 WORKFLOW_RUN_ID_SCHEMA = ToolSchema(
@@ -1409,7 +1478,13 @@ def _validate_artifact_save(cleaned: dict) -> None:
 
 # Shared slug pattern (matches _ARTIFACT_SLUG_RE + deploy slug validation).
 _WM_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
-_WM_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+# constants.AWS_PROFILE_NAME_RE — the single source of truth (#6063): '+'
+# admitted for IAM Identity Center derived profiles
+# ("<account>+<permission-set>", #6051); first char excludes '-' so a stored
+# profile is never option-shaped when it later reaches `--profile <value>`
+# argv. \Z is load-bearing here: this path matches the raw value WITHOUT a
+# strip, so the old $ anchor let a trailing-newline value through.
+_WM_PROFILE_RE = AWS_PROFILE_NAME_RE
 _WM_URL_RE = re.compile(r"^https?://.{1,2048}$")
 _WM_LIFECYCLE_STATUSES = {"draft", "deploying", "live", "error", "expired"}
 _WM_LIST_CAP = 50
@@ -1880,9 +1955,7 @@ ISSUE_RADAR_RECORD_INVESTIGATION_SCHEMA = ToolSchema(
     fields=[
         FieldSpec("owner", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("repo", str, required=True, max_len=MAX_SHORT_STRING),
-        FieldSpec(
-            "number", int, required=True, min_val=1, max_val=_ISSUE_RADAR_MAX_ITEM_NUMBER
-        ),
+        FieldSpec("number", int, required=True, min_val=1, max_val=_ISSUE_RADAR_MAX_ITEM_NUMBER),
         # provider/host/kind are REQUIRED, with no defaults, because together
         # with owner/repo they select the record's STORAGE NAMESPACE (see
         # ``store.provider_root``: public GitHub keeps the original
@@ -1894,9 +1967,7 @@ ISSUE_RADAR_RECORD_INVESTIGATION_SCHEMA = ToolSchema(
         # The caller always has this information to hand (`recordIdentityJson`
         # in ``website/src/apps/issue-radar/lib/links.ts`` emits all three), so
         # requiring them costs nothing and removes the ambiguity.
-        FieldSpec(
-            "provider", str, required=True, max_len=16, allowed=_ISSUE_RADAR_PROVIDERS
-        ),
+        FieldSpec("provider", str, required=True, max_len=16, allowed=_ISSUE_RADAR_PROVIDERS),
         FieldSpec("host", str, required=True, max_len=253),
         FieldSpec("kind", str, required=True, max_len=8, allowed=_ISSUE_RADAR_ITEM_KINDS),
         FieldSpec("status", str, max_len=16, allowed=_ISSUE_RADAR_STATUSES, default="resolved"),
@@ -2036,9 +2107,7 @@ ISSUE_RADAR_CREW_RECORD_SCHEMA = ToolSchema(
         # Bounds the number that becomes the work item's FILENAME
         # (``crews/<crew_id>/<n>.json``) — same ENAMETOOLONG rationale as the
         # investigation record, hence the same constant.
-        FieldSpec(
-            "number", int, required=True, min_val=1, max_val=_ISSUE_RADAR_MAX_ITEM_NUMBER
-        ),
+        FieldSpec("number", int, required=True, min_val=1, max_val=_ISSUE_RADAR_MAX_ITEM_NUMBER),
         FieldSpec("phase", str, max_len=32, allowed=_ISSUE_RADAR_CREW_PHASES),
         # Bounded but deliberately NOT ``allowed=``, unlike ``phase`` beside it.
         # An out-of-vocabulary phase has to be refused — it would corrupt the
@@ -2267,7 +2336,13 @@ HOOK_CREATE_SCHEMA = ToolSchema(
         FieldSpec("command", str, max_len=2000, default=""),
         FieldSpec("event", str, required=True, allowed=ALLOWED_HOOK_EVENTS),
         FieldSpec("matcher", str, max_len=500, default=""),  # optional: empty = match all
-        FieldSpec("matcher_mode", str, max_len=10, default="glob", allowed=frozenset({"glob", "regex", "contains"})),
+        FieldSpec(
+            "matcher_mode",
+            str,
+            max_len=10,
+            default="glob",
+            allowed=frozenset({"glob", "regex", "contains"}),
+        ),
         FieldSpec("skills", list, default=[], item_type=str, item_max_len=100),
         FieldSpec("timeout", int, min_val=1, max_val=300, default=30),
         FieldSpec("enabled", bool, default=True),
@@ -2282,7 +2357,9 @@ HOOK_UPDATE_SCHEMA = ToolSchema(
         FieldSpec("command", str, max_len=2000),  # optional on update
         FieldSpec("event", str, allowed=ALLOWED_HOOK_EVENTS),
         FieldSpec("matcher", str, max_len=500),  # optional: empty = match all
-        FieldSpec("matcher_mode", str, max_len=10, allowed=frozenset({"glob", "regex", "contains"})),
+        FieldSpec(
+            "matcher_mode", str, max_len=10, allowed=frozenset({"glob", "regex", "contains"})
+        ),
         FieldSpec("skills", list, item_type=str, item_max_len=100),
         FieldSpec("timeout", int, min_val=1, max_val=300),
         FieldSpec("enabled", bool),
@@ -2330,10 +2407,88 @@ FILE_WRITE_SCHEMA = ToolSchema(
     ],
 )
 
+# Non-Slack channel routing for send_message. `validate_tool_args` REJECTS an
+# unknown field, so a property advertised in the MCP inputSchema but missing here
+# is not merely unvalidated — the whole call fails, and the capability is 0%
+# reachable over MCP. The two must be added together.
+#
+# The channel is matched by SHAPE, not against an enumeration: the authoritative
+# set is which transports are registered and what channels governance permits,
+# both checked at send time, and a literal list here would be a second copy that
+# goes stale the moment a channel is added. The pattern itself lives on the
+# ``channel_type`` FieldSpec below, so there is exactly one of it.
+#
+# A configured-destination id is opaque and channel-defined — a Webex room id is
+# a ~90-char base64 Hydra blob — so this bounds length and excludes control
+# characters and whitespace rather than pretending to know the grammar. The id is
+# re-resolved against the channel's own configured targets before any send, which
+# is what actually authorizes it.
+_TARGET_ID_RE = re.compile(r"^[\x21-\x7e]{1,512}$")
+
+
+# Fields that select or shape a SLACK delivery. Combined with the
+# ``channel_type``/``target_id`` pair — which addresses a non-Slack destination
+# directly — they have no destination, so the pair's handler drops them before
+# any Slack-shaped validation runs. Refused here at the boundary rather than
+# dropped, because the caller (including the model) cannot observe a drop and
+# would read a private channel DM as a threaded post to a named Slack channel.
+_CHANNEL_TARGET_INCOMPATIBLE = (
+    "channel",
+    "user",
+    "blocks",
+    "thread_ts",
+    "reply_broadcast",
+    "unfurl_links",
+    "unfurl_media",
+    "session",
+)
+
+
+def _validate_channel_routing(cleaned: dict[str, Any]) -> None:
+    """``target_id`` is meaningful only ALONGSIDE ``channel_type``.
+
+    ``channel_type`` alone is complete on its own: it means the non-Slack
+    conversation this session already belongs to. Adding ``target_id`` narrows that
+    transport to one explicit configured destination on it. So the only
+    under-specified combination is a ``target_id`` with no transport to resolve it
+    against, and it is rejected at the boundary rather than ignored downstream,
+    where it would silently fall back to the default Slack/dashboard destination.
+
+    A Slack-routing field travelling with ``channel_type`` is likewise refused, not
+    dropped: the channel wins the routing, so the field would reach nothing.
+    """
+    has_channel = bool(cleaned.get("channel_type"))
+    if bool(cleaned.get("target_id")) and not has_channel:
+        raise ValidationError("channel_type", "target_id requires channel_type")
+    if has_channel:
+        stray = [f for f in _CHANNEL_TARGET_INCOMPATIBLE if cleaned.get(f) is not None]
+        if stray:
+            raise ValidationError(
+                stray[0],
+                "channel_type/target_id addresses the destination directly and cannot be "
+                f"combined with the Slack-routing field(s): {', '.join(stray)}",
+            )
+
+
 SEND_MESSAGE_SCHEMA = ToolSchema(
     tool_name="send_message",
     fields=[
         FieldSpec("text", str, required=True, max_len=MAX_MEDIUM_STRING),
+        # Non-Slack transport name. Shape-only here (the cheap first gate, same
+        # role as SEND_NOTIFICATION's `url` pattern); the authoritative closed set
+        # is `_SEND_MESSAGE_CHANNEL_TYPES` in dashboard/handlers/messaging.py,
+        # derived from `CHANNEL_SESSION_NAMESPACES`. Enumerating it here too would
+        # be a second copy that goes stale when a transport is added.
+        #
+        # A BARE transport name, so no digits and no separator: that is what keeps a
+        # session key or a namespaced value (`telegram:99887766`) from arriving where
+        # a transport is expected. Declared ONCE, beside the ``target_id`` it pairs
+        # with -- ``validate_tool_args`` ITERATES this list rather than indexing it,
+        # so a second ``channel_type`` spec is not an alternative: a value would have
+        # to satisfy both and the later one would overwrite ``cleaned``, silently
+        # making the first pattern dead.
+        FieldSpec("channel_type", str, max_len=16, pattern=re.compile(r"^[a-z]+$")),
+        FieldSpec("target_id", str, max_len=512, pattern=_TARGET_ID_RE),
         FieldSpec("title", str, max_len=MAX_SHORT_STRING),
         FieldSpec("blocks", list, item_type=dict, max_items=50),
         FieldSpec("channel", str, max_len=CHANNEL_MAX_LEN, pattern=CHANNEL_ID_RE),
@@ -2342,11 +2497,20 @@ SEND_MESSAGE_SCHEMA = ToolSchema(
         FieldSpec("unfurl_media", bool),
         FieldSpec("thread_ts", str, max_len=30, pattern=re.compile(r"^\d+\.\d+$")),
         FieldSpec("reply_broadcast", bool),
+        # Must accept every value ``mcp_tools.messaging._SESSION_TARGETS``
+        # advertises: this pattern runs BEFORE the handler, so a value missing
+        # here is rejected as malformed even though the tool's own enum offers
+        # it. Spelled out rather than imported because ``mcp_tools`` imports this
+        # module; ``test_mcp_messaging_discord`` pins the two together.
         FieldSpec(
-            "session", str, max_len=MAX_SHORT_STRING, pattern=re.compile(r"^(origin|slack)$")
+            "session",
+            str,
+            max_len=MAX_SHORT_STRING,
+            pattern=re.compile(r"^(origin|slack|discord)$"),
         ),
         FieldSpec("caller_session", str, max_len=MAX_SHORT_STRING, pattern=CRON_SESSION_RE),
     ],
+    custom_validator=_validate_channel_routing,
 )
 
 SEND_NOTIFICATION_SCHEMA = ToolSchema(
@@ -2411,28 +2575,28 @@ SELECT_CREW_SCHEMA = ToolSchema(
     ],
 )
 
-# ── Tool Schemas (Slack Reactions) ──
+# ── Slack reaction field patterns ──
 
 # Slack emoji names: alphanumeric, underscores, hyphens, and plus signs
 _EMOJI_NAME_RE = re.compile(r"^[a-zA-Z0-9+\-][a-zA-Z0-9_+\-]{0,98}[a-zA-Z0-9]$|^[a-zA-Z0-9+]$")
 # Slack message timestamp: digits.digits
 _SLACK_TS_RE = re.compile(r"^\d+\.\d+$")
 
-ADD_REACTION_SCHEMA = ToolSchema(
-    tool_name="add_reaction",
-    fields=[
-        FieldSpec("channel", str, required=True, max_len=CHANNEL_MAX_LEN, pattern=CHANNEL_ID_RE),
-        FieldSpec("timestamp", str, required=True, max_len=30, pattern=_SLACK_TS_RE),
-        FieldSpec("reaction", str, required=True, max_len=100, pattern=_EMOJI_NAME_RE),
-    ],
-)
-
 LOCAL_KNOWLEDGE_SEARCH_SCHEMA = ToolSchema(
     tool_name="local_knowledge_search",
     fields=[
         FieldSpec("query", str, required=True, max_len=500),
         FieldSpec("limit", int, required=False, min_val=1, max_val=5, default=3),
+        # Opaque source id (uuid4 today). No pattern: an unknown id must reach
+        # the handler for a graceful "use knowledge_list_sources" reply, not a
+        # ValidationError; every downstream use is a parameterized SQL bind.
+        FieldSpec("source_id", str, required=False, max_len=64),
     ],
+)
+
+KNOWLEDGE_LIST_SOURCES_SCHEMA = ToolSchema(
+    tool_name="knowledge_list_sources",
+    fields=[],
 )
 
 KNOWLEDGE_DEDUP_SCHEMA = ToolSchema(
@@ -2484,6 +2648,45 @@ LIST_SESSIONS_SCHEMA = ToolSchema(
     ],
 )
 
+SESSION_CREATE_SCHEMA = ToolSchema(
+    tool_name="session_create",
+    fields=[
+        FieldSpec("title", str, required=False, default="", max_len=200),
+        FieldSpec("agent", str, required=False, default="", max_len=MAX_SHORT_STRING),
+    ],
+)
+
+SESSION_STOP_SCHEMA = ToolSchema(
+    tool_name="session_stop",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+    ],
+)
+
+SESSION_CLOSE_SCHEMA = ToolSchema(
+    tool_name="session_close",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+    ],
+)
+
+SESSION_SEND_SCHEMA = ToolSchema(
+    tool_name="session_send",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+        FieldSpec("message", str, required=True, max_len=MAX_LONG_STRING),
+    ],
+)
+
+SESSION_READ_MESSAGE_SCHEMA = ToolSchema(
+    tool_name="session_read_message",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+        FieldSpec("limit", int, required=False, min_val=1, max_val=100, default=20),
+        FieldSpec("since", int, required=False, min_val=0),
+    ],
+)
+
 # ── Schema Registry ──
 
 MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
@@ -2494,6 +2697,8 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "spawn_status": SPAWN_STATUS_SCHEMA,
     "learn_add": LEARN_ADD_SCHEMA,
     "learn_remove": LEARN_REMOVE_SCHEMA,
+    "session_ledger_read": SESSION_LEDGER_READ_SCHEMA,
+    "session_ledger_record": SESSION_LEDGER_RECORD_SCHEMA,
     "skill_search": SKILL_SEARCH_SCHEMA,
     "skill_discover": SKILL_DISCOVER_SCHEMA,
     "skill_fetch": SKILL_FETCH_SCHEMA,
@@ -2512,10 +2717,12 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "local_knowledge_search": LOCAL_KNOWLEDGE_SEARCH_SCHEMA,
     "knowledge_dedup": KNOWLEDGE_DEDUP_SCHEMA,
     "knowledge_add_document": KNOWLEDGE_ADD_DOCUMENT_SCHEMA,
+    "knowledge_list_sources": KNOWLEDGE_LIST_SOURCES_SCHEMA,
     "search_chat_history": SEARCH_CHAT_HISTORY_SCHEMA,
     "get_chat_session": GET_CHAT_SESSION_SCHEMA,
     "list_sessions": LIST_SESSIONS_SCHEMA,
     "set_project": SET_PROJECT_SCHEMA,
+    "reset_conversation": RESET_CONVERSATION_SCHEMA,
     "suggest_followup": SUGGEST_FOLLOWUP_SCHEMA,
     "artifact_save": ARTIFACT_SAVE_SCHEMA,
     "artifact_get": ARTIFACT_GET_SCHEMA,
@@ -2547,6 +2754,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "workflow_result": WORKFLOW_RUN_ID_SCHEMA,
     "workflow_cancel": WORKFLOW_RUN_ID_SCHEMA,
     "workflow_rerun_subtree": WORKFLOW_RERUN_SCHEMA,
+    "workflow_library_list": WORKFLOW_LIBRARY_LIST_SCHEMA,
     "deploy_artifact": DEPLOY_ARTIFACT_SCHEMA,
     "issue_radar_record_investigation": ISSUE_RADAR_RECORD_INVESTIGATION_SCHEMA,
     "ops_mission_control_api": OPS_MISSION_CONTROL_API_SCHEMA,
@@ -2651,6 +2859,14 @@ _CU_OPTIONAL_ELEMENT_FIELD = FieldSpec(
 )
 _CU_CLICK_METHODS = frozenset(_cu_types.CLICK_METHODS)
 _CU_MOUSE_BUTTONS = frozenset(_cu_types.MOUSE_BUTTONS)
+_CU_DRAG_PATHS = frozenset(_cu_types.DRAG_PATHS)
+# ``computer_launch_app``'s target is a NAME, and this field is where that is
+# enforced on the wire. Deliberately the same bounded single-line string shape as
+# ``app`` — there is no path field and no argument field, because a launch that
+# accepted either would be "run an arbitrary program with attacker-chosen input"
+# rather than "open an application". The drivers narrow it much further (a resolved
+# executable must sit under a protected install root); this is only the outer bound.
+_CU_LAUNCH_APP_FIELD = FieldSpec("app", str, required=True, max_len=_cu_types.MAX_LAUNCH_QUERY_LEN)
 
 
 def _cu_coord_field(name: str, *, required: bool = False) -> FieldSpec:
@@ -2683,6 +2899,11 @@ def _cu_coord_field(name: str, *, required: bool = False) -> FieldSpec:
 # routes validation through it, and a tool absent from its server's registry has
 # its args passed through raw.
 MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
+    "session_create": SESSION_CREATE_SCHEMA,
+    "session_stop": SESSION_STOP_SCHEMA,
+    "session_close": SESSION_CLOSE_SCHEMA,
+    "session_send": SESSION_SEND_SCHEMA,
+    "session_read_message": SESSION_READ_MESSAGE_SCHEMA,
     "chat_folder_tree": CHAT_FOLDER_TREE_SCHEMA,
     "chat_folder_create": CHAT_FOLDER_CREATE_SCHEMA,
     "chat_folder_move": CHAT_FOLDER_MOVE_SCHEMA,
@@ -2691,6 +2912,16 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
 
 MCP_COMPUTER_SCHEMAS: dict[str, ToolSchema] = {
     _cu_types.TOOL_LIST_APPS: ToolSchema(tool_name=_cu_types.TOOL_LIST_APPS, fields=[]),
+    _cu_types.TOOL_LAUNCH_APP: ToolSchema(
+        tool_name=_cu_types.TOOL_LAUNCH_APP,
+        # ONE field, and the absence of the others is the point. No ``path``, no
+        # ``args``, no ``url``: the target is a name resolved against the OS's own
+        # catalog of installed applications, and each of those fields would turn this
+        # into a way to run an arbitrary program with attacker-chosen input — which,
+        # because computer use is deliberately not governance-gated, would also skip
+        # the ``BUILTIN_DENIED_RULES`` floor every ``bash`` call passes.
+        fields=[_CU_LAUNCH_APP_FIELD],
+    ),
     _cu_types.TOOL_GET_STATE: ToolSchema(
         tool_name=_cu_types.TOOL_GET_STATE,
         fields=[
@@ -2743,6 +2974,17 @@ MCP_COMPUTER_SCHEMAS: dict[str, ToolSchema] = {
             # for a drag — enumerating a smaller set here would put the same rule
             # in two places and let them drift.
             FieldSpec("click_method", str, max_len=16, allowed=_CU_CLICK_METHODS),
+            # The PATH shape. ``steps`` has no default here: absent means the
+            # dispatcher's ``DEFAULT_DRAG_STEPS`` (the two-point form), and putting a
+            # default in the schema as well would make one of the two authoritative
+            # by accident.
+            FieldSpec(
+                "steps",
+                int,
+                min_val=_cu_types.MIN_DRAG_STEPS,
+                max_val=_cu_types.MAX_DRAG_STEPS,
+            ),
+            FieldSpec("path", str, max_len=16, allowed=_CU_DRAG_PATHS),
         ],
     ),
     _cu_types.TOOL_TYPE_TEXT: ToolSchema(

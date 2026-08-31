@@ -20,6 +20,7 @@ while CLI and MCP-stdio callers can import the leaf directly and skip the
 from __future__ import annotations
 
 import logging
+import re
 
 # ``socket`` is not used directly here anymore (the hostname helpers moved to
 # ``urls``), but it is re-exported on purpose: callers and tests patch
@@ -57,6 +58,8 @@ from kiro_crew.dashboard.urls import (  # noqa: F401
 )
 
 if TYPE_CHECKING:  # aiohttp is needed for annotations only
+    from collections.abc import Iterable
+
     from aiohttp import web
 
 logger = logging.getLogger(__name__)
@@ -343,3 +346,28 @@ def check_host(request: web.Request) -> bool:
     if _is_known_tunnel_host(host) or host in allowed:
         return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Frame-ancestor origin for sandboxed documents
+# ---------------------------------------------------------------------------
+
+
+# A CSP host-source is ``scheme://host[:port]`` where host admits only letters,
+# digits and hyphens (CSP3 grammar). Ancestor origins are re-validated against this
+# before they reach a header: a value carrying a space would smuggle a second
+# source and one carrying a semicolon a whole directive. A bracketed IPv6 literal is
+# also NOT expressible — ``http://[::1]:5476`` is refused by the browser with "the
+# directive 'frame-ancestors' does not support the source expression" and the entry
+# is dropped (verified in Chrome 152) — so there is no valid spelling for an
+# IPv6-loopback ancestor and emitting one only adds console noise.
+_FRAME_ANCESTOR_ORIGIN_RE = re.compile(r"^https?://[A-Za-z0-9.\-]+(:[0-9]{1,5})?$")
+
+
+def frame_ancestors_value(extra: "Iterable[str]" = ()) -> str:
+    """The complete CSP ``frame-ancestors`` value for a framed, sandboxed response."""
+    origins = ["'self'"]
+    for candidate in extra:
+        if candidate and _FRAME_ANCESTOR_ORIGIN_RE.match(candidate) and candidate not in origins:
+            origins.append(candidate)
+    return " ".join(origins)

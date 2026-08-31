@@ -7,6 +7,7 @@ import reducer, {
   sideClose as sideCloseAction,
 } from '../store/chatSlice'
 import { renderWithProviders, createTestStore } from './helpers'
+import dashboardReducer from '../store/dashboardSlice'
 
 vi.mock('../api/client', () => ({
   api: {
@@ -22,6 +23,10 @@ vi.mock('../api/client', () => ({
 import SideChat from '../pages/chat/SideChat'
 import { api } from '../api/client'
 
+// The composer blocks sends while the gateway reads as offline, so every
+// scene runs against a connected dashboard unless it tests the offline path.
+const dashInitial = { ...dashboardReducer(undefined, { type: '@@INIT' }), connected: true }
+
 const SLOT = 'test-slot-1'
 const initial = reducer(undefined, { type: '@@INIT' })
 
@@ -29,6 +34,7 @@ const initial = reducer(undefined, { type: '@@INIT' })
  *  steer or queue. */
 function busyState(extra: Record<string, unknown> = {}) {
   return createTestStore({
+    dashboard: dashInitial,
     chat: {
       ...initial,
       activeSlot: SLOT,
@@ -80,7 +86,7 @@ describe('SideChat busy-send: steer vs queue', () => {
 
   it('an idle side keeps the plain send button and never sends a steer flag', async () => {
     const user = userEvent.setup()
-    const store = createTestStore({ chat: { ...initial, activeSlot: SLOT } })
+    const store = createTestStore({ dashboard: dashInitial, chat: { ...initial, activeSlot: SLOT } })
     renderWithProviders(<SideChat slot={SLOT} />, { store })
 
     await user.type(screen.getByLabelText('Ask a side question'), 'fresh question')
@@ -1128,7 +1134,9 @@ describe('chatSlice steer frame placement', () => {
 
     await user.type(composer, 'bar, bar')
     // Only the LAST one is treated as the pick, so the chip offers to take one back.
-    expect(chip).toHaveAttribute('title', 'Click to remove from input (double-click to send)')
+    // The tooltip leads with the chip's own label (it may be visually clamped), so
+    // assert the hint is present rather than that it is the whole attribute.
+    expect(chip.getAttribute('title')).toContain('Click to remove from input (double-click to send)')
 
     await user.click(chip)
     await waitFor(() => expect(composer).toHaveValue('bar'))
@@ -1258,20 +1266,20 @@ describe('chatSlice steer frame placement', () => {
 
     await user.click(chip)
     await waitFor(() => expect(composer).toHaveValue('Rebase first'))
-    await waitFor(() => expect(chip).toHaveAttribute('title', 'Click to remove from input (double-click to send)'))
+    await waitFor(() => expect(chip.getAttribute('title')).toContain('Click to remove from input (double-click to send)'))
 
     // Typing past the option makes it part of the user's own sentence, so it stops being a block
     // this can take back out — and the chip must stop claiming otherwise.
     await user.type(composer, ' but only if CI is green')
     expect(composer).toHaveValue('Rebase first but only if CI is green')
-    expect(chip).toHaveAttribute('title', 'Click to add to input (double-click to select and send)')
+    expect(chip.getAttribute('title')).toContain('Click to add to input (double-click to select and send)')
 
     // So the next click is a fresh pick: it appends rather than being swallowed.
     await user.click(chip)
     await waitFor(() => {
       expect(composer).toHaveValue('Rebase first but only if CI is green, Rebase first')
     })
-    expect(chip).toHaveAttribute('title', 'Click to remove from input (double-click to send)')
+    expect(chip.getAttribute('title')).toContain('Click to remove from input (double-click to send)')
   })
 
   it('un-picking one option leaves another whose text contains it intact', async () => {

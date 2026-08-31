@@ -14,12 +14,12 @@ import contextlib
 import json
 import logging
 import os
-import shutil
 import tempfile
 import time
 
 from aiohttp import web
 
+from kiro_crew import aws_consent
 from kiro_crew.config.loader import config_path
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -27,8 +27,10 @@ from kiro_crew.slack.handler import _vc
 from kiro_crew.voice_reply import (
     PROVIDER_OPENAI,
     PROVIDER_PIPER,
+    PROVIDER_POLLY,
     VALID_ENGINES,
     VALID_PROVIDERS,
+    resolve_polly_cli,
     stitch_mp3s,
     streaming_voice_reply,
     synthesize_speech,
@@ -49,8 +51,7 @@ async def api_voice_config(request: web.Request) -> web.Response:
                 "engine": _vc.default_engine,
                 "rate": _vc.default_rate,
                 "pitch": _vc.default_pitch,
-                "autoSpeak": _vc.global_enabled,
-                "auto_speak": getattr(_vc, 'auto_speak', _vc.global_enabled),
+                "autoSpeak": _vc.auto_speak,
                 "aws_profile": _vc.aws_profile,
                 "region": _vc.region,
                 "piper_binary": _vc.piper_binary,
@@ -85,7 +86,10 @@ async def api_voice_config(request: web.Request) -> web.Response:
     if "enabled" in body:
         _vc.global_enabled = bool(body["enabled"])
     if "autoSpeak" in body:
+<<<<<<< HEAD
         _vc.global_enabled = bool(body["autoSpeak"])
+=======
+>>>>>>> upstream/main
         _vc.auto_speak = bool(body["autoSpeak"])
     if "aws_profile" in body:
         _vc.aws_profile = str(body["aws_profile"]).strip()
@@ -126,6 +130,7 @@ async def api_voice_config(request: web.Request) -> web.Response:
         vr.update(
             {
                 "enabled": _vc.global_enabled,
+                "auto_speak": _vc.auto_speak,
                 "provider": _vc.provider,
                 "voice_id": _vc.default_voice,
                 "engine": _vc.default_engine,
@@ -284,11 +289,17 @@ async def _synthesize_nonstreaming(
             audio_b64 = base64.b64encode(f.read()).decode()
         state.broadcast_ws(
             "voice_chunk",
-            {"slot": slot_key, "index": 0, "sentence": text, "audio": audio_b64},
+            {
+                "slot": slot_key,
+                "index": 0,
+                "sentence": text,
+                "audio": audio_b64,
+                "audioMime": "audio/wav",
+            },
         )
         state.broadcast_ws(
             "voice_complete",
-            {"slot": slot_key, "audio": audio_b64, "chunks": 1},
+            {"slot": slot_key, "audio": audio_b64, "chunks": 1, "audioMime": "audio/wav"},
         )
 
         # Track OpenAI TTS cost on the last assistant message's turn_stats.
@@ -335,18 +346,44 @@ async def api_voice_voices(request: web.Request) -> web.Response:
     if _voices_cache is not None and (now - _voices_cache_ts) < _VOICES_CACHE_TTL:
         return web.json_response({"voices": _voices_cache})
 
-    if await asyncio.to_thread(shutil.which, "aws") is None:
-        # Polly voice listing needs the AWS CLI, which is optional (the
-        # default Piper provider works without it). When the gateway runs
-        # under launchd, its PATH may also lack the dirs where `aws` is
-        # installed (e.g. /usr/local/bin). Degrade to an empty list instead
-        # of a 500 + traceback. Not cached, so the list recovers as soon as
-        # `aws` becomes resolvable. The probe runs in a thread so a wedged
-        # network mount on PATH cannot stall the event loop.
-        logger.info("aws CLI not found on PATH — returning empty voices list")
+    # The catalogue lives behind a paid provider, so two gates come before the
+    # subprocess. Both used to be absent here: the ONLY thing stopping this
+    # endpoint from calling AWS was the frontend declining to fetch it while
+    # Piper was selected, so any other client — or a direct request — reached
+    # `aws polly describe-voices` against whatever the ambient credential chain
+    # resolved to.
+    #
+    # 1. Not the active provider: a Piper user has no business shipping a
+    #    request to Polly at all.
+    if _vc.provider != PROVIDER_POLLY:
+        return web.json_response({"voices": []})
+    # 2. Polly IS selected but unconfirmed. Same empty list: the operator-facing
+    #    explanation is the consent card's job (it has its own GET carrying the
+    #    reason), so returning a second copy here would be a response field with
+    #    no reader. Routed through ``refuse_and_log`` rather than ``authorize``
+    #    so the denial reaches the tamper-evident audit log like every other
+    #    gated call site -- a denial that only logs is a denial an incident
+    #    review cannot see.
+    if not await aws_consent.refuse_and_log(
+        aws_consent.SERVICE_POLLY, profile=_vc.aws_profile, region=_vc.region
+    ):
         return web.json_response({"voices": []})
 
-    cmd = ["aws", "polly", "describe-voices", "--output", "json"]
+    aws_bin = await asyncio.to_thread(resolve_polly_cli)
+    if aws_bin is None:
+        # Polly voice listing needs the AWS CLI, which is optional (the
+        # default Piper provider works without it). Resolution goes through
+        # the deploy engine's shared well-known-dirs resolver, so a gateway
+        # running under launchd with a minimal PATH still finds a Homebrew /
+        # official-pkg install (#4770). When the CLI genuinely is not
+        # installed, degrade to an empty list instead of a 500 + traceback.
+        # Not cached, so the list recovers as soon as `aws` becomes
+        # resolvable. The probe runs in a thread so a wedged network mount
+        # on PATH cannot stall the event loop.
+        logger.info("aws CLI not resolvable — returning empty voices list")
+        return web.json_response({"voices": []})
+
+    cmd = [aws_bin, "polly", "describe-voices", "--output", "json"]
     if _vc.aws_profile:
         cmd += ["--profile", _vc.aws_profile]
     if _vc.region:
@@ -381,7 +418,11 @@ async def api_voice_voices(request: web.Request) -> web.Response:
     except asyncio.TimeoutError:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
-        await proc.wait()
+        # Reap via communicate(), not wait(): wait_for cancelled the pipe
+        # readers before the kill landed, so a child blocked writing to a
+        # full stderr PIPE is never drained and wait() can hang the request
+        # handler indefinitely (#5975, same class as #5834).
+        await proc.communicate()
         return web.json_response({"error": "timeout"}, status=504)
     except FileNotFoundError:
         # Defense-in-depth behind the which() guard above: exec can still

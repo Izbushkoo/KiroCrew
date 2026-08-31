@@ -102,6 +102,7 @@ interface PreloadStub {
   openExternal: ReturnType<typeof vi.fn>
   updateHitbox: ReturnType<typeof vi.fn>
   setMenuHitbox: ReturnType<typeof vi.fn>
+  turnOff: ReturnType<typeof vi.fn>
 }
 
 /** Install the preload bridge the desktop windows have and a browser tab does not. */
@@ -115,6 +116,7 @@ function stubPreload(offBridge = vi.fn()): PreloadStub {
     openExternal: vi.fn(),
     updateHitbox: vi.fn(),
     setMenuHitbox: vi.fn(),
+    turnOff: vi.fn(),
   }
   ;(window as unknown as { crewCompanion?: unknown }).crewCompanion = bridge
   return bridge
@@ -182,13 +184,27 @@ describe('savePosition coalescing', () => {
     expect(calls[0].body).toEqual({ petX: 30, petY: 41 })
   })
 
-  it('swallows a failed write — the companion stays where it is on screen', async () => {
-    stubFetchAll({ fails: true })
+  it('a failed write does not wedge the coalescing timer', async () => {
+    // Renamed and re-pointed. The old body was `expect(true).toBe(true)` behind a
+    // comment claiming "no unhandled rejection escapes", which asserted nothing —
+    // it passed whether or not `flushSave` kept its `.catch()`. Asserting the
+    // rejection directly does not close that gap either: MEASURED, deleting the
+    // `.catch()` still leaves all 68 tests green, because the rejection surfaces
+    // as a process-level event that vitest attributes to no single test.
+    //
+    // So this pins the consequence that IS observable from here, and is the one
+    // that would actually break the feature: a failed save must leave the module's
+    // timer handle clear, or the companion's position silently stops persisting
+    // for the rest of the session after one network blip.
+    const { fn } = stubFetchAll({ fails: true })
     petBridge.savePosition!(1, 2)
     vi.advanceTimersByTime(250)
-    // No unhandled rejection escapes; the call simply had no effect.
+    expect(fn).toHaveBeenCalledOnce()
     await Promise.resolve()
-    expect(true).toBe(true)
+
+    petBridge.savePosition!(3, 4)
+    vi.advanceTimersByTime(250)
+    expect(fn).toHaveBeenCalledTimes(2)
   })
 })
 
@@ -798,22 +814,27 @@ describe('window-level bridge calls', () => {
 })
 
 describe('contextMenuAction', () => {
-  it('"quit" disables the app instead of quitting Kiro Crew itself', async () => {
+  it('"quit" disables the app and then closes the overlay at once', async () => {
     const { calls } = stubFetchAll({ ok: true })
     const bridge = stubPreload()
     petBridge.contextMenuAction!('quit')
-    await Promise.resolve()
+    await new Promise((r) => setTimeout(r, 0))
     expect(calls[0].url).toBe('/api/apps/crew-companion/disable')
     expect(calls[0].method).toBe('POST')
     // Disabling is a gateway call, not a window-level one.
     expect(bridge.contextMenuAction).not.toHaveBeenCalled()
+    // On success the overlay is closed immediately, not left for the reconcile tick.
+    expect(bridge.turnOff).toHaveBeenCalledOnce()
   })
 
-  it('a failed disable request is swallowed', async () => {
+  it('a failed disable leaves the companion up instead of closing it', async () => {
+    const bridge = stubPreload()
     stubFetchAll({ fails: true })
     expect(() => petBridge.contextMenuAction!('quit')).not.toThrow()
-    await Promise.resolve()
-    await Promise.resolve()
+    await new Promise((r) => setTimeout(r, 0))
+    // The disable failed, so the overlay must NOT be closed — better a companion
+    // that stays than one that vanishes with nothing actually turned off.
+    expect(bridge.turnOff).not.toHaveBeenCalled()
   })
 
   it('"gallery" opens the gallery window', () => {

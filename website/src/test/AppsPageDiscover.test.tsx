@@ -29,6 +29,11 @@ vi.mock('../api/client', () => ({
 
 vi.mock('../hooks/useTheme', () => ({ useTheme: () => ({ theme: 'dark' }) }))
 
+// The Library tiles' overflow menu is a Radix DropdownMenu, which happy-dom
+// cannot drive — swap in the repo's stateful mock (FileExplorerPageCoverage
+// pattern): Trigger click toggles, items render inline as role="menuitem".
+vi.mock('@radix-ui/react-dropdown-menu', async () => await import('./__mocks__/@radix-ui/react-dropdown-menu'))
+
 vi.mock('../components/AppIcon', () => ({
   default: ({ icon, iconUrl }: { icon?: string; iconUrl?: string }) => (
     <div data-testid="app-icon" data-icon={icon || ''} data-icon-url={iconUrl || ''} />
@@ -50,16 +55,21 @@ vi.mock('../components/SegmentedControl', () => ({
   ),
 }))
 
-import AppsPage from '../pages/AppsPage'
+import AppsPage from '../pages/apps/DiscoverPage'
+import LibraryPage from '../pages/apps/LibraryPage'
 
 const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
-function renderPage() {
+function renderPage(path = '/apps') {
   return render(
     <QueryClientProvider client={qc}>
-      <MemoryRouter initialEntries={['/apps']}>
+      <MemoryRouter initialEntries={[path]}>
         <Routes>
           <Route path="/apps" element={<AppsPage />} />
+          {/* Static segment BEFORE the detail param route, mirroring App.tsx's
+              route order: /apps/library must never fall through to a
+              /apps/:name-style catch-all. */}
+          <Route path="/apps/library" element={<LibraryPage />} />
           <Route path="/apps/detail/:name" element={<div data-testid="detail-route" />} />
         </Routes>
       </MemoryRouter>
@@ -107,18 +117,21 @@ describe('AppsPage — hybrid Discover', () => {
 
   it('lands on Discover with the top-flagged app as spotlight', async () => {
     renderPage()
-    // Spotlight renders the FEATURED kicker with the featured=1 app
-    await screen.findByText('FEATURED')
+    // The derived fallback is DATA-level: with no published sections the three
+    // picks render through the same block path as editorial -- a `full` lead
+    // plus a `row` of two, every card the same component. Three kickers is
+    // that contract; a fourth surface or a bespoke fallback card breaks it.
+    expect(await screen.findAllByText('FEATURED')).toHaveLength(3)
     const heading = await screen.findByRole('heading', { level: 2, name: 'Code Review Sage' })
     expect(heading).toBeInTheDocument()
-    // Secondary feature card shows the featured=2 app: it renders twice —
-    // once as the feature card, once in the All-apps list below.
+    // A row card shows the featured=2 app: it renders twice —
+    // once as the row card, once in the All-apps list below.
     expect(screen.getAllByRole('button', { name: 'View details for Oncall Radar' })).toHaveLength(2)
   })
 
   it('shows category rail with counts and sources with provenance', async () => {
     renderPage()
-    await screen.findByText('FEATURED')
+    await screen.findAllByText('FEATURED')
     expect(screen.getByRole('button', { name: /All apps 3/ })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /Developer Tools 1/ })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /On-call & Ops 1/ })).toBeInTheDocument()
@@ -128,22 +141,26 @@ describe('AppsPage — hybrid Discover', () => {
     expect(screen.getByText('1 app')).toBeInTheDocument()
   })
 
-  it('selecting a category filters the list and hides the editorial layer', async () => {
+  it('selecting a category filters the list but KEEPS the editorial layer', async () => {
     renderPage()
-    await screen.findByText('FEATURED')
+    const kickersBefore = (await screen.findAllByText('FEATURED')).length
     fireEvent.click(screen.getByRole('button', { name: /On-call & Ops 1/ }))
-    await waitFor(() => expect(screen.queryByText('FEATURED')).not.toBeInTheDocument())
-    // Section heading switches to the category, list shows only the match
-    expect(screen.getByRole('heading', { name: 'On-call & Ops' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /View details for Oncall Radar/ })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /View details for Code Review Sage/ })).not.toBeInTheDocument()
+    // Section heading switches to the category, list shows only the match…
+    await screen.findByRole('heading', { name: 'On-call & Ops' })
+    const listRows = screen.getAllByRole('button', { name: /View details for Oncall Radar/ })
+    expect(listRows.length).toBeGreaterThan(0)
+    // …but curated placements are content, not list rows: the spotlight
+    // survives the category pick untouched (same card count as before), and a
+    // featured app OUTSIDE the picked category still shows there.
+    expect(screen.getAllByText('FEATURED')).toHaveLength(kickersBefore)
+    expect(screen.getAllByRole('button', { name: /View details for Code Review Sage/ }).length).toBeGreaterThan(0)
   })
 
   it('search filters rows and hides editorial; row click routes to detail', async () => {
     renderPage()
-    await screen.findByText('FEATURED')
+    await screen.findAllByText('FEATURED')
     fireEvent.change(screen.getByLabelText('Search apps'), { target: { value: 'secretary' } })
-    await waitFor(() => expect(screen.queryByText('FEATURED')).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryAllByText('FEATURED')).toHaveLength(0))
     const row = screen.getByRole('button', { name: /View details for Secretary/ })
     // Installed app row shows update action; provenance line carries the registry
     expect(within(row).getByText(/kirodotdev-labs/)).toBeInTheDocument()
@@ -151,22 +168,31 @@ describe('AppsPage — hybrid Discover', () => {
     expect(await screen.findByTestId('detail-route')).toBeInTheDocument()
   })
 
-  it('shows the pending-updates banner on Library and runs Update All', async () => {
-    updateApp.mockResolvedValue({ ok: true })
-    renderPage()
-    await screen.findByText('FEATURED')
-    fireEvent.click(screen.getByText('Library'))
+  it('shows the pending-updates hint row on Library, linking to the Updates sub-page', async () => {
+    // Library is its own routed page now (PR1 split) — mount it directly.
+    renderPage('/apps/library')
+    // PR2 demoted the banner to a muted one-line hint: a count and a hand-off
+    // link to the Discover Updates sub-page, which owns the update worklist.
     expect(await screen.findByText('1 update available')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Update All' }))
-    await waitFor(() => expect(updateApp).toHaveBeenCalledWith('secretary'))
+    expect(screen.getByRole('link', { name: 'View updates' }))
+      .toHaveAttribute('href', '/apps/-/updates')
+    // Update All left with the banner — the hint row carries no batch action.
+    expect(screen.queryByRole('button', { name: 'Update All' })).toBeNull()
+    // The affected tile still offers per-app Update — in its overflow menu
+    // (the redesigned action bar caps at Open + menu).
+    fireEvent.click(screen.getByRole('button', { name: 'More actions for Secretary' }))
+    expect(screen.getByRole('menuitem', { name: 'Update' })).toBeInTheDocument()
   })
 
   it('persists and migrates the stored tab (installed → library)', async () => {
     sessionStorage.setItem('appstore-tab', 'installed')
     renderPage()
-    // Lands on Library (migrated), which shows the installed management card
+    // The legacy key redirects /apps to /apps/library (REPLACE), which shows
+    // the installed management surface — the pending-updates hint row proves
+    // Library content actually rendered, not just a route change.
     expect(await screen.findByText('1 update available')).toBeInTheDocument()
-    expect(sessionStorage.getItem('appstore-tab')).toBe('library')
+    // The key is cleared after migration so the redirect can never fire twice.
+    await waitFor(() => expect(sessionStorage.getItem('appstore-tab')).toBeNull())
   })
 })
 
@@ -182,7 +208,7 @@ describe('AppsPage — hero art and provenance trust', () => {
 
   it('renders developer hero art on the editorial surface only, theme-appropriate', async () => {
     renderPage()
-    await screen.findByText('FEATURED')
+    await screen.findAllByText('FEATURED')
     // EXACTLY one, not "at least one": this app is featured, so the spotlight is
     // the only surface that renders its art. It used to be two -- the spotlight
     // and the dense row -- and a row rendering a 96x54 crop of marketing art is
@@ -196,7 +222,7 @@ describe('AppsPage — hero art and provenance trust', () => {
 
   it('falls back to gradient art when a hero image fails to load', async () => {
     renderPage()
-    await screen.findByText('FEATURED')
+    await screen.findAllByText('FEATURED')
     const sel = 'img[src="/api/apps/blob?repo=Sage&path=hero-dark.png"]'
     const before = document.querySelectorAll(sel).length
     // Fail the first hero (the spotlight); it must drop to gradient art while
@@ -217,7 +243,7 @@ describe('AppsPage — hero art and provenance trust', () => {
     renderPage()
     // A one-app catalog renders it in both the spotlight and the dense list;
     // the badge must be absent from every surface.
-    await screen.findByText('FEATURED')
+    await screen.findAllByText('FEATURED')
     const surfaces = screen.getAllByRole('button', { name: /View details for Impostor/ })
     for (const s of surfaces) expect(within(s).queryByLabelText('Verified publisher')).toBeNull()
     // Provenance is still surfaced so the user can see where it came from.
@@ -231,7 +257,7 @@ describe('AppsPage — hero art and provenance trust', () => {
     })
     renderPage()
     // Falls back to the app name; no TypeError during sort/filter/render.
-    await screen.findByText('FEATURED')
+    await screen.findAllByText('FEATURED')
     expect(screen.getAllByRole('button', { name: /View details for orphan-app/ }).length).toBeGreaterThan(0)
   })
 })

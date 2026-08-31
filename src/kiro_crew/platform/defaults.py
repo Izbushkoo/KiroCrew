@@ -19,7 +19,12 @@ if TYPE_CHECKING:
     from kiro_crew.platform.interfaces import ImportSource, McpScope
 
 from kiro_crew import security, sso_status
-from kiro_crew.platform.interfaces import CapabilityResult, InterceptDecision
+from kiro_crew.platform.interfaces import (
+    CapabilityResult,
+    InterceptDecision,
+    MobileConnectMethod,
+    OtlpDestination,
+)
 
 # ``agent``, ``sandbox``, ``embeddings``, ``apps.registry`` and ``slack.enterprise``
 # import ``kiro_crew.platform`` at module-load time, so importing them at the top
@@ -44,7 +49,10 @@ class DefaultProviderRegistry:
     def register_acp_backends(self) -> None:
         # The public edition registers no extra ACP backends.  The companion
         # re-registers a Claude backend here via the acp/client.py:_is_claude
-        # seam.
+        # seam, and pairs it with
+        # ``acp_backends.register_selectable_backend(ACP_BACKEND_CLAUDE)`` so the
+        # dashboard switch, the PATCH allowlist and the config load path all see
+        # it — the provider alone is runnable but unreachable.
         return None
 
 
@@ -431,6 +439,24 @@ class DefaultTelemetryProvider:
     def frontend_rum_config(self) -> Optional[dict]:
         return None
 
+    def otlp_destinations(self, cfg: Any) -> "tuple[OtlpDestination, ...]":
+        # Byte-identical to the endpoint-only OTLP exporter this seam replaced:
+        # ONE destination when telemetry.otlp_endpoint is a non-empty string,
+        # NONE otherwise — so egress stays off by default and the standalone
+        # build reaches exactly the collector it reached before. Read with
+        # getattr so any telemetry-config shape works, and never logged here:
+        # the value can carry credentials in userinfo or query parameters.
+        endpoint = str(getattr(cfg, "otlp_endpoint", "") or "").strip()
+        if not endpoint:
+            return ()
+        return (
+            OtlpDestination(
+                name="telemetry.otlp_endpoint",
+                endpoint=endpoint,
+                signals=frozenset({"metrics"}),
+            ),
+        )
+
 
 class DefaultKnowledgeProvider:
     """No extra connectors — the public edition ships only the built-in set."""
@@ -488,3 +514,20 @@ class DefaultJailProvider:
     def maybe_reexec_into_jail(self, argv: List[str], mode: str) -> Optional[int]:
         # None → no re-exec; the command runs in-process exactly as today.
         return None
+
+
+class DefaultMobileConnectProvider:
+    """The personal-install phone-connection pair.
+
+    ``tailnet_qr`` rides the existing tailnet publish + QR mint surface
+    (``/api/tailnet/mobile/*``); ``login_link`` rides the one-time mobile
+    sign-in link (``/api/auth/mobile-link``).  Descriptors only — each method's
+    own endpoint keeps its full guard stack.  An enterprise companion replaces
+    this list via ``dataclasses.replace(ctx, mobile_connect=...)``.
+    """
+
+    def connect_methods(self) -> List[MobileConnectMethod]:
+        return [
+            MobileConnectMethod(id="tailnet_qr", kind="tailnet_qr"),
+            MobileConnectMethod(id="login_link", kind="login_link"),
+        ]

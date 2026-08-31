@@ -9,15 +9,16 @@ import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
 
-from kiro_crew import platform_compat
+from kiro_crew import identity_stores, platform_compat
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.env import augmented_path
 
 KIRO_CLI_NAME = "kiro-cli"
 
 # kiro-cli's own local state database. Holds identity-describing rows next to
-# credential rows, so every reader here is read-only and key-scoped.
-KIRO_CLI_STATE_DB = "data.sqlite3"
+# credential rows, so every reader here is read-only and key-scoped. Alias of
+# the single canonical filename constant so the six former copies cannot drift.
+KIRO_CLI_STATE_DB = identity_stores.AUTH_SQLITE_DB
 
 # Non-secret rows kiro-cli writes when the signed-in identity came from IAM
 # Identity Center. Presence is the whole signal: the values (a start URL and a
@@ -44,24 +45,11 @@ def kiro_cli_state_dbs(
 
     Mirrors the per-platform data directories the readiness probe stages from,
     including the ``XDG_DATA_HOME`` / ``LOCALAPPDATA`` redirections, so a host
-    with a relocated data dir is not silently treated as having no store.
+    with a relocated data dir is not silently treated as having no store. Thin
+    wrapper over :func:`identity_stores.state_db_candidates`, which owns the
+    canonical per-platform table and the dedupe.
     """
-    if platform_name == "darwin":
-        roots = [home / "Library" / "Application Support" / KIRO_CLI_NAME]
-    elif platform_name == "win32":
-        local_app_data = Path(environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
-        roots = [
-            local_app_data / KIRO_CLI_NAME,
-            home / "AppData" / "Roaming" / KIRO_CLI_NAME,
-        ]
-    else:
-        data_home = Path(environ.get("XDG_DATA_HOME") or home / ".local" / "share")
-        roots = [data_home / KIRO_CLI_NAME]
-    return tuple(root / KIRO_CLI_STATE_DB for root in _unique_paths(roots))
-
-
-def _unique_paths(items: list[Path]) -> list[Path]:
-    return list(dict.fromkeys(items))
+    return identity_stores.state_db_candidates(platform_name, home, environ)
 
 
 def api_key_configured(environ: Mapping[str, str] | None = None) -> bool:
@@ -197,7 +185,11 @@ def known_kiro_cli_dirs(
     """Return fixed and inherited directories where Kiro CLI may be installed."""
 
     if platform_name == "win32":
-        dirs = [str(Path(_windows_program_files(environ)) / "Kiro-Cli")]
+        local_app_data = Path(environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
+        dirs = [
+            str(local_app_data / "Kiro-Cli"),
+            str(Path(_windows_program_files(environ)) / "Kiro-Cli"),
+        ]
     else:
         dirs = [
             str(home / ".local" / "bin"),
@@ -214,10 +206,10 @@ def known_kiro_cli_dirs(
         )
     if include_inherited_path and platform_name == "win32":
         dirs.extend(part for part in environ.get("PATH", "").split(";") if part)
-        # A GUI-launched Windows gateway may omit its venv's Scripts directory
-        # from PATH. ACP launch still needs the console-script fallback that
-        # existed before setup and ACP adopted this shared resolver.
-        dirs.append(str(Path(sys.executable).parent))
+        # A GUI-launched Windows gateway can retain an old PATH after a user
+        # installs a CLI. Keep the inherited order, then add the shared set of
+        # standard user tool directories and the venv Scripts fallback.
+        dirs.extend(part for part in augmented_path("", home=str(home)).split(os.pathsep) if part)
     elif include_inherited_path:
         dirs.extend(
             part for part in augmented_path(environ.get("PATH", "")).split(os.pathsep) if part
@@ -251,6 +243,12 @@ def find_kiro_cli_candidates(
     result: list[str] = []
     for candidate in _unique(candidates):
         if platform_compat.is_executable_file(candidate, platform_name=platform_name):
+            if platform_name == "win32":
+                try:
+                    if os.path.getsize(candidate) == 0:
+                        continue
+                except OSError:
+                    continue
             result.append(os.path.realpath(candidate) if platform_name == "win32" else candidate)
     return result
 

@@ -654,6 +654,13 @@ async def test_run_json_kills_process_tree_when_stdout_exceeds_limit(monkeypatch
             self.returncode = -9
             self.done.set()
 
+        async def communicate(self):
+            # The bounded reap drains the pipes via communicate() rather than a
+            # bare wait() that a full pipe could hang.
+            self.returncode = -9
+            self.done.set()
+            return b"", b""
+
     proc = FakeProcess()
     spawn_kwargs = {}
 
@@ -661,47 +668,96 @@ async def test_run_json_kills_process_tree_when_stdout_exceeds_limit(monkeypatch
         spawn_kwargs.update(kwargs)
         return proc
 
-    def kill_tree(pid, sig):
-        assert pid == proc.pid
-        assert sig == source.platform_compat.SIGKILL
+    tree_kills: list[tuple[int, int]] = []
+
+    async def kill_tree(pid, sig):
+        tree_kills.append((pid, sig))
         proc.returncode = -sig
         proc.done.set()
         return True
 
-    tree_kill = MagicMock(side_effect=kill_tree)
     monkeypatch.setattr(source, "_resolve_provider_executable", lambda _name: "/usr/bin/gh")
     monkeypatch.setattr(
         source,
         "sandboxed_spawn_argv",
         lambda argv, **kwargs: (argv, kwargs["env"], None),
     )
-    monkeypatch.setattr(source.platform_compat, "kill_process_tree", tree_kill)
+    monkeypatch.setattr(source.platform_compat, "kill_process_tree_async", kill_tree)
     monkeypatch.setattr(source.asyncio, "create_subprocess_exec", fake_create)
     with pytest.raises(source.SourceProviderError, match="response was too large"):
         await source._run_json("gh", "api", "repos/acme/repo", max_output_bytes=4)
-    tree_kill.assert_called_once_with(proc.pid, source.platform_compat.SIGKILL)
-    assert proc.killed is False
+    # The whole tree is SIGKILLed through the bounded reap (kill_and_reap).
+    assert tree_kills == [(proc.pid, source.platform_compat.SIGKILL)]
     assert spawn_kwargs["env"]["GH_HOST"] == "github.com"
     assert spawn_kwargs["start_new_session"] is source.platform_compat.IS_POSIX
     assert spawn_kwargs["creationflags"] == source.platform_compat.CREATE_NEW_PROCESS_GROUP
 
 
 @pytest.mark.asyncio
-async def test_run_json_refuses_provider_cli_on_windows(monkeypatch) -> None:
-    resolver = MagicMock()
-    sandbox = MagicMock()
+async def test_run_json_on_windows_defers_to_the_sandbox_gate(monkeypatch) -> None:
+    """Windows is no longer refused by a platform check of its own.
+
+    It has no OS sandbox backend, but neither does a backend-less Linux host, and
+    both must reach the same gate: ``sandboxed_spawn_argv`` fail-closes unless the
+    operator opted into unsandboxed exec, and its refusal names that opt-in. The
+    old blanket check ran BEFORE that gate, so it made the documented escape
+    hatch unreachable on Windows alone and left the Changes panel permanently
+    dead there. Asserting the resolver is now REACHED is what pins that: it sat
+    behind the removed refusal, so a reintroduced platform check fails here.
+    """
+    resolver = MagicMock(return_value="C:\\gh\\gh.exe")
+    sandbox = MagicMock(side_effect=RuntimeError("no OS-level sandbox backend"))
     spawn = AsyncMock()
     monkeypatch.setattr(source.platform_compat, "IS_WINDOWS", True)
     monkeypatch.setattr(source, "_resolve_provider_executable", resolver)
     monkeypatch.setattr(source, "sandboxed_spawn_argv", sandbox)
     monkeypatch.setattr(source.asyncio, "create_subprocess_exec", spawn)
 
-    with pytest.raises(source.SourceProviderError, match="not supported on Windows"):
+    with pytest.raises(source.SourceProviderError, match="could not start securely"):
         await source._run_json("gh", "api", "repos/acme/repo")
 
-    resolver.assert_not_called()
-    sandbox.assert_not_called()
+    resolver.assert_called_once()
+    sandbox.assert_called_once()
+    # The sandbox refused, so nothing was ever executed unisolated.
     spawn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_json_on_windows_proceeds_once_the_sandbox_gate_allows(monkeypatch) -> None:
+    """With the opt-in in force the gate returns argv and the read completes.
+
+    The companion to the test above: together they show Windows now has BOTH
+    outcomes the gate defines, rather than one hard-coded refusal.
+
+    **The resolved path is POSIX-shaped on purpose — do not "correct" it to a
+    Windows one.** Only ``IS_WINDOWS`` is patched here; CI runs this on a POSIX
+    host where ``os.sep`` and ``shutil.which`` are real. A ``C:\\...`` value
+    would take ``create_subprocess_limited``'s PATH-search branch (the spawn shim
+    is non-empty on POSIX), ``shutil.which`` would return None, and the read
+    would die with ``gh could not start`` before reaching the mocked spawn — the
+    test would fail deterministically on CI while passing on a Windows dev box.
+    What this test pins is the sandbox gate, not path resolution, so it uses the
+    same absolute POSIX path every sibling test does.
+    """
+
+    class FakeProcess:
+        returncode = 0
+
+    monkeypatch.setattr(source.platform_compat, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        source, "_resolve_provider_executable", MagicMock(return_value="/usr/bin/gh")
+    )
+    monkeypatch.setattr(
+        source,
+        "sandboxed_spawn_argv",
+        lambda argv, **kwargs: (argv, kwargs["env"], None),
+    )
+    monkeypatch.setattr(
+        source.asyncio, "create_subprocess_exec", AsyncMock(return_value=FakeProcess())
+    )
+    monkeypatch.setattr(source, "_collect_process_output", AsyncMock(return_value=(b"{}", b"")))
+
+    assert await source._run_json("gh", "api", "repos/acme/repo") == {}
 
 
 @pytest.mark.asyncio
@@ -1209,6 +1265,17 @@ async def test_fetch_github_normalizes_commits_checks_comments_and_files(monkeyp
     )
 
     assert data["provider"] == "github"
+    # The plugin contract (`SourceChangePayload`) is defined as "what the
+    # built-in fetchers produce", so the two must not drift: a key added to or
+    # removed from `_fetch_github` without the schema (or vice versa) breaks
+    # every downstream plugin silently. Exact equality, both directions (the
+    # GitHub fetcher emits none of the `total=False` extras).
+    assert set(data) == set(source.SourceChangePayload.__required_keys__)
+    assert set(data["commits"][0]) == set(source.SourceChangeCommit.__annotations__)
+    assert set(data["files"][0]) == set(source.SourceChangeFile.__annotations__)
+    assert {frozenset(comment) for comment in data["comments"]} == {
+        frozenset(source.SourceChangeComment.__annotations__)
+    }
     assert data["mergeable"] == "conflicting"
     assert data["mergeStateStatus"] == "dirty"
     assert data["commits"][0]["sha"] == "abc123"
@@ -1271,6 +1338,108 @@ async def test_fetch_github_marks_failed_secondary_endpoints_partial(
     )
 
     assert data["partialSections"] == [expected_section]
+
+
+@pytest.mark.asyncio
+async def test_fetch_github_reads_rollup_outside_the_core_field_set(monkeypatch) -> None:
+    """The core `pr view` field set must not bundle `statusCheckRollup` (#5115).
+
+    `gh` resolves a `--json` field set atomically, so a bundled rollup made a
+    fine-grained token without Checks read access fail the WHOLE panel read.
+    """
+    commands: list[tuple[str, int | None]] = []
+
+    async def fake_run(*argv: str, **kwargs: int):
+        command = " ".join(argv)
+        commands.append((command, kwargs.get("max_output_bytes")))
+        if "statusCheckRollup" in command:
+            return {
+                "statusCheckRollup": [
+                    {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}
+                ],
+                "headRefOid": "abc123",
+            }
+        if "pr view" in command:
+            return {"number": 12, "title": "Split", "state": "OPEN", "headRefOid": "abc123"}
+        return {} if "graphql" in command else []
+
+    monkeypatch.setattr(source, "_run_json", fake_run)
+
+    data = await source._fetch_github(
+        source.parse_source_url("https://github.com/acme/repo/pull/12")
+    )
+
+    core_reads = [
+        command for command, _limit in commands if "pr view" in command and "title" in command
+    ]
+    assert core_reads
+    assert all("statusCheckRollup" not in command for command in core_reads)
+    rollup_reads = [
+        (command, limit) for command, limit in commands if "statusCheckRollup" in command
+    ]
+    assert len(rollup_reads) == 1
+    assert rollup_reads[0][0].endswith("statusCheckRollup,headRefOid")
+    assert rollup_reads[0][1] == source._CHECKS_OUTPUT_BYTES
+    assert data["checks"][0]["bucket"] == "passed"
+    assert "checks" not in data["partialSections"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_github_core_payload_survives_rollup_failure(monkeypatch) -> None:
+    """A Checks-blind token costs the checks SECTION, never the panel (#5115)."""
+
+    async def fake_run(*argv: str, **_kwargs: int):
+        command = " ".join(argv)
+        if "statusCheckRollup" in command:
+            raise source.SourceProviderError("gh: Resource not accessible by integration")
+        if "pr view" in command:
+            return {
+                "number": 12,
+                "title": "Fine-grained token",
+                "state": "OPEN",
+                "headRefOid": "abc123",
+            }
+        return {} if "graphql" in command else []
+
+    monkeypatch.setattr(source, "_run_json", fake_run)
+
+    data = await source._fetch_github(
+        source.parse_source_url("https://github.com/acme/repo/pull/12")
+    )
+
+    assert data["title"] == "Fine-grained token"
+    assert data["state"] == "OPEN"
+    assert data["checks"] == []
+    # The degraded state is distinguishable IN THE PAYLOAD: an empty `checks`
+    # list plus the named partial section, never a silent "no checks".
+    assert "checks" in data["partialSections"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_github_discards_rollup_from_a_different_head(monkeypatch) -> None:
+    """A rollup read that straddled a push must not pin another commit's CI."""
+
+    async def fake_run(*argv: str, **_kwargs: int):
+        command = " ".join(argv)
+        if "statusCheckRollup" in command:
+            return {
+                "statusCheckRollup": [
+                    {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}
+                ],
+                "headRefOid": "pushed-after-core-read",
+            }
+        if "pr view" in command:
+            return {"number": 12, "state": "OPEN", "headRefOid": "abc123"}
+        return {} if "graphql" in command else []
+
+    monkeypatch.setattr(source, "_run_json", fake_run)
+
+    data = await source._fetch_github(
+        source.parse_source_url("https://github.com/acme/repo/pull/12")
+    )
+
+    assert data["checks"] == []
+    assert "checks" in data["partialSections"]
 
 
 @pytest.mark.asyncio
@@ -1561,7 +1730,10 @@ async def test_github_check_status_carries_settled_merge_state(monkeypatch) -> N
     panel is open lands on a poll instead of waiting for a manual refresh."""
 
     async def fake_run(*argv: str, **_kwargs: int):
-        assert "mergeable,mergeStateStatus" in " ".join(argv)
+        command = " ".join(argv)
+        if "statusCheckRollup" in command:
+            return {"statusCheckRollup": [], "headRefOid": "abc123"}
+        assert "mergeable,mergeStateStatus" in command
         return {"state": "OPEN", "mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"}
 
     monkeypatch.setattr(source, "_run_json", fake_run)
@@ -1586,6 +1758,73 @@ async def test_github_check_status_omits_unsettled_merge_state(
     status = await source._fetch_check_status("https://github.com/acme/repo/pull/12")
 
     assert status == {"state": "open"}
+
+
+@pytest.mark.asyncio
+async def test_github_check_status_keeps_authorized_fields_when_rollup_fails(
+    monkeypatch,
+) -> None:
+    """The chip renders state/merge under a Checks-blind token (#5115).
+
+    Bundling `statusCheckRollup` into the chip read made the WHOLE read fail
+    when the token lacked Checks access; the split keeps the fields the token
+    was authorized for and flags only the CI portion as unavailable.
+    """
+
+    async def fake_run(*argv: str, **_kwargs: int):
+        command = " ".join(argv)
+        if "statusCheckRollup" in command:
+            raise source.SourceProviderError("gh: Resource not accessible by integration")
+        return {"state": "OPEN", "mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"}
+
+    monkeypatch.setattr(source, "_run_json", fake_run)
+
+    status = await source._fetch_check_status("https://github.com/acme/repo/pull/12")
+
+    assert status is not None
+    assert status.pop(source._CHIP_CI_UNAVAILABLE, None) == "1"
+    assert status == {"state": "open", "mergeable": "conflicting", "mergeStateStatus": "dirty"}
+
+
+@pytest.mark.asyncio
+async def test_github_check_status_marks_stale_rollup_unavailable(monkeypatch) -> None:
+    """A rollup read that straddled a push must not paint another head's CI."""
+
+    async def fake_run(*argv: str, **_kwargs: int):
+        command = " ".join(argv)
+        if "statusCheckRollup" in command:
+            return {
+                "statusCheckRollup": [
+                    {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}
+                ],
+                "headRefOid": "pushed-after-core-read",
+            }
+        return {"state": "OPEN", "headRefOid": "abc123"}
+
+    monkeypatch.setattr(source, "_run_json", fake_run)
+
+    status = await source._fetch_check_status("https://github.com/acme/repo/pull/12")
+
+    assert status is not None
+    assert status.pop(source._CHIP_CI_UNAVAILABLE, None) == "1"
+    assert status == {"state": "open"}
+
+
+@pytest.mark.asyncio
+async def test_github_check_status_still_fails_when_core_read_fails(monkeypatch) -> None:
+    """Only the rollup is degradable: a failed CORE read must keep raising, so
+    `_refresh_check_status` keeps its keep-previous-wholesale posture."""
+
+    async def fake_run(*argv: str, **_kwargs: int):
+        command = " ".join(argv)
+        if "statusCheckRollup" in command:
+            return {"statusCheckRollup": [], "headRefOid": "abc123"}
+        raise source.SourceProviderError("core read failed")
+
+    monkeypatch.setattr(source, "_run_json", fake_run)
+
+    with pytest.raises(source.SourceProviderError):
+        await source._fetch_check_status("https://github.com/acme/repo/pull/12")
 
 
 @pytest.mark.asyncio
@@ -2039,6 +2278,53 @@ async def test_chip_refresh_without_change_keeps_full_payload(monkeypatch) -> No
     assert url in source._CACHE
     source._CACHE.clear()
     source._check_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_chip_refresh_keeps_known_ci_when_rollup_alone_fails(monkeypatch) -> None:
+    """Mirror of the full-payload keep-known rule for a partial `checks`: a
+    degraded rollup must not erase a glyph the chip cache already knows, and
+    the internal marker must never reach the cache."""
+    url = "https://github.com/acme/repo/pull/12"
+    source._check_cache.clear()
+    source._check_inflight.clear()
+    source._check_cache[url] = (source.time.monotonic(), {"ci": "passed", "state": "open"})
+    monkeypatch.setattr(
+        source,
+        "_fetch_check_status",
+        AsyncMock(return_value={"state": "open", source._CHIP_CI_UNAVAILABLE: "1"}),
+    )
+
+    try:
+        await source._refresh_check_status(url)
+
+        assert source._check_cache[url][1] == {"ci": "passed", "state": "open"}
+    finally:
+        source._check_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_chip_refresh_lets_a_clean_empty_rollup_clear_a_stale_ci(monkeypatch) -> None:
+    """A rollup that SUCCEEDS with zero checks carries no marker: the CI glyph
+    was legitimately withdrawn (no checks configured), so it must clear."""
+    url = "https://github.com/acme/repo/pull/12"
+    source._CACHE.clear()
+    source._check_cache.clear()
+    source._check_inflight.clear()
+    source._check_cache[url] = (source.time.monotonic(), {"ci": "passed", "state": "open"})
+    monkeypatch.setattr(
+        source,
+        "_fetch_check_status",
+        AsyncMock(return_value={"state": "open"}),
+    )
+
+    try:
+        await source._refresh_check_status(url)
+
+        assert source._check_cache[url][1] == {"state": "open"}
+    finally:
+        source._CACHE.clear()
+        source._check_cache.clear()
 
 
 @pytest.mark.asyncio
@@ -2665,7 +2951,7 @@ async def test_fetch_github_checks_uses_one_call_without_rewriting_cache(monkeyp
         "view",
         url,
         "--json",
-        "statusCheckRollup",
+        "statusCheckRollup,headRefOid",
         max_output_bytes=source._CHECKS_OUTPUT_BYTES,
     )
     assert checks[0]["bucket"] == "pending"
@@ -3381,11 +3667,11 @@ async def test_gitlab_allowlist_never_reads_config_on_the_event_loop(monkeypatch
     in a worker thread; the sync accessor every URL parse uses is cache-only."""
     calls: list[str] = []
 
-    def fake_load() -> tuple[frozenset[str], frozenset[str]]:
+    def fake_load() -> tuple[frozenset[str], frozenset[str], bool]:
         calls.append("load")
-        return frozenset({"gitlab.acme.internal"}), frozenset()
+        return frozenset({"gitlab.acme.internal"}), frozenset(), True
 
-    monkeypatch.setattr(source, "_load_provider_hosts", fake_load)
+    monkeypatch.setattr(source, "_load_source_link_settings", fake_load)
     monkeypatch.setattr(source, "_gitlab_hosts_snapshot", frozenset())
     monkeypatch.setattr(source, "_gitlab_hosts_loaded_at", 0.0)
     to_thread_calls: list[object] = []
@@ -3684,20 +3970,20 @@ async def test_concurrent_allowlist_refresh_cannot_restore_a_revoked_host(monkey
     release = source.asyncio.Event()
     loads = {"n": 0}
 
-    def slow_stale_load() -> tuple[frozenset[str], frozenset[str]]:
+    def slow_stale_load() -> tuple[frozenset[str], frozenset[str], bool]:
         loads["n"] += 1
         # asyncio.Event is not thread-safe: this runs in a worker thread, so the
         # set() must be marshalled back onto the loop.
         loop.call_soon_threadsafe(started.set)
         # Block inside the worker thread so a second waiter queues on the lock.
         source.asyncio.run_coroutine_threadsafe(_noop(), loop).result(timeout=5)
-        return frozenset({"gitlab.acme.internal"}), frozenset()
+        return frozenset({"gitlab.acme.internal"}), frozenset(), True
 
     async def _noop() -> None:
         await release.wait()
 
     loop = source.asyncio.get_running_loop()
-    monkeypatch.setattr(source, "_load_provider_hosts", slow_stale_load)
+    monkeypatch.setattr(source, "_load_source_link_settings", slow_stale_load)
     monkeypatch.setattr(source, "_gitlab_hosts_snapshot", frozenset())
     monkeypatch.setattr(source, "_gitlab_hosts_loaded_at", 0.0)
     monkeypatch.setattr(source, "_gitlab_hosts_lock", source.asyncio.Lock())
@@ -4663,7 +4949,9 @@ async def test_resolve_handler_denies_local_token_when_no_owner(
     monkeypatch, _mock_source_sel
 ) -> None:
     """The local no-owner fallback is scoped to reads: the resolve *mutation*
-    stays owner-only, so a local-app token with no owner still fails closed."""
+    stays owner-only, so a local-app token with no owner still fails closed —
+    but the refusal names the remedy with a machine-readable code, because this
+    caller class saw live buttons whose reads already succeeded."""
     resolve = AsyncMock()
     monkeypatch.setattr(source, "resolve_pull_request_thread", resolve)
 
@@ -4673,7 +4961,9 @@ async def test_resolve_handler_denies_local_token_when_no_owner(
             json={"url": "https://github.com/acme/repo/pull/1", "threadId": "PRRT_1"},
         )
         assert response.status == 403
-        assert (await response.json()) == {"error": "forbidden"}
+        body = await response.json()
+        assert body["code"] == source.OWNER_NOT_CONFIGURED_CODE
+        assert "Owner Slack member ID" in body["error"]
 
     resolve.assert_not_awaited()
 
@@ -4934,12 +5224,47 @@ async def test_action_handlers_deny_local_token_when_no_owner(
     monkeypatch, _mock_source_sel, path: str, action_name: str
 ) -> None:
     """The local no-owner fallback is scoped to reads: these mutations stay
-    owner-only, so a local-app token with no owner still fails closed."""
+    owner-only, so a local-app token with no owner still fails closed — with
+    the coded, actionable body reserved for signed local dashboard sessions."""
     action = AsyncMock()
     monkeypatch.setattr(source, action_name, action)
 
     async with TestClient(TestServer(_app(owner_id="", user="local-app", app_name=""))) as client:
         response = await client.post(path, json={"url": "https://github.com/acme/repo/pull/1"})
+        assert response.status == 403
+        body = await response.json()
+        assert body["code"] == source.OWNER_NOT_CONFIGURED_CODE
+        assert "Owner Slack member ID" in body["error"]
+
+    action.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "app_kwargs",
+    [
+        # A non-local subject must not learn which denial class it hit.
+        {"owner_id": "", "user": "U_OTHER", "app_name": ""},
+        # Nor an app token, even one carrying a local-shaped subject.
+        {"owner_id": "", "user": "local-app", "app_name": "app-X"},
+        # Nor an unauthenticated caller with no user claim at all.
+        {"owner_id": "", "user": "", "app_name": ""},
+    ],
+)
+async def test_no_owner_mutation_code_reserved_for_signed_local_subjects(
+    monkeypatch, _mock_source_sel, app_kwargs: dict
+) -> None:
+    """The ``owner_not_configured`` discriminator is scoped exactly like
+    ``stale_owner_session_response``: every caller that is not a signed
+    machine-local dashboard session keeps the generic body."""
+    action = AsyncMock()
+    monkeypatch.setattr(source, "enable_pull_request_auto_merge", action)
+
+    async with TestClient(TestServer(_app(**app_kwargs))) as client:
+        response = await client.post(
+            "/api/source/pull-request/auto-merge",
+            json={"url": "https://github.com/acme/repo/pull/1"},
+        )
         assert response.status == 403
         assert (await response.json()) == {"error": "forbidden"}
 
@@ -5530,6 +5855,59 @@ def test_self_hosted_jira_rejected_when_allowlist_empty(monkeypatch) -> None:
     monkeypatch.setattr(source, "_jira_hosts_snapshot", frozenset())
     with pytest.raises(ValueError, match="dashboard.jira_hosts"):
         source.parse_source_url("https://jira.acme.internal/browse/PROJ-1")
+
+
+class TestSourceRefLabel:
+    """``source_ref_label`` -- what a sidebar chip is CALLED.
+
+    These assertions were previously spread across the sidebar's own render
+    fixtures, where each provider's punctuation was rebuilt by a template
+    string. They live here now because this is the side that knows the
+    convention, and the renderer prints whatever it is handed.
+    """
+
+    def test_github_uses_hash_for_both_namespaces(self) -> None:
+        """GitHub writes ``#123`` for a pull request and an issue alike -- the two
+        namespaces share one number counter, and the provider does not
+        distinguish them in writing either."""
+        pull = source.parse_source_url("https://github.com/acme/widgets/pull/123")
+        issue = source.parse_source_url("https://github.com/acme/widgets/issues/124")
+        assert source.source_ref_label(pull) == "#123"
+        assert source.source_ref_label(issue) == "#124"
+
+    def test_gitlab_bangs_only_the_merge_request(self) -> None:
+        """``!7`` is GitLab's mark for a MERGE REQUEST specifically; its issues
+        are ``#7``. Labelling a GitLab issue ``!7`` names an unrelated object
+        that usually also exists, which is why the split is pinned rather than
+        left to whichever renderer formats the chip."""
+        mr = source.parse_source_url("https://gitlab.com/acme/service/-/merge_requests/7")
+        issue = source.parse_source_url("https://gitlab.com/acme/service/-/issues/7")
+        assert source.source_ref_label(mr) == "!7"
+        assert source.source_ref_label(issue) == "#7"
+
+    def test_jira_label_is_the_whole_key(self) -> None:
+        """Jira has no bare number: ``PROJ-123`` is the identifier. This is the
+        case that had the serializer shipping a project key purely so the
+        renderer could paste it back on."""
+        ref = source.parse_source_url("https://acme.atlassian.net/browse/PROJ-123")
+        assert source.source_ref_label(ref) == "PROJ-123"
+
+    def test_unknown_provider_borrows_no_vendor_punctuation(self) -> None:
+        """A provider this build does not know gets ``#``, the most widely shared
+        convention -- never ``!``, which would assert it is GitLab. Constructed
+        directly because ``parse_source_url`` cannot yet produce such a ref; the
+        point is that the label function is total over its input rather than
+        exhaustive over today's three providers."""
+        ref = source.SourceRef(
+            "acme-review",
+            "https://review.acme.internal/c/4821",
+            "review.acme.internal",
+            "acme",
+            "widgets",
+            4821,
+            kind="change",
+        )
+        assert source.source_ref_label(ref) == "#4821"
 
 
 @pytest.mark.parametrize(
@@ -7418,6 +7796,337 @@ class TestGetJiraAuth:
         result = source._get_jira_auth("acme.atlassian.net")
         assert result == ("dev@acme.com", "per-host-secret")
 
+    def test_seeded_global_env_does_not_bypass_per_host_vault(self, monkeypatch):
+        """A global JIRA_API_TOKEN that load_credentials merely SEEDED into
+        os.environ (setdefault), not a real pre-existing operator override,
+        must NOT be treated as a live override: a host with its own per-host
+        vault token still gets that per-host token. The snapshot is captured
+        BEFORE load_credentials runs, so a value that did not exist in the
+        environment beforehand is not seen as an override."""
+
+        class FakeEntry:
+            host = "acme.atlassian.net"
+            email = "dev@acme.com"
+
+        class FakeDashboard:
+            jira_auth = [FakeEntry()]
+
+        # No REAL operator override present before the call.
+        monkeypatch.delenv("JIRA_API_TOKEN", raising=False)
+
+        class FakeConfig:
+            dashboard = FakeDashboard()
+
+            @classmethod
+            def load(cls):
+                return cls()
+
+            def load_credentials(self):
+                # Simulate load_credentials' setdefault seeding the .env global
+                # into the process environment during the call. Use monkeypatch
+                # so the seed is auto-reverted at test teardown and cannot leak
+                # into later tests (a raw os.environ.setdefault would persist).
+                monkeypatch.setenv("JIRA_API_TOKEN", "seeded-global")
+                return {"JIRA_API_TOKEN": "seeded-global"}
+
+        host_key = "acme.atlassian.net".encode().hex().upper()
+        monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
+        monkeypatch.setattr(
+            source,
+            "_resolve_jira_token_from_vault",
+            lambda name: "per-host-vault" if name == f"JIRA_TOKEN_{host_key}" else "",
+        )
+        result = source._get_jira_auth("acme.atlassian.net")
+        # Per-host vault token wins; the seeded global is ignored.
+        assert result == ("dev@acme.com", "per-host-vault")
+
+    def test_vault_token_preferred_over_env(self, monkeypatch):
+        """A vault secret wins over the legacy .env value for the same host."""
+
+        class FakeEntry:
+            host = "acme.atlassian.net"
+            email = "dev@acme.com"
+
+        class FakeDashboard:
+            jira_auth = [FakeEntry()]
+
+        class FakeConfig:
+            dashboard = FakeDashboard()
+
+            @classmethod
+            def load(cls):
+                return cls()
+
+            def load_credentials(self):
+                return {"JIRA_API_TOKEN": "env-token"}
+
+        monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
+        host_key = "acme.atlassian.net".encode().hex().upper()
+        monkeypatch.setattr(
+            source,
+            "_resolve_jira_token_from_vault",
+            lambda name: "vault-token" if name == f"JIRA_TOKEN_{host_key}" else "",
+        )
+        result = source._get_jira_auth("acme.atlassian.net")
+        assert result == ("dev@acme.com", "vault-token")
+
+    def test_vault_miss_falls_back_to_env(self, monkeypatch):
+        """When the vault has no entry, the .env / environ value is used."""
+
+        class FakeEntry:
+            host = "acme.atlassian.net"
+            email = "dev@acme.com"
+
+        class FakeDashboard:
+            jira_auth = [FakeEntry()]
+
+        class FakeConfig:
+            dashboard = FakeDashboard()
+
+            @classmethod
+            def load(cls):
+                return cls()
+
+            def load_credentials(self):
+                return {"JIRA_API_TOKEN": "env-token"}
+
+        monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
+        monkeypatch.setattr(source, "_resolve_jira_token_from_vault", lambda name: "")
+        monkeypatch.delenv("JIRA_API_TOKEN", raising=False)
+        result = source._get_jira_auth("acme.atlassian.net")
+        assert result == ("dev@acme.com", "env-token")
+
+    def test_vault_single_host_global_token(self, monkeypatch):
+        """Single host with no per-host vault entry uses the global vault secret."""
+
+        class FakeEntry:
+            host = "acme.atlassian.net"
+            email = "dev@acme.com"
+
+        class FakeDashboard:
+            jira_auth = [FakeEntry()]
+
+        class FakeConfig:
+            dashboard = FakeDashboard()
+
+            @classmethod
+            def load(cls):
+                return cls()
+
+            def load_credentials(self):
+                return {}
+
+        monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
+        monkeypatch.setattr(
+            source,
+            "_resolve_jira_token_from_vault",
+            lambda name: "vault-global" if name == "JIRA_API_TOKEN" else "",
+        )
+        monkeypatch.delenv("JIRA_API_TOKEN", raising=False)
+        result = source._get_jira_auth("acme.atlassian.net")
+        assert result == ("dev@acme.com", "vault-global")
+
+    def test_global_env_override_beats_stale_global_vault(self, monkeypatch):
+        """A nonempty process-environment JIRA_API_TOKEN overrides even a stale
+        global vault entry.
+
+        `load_credentials` overlays `os.environ` over the .env for this key, so
+        a live env var is the effective credential — and `secrets import` skips
+        migrating the key while such an override is set. A vault entry left by an
+        EARLIER migration must NOT shadow that override under vault-first
+        resolution. Per-host keys are unaffected (not env-overlaid)."""
+
+        class FakeEntry:
+            host = "acme.atlassian.net"
+            email = "dev@acme.com"
+
+        class FakeDashboard:
+            jira_auth = [FakeEntry()]
+
+        class FakeConfig:
+            dashboard = FakeDashboard()
+
+            @classmethod
+            def load(cls):
+                return cls()
+
+            def load_credentials(self):
+                # env overlay would also place it here; the resolver reads the
+                # override directly from os.environ before the global vault.
+                return {"JIRA_API_TOKEN": "env-override"}
+
+        monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
+        # Stale global vault entry that must NOT win.
+        monkeypatch.setattr(
+            source,
+            "_resolve_jira_token_from_vault",
+            lambda name: "stale-vault" if name == "JIRA_API_TOKEN" else "",
+        )
+        monkeypatch.setenv("JIRA_API_TOKEN", "env-override")
+        result = source._get_jira_auth("acme.atlassian.net")
+        assert result == ("dev@acme.com", "env-override")
+
+    def test_migrated_secret_ref_in_env_resolves_from_vault_not_uri(self, monkeypatch):
+        """After `secrets import --apply`, the .env line is
+        `JIRA_API_TOKEN=secret://JIRA_API_TOKEN` and `load_credentials`
+        propagates that ref into os.environ AND the creds dict. The resolver
+        must NOT hand the `secret://` URI to Jira as the token — it must treat
+        it as a vault reference and resolve the real secret from the vault."""
+
+        class FakeEntry:
+            host = "acme.atlassian.net"
+            email = "dev@acme.com"
+
+        class FakeDashboard:
+            jira_auth = [FakeEntry()]
+
+        class FakeConfig:
+            dashboard = FakeDashboard()
+
+            @classmethod
+            def load(cls):
+                return cls()
+
+            def load_credentials(self):
+                # load_credentials overlays the migrated secret:// ref here too.
+                return {"JIRA_API_TOKEN": "secret://JIRA_API_TOKEN"}
+
+        monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
+        monkeypatch.setattr(
+            source,
+            "_resolve_jira_token_from_vault",
+            lambda name: "real-vault-secret" if name == "JIRA_API_TOKEN" else "",
+        )
+        # The migrated ref is propagated into the environment by load_credentials.
+        monkeypatch.setenv("JIRA_API_TOKEN", "secret://JIRA_API_TOKEN")
+        result = source._get_jira_auth("acme.atlassian.net")
+        # The vault secret is used — NOT the secret:// URI.
+        assert result == ("dev@acme.com", "real-vault-secret")
+
+    def test_returns_none_when_no_token_anywhere(self, monkeypatch):
+        """Configured host but neither vault nor env holds a token → None."""
+
+        class FakeEntry:
+            host = "acme.atlassian.net"
+            email = "dev@acme.com"
+
+        class FakeDashboard:
+            jira_auth = [FakeEntry()]
+
+        class FakeConfig:
+            dashboard = FakeDashboard()
+
+            @classmethod
+            def load(cls):
+                return cls()
+
+            def load_credentials(self):
+                return {}
+
+        monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
+        monkeypatch.setattr(source, "_resolve_jira_token_from_vault", lambda name: "")
+        assert source._get_jira_auth("acme.atlassian.net") is None
+
+    def test_env_override_equal_to_env_file_is_not_genuine_override(self, monkeypatch):
+        """When os.environ['JIRA_API_TOKEN'] equals the .env file value (i.e. it
+        was seeded there by GatewayOrchestrator's startup load_credentials call),
+        it must NOT beat a vault entry — the vault's rotated value should win.
+
+        This is the Finding 2 fix: a value that merely came from .env via
+        load_credentials' setdefault is NOT a genuine operator override.
+        """
+
+        class FakeEntry:
+            host = "acme.atlassian.net"
+            email = "dev@acme.com"
+
+        class FakeDashboard:
+            jira_auth = [FakeEntry()]
+
+        _ENV_FILE_TOKEN = "stale-env-token"
+        _VAULT_TOKEN = "fresh-vault-token"
+
+        monkeypatch.setenv("JIRA_API_TOKEN", _ENV_FILE_TOKEN)
+
+        class FakeConfig:
+            dashboard = FakeDashboard()
+
+            @classmethod
+            def load(cls):
+                return cls()
+
+            def load_credentials(self):
+                return {"JIRA_API_TOKEN": _ENV_FILE_TOKEN}
+
+        monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
+        # Per-host vault returns nothing; global vault has the rotated token.
+        monkeypatch.setattr(
+            source,
+            "_resolve_jira_token_from_vault",
+            lambda name: (
+                _VAULT_TOKEN if name == "JIRA_API_TOKEN" else ""
+            ),
+        )
+        # .env file contains the same value as os.environ (startup-seeded).
+        monkeypatch.setattr(
+            source,
+            "read_env_file_credential",
+            lambda key: _ENV_FILE_TOKEN if key == "JIRA_API_TOKEN" else "",
+        )
+        result = source._get_jira_auth("acme.atlassian.net")
+        # Vault token must win; the .env-seeded env value must NOT override it.
+        assert result == ("dev@acme.com", _VAULT_TOKEN), (
+            "Vault token should win when env value equals .env file value "
+            f"(startup-seeded); got {result}"
+        )
+
+    def test_env_override_differing_from_env_file_is_genuine_override(self, monkeypatch):
+        """When os.environ['JIRA_API_TOKEN'] DIFFERS from the .env file value,
+        the operator explicitly set it at runtime — it must beat the vault entry.
+        """
+
+        class FakeEntry:
+            host = "acme.atlassian.net"
+            email = "dev@acme.com"
+
+        class FakeDashboard:
+            jira_auth = [FakeEntry()]
+
+        _ENV_FILE_TOKEN = "stale-env-token"
+        _OPERATOR_TOKEN = "operator-set-at-runtime"
+        _VAULT_TOKEN = "vault-token"
+
+        monkeypatch.setenv("JIRA_API_TOKEN", _OPERATOR_TOKEN)
+
+        class FakeConfig:
+            dashboard = FakeDashboard()
+
+            @classmethod
+            def load(cls):
+                return cls()
+
+            def load_credentials(self):
+                return {"JIRA_API_TOKEN": _OPERATOR_TOKEN}
+
+        monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
+        monkeypatch.setattr(
+            source,
+            "_resolve_jira_token_from_vault",
+            lambda name: _VAULT_TOKEN if name == "JIRA_API_TOKEN" else "",
+        )
+        # .env file contains a different (older) value — operator set a new one.
+        monkeypatch.setattr(
+            source,
+            "read_env_file_credential",
+            lambda key: _ENV_FILE_TOKEN if key == "JIRA_API_TOKEN" else "",
+        )
+        result = source._get_jira_auth("acme.atlassian.net")
+        # The differing env value is a genuine override; it must win over vault.
+        assert result == ("dev@acme.com", _OPERATOR_TOKEN), (
+            "Operator runtime override should win over vault when it differs "
+            f"from .env file value; got {result}"
+        )
+
 
 class TestJiraIsCloud:
     def test_cloud_host(self):
@@ -7618,3 +8327,62 @@ class TestJiraLinkedChanges:
         assert result[1]["issueKey"] == "B-2"
         assert result[1]["relation"] == "is duplicated by"
         assert result[1]["state"] == "closed"
+
+
+class _ReapProbe:
+    """A PIPE-stdio child double that records how it is reaped.
+
+    A killed child blocked writing into a full pipe -- or a surviving
+    descendant still holding the pipes open -- makes a bare ``await
+    proc.wait()`` hang the caller forever (#6005). The bounded reap must
+    therefore drain the pipes via ``communicate()`` and must never touch
+    ``wait()``.
+    """
+
+    def __init__(self, pid: int = 4242) -> None:
+        self.pid = pid
+        self.returncode: "int | None" = None
+        self.kill_calls = 0
+        self.wait_calls = 0
+        self.communicate_calls = 0
+
+    async def communicate(self):
+        self.communicate_calls += 1
+        self.returncode = -9
+        return b"", b""
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+
+    async def wait(self) -> int:
+        self.wait_calls += 1
+        return -9
+
+
+@pytest.mark.asyncio
+async def test_terminate_process_reaps_via_communicate_not_wait(monkeypatch):
+    """``_terminate_process`` must route through the bounded, pipe-draining
+    ``kill_and_reap`` -- a bare ``await proc.wait()`` here can hang the gateway
+    task forever when the child is killed with a full pipe (#6005)."""
+    from kiro_crew import platform_compat
+
+    proc = _ReapProbe()
+    tree_kills: "list[tuple[int, int]]" = []
+
+    async def _fake_tree(pid, sig):
+        tree_kills.append((pid, sig))
+        return True
+
+    # Fake pid + patched tree kill so no test can reach a real killpg. Both the
+    # async helper (used by kill_and_reap) and the legacy sync entry point are
+    # patched so the pin stays safe even when run against unmodified code.
+    monkeypatch.setattr(platform_compat, "kill_process_tree_async", _fake_tree)
+    monkeypatch.setattr(
+        platform_compat, "kill_process_tree", lambda *a, **k: tree_kills.append(a)
+    )
+
+    await source._terminate_process(proc)
+
+    assert proc.communicate_calls == 1
+    assert proc.wait_calls == 0
+    assert tree_kills and tree_kills[0][0] == proc.pid

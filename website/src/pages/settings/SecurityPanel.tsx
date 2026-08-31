@@ -1,19 +1,19 @@
 import React, { useEffect, useMemo, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ShieldCheck, ShieldAlert, Lock, Eye, EyeOff, FileWarning, Terminal, Globe, Fingerprint, KeyRound, ScanLine, Layers, AlertTriangle, CheckCircle2, Circle, Clock, ExternalLink, ChevronRight, ChevronDown, Plus, Trash2, Gavel, Building2, Gauge, ToggleRight, MessageSquare, ListChecks, ArrowLeft, Boxes, BookOpen, Network, Copy, Check, Package } from 'lucide-react'
+import { ShieldCheck, ShieldAlert, Lock, Eye, EyeOff, FileWarning, Terminal, Globe, Fingerprint, KeyRound, ScanLine, Layers, AlertTriangle, CheckCircle2, Circle, Clock, ExternalLink, ChevronRight, ChevronDown, Plus, Trash2, Gavel, Building2, Gauge, ToggleRight, MessageSquare, ListChecks, Boxes, BookOpen, Network, Copy, Check, Package } from 'lucide-react'
 import { useAppSelector } from '../../store'
-import { useContainerWidth } from '../../hooks/useContainerWidth'
+import { SettingsSubNav } from '../../components/SettingsSubNav'
 import { useImeGuard } from '../../hooks/useImeGuard'
 import { Badge, Btn, Input, Toggle, Checkbox } from '../../components/ui'
 import { SettingsSection, SettingsCard, SettingsToggle } from '../../components/settings'
 import Modal from '../../components/Modal'
 import InfoTip from '../../components/InfoTip'
-import { api, ApiError, type DeniedCommandsData, type DeniedCommandRule, type DeniedUserRule, type GovernancePolicyData, type GovernanceScope, type GovernanceScopeDetail, type SecurityPostureData, type TailnetStatusData, type TrustedAppsData } from '../../api/client'
+import { api, ApiError, type DeniedCommandsData, type DeniedCommandRule, type DeniedUserRule, type GovernanceDistributionData, type GovernancePolicyData, type GovernanceScope, type GovernanceScopeDetail, type SecurityPostureData, type TailnetStatusData, type TrustedAppsData } from '../../api/client'
 import { PostureDisclosureRow, CODE_BASE as POSTURE_CODE_BASE } from './PostureDisclosure'
+import { MobileLoginCard } from './MobileLoginCard'
 
 import { i18nT } from '../../i18n/t'
-import { fmtDateFields, fmtList, fmtTime, fmtTimeNumeric, toDate } from '../../i18n/format'
+import { fmtDateFields, fmtDuration, fmtList, fmtTime, fmtTimeNumeric, fmtUnit, toDate, compareText } from '../../i18n/format'
 import ErrorNotice from '../../components/ErrorNotice'
 /* ── Security feature registry ──
  *
@@ -405,13 +405,7 @@ function AddDenyInput({ value, onChange, note, onNoteChange, onAdd, busy, submit
         <Input
           value={value}
           onChange={e => { onChange(e.target.value); if (error) setError('') }}
-          {...ime.bindComposition()}
-          onKeyDown={e => {
-            if (e.key !== 'Enter') return
-            // Rule 1: single-line input — decline the IME's committing Enter only.
-            if (ime.isComposing(e)) return
-            e.preventDefault(); submit()
-          }}
+          {...ime.bindEnter({ onEnter: submit })}
           placeholder={i18nT('pages.settings.securityPanel.add_a_custom_deny_pattern_regex_e_g_rm_rf_tmp_mi')}
           aria-label={i18nT('pages.settings.securityPanel.custom_deny_pattern')}
         />
@@ -428,14 +422,7 @@ function AddDenyInput({ value, onChange, note, onNoteChange, onAdd, busy, submit
         <Input
           value={note}
           onChange={e => onNoteChange(e.target.value)}
-          {...ime.bindComposition()}
-          onKeyDown={e => {
-            if (e.key !== 'Enter') return
-            // Rule 1: single-line input — one shared instance covers both fields;
-            // the binding's blur reset makes that safe.
-            if (ime.isComposing(e)) return
-            e.preventDefault(); submit()
-          }}
+          {...ime.bindEnter({ onEnter: submit })}
           placeholder={i18nT('pages.settings.securityPanel.optional_why_shown_to_the_agent_when_this_rule_fir')}
           aria-label={i18nT('pages.settings.securityPanel.custom_deny_note')}
           maxLength={200}
@@ -764,7 +751,9 @@ function YoloDurationCard() {
           <Clock size={12} className="shrink-0" />{activeNote}
         </div>
       )}
-      <div className="flex flex-col gap-1.5" role="radiogroup" aria-label={i18nT('pages.settings.securityPanel.yolo_duration_title')}>
+      {/* data-setting-label: deep-link anchor for the manual registry entry
+          (settingsManual.ts) — the highlight hook queries the rendered label. */}
+      <div className="flex flex-col gap-1.5" role="radiogroup" aria-label={i18nT('pages.settings.securityPanel.yolo_duration_title')} data-setting-label={i18nT('pages.settings.securityPanel.yolo_duration_title')}>
         {YOLO_DURATION_KEYS.map(k => {
           const selected = current === k
           const disabled = k === 'until_shutdown' && !untilShutdownPermitted
@@ -901,7 +890,9 @@ function TailnetOriginCard() {
 
   return (
     <SettingsCard>
-      <div className="flex items-start justify-between py-1.5 gap-4">
+      {/* data-setting-label: deep-link anchor for the manual registry entry
+          (settingsManual.ts) — the highlight hook queries the rendered label. */}
+      <div className="flex items-start justify-between py-1.5 gap-4" data-setting-label={i18nT('pages.settings.securityPanel.tailnet_title')}>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5 flex-wrap">
             <Network size={14} className="lucide-inline text-muted shrink-0" />
@@ -1046,6 +1037,141 @@ function TailnetOriginCard() {
   )
 }
 
+/**
+ * Catalog KEY per central-distribution refresh outcome, and per posture error code.
+ *
+ * Flat `Record`s of full literal keys indexed inline at the `i18nT()` call, the same
+ * shape and for the same reason as `TAILNET_STATE_KEY` above: that is the form
+ * `scripts/check-i18n-keys.mjs` resolves statically, so a key rendered here is a key
+ * it can prove exists.
+ *
+ * Keyed by `string` rather than by the union, and read through an `in` guard, because
+ * these enums are produced by the backend: a value this build has no copy for must
+ * render NOTHING, never a raw backend token standing in for English.
+ */
+const DISTRIBUTION_REFRESH_KEY: Record<string, string> = {
+  applied: 'pages.settings.securityPanel.distribution_refresh_applied',
+  unchanged: 'pages.settings.securityPanel.distribution_refresh_unchanged',
+  rejected: 'pages.settings.securityPanel.distribution_refresh_rejected',
+  unreachable: 'pages.settings.securityPanel.distribution_refresh_unreachable',
+  not_configured: 'pages.settings.securityPanel.distribution_refresh_not_configured',
+}
+
+/** Badge tone for the two refresh outcomes an operator has to act on. Everything
+ *  else falls to the muted default below, deliberately: a green badge is a health
+ *  verdict, and this block reports facts. */
+const DISTRIBUTION_REFRESH_VARIANT: Record<string, 'err' | 'warn'> = {
+  rejected: 'err',
+  unreachable: 'warn',
+}
+
+/**
+ * A coarse interval or age, in the units an operator reads at a glance.
+ *
+ * Days/hours/minutes and no seconds: the poll interval has a 60-second floor and a
+ * cache age is judged against a staleness bound measured in hours, so seconds are
+ * noise on both. `dropZero` is what keeps three days from rendering as `3d 0h 0m`.
+ * Below a minute falls back to seconds, so a cache written moments ago does not read
+ * as `0m` — which on this row would look like a broken measurement.
+ */
+function fmtCoarseSecs(secs: number): string {
+  const s = Math.max(0, Math.floor(secs))
+  if (s < 60) return fmtUnit(s, 'second', { maximumFractionDigits: 0 })
+  return fmtDuration(
+    [
+      [Math.floor(s / 86400), 'day'],
+      [Math.floor((s % 86400) / 3600), 'hour'],
+      [Math.floor((s % 3600) / 60), 'minute'],
+    ],
+    { dropZero: true, maximumFractionDigits: 0 },
+  )
+}
+
+/**
+ * Where the ceiling itself comes from, when an admin publishes one centrally.
+ *
+ * READ-ONLY like the rest of this viewer, and for a stronger reason: the source is
+ * declared in the file-authored policy or in per-machine environment, so a control
+ * here could only ever lie about being able to change it.
+ *
+ * It reports facts and no verdict — the transport, whether the poll loop is alive in
+ * this process, how old the last-known-good copy is, what the most recent refresh did,
+ * and whether the declaration could be resolved at all. Deliberately no "healthy"
+ * badge, by the same rule the section rail follows: a summary that renders its own
+ * verdict keeps asserting it while the read behind it is failing.
+ *
+ * `pending` is the state the rest of the viewer cannot express. A host configured to
+ * fetch a central ceiling whose first fetch has not landed reports `has_policy: false`
+ * and `profile: null`, which is indistinguishable from an ungoverned machine
+ * everywhere else on this page.
+ */
+function PolicyDistributionBlock({ posture, pending }: { posture: GovernanceDistributionData; pending: boolean }) {
+  const interval = posture.refresh_interval_seconds ?? 0
+  const age = posture.cache_age_seconds
+  const status = posture.last_refresh_status ?? ''
+  const errorCode = posture.error_code ?? ''
+  return (
+    <div className="border-b border-border pb-2 mb-2">
+      <div className="flex items-center gap-1.5">
+        <Lock size={11} className="lucide-inline text-muted" />
+        <span className="text-[11px] font-semibold uppercase tracking-[.04em] text-muted">{i18nT('pages.settings.securityPanel.distribution_title')}</span>
+        <InfoTip text={i18nT('pages.settings.securityPanel.distribution_tip')} />
+      </div>
+      <div className="mt-1 flex items-center gap-2 flex-wrap">
+        {/* The SCHEME, never the URL — the producer withholds the endpoint because
+            this page is reachable by the agent's own browser tooling, and it is the
+            fleet's control plane. A scheme still answers what an operator asks here:
+            is the channel encrypted, or is this a local mount.
+            Rendered verbatim rather than through a key map, unlike the two enums
+            below: the transport registry is extensible, so a map would be incomplete
+            by construction and would silently blank out an edition's own scheme. It
+            is an identifier in a mono badge, not copy — there is nothing to
+            translate. */}
+        {posture.source_scheme && (
+          <Badge variant="muted"><Network size={11} className="lucide-inline" /> {i18nT('pages.settings.securityPanel.distribution_source', { scheme: posture.source_scheme })}</Badge>
+        )}
+        {posture.configured && (
+          <Badge variant="muted">
+            <Clock size={11} className="lucide-inline" />{' '}
+            {/* Three distinct facts, not one with two spellings: no interval means
+                boot-only fetching (still centrally governed), an interval with no live
+                loop means a pushed change will NOT bind until the next restart, and a
+                live loop is the state the feature promises. */}
+            {interval <= 0
+              ? i18nT('pages.settings.securityPanel.distribution_boot_only')
+              : posture.refresher_running
+                ? i18nT('pages.settings.securityPanel.distribution_polling', { interval: fmtCoarseSecs(interval) })
+                : i18nT('pages.settings.securityPanel.distribution_polling_stopped')}
+          </Badge>
+        )}
+        {posture.configured && (
+          <Badge variant={posture.cache_present ? 'muted' : 'warn'}>
+            <Package size={11} className="lucide-inline" />{' '}
+            {/* The cache is what keeps a host governed through an outage, so its
+                absence is the fact worth a warn tone: this machine has no fallback
+                if the source goes away. */}
+            {posture.cache_present && typeof age === 'number'
+              ? i18nT('pages.settings.securityPanel.distribution_cache_age', { age: fmtCoarseSecs(age) })
+              : i18nT('pages.settings.securityPanel.distribution_cache_none')}
+          </Badge>
+        )}
+        {status in DISTRIBUTION_REFRESH_KEY && (
+          <Badge variant={DISTRIBUTION_REFRESH_VARIANT[status] ?? 'muted'}>{i18nT(DISTRIBUTION_REFRESH_KEY[status])}</Badge>
+        )}
+        {errorCode === 'misconfigured' && (
+          <Badge variant="warn"><AlertTriangle size={11} className="lucide-inline" /> {i18nT('pages.settings.securityPanel.distribution_error_misconfigured')}</Badge>
+        )}
+      </div>
+      {pending && (
+        <div className="text-[12px] text-warn mt-1.5 flex items-start gap-1.5 leading-relaxed">
+          <AlertTriangle size={13} className="lucide-inline shrink-0 mt-0.5" />
+          <span>{i18nT('pages.settings.securityPanel.distribution_awaiting_policy')}</span>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function GovernancePolicyViewer() {
   const { data, isLoading, isError } = useQuery<GovernancePolicyData>({
     queryKey: ['governance-policy'],
@@ -1064,6 +1190,16 @@ function GovernancePolicyViewer() {
   // the backend returns via `unavailable`. Enforcement is server-side and
   // unaffected either way; this only governs what the viewer claims.
   const unavailable = isError || data?.unavailable
+
+  // Central distribution reports itself on BOTH the normal and the fail-safe
+  // snapshot, so it survives `unavailable` — a host whose governance resolution
+  // glitched still knows where its ceiling is fetched from, and that is exactly when
+  // an operator needs to be told. A misconfigured declaration reports
+  // `configured: false` (the fleet DID point this host somewhere, the pins just do not
+  // parse), so the block renders on either signal or the one state that most needs
+  // saying is the one that disappears.
+  const distribution = data?.distribution
+  const distributionConfigured = !!distribution && (distribution.configured || !!distribution.error_code)
 
   const byScope = useMemo(() => {
     const m = new Map<string, GovernanceScope>()
@@ -1094,10 +1230,22 @@ function GovernancePolicyViewer() {
     })
   }, [data, byScope])
 
+  // Profiles naming capability scopes this build does not register — a
+  // companion edition's scopes (or a misspelled key), tolerated at load and
+  // inert here. Empty lists are filtered so a profile can never render a badge
+  // with nothing after it. Deliberately NOT memoized: compareText resolves the
+  // active language per call, and a useMemo whose deps exclude the language
+  // would keep the old sort order across a language switch.
+  const unknownScopeRows = Object.entries(data?.unknown_profile_scopes ?? {})
+    .filter(([, scopes]) => scopes.length > 0)
+    .sort(([a], [b]) => compareText(a, b))
+
   return (
     <SettingsSection title={i18nT('pages.settings.securityPanel.governance_policy')}>
       <SettingsCard>
-        <div className="flex items-start gap-3 pb-1">
+        {/* data-setting-label: deep-link anchor for the manual registry entry
+            (settingsManual.ts) — the highlight hook queries the rendered label. */}
+        <div className="flex items-start gap-3 pb-1" data-setting-label={i18nT('pages.settings.securityPanel.governance_policy')}>
           <div className="mt-0.5 shrink-0 w-7 h-7 rounded-md bg-accent-subtle flex items-center justify-center text-accent">
             <Gavel size={14} className="lucide-inline" />
           </div>
@@ -1109,6 +1257,23 @@ function GovernancePolicyViewer() {
           </div>
         </div>
 
+        {/* Rendered OUTSIDE the branch tree below, not inside one arm of it. Every
+            arm is a claim about the ceiling, and where the ceiling comes from
+            qualifies all three of them: the soft "temporarily unavailable" notice, the
+            reassuring "no enterprise policy" card, and the governed rows. Putting it
+            here is what keeps `unavailable` from swallowing a distribution state the
+            payload did report. */}
+        {distributionConfigured && distribution && (
+          // `pending` is gated on `!unavailable` because the fail-safe snapshot sets
+          // `has_policy: false` UNCONDITIONALLY — it is what the backend answers when it
+          // could not resolve the ceiling at all, not a report that there is none. Read
+          // as pending it would tell an operator no enterprise ceiling restricts the
+          // host surface on a machine whose ceiling is installed and enforcing, which is
+          // the same false reassurance the term below exists to remove, in the other
+          // direction.
+          <PolicyDistributionBlock posture={distribution} pending={!unavailable && !data?.has_policy} />
+        )}
+
         {isLoading ? (
           <div className="text-[12px] text-muted py-2">{i18nT('pages.settings.securityPanel.loading_governance_policy')}</div>
         ) : unavailable ? (
@@ -1116,7 +1281,14 @@ function GovernancePolicyViewer() {
             <AlertTriangle size={14} className="lucide-inline text-warn shrink-0 mt-0.5" />
             <span className="text-[12px] text-muted leading-relaxed">{i18nT('pages.settings.securityPanel.governance_status_is_temporarily_unavailable_enf')}</span>
           </div>
-        ) : !data?.has_policy && !data?.profile ? (
+        ) : /* `!distributionConfigured` is a load-bearing term, not a tidy-up. A host
+              pointed at a central ceiling whose first fetch has not landed reports
+              `has_policy: false` and `profile: null`, so without it this arm renders a
+              reassuring "no enterprise policy in effect" — with a green shield — for a
+              machine that is supposed to have one and could not get it. It yields to
+              the scope rows instead, which say every scope is unrestricted, and the
+              distribution block above says why. */
+          !data?.has_policy && !data?.profile && unknownScopeRows.length === 0 && !distributionConfigured ? (
           <div className="flex items-start gap-2.5 py-3 mt-1 rounded-md bg-bg-elevated border border-border px-3">
             <ShieldCheck size={16} className="lucide-inline text-ok shrink-0 mt-0.5" />
             <div>
@@ -1153,6 +1325,31 @@ function GovernancePolicyViewer() {
                       rare state; demoted so the two sentences that matter are not
                       buried in a paragraph wall at 12px. */}
                   <div className="text-muted mt-1">{i18nT('pages.settings.securityPanel.profile_unusable_detail')}</div>
+                </div>
+              </div>
+            )}
+            {/* Profiles naming capability scopes this build does not register —
+                typically a companion edition's scopes, tolerated at load and
+                inert here. Rendered so a reader auditing a profile file can
+                account for every key it declares, not just the ones this build
+                enforces. Reachable even with no policy and no host profile: the
+                payload aggregates EVERY loaded profile (see client.ts), so the
+                no-policy branch above yields to this block when rows exist. */}
+            {unknownScopeRows.length > 0 && (
+              <div className="border-t border-border pt-2 mt-2">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[11px] font-semibold uppercase tracking-[.04em] text-muted">{i18nT('pages.settings.securityPanel.unknown_scopes_title')}</span>
+                  <InfoTip text={i18nT('pages.settings.securityPanel.unknown_scopes_tip')} />
+                </div>
+                <div className="mt-1 space-y-1">
+                  {unknownScopeRows.map(([stem, scopes]) => (
+                    <div key={stem} className="flex items-center gap-2 flex-wrap">
+                      <Badge variant="muted"><ListChecks size={11} className="lucide-inline" /> {stem}</Badge>
+                      {/* fmtList for the same reason as the profile_unusable
+                          block above: zh joins with 、 and no spaces. */}
+                      <span className="text-[11px] font-mono text-muted break-all">{fmtList(scopes, { type: 'unit' })}</span>
+                    </div>
+                  ))}
                 </div>
               </div>
             )}
@@ -1260,6 +1457,12 @@ function PostureSection() {
 
   return (
     <SettingsSection title={i18nT('pages.settings.securityPanel.live_security_posture')}>
+      <MobileLoginCard />
+      {/* data-setting-label: deep-link anchor for the manual registry entry
+        * (settingsManual.ts `security.live-security-posture`) — the section is
+        * raw markup the extractor cannot see, so without this the highlight
+        * would querySelector a label no element carries and silently no-op. */}
+      <div data-setting-label={i18nT('pages.settings.securityPanel.live_security_posture')}>
       <SettingsCard>
         {/* Non-expandable rows: single-valued modes, not counted sets. */}
         <StatusRow icon={<Lock size={14} />} label={i18nT('pages.settings.securityPanel.process_sandbox')} value={i18nT('pages.settings.securityPanel.standard')} variant="ok"
@@ -1340,6 +1543,7 @@ function PostureSection() {
           )}
         </div>
       </SettingsCard>
+      </div>
     </SettingsSection>
   )
 }
@@ -1480,7 +1684,9 @@ function DeniedCommandsSection({ draft, onDraftChange, noteDraft, onNoteDraftCha
     <SettingsSection title={i18nT('pages.settings.securityPanel.denied_commands')}>
       {/* Card A — Built-in denies */}
       <SettingsCard>
-        <div className="flex items-center justify-between py-1.5">
+        {/* data-setting-label: deep-link anchor for the manual registry entry
+            (settingsManual.ts) — the highlight hook queries the rendered label. */}
+        <div className="flex items-center justify-between py-1.5" data-setting-label={i18nT('pages.settings.securityPanel.denied_commands')}>
           <div className="flex-1 min-w-0 mr-4">
             <div className="flex items-center gap-1.5">
               <span className="text-[13px] font-semibold text-text">{i18nT('pages.settings.securityPanel.disable_all_built_in_denies')}</span>
@@ -1588,7 +1794,7 @@ function DeniedCommandsSection({ draft, onDraftChange, noteDraft, onNoteDraftCha
 
       {/* Card B — Your custom denies */}
       <SettingsCard index={1}>
-        <div className="text-[13px] font-semibold text-text">{i18nT('pages.settings.securityPanel.your_custom_denies')}</div>
+        <div className="text-[13px] font-semibold text-text" data-setting-label={i18nT('pages.settings.securityPanel.your_custom_denies')}>{i18nT('pages.settings.securityPanel.your_custom_denies')}</div>
         <div className="text-[12px] text-muted mt-0.5 mb-1 leading-relaxed">
           {i18nT('pages.settings.securityPanel.add_your_own_deny_patterns_python_compatible_reg')}
         </div>
@@ -1667,7 +1873,7 @@ function ThirdPartyAppsCard() {
   // newer dashboard talking to an older gateway (or any response shape that drops
   // a list) would otherwise reach `ta.ineffective.length` and throw — taking down
   // the WHOLE Security page, not just this card. The i18n render gate caught
-  // exactly that on /settings?tab=security.
+  // exactly that on /settings/security.
   const ta = useMemo(
     () =>
       taRaw
@@ -2034,11 +2240,6 @@ const SECURITY_SECTIONS: readonly SecuritySectionDef[] = [
   { key: 'docs', icon: <BookOpen size={15} />, group: 'reference' },
 ]
 
-/** Below this container width the rail and the detail pane stack: the rail
- *  becomes the whole view and choosing a section replaces it (with a back
- *  link), the same responsive contract ChannelsPanel uses. */
-const TWO_PANE_MIN_WIDTH = 760
-
 /** One rail row. `summary` is a live, FACTUAL value (a count, an on/off) — never
  *  a verdict: a rail that renders its own "OK" is a security claim made by the
  *  navigation, and it would keep claiming it while the underlying read failed.
@@ -2074,55 +2275,10 @@ function fmtRailExpiry(expiry: Date, now: Date = new Date()): string {
     : fmtDateFields(expiry, { weekday: 'short', hour: 'numeric', minute: '2-digit' })
 }
 
-function SectionRow({ section, active, summary, onSelect, twoPane }: {
-  section: SecuritySectionDef
-  active: boolean
-  summary?: string
-  onSelect: () => void
-  twoPane: boolean
-}) {
-  const label = i18nT(SECTION_LABEL_KEY[section.key])
-  return (
-    <button
-      type="button"
-      role="option"
-      aria-selected={active}
-      onClick={onSelect}
-      // The longest label still ellipsizes in the most verbose locales, so the
-      // full string stays reachable on hover rather than being lost.
-      title={label}
-      className={`flex items-center gap-2.5 w-full px-2.5 py-2 rounded-md text-left cursor-pointer border-none transition-colors ${
-        active ? 'bg-accent-subtle text-accent' : 'bg-transparent text-muted hover:text-text hover:bg-bg-hover'
-      }`}
-    >
-      <span className={`w-4 h-4 shrink-0 flex items-center justify-center ${active ? 'text-accent' : 'text-muted'}`}>
-        {section.icon}
-      </span>
-      <span className="flex-1 min-w-0">
-        {/* Wraps to two lines rather than truncating. The rail is a fixed 248px
-            and the longest label ("Defense-in-Depth Architecture") inflates to
-            52 characters under the pseudolocale, which truncated at 1.36x —
-            over the render gate's 1.35x budget, and a real problem in any
-            verbose locale, not just en-XA. Widening the rail would only move
-            the boundary; not truncating removes it. `title` stays for the
-            pathological case. */}
-        <span className="block text-[13px] font-medium line-clamp-2">{label}</span>
-        {summary && (
-          <span className="block text-[11px] text-muted tabular-nums truncate mt-px">{summary}</span>
-        )}
-      </span>
-      {!twoPane && <ChevronRight size={14} className="text-muted shrink-0" />}
-    </button>
-  )
-}
-
-export function SecurityPanel() {
-  const [params, setParams] = useSearchParams()
-  const [containerRef, width] = useContainerWidth<HTMLDivElement>()
-  // null width = first paint before measurement; assume wide to avoid flashing
-  // the narrow layout on desktop.
-  const twoPane = width === null || width >= TWO_PANE_MIN_WIDTH
-
+/** Security tab. `basePath` opts the section sub-nav into path navigation
+ *  (`${basePath}/security/<section>`); omitted, the historical ?sub= /
+ *  ?section= query behavior is unchanged. Passed by the Settings host. */
+export function SecurityPanel({ basePath }: { basePath?: string } = {}) {
   // Held HERE, not in the rules pane: picking another rail section unmounts that
   // pane, and a half-typed deny pattern living in its local state would be
   // silently discarded. The 137-row rule table still unmounts — only the draft
@@ -2131,30 +2287,6 @@ export function SecurityPanel() {
   // Lifted for the same reason as denyDraft: the rules section unmounts on rail
   // navigation, which would discard a half-typed note.
   const [denyNoteDraft, setDenyNoteDraft] = useState('')
-
-  const rawSection = params.get('section')
-  const selectedKey = SECURITY_SECTIONS.some(s => s.key === rawSection)
-    ? (rawSection as SecuritySectionKey)
-    : null
-  // Wide mode always shows a detail pane; default to the first section.
-  const effectiveKey = selectedKey ?? (twoPane ? SECURITY_SECTIONS[0].key : null)
-
-  const setSection = (key: SecuritySectionKey | null) => setParams(prev => {
-    const next = new URLSearchParams(prev)
-    if (key) next.set('section', key)
-    else next.delete('section')
-    return next
-  }, { replace: true })
-
-  // Canonicalize the wide-mode implicit selection into the URL, so shrinking
-  // below the breakpoint does not silently drop the shown pane back to the bare
-  // rail. Gated on a REAL measurement: the pre-measurement paint optimistically
-  // renders wide, and writing `section=posture` before the ResizeObserver
-  // reports would make a fresh narrow visit open a section instead of the rail.
-  useEffect(() => {
-    if (width !== null && twoPane && !selectedKey) setSection(SECURITY_SECTIONS[0].key)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [width, twoPane, selectedKey])
 
   // Rail summaries. Both reads are shared cache entries with the sections that
   // own them, so the rail adds no extra request.
@@ -2172,51 +2304,35 @@ export function SecurityPanel() {
     switch (key) {
       case 'approval':
         // An active grant outranks the configured duration: it is the state that
-        // is currently weakening the install, so it is what the rail reports.
-        //
-        // It reports WHEN THE GRANT ENDS, not that it exists. Returning the
-        // section's own label here made the row read "YOLO (auto-approve)" twice
-        // — once as the label, once as a muted 11px echo underneath — spending
-        // the rail's most important row on a duplicate instead of the one fact a
-        // reader needs. The expiry is already in `status`; the card below shows
-        // the same values in full sentences.
+        // is currently weakening the install, so it is what the rail reports —
+        // WHEN THE GRANT ENDS, not that it exists.
         if (status?.yolo) {
           if (status.yolo_until_shutdown) return i18nT('pages.settings.securityPanel.rail_until_restart')
           // Parse before formatting, and fall back to the bare "active" string
-          // when the timestamp will not parse. `fmtRailExpiry` would otherwise
-          // be handed an invalid Date and render an em-dash placeholder, which
-          // would put "Until —" on a row asserting that a grant is live —
-          // announcing a weakened install while withholding the one fact that
-          // makes the claim actionable. The backend sends ISO-or-empty today,
-          // so this is a guard against the field's shape changing.
+          // when the timestamp will not parse: "Until —" on a row asserting a
+          // live grant would announce a weakened install while withholding the
+          // one fact that makes the claim actionable.
           const expiry = toDate(status.yolo_expires_at)
           return expiry
             ? i18nT('pages.settings.securityPanel.rail_until_time', { time: fmtRailExpiry(expiry) })
             : i18nT('pages.settings.securityPanel.rail_active')
         }
         // `== null`, NOT `=== undefined`: `dashboard.status` is typed
-        // `StatusData | null` and initialises to `null`, so an `undefined` check
-        // never fires and the rail would claim the safe "Interactive" on every
-        // fresh load — before any status payload has arrived, on an install where
-        // auto-approve may well be active. Same rule the apps case follows, where
-        // React Query genuinely yields `undefined`: an unread state is reported as
-        // no summary, never as the reassuring one.
+        // `StatusData | null` and initialises to `null`. An unread state is
+        // reported as no summary, never as the reassuring one.
         return status == null ? undefined : i18nT('pages.settings.securityPanel.interactive')
       case 'rules':
         return dc ? String(dc.builtins.filter(r => r.enabled).length) : undefined
       case 'tailnet':
-        // An unread state gets no summary, never the reassuring one — the same
-        // rule the apps case follows. The label is the server-owned `state`, so
-        // the rail cannot disagree with the card it navigates to.
+        // An unread state gets no summary, never the reassuring one. The label
+        // is the server-owned `state`, so the rail cannot disagree with the
+        // card it navigates to.
         if (tailnetError || tailnet === undefined) return undefined
         return i18nT(TAILNET_STATE_KEY[tailnet.state])
       case 'apps':
         // An UNREADABLE value is not "off" — mirror the card's own handling and
         // render no summary rather than asserting a state we could not read.
         if (cfgError || cfg === undefined) return undefined
-        // Names what the gate DOES rather than "On"/"Off": a bare "On" is a
-        // connector word with nothing for a translator to work from, and the
-        // verb reads better against a blanket admission control.
         return cfg.agent?.apps_allow_third_party === true
           ? i18nT('pages.settings.securityPanel.state_allowed')
           : i18nT('pages.settings.securityPanel.state_blocked')
@@ -2227,103 +2343,71 @@ export function SecurityPanel() {
     }
   }
 
-  // Grouped as listbox > group > option. The group headers used to be
-  // `aria-hidden`, which handed screen-reader users seven flat options and threw
-  // away the yours-vs-enforced split the rail exists to convey; `role="group"`
-  // with the header as its accessible name is the ARIA-valid way to keep it,
-  // since a listbox may contain groups but not arbitrary children.
-  const groupedSections = SECURITY_SECTIONS.reduce<{ group: SecuritySectionGroup; items: SecuritySectionDef[] }[]>(
-    (acc, section) => {
-      const last = acc[acc.length - 1]
-      if (last && last.group === section.group) last.items.push(section)
-      else acc.push({ group: section.group, items: [section] })
-      return acc
-    },
-    [],
-  )
+  const items = SECURITY_SECTIONS.map(section => {
+    const summary = summaryFor(section.key)
+    return {
+      key: section.key,
+      label: i18nT(SECTION_LABEL_KEY[section.key]),
+      icon: section.icon,
+      group: i18nT(SECTION_GROUP_KEY[section.group]),
+      summary: summary ? (
+        <span className="block text-[11px] text-muted tabular-nums truncate mt-px">{summary}</span>
+      ) : undefined,
+    }
+  })
 
-  const rail = (
-    // No aria-label on the wrapper: the listbox inside already carries this name,
-    // and naming both makes a screen reader announce it twice.
-    <nav className={twoPane ? 'w-[248px] shrink-0' : 'w-full'}>
-      <div className="flex flex-col gap-0.5" role="listbox" aria-label={i18nT('pages.settings.securityPanel.security_sections')}>
-        {groupedSections.map(({ group, items }) => (
-          <div key={group} role="group" aria-label={i18nT(SECTION_GROUP_KEY[group])}>
-            <div className="text-[11px] text-muted uppercase tracking-wider font-medium px-2.5 pt-2.5 pb-1 select-none">
-              {i18nT(SECTION_GROUP_KEY[group])}
-            </div>
-            {items.map(section => (
-              <SectionRow
-                key={section.key}
-                section={section}
-                active={twoPane && section.key === effectiveKey}
-                summary={summaryFor(section.key)}
-                onSelect={() => setSection(section.key)}
-                twoPane={twoPane}
-              />
-            ))}
-          </div>
-        ))}
-      </div>
-    </nav>
-  )
-
-  return (
-    <div ref={containerRef}>
-      {/* ── Data Classification Warning ──
-       *  Outside the rail on purpose. It is an instruction about what to type
-       *  into the product, not a section of the security model, and a notice you
-       *  can navigate away from is a notice most readers never see. */}
-      <div className="mb-5 bg-bg-elevated border rounded-lg p-4 flex items-start gap-3 animate-rise" style={{ borderColor: 'color-mix(in srgb, var(--warn) 45%, transparent)' }}>
-        <AlertTriangle size={18} className="text-warn shrink-0 mt-0.5" />
-        <div>
-          <div className="text-[13px] font-semibold text-text-strong">{i18nT('pages.settings.securityPanel.data_classification_notice')}</div>
-          <div className="text-[12px] text-muted mt-1 leading-relaxed">
-            {i18nT('pages.settings.securityPanel.do_not_enter_highly_sensitive_or_restricted_data')}
-          </div>
-        </div>
-      </div>
-
-      {/* Both responsive modes render the same child slots in the same order
-          (rail?, back-link?, pane wrapper) so React reconciles the pane by
-          position and a width transition never remounts it — remounting would
-          discard an unsaved custom deny pattern mid-type. Only changing the
-          selected section remounts, which is intended. */}
-      <div className={twoPane ? 'flex gap-6 items-start' : 'flex flex-col'}>
-        {(twoPane || !effectiveKey) && rail}
-        {!twoPane && effectiveKey && (
-          <button
-            type="button"
-            onClick={() => setSection(null)}
-            className="flex items-center gap-1.5 self-start text-[13px] font-medium text-accent bg-transparent border-none cursor-pointer px-0 py-1 mb-2 hover:underline"
-          >
-            <ArrowLeft size={14} />
-            {i18nT('pages.settings.securityPanel.security_sections')}
-          </button>
-        )}
-        <div className={twoPane ? 'flex-1 min-w-0' : 'w-full'}>
-          {effectiveKey === 'posture' && <PostureSection />}
-          {effectiveKey === 'approval' && (
-            <SettingsSection title={i18nT('pages.settings.securityPanel.yolo_auto_approve')}>
-              <YoloDurationCard />
-            </SettingsSection>
-          )}
-          {effectiveKey === 'rules' && <DeniedCommandsSection draft={denyDraft} onDraftChange={setDenyDraft} noteDraft={denyNoteDraft} onNoteDraftChange={setDenyNoteDraft} />}
-          {effectiveKey === 'tailnet' && (
-            <SettingsSection title={i18nT('pages.settings.securityPanel.tailnet_section')}>
-              <TailnetOriginCard />
-            </SettingsSection>
-          )}
-          {effectiveKey === 'apps' && (
-            <SettingsSection title={i18nT('pages.settings.securityPanel.third_party_apps_section')}>
-              <ThirdPartyAppsCard />
-            </SettingsSection>
-          )}
-          {effectiveKey === 'layers' && <LayersSection />}
-          {effectiveKey === 'governance' && <GovernancePolicyViewer />}
-          {effectiveKey === 'docs' && <DocsSection />}
+  const banner = (
+    // ── Data Classification Warning ──
+    // In the SubNav banner slot on purpose: it is an instruction about what to
+    // type into the product, not a section of the security model, and a notice
+    // you can navigate away from is a notice most readers never see.
+    <div className="mb-5 bg-bg-elevated border rounded-lg p-4 flex items-start gap-3 animate-rise" style={{ borderColor: 'color-mix(in srgb, var(--warn) 45%, transparent)' }}>
+      <AlertTriangle size={18} className="text-warn shrink-0 mt-0.5" />
+      <div>
+        <div className="text-[13px] font-semibold text-text-strong">{i18nT('pages.settings.securityPanel.data_classification_notice')}</div>
+        <div className="text-[12px] text-muted mt-1 leading-relaxed">
+          {i18nT('pages.settings.securityPanel.do_not_enter_highly_sensitive_or_restricted_data')}
         </div>
       </div>
     </div>
+  )
+
+  return (
+    <SettingsSubNav
+      items={items}
+      railWidth={248}
+      listLabel={i18nT('pages.settings.securityPanel.security_sections')}
+      backLabel={i18nT('settings.tabs.security.label')}
+      banner={banner}
+      basePath={basePath}
+    >
+      {active => {
+        const key = active as SecuritySectionKey | null
+        return (
+          <>
+            {key === 'posture' && <PostureSection />}
+            {key === 'approval' && (
+              <SettingsSection title={i18nT('pages.settings.securityPanel.yolo_auto_approve')}>
+                <YoloDurationCard />
+              </SettingsSection>
+            )}
+            {key === 'rules' && <DeniedCommandsSection draft={denyDraft} onDraftChange={setDenyDraft} noteDraft={denyNoteDraft} onNoteDraftChange={setDenyNoteDraft} />}
+            {key === 'tailnet' && (
+              <SettingsSection title={i18nT('pages.settings.securityPanel.tailnet_section')}>
+                <TailnetOriginCard />
+              </SettingsSection>
+            )}
+            {key === 'apps' && (
+              <SettingsSection title={i18nT('pages.settings.securityPanel.third_party_apps_section')}>
+                <ThirdPartyAppsCard />
+              </SettingsSection>
+            )}
+            {key === 'layers' && <LayersSection />}
+            {key === 'governance' && <GovernancePolicyViewer />}
+            {key === 'docs' && <DocsSection />}
+          </>
+        )
+      }}
+    </SettingsSubNav>
   )
 }

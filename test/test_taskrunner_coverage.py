@@ -280,6 +280,7 @@ class TestPlan:
             with pytest.raises(ValueError, match="timed out"):
                 await runner.plan(input_text="go", source="text")
         assert runner._runs == {}
+        assert list(tmp_path.glob("plan_*")) == []
 
     @pytest.mark.asyncio
     async def test_decompose_cancelled_becomes_value_error(self, tmp_path: Path) -> None:
@@ -289,6 +290,7 @@ class TestPlan:
         ):
             with pytest.raises(ValueError, match="cancelled"):
                 await runner.plan(input_text="go", source="text")
+        assert list(tmp_path.glob("plan_*")) == []
 
     @pytest.mark.asyncio
     async def test_empty_plan_rejected(self, tmp_path: Path) -> None:
@@ -296,6 +298,23 @@ class TestPlan:
         with patch.object(TaskRunner, "_decompose", AsyncMock(return_value=[])):
             with pytest.raises(ValueError, match="Could not generate a plan"):
                 await runner.plan(input_text="go", source="text")
+        assert list(tmp_path.glob("plan_*")) == []
+
+    @pytest.mark.asyncio
+    async def test_failed_plan_preserves_caller_workspace(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "caller-owned"
+        workspace.mkdir()
+        marker = workspace / "keep.txt"
+        marker.write_text("owned by caller", encoding="utf-8")
+        runner = _runner(tmp_path / "runner")
+        with patch.object(TaskRunner, "_decompose", AsyncMock(return_value=[])):
+            with pytest.raises(ValueError, match="Could not generate a plan"):
+                await runner.plan(
+                    input_text="go",
+                    source="text",
+                    workspace_dir=str(workspace),
+                )
+        assert marker.read_text(encoding="utf-8") == "owned by caller"
 
     def test_cancel_plan_cancels_live_task_only(self, tmp_path: Path) -> None:
         runner = _runner(tmp_path)
@@ -328,6 +347,19 @@ class TestUpdatePlan:
         _seed_run(runner, tmp_path, status=status)
         with pytest.raises(ValueError, match=f"while {status}"):
             await runner.update_plan("plan_1", [])
+
+    @pytest.mark.asyncio
+    async def test_populates_new_empty_chat_plan(self, tmp_path: Path) -> None:
+        runner = _runner(tmp_path)
+        run = _seed_run(runner, tmp_path, tasks=[])
+
+        updated = await runner.update_plan(
+            run.task_id,
+            [{"title": "First"}, {"title": "Second", "depends_on": [1]}],
+        )
+
+        assert [task.title for task in updated.tasks] == ["First", "Second"]
+        assert updated.tasks[1].depends_on == [1]
 
 
 class TestUpdateTask:
@@ -1143,27 +1175,6 @@ class TestWatchdogLoop:
         # second tick sees the id already recorded and does not reset again
         assert runner._sessions.reset.await_count == 1
         assert any("stalled task" in call.args[0] for call in notify.await_args_list)
-
-
-# ── Tests hook ──
-
-
-class TestRunTests:
-    @pytest.mark.asyncio
-    async def test_no_command_configured(self, tmp_path: Path) -> None:
-        ok, out = await _runner(tmp_path)._run_tests()
-        assert (ok, out) == (True, "no test command configured")
-
-    @pytest.mark.asyncio
-    async def test_delegates_to_run_tests(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        runner = _runner(tmp_path)
-        runner._test_cmd = ["pytest", "-q"]
-        fake = AsyncMock(return_value=(False, "1 failed"))
-        monkeypatch.setattr(tr, "run_tests", fake)
-        assert await runner._run_tests() == (False, "1 failed")
-        assert fake.await_args.args == (["pytest", "-q"], Path(tmp_path))
 
 
 # ── Registry persistence ──

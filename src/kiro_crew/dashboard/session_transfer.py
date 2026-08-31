@@ -2,8 +2,8 @@
 
 Two halves live here:
 
-* :func:`build_transfer_bundle` serialises one slot's visible conversation into
-  a portable, version-tagged dict. Called on the **sending** side.
+* :func:`build_transfer_bundle_async` serialises one slot's visible conversation
+  into a portable, version-tagged dict. Called on the **sending** side.
 * :func:`api_chat_slot_import` accepts such a dict and materialises it as a new
   slot. Called on the **receiving** side.
 
@@ -63,14 +63,19 @@ from kiro_crew import platform_compat
 from kiro_crew.agent_discovery import list_agents
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import kiro_sessions_dir
-from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+
+# Layering: this module may import chat_handlers, never the reverse — the only
+# consumer of session_transfer is handlers_instances, which chat_handlers'
+# transitive graph does not reach. If chat_handlers ever needs session_transfer,
+# move the shared collaborators down to chat_persistence first rather than
+# creating the cycle.
+from kiro_crew.dashboard.chat_persistence import save_slot_off_loop, session_was_deleted
 from kiro_crew.dashboard.chat_utils import (
     _sync_dashboard_slots,
     effective_session_key,
     slot_history_key,
 )
-from kiro_crew.dashboard.state import DashboardState, _ChatSlot
-from kiro_crew.platform_compat import restrict_to_owner
+from kiro_crew.dashboard.state import MAX_LIVE_SLOTS, DashboardState, _ChatSlot
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
@@ -91,10 +96,6 @@ BUNDLE_VERSION = 2
 #: best-effort parsed, because a silently misread field lands as corrupted
 #: conversation.
 _SUPPORTED_BUNDLE_VERSIONS = (1, 2)
-
-#: Same cap the fork path uses, for the same reason: bound the number of live
-#: slots so a repeated import cannot exhaust the slot table.
-_MAX_SLOTS_FOR_IMPORT = 500
 
 #: Per-bundle limits. A bundle arrives from another instance, so it is untrusted
 #: input even though the peer is one the owner configured: these bound the work
@@ -417,29 +418,37 @@ def _write_layer_b_files(layer_b: dict[str, Any], agent: str) -> str | None:
             # concurrent writers cannot collide on a deterministic ``.tmp`` name
             # (an ENOENT race the previous hand-rolled write here was exposed to),
             # and it retries the Windows rename window.
-            atomic_write(path, text, mode=0o600)
+            #
+            # ``restrict_to_owner=True`` applies the owner-only lockdown to the
+            # temp file BEFORE any content reaches it — POSIX mode bits are
+            # meaningless against NTFS ACLs, and the previous post-rename
+            # ``restrict_to_owner`` call left Layer B readable under the
+            # inherited DACL for the whole write window (issue #5285). It
+            # implies 0o600 on POSIX, and the default
+            # ``restrict_on_error="raise"`` keeps this site FAIL CLOSED.
             try:
-                # POSIX mode bits are meaningless against NTFS ACLs, so on Windows
-                # this call is the ONLY thing making the file owner-only -- the
-                # ``mode=0o600`` above is a no-op there. It raises for documented,
-                # reachable reasons (it refuses to apply a half-configured DACL
-                # when the invoking user's SID will not resolve).
-                restrict_to_owner(path)
+                atomic_write(path, text, restrict_to_owner=True)
             except OSError:
                 # FAIL CLOSED. This is the model's whole context window; leaving it
                 # readable by other local accounts on a shared machine is worse
                 # than not resuming, and this feature already has an honest
                 # fallback for exactly that -- returning ``None`` imports the
                 # session transcript-only. Both files go, not just this one: the
-                # pair is useless alone and the ``.json`` carries context too.
+                # pair is useless alone and the ``.json`` carries context too
+                # (a lockdown failure on the SECOND file leaves the first,
+                # already-published one behind otherwise).
                 #
                 # This overrides the warn-and-continue precedent in
                 # ``handlers/weixin_qr.py``. That path has no fallback -- refusing
                 # breaks the feature outright -- whereas refusing here costs only
                 # resume fidelity, so the same trade resolves the other way.
+                #
+                # The outer ``except Exception`` below performs the same
+                # cleanup as a backstop for non-OSError failures; keep the two
+                # paths in sync.
                 logger.warning(
-                    "session_transfer: could not restrict Layer B permissions on %s; "
-                    "discarding it and importing transcript-only",
+                    "session_transfer: could not write owner-only Layer B file %s; "
+                    "discarding the pair and importing transcript-only",
                     path.name,
                     exc_info=True,
                 )
@@ -499,7 +508,24 @@ def _join_layer_b(sessions: Any, sm_key: str, sid: str) -> bool:
 async def build_transfer_bundle_async(
     state: DashboardState, slot: _ChatSlot, *, origin: str = ""
 ) -> dict[str, Any]:
-    """:func:`build_transfer_bundle` with the disk read off the event loop.
+    """Serialise *slot*'s visible conversation into a portable bundle, with the
+    disk read off the event loop.
+
+    Carries the FULL conversation rather than only the window currently held in
+    memory — a long-running session keeps just its tail resident, and bundling
+    ``slot.messages`` alone would silently truncate the transfer to that tail.
+    *origin* is a human label for where the session came from (an instance name
+    or ``"local"``); it is recorded for provenance and shown on arrival.
+
+    The un-flushed tail is a ``_disk_window_len`` boundary slice, which is valid
+    only because the flush below runs first: the save folds a durable injector's
+    ``append_if_absent`` copy into the window and advances the boundary, so the
+    counter is honest by the time the tail is snapshotted. A caller that bundled
+    WITHOUT flushing could not use this slice — a durable injector
+    (``cron_inject``, ``workflow_inject``, ``crew_chat``) puts the same row into
+    the window and onto disk without a save, so the boundary would start one row
+    too early and ship the injection twice. There is deliberately no such
+    caller: this is the only builder, and it always flushes.
 
     The transcript read is synchronous file IO plus JSON parsing over a whole
     session, which is exactly the "large synchronous file IO" the
@@ -595,16 +621,25 @@ async def build_transfer_bundle_async(
             # across this await and spend an attempt rather than trusting it.
             gen_before_save = slot._dirty_gen
             try:
-                await save_slot_off_loop(state, slot, best_effort=False)
+                saved = await save_slot_off_loop(state, slot, best_effort=False)
             except Exception as exc:
                 logger.warning(
                     "session_transfer: could not persist slot=%s before bundling",
                     slot.key,
                     exc_info=True,
                 )
-                raise SnapshotUnstable(
-                    "the session could not be persisted before copying"
-                ) from exc
+                raise SnapshotUnstable("the session could not be persisted before copying") from exc
+            if not saved:
+                # Delete-won: the session was permanently deleted while the
+                # flush awaited the lock. Bundling would ship the destroyed
+                # conversation to the peer (or an empty shell of it), so the
+                # transfer fails instead of answering success.
+                logger.warning(
+                    "session_transfer: slot=%s was permanently deleted during "
+                    "the pre-bundle flush; refusing the transfer",
+                    slot.key,
+                )
+                raise SnapshotUnstable("the session was permanently deleted")
             if slot._dirty_gen != gen_before_save:
                 continue
             _guard_snapshot(slot)
@@ -623,6 +658,19 @@ async def build_transfer_bundle_async(
         # kept because this snapshot has already been wrong twice by assuming a
         # single field told the whole story.
         count_before = len(slot.messages)
+        # Direct delete check, independent of the flush arm above: if the
+        # periodic 5s flush hit the delete-won guard first, it cleared
+        # ``_dirty``, the flush arm here never ran, and the disk read below
+        # would assemble a bundle from a permanently deleted session (its
+        # in-memory tail plus an empty transcript). The ``saved``-check above
+        # only covers a delete observed by THIS builder's own flush.
+        if session_was_deleted(state, slot):
+            logger.warning(
+                "session_transfer: slot=%s belongs to a permanently deleted "
+                "session; refusing the transfer",
+                slot.key,
+            )
+            raise SnapshotUnstable("the session was permanently deleted")
         # Snapshot the unpersisted tail (and the slot fields the bundle needs) ON
         # THE LOOP, so the thread below never touches the slot while the loop
         # could be appending to it. Everything past this point is plain data.
@@ -658,6 +706,18 @@ async def build_transfer_bundle_async(
         # while ``_disk_window_len`` stays put, which would otherwise read as
         # "stable" and copy turns the user just discarded.
         _guard_snapshot(slot)
+        # The deletion check too: the assembly read above is the longest await
+        # in this builder (redaction regexes over the whole transcript), so a
+        # permanent delete can complete inside it — after the pre-read probe
+        # passed — and the bundle in hand is the destroyed conversation. A
+        # delete is permanent, so this is a refusal, not a retry.
+        if session_was_deleted(state, slot):
+            logger.warning(
+                "session_transfer: slot=%s was permanently deleted during "
+                "bundle assembly; refusing the transfer",
+                slot.key,
+            )
+            raise SnapshotUnstable("the session was permanently deleted")
         if (
             slot._dirty_gen == gen_before
             and slot._disk_window_len == boundary_before
@@ -668,9 +728,7 @@ async def build_transfer_bundle_async(
             "session_transfer: slot %s flushed during the transcript read; retrying",
             slot.key,
         )
-    raise SnapshotUnstable(
-        f"transcript snapshot did not settle in {_SNAPSHOT_ATTEMPTS} attempts"
-    )
+    raise SnapshotUnstable(f"transcript snapshot did not settle in {_SNAPSHOT_ATTEMPTS} attempts")
 
 
 def _guard_snapshot(slot: _ChatSlot) -> None:
@@ -694,8 +752,7 @@ def _guard_snapshot(slot: _ChatSlot) -> None:
     # not.)
     if slot._disk_window_len > len(slot.messages):
         raise SnapshotUnstable(
-            "the persisted boundary is ahead of the resident window "
-            "(a flush landed mid-stream)"
+            "the persisted boundary is ahead of the resident window " "(a flush landed mid-stream)"
         )
 
 
@@ -717,8 +774,6 @@ def _read_and_assemble(
     """
     history = _read_chained_history(state, session_key)
     history.extend(tail)
-    if not history:
-        history = list(tail)
     layer_b = _read_layer_b(layer_b_sid)
     if layer_b_sid and layer_b is None:
         # A sid was MAPPED but its files would not read -- pruned, over the size
@@ -729,56 +784,6 @@ def _read_and_assemble(
         # which means there was never a context to carry.
         layer_b_skipped = True
     return _assemble_bundle(history, title, agent, origin, layer_b, layer_b_skipped)
-
-
-def build_transfer_bundle(
-    state: DashboardState,
-    slot: _ChatSlot,
-    *,
-    origin: str = "",
-    history: list[dict] | None = None,
-) -> dict[str, Any]:
-    """Serialise *slot*'s visible conversation into a portable bundle.
-
-    Carries the FULL conversation rather than only the window currently held in
-    memory — a long-running session keeps just its tail resident, and bundling
-    ``slot.messages`` alone would silently truncate the transfer to that tail.
-
-    *history* supplies an already-read on-disk transcript so the blocking read
-    can happen in a thread; when omitted it is read inline, which is fine for
-    tests and any caller not on the event loop.
-
-    *origin* is a human label for where the session came from (an instance name
-    or ``"local"``); it is recorded for provenance and shown on arrival.
-    """
-    all_messages: list[dict] = (
-        list(history)
-        if history is not None
-        else _read_chained_history(state, slot_history_key(slot))
-    )
-    # Append the resident messages that are not on disk yet, so the bundle carries
-    # the tail the user can actually see.
-    #
-    # The boundary is ``_disk_window_len`` — set by the save path to "how many
-    # window messages are now on disk" — NOT ``_resumed_count``, which only
-    # records how many messages were loaded when the slot was rehydrated. For a
-    # session created in this gateway run ``_resumed_count`` stays 0 no matter how
-    # many times it flushes, so using it appended the ENTIRE resident window on
-    # top of the disk history and duplicated every persisted turn.
-    #
-    # No ``_dirty`` gate: the boundary alone is authoritative, and the slice is
-    # empty when everything is persisted.
-    new_msgs = slot.messages[slot._disk_window_len :]
-    if new_msgs:
-        all_messages.extend(new_msgs)
-    if not all_messages:
-        all_messages = list(slot.messages)
-    return _assemble_bundle(
-        all_messages,
-        slot.title if slot._titled else "",
-        slot.agent,
-        origin,
-    )
 
 
 def _assemble_bundle(
@@ -1034,7 +1039,7 @@ async def api_chat_slot_import(request: web.Request) -> web.Response:
     request_app = request.get("app", "")
     caller = request_app or "dashboard"
 
-    if state.live_slot_count() >= _MAX_SLOTS_FOR_IMPORT:
+    if state.live_slot_count() >= MAX_LIVE_SLOTS:
         sel().log_api_access(
             caller=caller,
             operation="chat.slot_import",
@@ -1045,7 +1050,7 @@ async def api_chat_slot_import(request: web.Request) -> web.Response:
         )
         return web.json_response(
             {
-                "error": f"slot cap reached ({_MAX_SLOTS_FOR_IMPORT})",
+                "error": f"slot cap reached ({MAX_LIVE_SLOTS})",
                 "code": "transfer_slot_cap",
             },
             status=429,
@@ -1084,7 +1089,7 @@ async def api_chat_slot_import(request: web.Request) -> web.Response:
     #
     # Distinct from the construction accounting below: that keeps a RETRACTED slot
     # counted, which is a different window (after creation). Both are needed.
-    if state.live_slot_count() >= _MAX_SLOTS_FOR_IMPORT:
+    if state.live_slot_count() >= MAX_LIVE_SLOTS:
         sel().log_api_access(
             caller=caller,
             operation="chat.slot_import",
@@ -1095,7 +1100,7 @@ async def api_chat_slot_import(request: web.Request) -> web.Response:
         )
         return web.json_response(
             {
-                "error": f"slot cap reached ({_MAX_SLOTS_FOR_IMPORT})",
+                "error": f"slot cap reached ({MAX_LIVE_SLOTS})",
                 "code": "transfer_slot_cap",
             },
             status=429,
@@ -1170,9 +1175,7 @@ async def api_chat_slot_import(request: web.Request) -> web.Response:
             # Files in a thread (blocking IO), join on the loop (the live map's
             # whole-file write is unsynchronised against concurrent session
             # starts). See _write_layer_b_files / _join_layer_b.
-            written_sid = await asyncio.to_thread(
-                _write_layer_b_files, layer_b, new_slot.agent
-            )
+            written_sid = await asyncio.to_thread(_write_layer_b_files, layer_b, new_slot.agent)
             layer_b_sid = written_sid or ""
             resumable = bool(layer_b_sid) and _join_layer_b(sessions, sm_key, layer_b_sid)
             if not resumable:
@@ -1262,8 +1265,11 @@ async def api_chat_slot_import(request: web.Request) -> web.Response:
                 exc_info=True,
             )
             sel().log_api_access(
-                caller=caller, operation="chat.slot_import", outcome="error",
-                source="dashboard", resources=f"to={new_slot.key}",
+                caller=caller,
+                operation="chat.slot_import",
+                outcome="error",
+                source="dashboard",
+                resources=f"to={new_slot.key}",
                 error="durable save failed",
             )
             return web.json_response(

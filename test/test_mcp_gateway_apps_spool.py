@@ -25,10 +25,12 @@ import os
 import stat
 import sys
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from kiro_crew.mcp_apps_render import find_marker
 from kiro_crew.mcp_caller import CallerContext
 from kiro_crew.mcp_gateway import apps
 from kiro_crew.mcp_gateway.apps import (
@@ -107,13 +109,14 @@ class TestExtractUiResourceUri:
 # --------------------------------------------------------------------------
 
 class TestAppendMarker:
-    def test_appends_to_first_text_item(self):
+    def test_prepends_to_first_text_item(self):
         result = {"content": [
             {"type": "text", "text": "hello"},
             {"type": "text", "text": "second"},
         ]}
         out = append_marker(result, "abc123")
-        assert out["content"][0]["text"] == "hello [kirocrew-mcp-app:abc123]"
+        # Marker at offset 0 so it survives the downstream ACP 4000-char cut.
+        assert out["content"][0]["text"] == "[kirocrew-mcp-app:abc123] hello"
         # Only the FIRST text item is marked.
         assert out["content"][1]["text"] == "second"
 
@@ -123,12 +126,15 @@ class TestAppendMarker:
             {"type": "text", "text": "caption"},
         ]}
         out = append_marker(result, "id9")
-        assert out["content"][1]["text"] == "caption [kirocrew-mcp-app:id9]"
+        assert out["content"][1]["text"] == "[kirocrew-mcp-app:id9] caption"
 
-    def test_no_text_item_appends_new_item(self):
+    def test_no_text_item_prepends_new_item(self):
         result = {"content": [{"type": "image", "data": "..."}]}
         out = append_marker(result, "zz")
-        assert out["content"][-1] == {"type": "text", "text": "[kirocrew-mcp-app:zz]"}
+        # No text item to lead, so a fresh marker item is inserted at offset 0
+        # to match the prepend framing; the existing non-text item follows.
+        assert out["content"][0] == {"type": "text", "text": "[kirocrew-mcp-app:zz]"}
+        assert out["content"][1] == {"type": "image", "data": "..."}
 
     def test_empty_content_appends_new_item(self):
         out = append_marker({"content": []}, "q")
@@ -208,6 +214,63 @@ class TestWriteSpool:
         record = json.loads((spool_tmp / f"{sid}.json").read_text())
         assert record["created_at"] == "2020-01-01T00:00:00+00:00"
 
+    def test_lockdown_precedes_content(self, spool_tmp, monkeypatch):
+        """The record's filename and callback_secret are live capability
+        tokens, so the file must never exist unprotected with content in it.
+
+        atomic_write(restrict_to_owner=True) locks the TEMP file down before
+        any byte reaches it (the previous hand-rolled os.open at the final
+        path published the content first and applied the Windows DACL only
+        afterwards, issue #5285). Asserted by measuring the file's SIZE at
+        lockdown time — zero means no payload byte existed yet.
+        """
+        from kiro_crew import platform_compat
+
+        calls: list[tuple[str, int]] = []
+        real_restrict = platform_compat.restrict_to_owner
+
+        def _measuring(target):
+            # is_file() guard: the spool DIRECTORY also routes through owner-
+            # only lockdown on some platforms, and a directory's st_size would
+            # fail the zero check with a misleading message.
+            p = Path(str(target))
+            if p.is_file():
+                calls.append((str(p), os.stat(p).st_size))
+            return real_restrict(target)
+
+        monkeypatch.setattr("kiro_crew.platform_compat.restrict_to_owner", _measuring)
+        sid = write_spool({"html": "x"})
+
+        assert (spool_tmp / f"{sid}.json").exists()
+        file_calls = [(p, s) for p, s in calls if str(spool_tmp) in p]
+        assert len(file_calls) == 1, f"expected exactly one record-file lockdown: {calls}"
+        _, size = file_calls[0]
+        assert size == 0, f"the record already held {size} payload bytes at lockdown time"
+
+    def test_failed_lockdown_publishes_no_record(self, spool_tmp, monkeypatch):
+        """Fail closed is structural now: an unprotectable record never exists
+        at the final path (no unlink needed), and the raised OSError lets the
+        interception caller's failure-safe path deliver the original result."""
+        from kiro_crew import platform_compat
+
+        real_restrict = platform_compat.restrict_to_owner
+
+        def _refuse(target):
+            # Only refuse the record file itself; the spool DIRECTORY lockdown
+            # (restrict_dir_to_owner routes elsewhere) and unrelated callers
+            # keep working.
+            if str(spool_tmp) in str(target):
+                raise OSError("cannot resolve the invoking user's SID")
+            return real_restrict(target)
+
+        monkeypatch.setattr("kiro_crew.platform_compat.restrict_to_owner", _refuse)
+        with pytest.raises(OSError):
+            write_spool({"html": "x"})
+
+        assert not list(spool_tmp.glob("*")), (
+            "an unprotectable record (or its temp file) was left in the spool"
+        )
+
     def test_tool_input_and_result_content_persisted(self, spool_tmp):
         """Additive v1 fields: the originating tools/call arguments and result
         content ride in the record so the app initializes from real state."""
@@ -275,6 +338,23 @@ class TestSweepSpool:
         os.utime(orphan, (old, old))
         sweep_spool(max_age_hours=24.0)
         assert not orphan.exists()
+
+    def test_reaps_orphaned_stale_atomic_write_temp(self, spool_tmp):
+        """A temp file can only survive a hard kill mid-write (atomic_write
+        cleans up on every exception), but nothing else reaps this bounded-
+        lifetime directory, so the sweep must age orphaned temps out too."""
+        spool_tmp.mkdir(parents=True, exist_ok=True)
+        stale_tmp = spool_tmp / "tmpabc12345.tmp"
+        stale_tmp.write_bytes(b"partial")
+        fresh_tmp = spool_tmp / "tmpdef67890.tmp"
+        fresh_tmp.write_bytes(b"in-flight")
+        old = time.time() - 48 * 3600
+        os.utime(stale_tmp, (old, old))
+
+        sweep_spool(max_age_hours=24.0)
+
+        assert not stale_tmp.exists(), "an orphaned stale temp was not reaped"
+        assert fresh_tmp.exists(), "an in-flight fresh temp must not be reaped"
 
     def test_write_spool_sweeps_opportunistically(self, spool_tmp):
         """Every write reaps expired records so a long-running flag-on
@@ -917,8 +997,9 @@ async def test_interception_end_to_end(apps_flag_on, spool_tmp):
     # Original stub id restored, marker injected on the first text item.
     assert delivered["id"] == 42
     text = delivered["result"]["content"][0]["text"]
-    assert text.startswith("drawn ")
-    assert text.startswith("drawn [kirocrew-mcp-app:")
+    # Marker is prepended (offset 0) and the original tool text is preserved.
+    assert text.startswith("[kirocrew-mcp-app:")
+    assert text.endswith(" drawn")
     # Structured content preserved.
     assert delivered["result"]["structuredContent"] == {"nodes": 3}
 
@@ -933,8 +1014,10 @@ async def test_interception_end_to_end(apps_flag_on, spool_tmp):
     assert record["tool"] == "draw"
     assert record["session_key"] == "dashboard:sess-1"
     assert record["structured_content"] == {"nodes": 3}
-    # The spool id in the marker matches the file on disk.
-    marker_id = text.split("[kirocrew-mcp-app:")[1].rstrip("]").strip()
+    # The spool id in the marker matches the file on disk. Parsed with the real
+    # consumer (find_marker) rather than a hand-rolled slice, so the assertion
+    # stays position-agnostic and cannot drift from the marker layout again.
+    marker_id = find_marker(text)
     assert (spool_tmp / f"{marker_id}.json").exists()
 
 
@@ -965,8 +1048,7 @@ async def test_interception_blob_base64(apps_flag_on, spool_tmp):
         "result": {"contents": [{"mimeType": MCP_APPS_MIME_TYPE, "blob": blob}]},
     }) + "\n").encode("utf-8"))
     delivered = await _drain_inbox(inbox)
-    marker_id = delivered["result"]["content"][0]["text"].split(
-        "[kirocrew-mcp-app:")[1].rstrip("]").strip()
+    marker_id = find_marker(delivered["result"]["content"][0]["text"])
     record = json.loads((spool_tmp / f"{marker_id}.json").read_text())
     assert record["html"] == "<html>blob</html>"
 

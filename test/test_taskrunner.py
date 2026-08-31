@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import kiro_crew.taskrunner as taskrunner_module
 from conftest import requires_git
 from kiro_crew.task_models import PROGRESS_FILE
 from kiro_crew.taskrunner import (
@@ -21,6 +24,8 @@ from kiro_crew.taskrunner import (
     TaskRunner,
     WorkingMemory,
 )
+from kiro_crew.workflows.service import WorkflowService
+from kiro_crew.workflows.store import WorkflowRunStore
 
 # ── Fixtures ──
 
@@ -39,7 +44,9 @@ def _make_mock_sessions() -> MagicMock:
     sessions.check_context_usage = MagicMock()
     sessions.close_all = AsyncMock()
 
-    async def _open_task_session(_parent_key, session_key, *, agent=None, cwd=None, approval_policy=""):
+    async def _open_task_session(
+        _parent_key, session_key, *, agent=None, cwd=None, approval_policy=""
+    ):
         # Fake: the run-scoped shared runtime is mocked away; forward to whatever
         # get_or_create is set to (preserves per-step key/call assertions).
         return await sessions.get_or_create(session_key, agent=agent, cwd=cwd)
@@ -88,6 +95,591 @@ class TestTaskRun:
         assert run.status == "pending"
         assert run.tasks == []
         assert run.error == ""
+
+
+class TestWorkflowRunIntegration:
+    @pytest.mark.asyncio
+    async def test_cancelled_background_start_removes_unowned_workflow_run(
+        self, tmp_path: Path
+    ) -> None:
+        sessions = _make_mock_sessions()
+        workflow_store = WorkflowRunStore(tmp_path / "workflow-store")
+        workflows = WorkflowService(sessions=sessions, store=workflow_store)
+        runner = TaskRunner(
+            sessions=sessions,
+            auto_test=False,
+            work_dir=tmp_path,
+            workflow_service=workflows,
+        )
+        spec_path = tmp_path / "background.md"
+        spec_path.write_text("# Background task\n", encoding="utf-8")
+        persistence_started = asyncio.Event()
+
+        async def block_placeholder_persistence() -> None:
+            persistence_started.set()
+            await asyncio.Future()
+
+        runner._apersist_runs = block_placeholder_persistence  # type: ignore[method-assign]
+        starting = asyncio.create_task(runner.start_background(spec_path))
+        await asyncio.wait_for(persistence_started.wait(), timeout=1)
+        starting.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await starting
+
+        assert runner._runs == {}
+        assert runner._tasks == {}
+        assert workflows.list_runs() == []
+        assert WorkflowService(sessions=sessions, store=workflow_store).list_runs() == []
+
+    @pytest.mark.asyncio
+    async def test_cancelled_plan_publication_removes_unowned_workflow_run(
+        self, tmp_path: Path
+    ) -> None:
+        sessions = _make_mock_sessions()
+        workflow_store = WorkflowRunStore(tmp_path / "workflow-store")
+        workflows = WorkflowService(sessions=sessions, store=workflow_store)
+        runner = TaskRunner(
+            sessions=sessions,
+            auto_test=False,
+            work_dir=tmp_path,
+            workflow_service=workflows,
+        )
+        runner._decompose = AsyncMock(
+            return_value=[Step(index=1, title="Implement", description="make the change")]
+        )
+        publication_started = asyncio.Event()
+
+        async def block_plan_source(_run_id: str, _source: str, *, source_format: str = "") -> bool:
+            del source_format
+            publication_started.set()
+            await asyncio.Future()
+            return True
+
+        workflows.set_source = block_plan_source  # type: ignore[method-assign]
+        planning = asyncio.create_task(runner.plan("implement the feature"))
+        await asyncio.wait_for(publication_started.wait(), timeout=1)
+        planning.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await planning
+
+        assert runner._runs == {}
+        assert workflows.list_runs() == []
+        assert WorkflowService(sessions=sessions, store=workflow_store).list_runs() == []
+        assert list(tmp_path.glob("plan_*")) == []
+
+    @pytest.mark.asyncio
+    async def test_cancelled_plan_drains_persist_before_rollback(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        sessions = _make_mock_sessions()
+        workflow_store = WorkflowRunStore(tmp_path / "workflow-store")
+        workflows = WorkflowService(sessions=sessions, store=workflow_store)
+        runner = TaskRunner(
+            sessions=sessions,
+            auto_test=False,
+            work_dir=tmp_path,
+            workflow_service=workflows,
+        )
+        runner._decompose = AsyncMock(
+            return_value=[Step(index=1, title="Implement", description="make the change")]
+        )
+        persist_started = threading.Event()
+        allow_persist = threading.Event()
+        persist_finished = threading.Event()
+        lifecycle: list[str] = []
+        original_atomic_write = taskrunner_module.atomic_write
+        first_write = True
+
+        def block_first_write(path, content, *, fsync=False):  # type: ignore[no-untyped-def]
+            nonlocal first_write
+            if first_write and path == runner._runs_path():
+                first_write = False
+                lifecycle.append("persist_started")
+                persist_started.set()
+                assert allow_persist.wait(timeout=5)
+                lifecycle.append("persist_finished")
+                persist_finished.set()
+            original_atomic_write(path, content, fsync=fsync)
+
+        original_delete = runner._workflow_delete_link
+
+        async def observe_delete(run: TaskRun) -> None:
+            lifecycle.append("workflow_deleted")
+            await original_delete(run)
+
+        monkeypatch.setattr(taskrunner_module, "atomic_write", block_first_write)
+        runner._workflow_delete_link = observe_delete  # type: ignore[method-assign]
+
+        planning = asyncio.create_task(runner.plan("implement the feature"))
+        assert await asyncio.to_thread(persist_started.wait, 2)
+        planning.cancel()
+
+        async def release_after_rollback_gets_one_turn() -> None:
+            await asyncio.sleep(0)
+            allow_persist.set()
+
+        release = asyncio.create_task(release_after_rollback_gets_one_turn())
+        with pytest.raises(asyncio.CancelledError):
+            await planning
+        await release
+        assert await asyncio.to_thread(persist_finished.wait, 2)
+
+        assert lifecycle.index("persist_finished") < lifecycle.index("workflow_deleted")
+        assert runner._runs == {}
+        assert workflows.list_runs() == []
+        assert WorkflowService(sessions=sessions, store=workflow_store).list_runs() == []
+        assert json.loads((tmp_path / "runs.json").read_text(encoding="utf-8")) == []
+        assert list(tmp_path.glob("plan_*")) == []
+
+    @pytest.mark.asyncio
+    async def test_cancellation_during_initial_persist_finalizes_both_run_views(
+        self, tmp_path: Path
+    ) -> None:
+        sessions = _make_mock_sessions()
+        workflows = WorkflowService(sessions=sessions, persist=False)
+        runner = TaskRunner(
+            sessions=sessions,
+            auto_test=False,
+            work_dir=tmp_path,
+            workflow_service=workflows,
+        )
+        spec_path = tmp_path / "cancel-during-setup.yaml"
+        spec_path.write_text("agents:\n  test:\n    prompt: run tests\n", encoding="utf-8")
+        persist_started = asyncio.Event()
+        persist_calls = 0
+
+        async def cancel_first_persist() -> None:
+            nonlocal persist_calls
+            persist_calls += 1
+            if persist_calls == 1:
+                persist_started.set()
+                await asyncio.Future()
+
+        runner._apersist_runs = cancel_first_persist  # type: ignore[method-assign]
+        task = asyncio.create_task(runner.run(spec_path, task_id="cancelled_setup", source="yaml"))
+        await asyncio.wait_for(persist_started.wait(), timeout=1)
+        task.cancel()
+
+        run = await task
+
+        assert run.status == "cancelled"
+        assert runner._runs[run.task_id].status == "cancelled"
+        assert workflows.status(run.workflow_run_id)["status"] == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_plan_registers_one_paused_task_plan_run_and_persists_the_link(
+        self, tmp_path: Path
+    ) -> None:
+        sessions = _make_mock_sessions()
+        workflows = WorkflowService(sessions=sessions, persist=False)
+        runner = TaskRunner(
+            sessions=sessions,
+            auto_test=False,
+            work_dir=tmp_path,
+            workflow_service=workflows,
+        )
+        runner._decompose = AsyncMock(
+            return_value=[Step(index=1, title="Implement", description="make the change")]
+        )
+
+        run = await runner.plan("implement the feature")
+
+        assert run.workflow_run_id
+        snap = workflows.result(run.workflow_run_id)
+        assert snap["status"] == "paused"
+        assert snap["driver"] == "taskrunner"
+        assert snap["task_id"] == run.task_id
+        assert snap["source_format"] == "task-plan"
+        assert "agents:" in snap["source"]
+
+        restored = TaskRunner(
+            sessions=sessions,
+            auto_test=False,
+            work_dir=tmp_path,
+            workflow_service=workflows,
+        )
+        assert restored._runs[run.task_id].workflow_run_id == run.workflow_run_id
+
+    @pytest.mark.asyncio
+    async def test_execute_plan_rebinds_and_finishes_the_same_workflow_run(
+        self, tmp_path: Path
+    ) -> None:
+        sessions = _make_mock_sessions()
+        workflows = WorkflowService(sessions=sessions, persist=False)
+        runner = TaskRunner(
+            sessions=sessions,
+            auto_test=False,
+            work_dir=tmp_path,
+            workflow_service=workflows,
+        )
+        runner._decompose = AsyncMock(
+            return_value=[Step(index=1, title="Implement", description="make the change")]
+        )
+        run = await runner.plan("implement the feature")
+        workflow_run_id = run.workflow_run_id
+
+        async def execute_existing_pipeline(project, history_key):
+            project.tasks[0].status = StepStatus.PASSED
+            project.tasks[0].result = "done"
+
+        runner._execute_tasks = AsyncMock(side_effect=execute_existing_pipeline)
+
+        await runner.execute_plan(run.task_id)
+        await runner._tasks[run.task_id]
+
+        snap = workflows.result(workflow_run_id)
+        assert run.status == "completed"
+        assert run.workflow_run_id == workflow_run_id
+        assert snap["status"] == "finished"
+        assert snap["result"]["task_id"] == run.task_id
+        assert runner._execute_tasks.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_execute_plan_reopens_a_failed_projection_without_a_second_run(
+        self, tmp_path: Path
+    ) -> None:
+        sessions = _make_mock_sessions()
+        workflows = WorkflowService(sessions=sessions, persist=False)
+        runner = TaskRunner(
+            sessions=sessions,
+            auto_test=False,
+            work_dir=tmp_path,
+            workflow_service=workflows,
+        )
+        runner._decompose = AsyncMock(
+            return_value=[Step(index=1, title="Implement", description="make the change")]
+        )
+        run = await runner.plan("implement the feature")
+        workflow_run_id = run.workflow_run_id
+        await workflows.fail(workflow_run_id, "interrupted")
+
+        async def execute_existing_pipeline(project, history_key):
+            project.tasks[0].status = StepStatus.PASSED
+
+        runner._execute_tasks = AsyncMock(side_effect=execute_existing_pipeline)
+        await runner.execute_plan(run.task_id)
+        await runner._tasks[run.task_id]
+
+        assert run.workflow_run_id == workflow_run_id
+        assert [item["run_id"] for item in workflows.list_runs()] == [workflow_run_id]
+        assert workflows.status(workflow_run_id)["status"] == "finished"
+
+    @pytest.mark.asyncio
+    async def test_terminal_projection_follows_taskrunner_persistence(self, tmp_path: Path) -> None:
+        sessions = _make_mock_sessions()
+        workflows = WorkflowService(sessions=sessions, persist=False)
+        runner = TaskRunner(
+            sessions=sessions,
+            auto_test=False,
+            work_dir=tmp_path,
+            workflow_service=workflows,
+        )
+        runner._decompose = AsyncMock(
+            return_value=[Step(index=1, title="Implement", description="make the change")]
+        )
+        run = await runner.plan("implement the feature")
+        timeline: list[str] = []
+        runner._apersist_runs = AsyncMock(side_effect=lambda: timeline.append("persist"))
+        original_finish = workflows.finish
+
+        async def finish(run_id, result):
+            timeline.append("finish")
+            await original_finish(run_id, result)
+
+        workflows.finish = AsyncMock(side_effect=finish)
+
+        async def execute_existing_pipeline(project, history_key):
+            project.tasks[0].status = StepStatus.PASSED
+
+        runner._execute_tasks = AsyncMock(side_effect=execute_existing_pipeline)
+        await runner.execute_plan(run.task_id)
+        await runner._tasks[run.task_id]
+
+        assert timeline[-2:] == ["persist", "finish"]
+
+    @pytest.mark.asyncio
+    async def test_execute_plan_backfills_workflow_link_for_legacy_run(
+        self, tmp_path: Path
+    ) -> None:
+        sessions = _make_mock_sessions()
+        workflows = WorkflowService(sessions=sessions, persist=False)
+        runner = TaskRunner(
+            sessions=sessions,
+            auto_test=False,
+            work_dir=tmp_path,
+            workflow_service=workflows,
+        )
+        runner._decompose = AsyncMock(
+            return_value=[Step(index=1, title="Implement", description="make the change")]
+        )
+        run = await runner.plan("implement the feature")
+        previous_workflow_run_id = run.workflow_run_id
+        run.workflow_run_id = ""
+
+        async def execute_existing_pipeline(project, history_key):
+            project.tasks[0].status = StepStatus.PASSED
+            project.tasks[0].result = "done"
+
+        runner._execute_tasks = AsyncMock(side_effect=execute_existing_pipeline)
+
+        await runner.execute_plan(run.task_id)
+        await runner._tasks[run.task_id]
+
+        assert run.workflow_run_id
+        assert run.workflow_run_id != previous_workflow_run_id
+        assert workflows.status(run.workflow_run_id)["status"] == "finished"
+
+    @pytest.mark.asyncio
+    async def test_rebind_persists_replacement_for_evicted_workflow_run(
+        self, tmp_path: Path
+    ) -> None:
+        sessions = _make_mock_sessions()
+        workflows = WorkflowService(sessions=sessions, persist=False)
+        runner = TaskRunner(
+            sessions=sessions,
+            auto_test=False,
+            work_dir=tmp_path,
+            workflow_service=workflows,
+        )
+        runner._decompose = AsyncMock(
+            return_value=[Step(index=1, title="Implement", description="make the change")]
+        )
+        run = await runner.plan("implement the feature")
+        evicted_workflow_run_id = run.workflow_run_id
+        assert await workflows.delete_run(evicted_workflow_run_id) is True
+        original_phase = workflows.phase
+
+        async def phase_after_durable_link(run_id: str, title: str) -> None:
+            restored = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
+            assert restored._runs[run.task_id].workflow_run_id == run_id
+            await original_phase(run_id, title)
+
+        workflows.phase = phase_after_durable_link  # type: ignore[method-assign]
+
+        await runner._workflow_rebind(run)
+
+        assert run.workflow_run_id != evicted_workflow_run_id
+        restored = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
+        assert restored._runs[run.task_id].workflow_run_id == run.workflow_run_id
+
+    @pytest.mark.asyncio
+    async def test_rebind_persists_replacement_for_rejected_workflow_run(
+        self, tmp_path: Path
+    ) -> None:
+        sessions = _make_mock_sessions()
+        workflows = WorkflowService(sessions=sessions, persist=False)
+        runner = TaskRunner(
+            sessions=sessions,
+            auto_test=False,
+            work_dir=tmp_path,
+            workflow_service=workflows,
+        )
+        runner._decompose = AsyncMock(
+            return_value=[Step(index=1, title="Implement", description="make the change")]
+        )
+        run = await runner.plan("implement the feature")
+        rejected_workflow_run_id = run.workflow_run_id
+        handle = workflows.registry.get(rejected_workflow_run_id)
+        assert handle is not None
+        handle.driver = "workflow"
+        await workflows.fail(rejected_workflow_run_id, "cannot resume as a host run")
+
+        await runner._workflow_rebind(run)
+
+        assert run.workflow_run_id != rejected_workflow_run_id
+        restored = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
+        assert restored._runs[run.task_id].workflow_run_id == run.workflow_run_id
+
+    @pytest.mark.asyncio
+    async def test_saved_task_plan_invocation_uses_exact_yaml_and_records_provenance(
+        self, tmp_path: Path
+    ) -> None:
+        sessions = _make_mock_sessions()
+        workflows = WorkflowService(sessions=sessions, persist=False)
+        runner = TaskRunner(
+            sessions=sessions,
+            auto_test=False,
+            work_dir=tmp_path,
+            workflow_service=workflows,
+        )
+        workflows.attach_task_runner(runner)
+        source = "agents:\n  test:\n    prompt: run tests\n    force_approval: true\n"
+        saved = workflows.save_definition(
+            source,
+            name="Test project",
+            slug="test-project",
+            source_format="task-plan",
+        )["definition"]
+
+        async def execute_existing_pipeline(project, history_key):
+            project.tasks[0].status = StepStatus.PASSED
+            project.tasks[0].result = "done"
+
+        runner._execute_tasks = AsyncMock(side_effect=execute_existing_pipeline)
+
+        started = await workflows.start_definition(saved["slug"], input_text="from slash")
+        await runner._tasks[started["task_id"]]
+        run = runner._runs[started["task_id"]]
+
+        assert run.spec_content == source
+        assert run.original_input == "from slash"
+        assert run.workflow_id == saved["id"]
+        assert run.workflow_slug == saved["slug"]
+        assert run.workflow_revision == saved["revision"]
+        assert run.tasks[0].force_approval is True
+        assert started["run_id"] == run.workflow_run_id
+        snapshot = workflows.result(started["run_id"])
+        assert snapshot["status"] == "finished"
+        assert snapshot["source"] == source
+        assert snapshot["workflow_id"] == saved["id"]
+
+    @pytest.mark.asyncio
+    async def test_editing_saved_task_plan_clears_revision_and_keeps_lineage(
+        self, tmp_path: Path
+    ) -> None:
+        sessions = _make_mock_sessions()
+        workflow_store = WorkflowRunStore(tmp_path / "workflow-store")
+        workflows = WorkflowService(sessions=sessions, store=workflow_store)
+        runner = TaskRunner(
+            sessions=sessions,
+            auto_test=False,
+            work_dir=tmp_path,
+            workflow_service=workflows,
+        )
+        source = "agents:\n  test:\n    prompt: run tests\n"
+        saved = workflows.save_definition(
+            source,
+            name="Test project",
+            slug="test-project",
+            source_format="task-plan",
+        )["definition"]
+        run = await runner.plan(
+            source,
+            source="yaml",
+            workflow_name=saved["name"],
+            workflow_id=saved["id"],
+            workflow_slug=saved["slug"],
+            workflow_revision=saved["revision"],
+            workflow_source=source,
+        )
+
+        await runner.update_task(run.task_id, 1, {"description": run.tasks[0].description})
+        assert run.workflow_id == saved["id"]
+
+        await runner.update_task(run.task_id, 1, {"description": "run the full test suite"})
+
+        assert run.workflow_id == ""
+        assert run.workflow_slug == ""
+        assert run.workflow_revision == 0
+        snapshot = workflows.result(run.workflow_run_id)
+        assert snapshot["workflow_id"] == ""
+        assert snapshot["workflow_slug"] == ""
+        assert snapshot["workflow_revision"] == 0
+        assert snapshot["derived_from"] == {
+            "workflow_id": saved["id"],
+            "revision": saved["revision"],
+        }
+        restored_run = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)._runs[
+            run.task_id
+        ]
+        assert restored_run.workflow_id == ""
+        assert restored_run.derived_from_workflow_id == saved["id"]
+        assert restored_run.derived_from_revision == saved["revision"]
+        restored_snapshot = WorkflowService(sessions=sessions, store=workflow_store).result(
+            run.workflow_run_id
+        )
+        assert restored_snapshot["workflow_id"] == ""
+        assert restored_snapshot["derived_from"] == {
+            "workflow_id": saved["id"],
+            "revision": saved["revision"],
+        }
+
+        promoted = await workflows.promote_run_definition(
+            run.workflow_run_id,
+            name="Adapted test project",
+            slug="adapted-test-project",
+        )
+        assert promoted["ok"] is True
+        assert promoted["definition"]["derived_from"] == {
+            "workflow_id": saved["id"],
+            "revision": saved["revision"],
+        }
+
+    @pytest.mark.asyncio
+    async def test_saved_task_plan_capacity_rejection_removes_created_run(
+        self, tmp_path: Path
+    ) -> None:
+        sessions = _make_mock_sessions()
+        workflows = WorkflowService(sessions=sessions, persist=False)
+        runner = TaskRunner(
+            sessions=sessions,
+            auto_test=False,
+            work_dir=tmp_path,
+            workflow_service=workflows,
+        )
+        blockers = [asyncio.create_task(asyncio.Event().wait()) for _ in range(3)]
+        runner._tasks.update({f"active_{index}": task for index, task in enumerate(blockers)})
+        definition = {
+            "id": "wfd_test",
+            "slug": "test-project",
+            "name": "Test project",
+            "revision": 1,
+            "source": "agents:\n  test:\n    prompt: run tests\n",
+        }
+
+        try:
+            started = await runner.start_workflow_definition(definition)
+        finally:
+            for task in blockers:
+                task.cancel()
+            await asyncio.gather(*blockers, return_exceptions=True)
+
+        assert started == {
+            "error": "Too many concurrent tasks (3/3). "
+            "Cancel or wait for a running task to finish."
+        }
+        assert runner._runs == {}
+        assert workflows.list_runs() == []
+        restored = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
+        assert restored._runs == {}
+
+    @pytest.mark.asyncio
+    async def test_concurrent_plans_get_distinct_ids_when_the_clock_repeats(
+        self, tmp_path: Path
+    ) -> None:
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
+        runner._decompose = AsyncMock(
+            return_value=[Step(index=1, title="Implement", description="make the change")]
+        )
+
+        with patch("kiro_crew.taskrunner.time.time_ns", return_value=123):
+            first, second = await asyncio.gather(runner.plan("first"), runner.plan("second"))
+
+        assert first.task_id == "plan_123"
+        assert second.task_id == "plan_124"
+        assert set(runner._runs) == {"plan_123", "plan_124"}
+
+    @pytest.mark.asyncio
+    async def test_delete_run_removes_its_linked_workflow_run(self, tmp_path: Path) -> None:
+        sessions = _make_mock_sessions()
+        workflows = WorkflowService(sessions=sessions, persist=False)
+        runner = TaskRunner(
+            sessions=sessions,
+            auto_test=False,
+            work_dir=tmp_path,
+            workflow_service=workflows,
+        )
+        runner._decompose = AsyncMock(
+            return_value=[Step(index=1, title="Implement", description="make the change")]
+        )
+        run = await runner.plan("implement the feature")
+        workflow_run_id = run.workflow_run_id
+
+        assert await runner.delete_run(run.task_id) is True
+        assert workflows.status(workflow_run_id) is None
 
 
 # ── Parse steps ──
@@ -141,6 +733,126 @@ class TestParseSteps:
         steps = runner._parse_tasks(text)
         assert len(steps) == 1
         assert steps[0].title == "has title"
+
+    def test_prose_preamble_before_json_object(self) -> None:
+        # Reporter's real shape: a one-line preamble before a complete
+        # {"steps": [...]} object, despite the prompt demanding bare JSON.
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        body = json.dumps(
+            {
+                "steps": [
+                    {"title": "Set up scaffolding", "description": "Init the repo"},
+                    {"title": "Implement feature", "description": "Write the code"},
+                ]
+            }
+        )
+        text = "Here is the decomposed task plan you asked for:\n" + body
+        steps = runner._parse_tasks(text)
+        assert len(steps) == 2
+        assert steps[0].title == "Set up scaffolding"
+        assert steps[1].index == 2
+
+    def test_prose_preamble_and_suffix_around_json_array(self) -> None:
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        text = 'Sure! Plan below.\n[{"title": "A"}, {"title": "B"}]\nLet me know if you need more.'
+        steps = runner._parse_tasks(text)
+        assert [s.title for s in steps] == ["A", "B"]
+
+    def test_preamble_with_stray_brace_still_finds_body(self) -> None:
+        # A brace in the preamble prose must not mask the real JSON body.
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        text = 'Note: use {placeholder} syntax.\n{"steps": [{"title": "A"}]}'
+        steps = runner._parse_tasks(text)
+        assert len(steps) == 1
+        assert steps[0].title == "A"
+
+    def test_preamble_json_with_braces_inside_strings(self) -> None:
+        # Braces/brackets inside string values must not end the span early.
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        body = json.dumps({"steps": [{"title": 'Fix "{}" rendering', "description": "x]}"}]})
+        steps = runner._parse_tasks("Plan:\n" + body)
+        assert len(steps) == 1
+        assert steps[0].title == 'Fix "{}" rendering'
+
+    def test_genuinely_unparseable_returns_empty(self) -> None:
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        assert runner._parse_tasks("no json here at all") == []
+        assert runner._parse_tasks("broken { not json [ anywhere") == []
+
+    def test_json_like_token_in_preamble_does_not_mask_body(self) -> None:
+        # A trivial parseable span in the preamble (here "[1]") must not win
+        # over the plan-shaped body that follows it.
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        text = 'Steps use depends_on: [1] for ordering.\n{"steps": [{"title": "Real task"}]}'
+        steps = runner._parse_tasks(text)
+        assert len(steps) == 1
+        assert steps[0].title == "Real task"
+
+    def test_empty_plan_snippet_in_preamble_does_not_mask_body(self) -> None:
+        # An empty-plan example in the preamble (e.g. '{"steps": []}') must not
+        # be selected over the real title-bearing plan that follows it.
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        text = 'The shape is {"steps": []} with items like:\n{"steps": [{"title": "Real task"}]}'
+        steps = runner._parse_tasks(text)
+        assert len(steps) == 1
+        assert steps[0].title == "Real task"
+
+    def test_nested_example_snippet_in_preamble_does_not_starve_scan(self) -> None:
+        # A deeply nested example plus stray prose braces before the body must
+        # not exhaust the extractor (raw_decode skips past each parsed value).
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        text = (
+            'Example: {"a": {"b": {"c": [1, 2, {"d": []}]}}} and tokens {x} {y} {z}.\n'
+            '{"steps": [{"title": "Real task"}]}'
+        )
+        steps = runner._parse_tasks(text)
+        assert len(steps) == 1
+        assert steps[0].title == "Real task"
+
+    def test_two_different_plans_is_ambiguous_and_fails_safe(self) -> None:
+        # A title-bearing worked EXAMPLE before the real plan is ambiguous: the
+        # parser cannot know which plan is real, and executing a guess is worse
+        # than failing. Two different plan-shaped values -> [] (logged).
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        text = (
+            'For example {"steps": [{"title": "Example task"}]} — here is the plan:\n'
+            '{"steps": [{"title": "Real task"}]}'
+        )
+        assert runner._parse_tasks(text) == []
+
+    def test_identical_restated_plan_is_not_ambiguous(self) -> None:
+        # A model restating the SAME payload twice is not ambiguity.
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        body = '{"steps": [{"title": "Real task"}]}'
+        steps = runner._parse_tasks(f"Plan:\n{body}\nAgain, the plan is:\n{body}")
+        assert len(steps) == 1
+        assert steps[0].title == "Real task"
+
+    def test_unparseable_error_log_is_bounded_and_redacted(self, caplog) -> None:
+        import logging
+
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        secret = "ghp_" + "a" * 36
+        text = "totally not json " + secret + " " + "x" * 5000
+        with caplog.at_level(logging.ERROR, logger="kiro_crew.task_planner"):
+            assert runner._parse_tasks(text) == []
+        record = next(r for r in caplog.records if "Failed to parse tasks JSON" in r.getMessage())
+        message = record.getMessage()
+        assert secret not in message
+        assert str(len(text)) in message
+        # Payload slice is bounded so one record cannot evict the log window.
+        assert len(message) < 700
 
 
 # ── Build step prompt ──
@@ -808,6 +1520,15 @@ class TestSaveProgress:
         assert "❌" in content
         assert "boom" in content
         assert "(attempts: 2)" in content
+
+    def test_save_progress_without_spec_does_not_write_to_cwd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        runner = TaskRunner(sessions=_make_mock_sessions(), auto_test=False)
+        run = TaskRun(spec_path="", spec_content="ad-hoc", started_at=1000.0)
+        runner._save_progress(run)
+        assert not (tmp_path / PROGRESS_FILE).exists()
 
 
 # ── 12.1a: Checkpoint Resume ──
@@ -3024,7 +3745,9 @@ class TestWorkspaceDirValidation:
         # A per-run workspace_dir overrides the runner's default base dir: the
         # planned run operates directly in the chosen (resolved) folder.
         runner = TaskRunner(sessions=_make_mock_sessions(), auto_test=False, work_dir=tmp_path)
-        runner._decompose = AsyncMock(return_value=[Step(index=1, title="step", description="desc")])
+        runner._decompose = AsyncMock(
+            return_value=[Step(index=1, title="step", description="desc")]
+        )
         override = tmp_path / "custom-root"
         run = await runner.plan(input_text="do X", source="text", workspace_dir=str(override))
         assert run.work_dir == str(override.resolve())
@@ -3243,3 +3966,93 @@ class TestSemaphoreParallelScheduling:
             f"task 3 started at index {start3_idx} but task 1 ended at {end1_idx}; "
             "expected task 3 to start BEFORE task 1 finishes (slot refill)"
         )
+
+
+class TestNotifySessionKey:
+    """``start_background(session_key=)`` reaches the notify sink as a keyword.
+
+    The sink is what routes a stall-worthy notice (an approval request, a denial)
+    back to the surface the run was started from. ``notify`` swallows sink
+    failures at debug level, so "the keyword broke the sink" and "there was no
+    notification" look identical from the outside — which is why each of these
+    asserts the notification ARRIVED, not merely that the call was shaped right.
+    """
+
+    @staticmethod
+    def _spec(tmp_path: Path) -> Path:
+        spec = tmp_path / "spec.md"
+        spec.write_text("# Bg Task\n## Steps\n1. Do thing\n   - run: echo hi")
+        return spec
+
+    async def _start(self, tmp_path: Path, sink, session_key: str) -> tuple[TaskRunner, TaskRun]:
+        runner = TaskRunner(sessions=_make_mock_sessions(), work_dir=tmp_path, on_notify=sink)
+        with patch.object(runner, "run", new_callable=AsyncMock):
+            task_id = await runner.start_background(self._spec(tmp_path), session_key=session_key)
+            # Drain the background wrapper here rather than leaving it to be
+            # garbage-collected: a task still pending at teardown escapes into
+            # the next test and prints "Task was destroyed but it is pending".
+            background = runner._tasks.get(task_id)
+            if background is not None:
+                await background
+        return runner, runner._runs[task_id]
+
+    @pytest.mark.asyncio
+    async def test_session_aware_sink_receives_the_originating_key(self, tmp_path: Path) -> None:
+        seen: list[tuple[str, str]] = []
+
+        async def _sink(title: str, body: str, task_id: str = "", *, session_key: str = "") -> None:
+            seen.append((title, session_key))
+
+        runner, run = await self._start(tmp_path, _sink, "telegram:kirocrew:direct:U9")
+        await runner._notify("Task 1 requires approval", "run the deploy?", run=run)
+
+        assert seen == [("[spec] Task 1 requires approval", "telegram:kirocrew:direct:U9")]
+
+    @pytest.mark.asyncio
+    async def test_omitted_session_key_leaves_the_call_shape_untouched(
+        self, tmp_path: Path
+    ) -> None:
+        """No originating conversation ⇒ the sink sees the call it always saw.
+
+        Asserted on the call SHAPE, not merely on an empty value: a sink is only
+        obliged to accept ``session_key`` once something hands it one, so a
+        notification with no origin has to arrive as the three-argument call every
+        pre-existing sink was written against.
+        """
+        calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+        async def _sink(*args: Any, **kwargs: Any) -> None:
+            calls.append((args, kwargs))
+
+        runner, run = await self._start(tmp_path, _sink, "")
+        await runner._notify("Task 1 requires approval", "run the deploy?", run=run)
+
+        assert calls == [(("[spec] Task 1 requires approval", "run the deploy?", run.task_id), {})]
+
+    @pytest.mark.asyncio
+    async def test_legacy_three_arg_sink_is_still_notified(self, tmp_path: Path) -> None:
+        """A sink that predates the keyword keeps working, present key or not.
+
+        The keyword is keyword-only WITH a default so a sink can adopt it at its
+        own pace; handing it to one that cannot take it would raise a
+        ``TypeError`` into ``notify``'s best-effort ``except``, and that sink's
+        notifications would simply stop arriving with nothing logged above debug.
+        """
+        seen: list[str] = []
+
+        async def _legacy(title: str, body: str, task_id: str = "") -> None:
+            seen.append(title)
+
+        runner, run = await self._start(tmp_path, _legacy, "telegram:kirocrew:direct:U9")
+        await runner._notify("Task 1 requires approval", "run the deploy?", run=run)
+
+        assert seen == ["[spec] Task 1 requires approval"]
+
+    @pytest.mark.asyncio
+    async def test_delete_forgets_the_originating_key(self, tmp_path: Path) -> None:
+        """The mapping is per-run bookkeeping, so deleting a run releases it."""
+        runner, run = await self._start(tmp_path, AsyncMock(), "telegram:kirocrew:direct:U9")
+        assert runner._run_session_keys.get(run.task_id)
+
+        assert await runner.delete_run(run.task_id) is True
+        assert run.task_id not in runner._run_session_keys

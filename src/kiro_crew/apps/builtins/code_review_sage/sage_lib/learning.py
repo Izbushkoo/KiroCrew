@@ -32,7 +32,6 @@ import re
 import shutil
 import stat
 import sys
-import tempfile
 import threading
 import time
 from collections.abc import Sequence
@@ -304,17 +303,7 @@ def list_patterns_for_review(root: Path | None = None) -> list[dict]:
 
 def _atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    try:
-        try:
-            os.write(fd, text.encode("utf-8"))
-        finally:
-            os.close(fd)  # always close the fd, even if os.write raised
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+    store.atomic_write_text(path, text)
 
 
 def _normalize_pattern(pattern: dict) -> dict:

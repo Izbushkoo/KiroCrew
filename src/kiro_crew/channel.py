@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
 
 logger = logging.getLogger(__name__)
@@ -38,10 +39,31 @@ _INBOX_POLL_SECS = 1.0
 # agents communicate exclusively through channel posts.  send_notification
 # reaches the user like send_message does (notification feed publish, badge,
 # and sound), so both sit
-# behind the same containment boundary.  Matched against the rendered
+# behind the same containment boundary.  All THREE session-control tools sit
+# behind it, in both directions: stopping one of the user's dashboard sessions
+# reaches the user through that session's transcript, and READING one pulls a
+# private dashboard conversation into a channel other humans can see.  The read
+# tool mutates nothing, but containment here is about what crosses the boundary,
+# not about who writes — so the exfiltration direction is blocked alongside the
+# control one.  CREATE is blocked for a different reason than the other two: it
+# writes nothing into an existing conversation, but a session it opened would be
+# one the channel agent then owns and may act on, which is exactly the
+# containment this list exists to hold.  SEND is the sharpest of the four: stop
+# only cancels and read only exfiltrates, but send delivers text that the target
+# session RUNS as a turn — so external channel content would execute inside a
+# private dashboard conversation.
+# Matched against the rendered
 # permission-request text/title via _blocked_tool_named() (boundary-aware,
 # not naive substring — "Editing send_notification.py" must NOT match).
-CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = ("send_message", "send_notification")
+CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
+    "send_message",
+    "send_notification",
+    "session_stop",
+    "session_send",
+    "session_read_message",
+    "session_create",
+    "session_close",
+)
 
 # Boundary-aware matcher: the tool name must stand alone in the rendered
 # title — not embedded in a filename/path/identifier ("send_notification.py",
@@ -397,7 +419,9 @@ class Channel:
         }
 
     @classmethod
-    def deserialize(cls, data: dict[str, Any], broadcast_fn: Any = None, save_fn: Any = None) -> "Channel":
+    def deserialize(
+        cls, data: dict[str, Any], broadcast_fn: Any = None, save_fn: Any = None
+    ) -> "Channel":
         """Restore a channel from serialized data."""
         ch = cls(id=data["id"], topic=data["topic"])
         ch.orchestrator_id = data.get("orchestrator_id")
@@ -415,7 +439,9 @@ class Channel:
                 session_key=ad.get("session_key", f"channel:{data['id']}:{ad['id']}"),
                 state="done",  # always restore as done
                 is_orchestrator=ad.get("is_orchestrator", False),
-                listen_mode=ListenMode(ad.get("listen_mode", "all" if ad.get("is_orchestrator") else "mention")),
+                listen_mode=ListenMode(
+                    ad.get("listen_mode", "all" if ad.get("is_orchestrator") else "mention")
+                ),
             )
             ch.members[aid] = agent
         for md in data.get("messages", []):
@@ -462,14 +488,32 @@ class ChannelManager:
         self._load_all()
 
     def _save_channel(self, channel: Channel) -> None:
-        """Persist channel state to disk."""
+        """Persist channel state to disk.
+
+        Routed through the shared :func:`atomic_write` helper rather than a
+        hand-rolled temp-write-and-rename. The hand-rolled form derived its temp
+        name from the destination (``<id>.json.tmp``), so two writers persisting
+        the same channel raced on one filename: the loser could publish a
+        half-written payload, or fail outright when its rename found the temp
+        already moved. It also missed the helper's bounded retry for the Windows
+        rename window, where a scanner holding the temp file makes a correct
+        write lose its payload.
+
+        Durability and permission semantics are deliberately unchanged: no
+        ``fsync`` (the pre-existing best-effort contract for channel state) and
+        no explicit ``mode``, so the file still lands at the umask default.
+        ``json.dumps`` is ASCII-only by default, so the helper's UTF-8 encoding
+        puts the same bytes on disk as the previous locale-default text handle.
+
+        ``os.makedirs`` stays OUTSIDE the ``try`` on purpose. The helper creates
+        the parent itself, so this call is now belt-and-braces -- but moving
+        directory creation inside the ``try`` would newly swallow a "cannot
+        create the channels directory" failure that callers see raised today.
+        """
         os.makedirs(self._CHANNELS_DIR, exist_ok=True)
         path = os.path.join(self._CHANNELS_DIR, f"{channel.id}.json")
-        tmp = path + ".tmp"
         try:
-            with open(tmp, "w") as f:
-                json.dump(channel.serialize(), f)
-            os.replace(tmp, path)
+            atomic_write(path, json.dumps(channel.serialize()))
         except Exception:
             logger.exception("Failed to save channel %s", channel.id)
 
@@ -491,7 +535,9 @@ class ChannelManager:
             try:
                 with open(path) as f:
                     data = json.load(f)
-                ch = Channel.deserialize(data, broadcast_fn=self._broadcast_fn, save_fn=self._save_channel)
+                ch = Channel.deserialize(
+                    data, broadcast_fn=self._broadcast_fn, save_fn=self._save_channel
+                )
                 ch._max_agents = self._max_agents
                 self._channels[ch.id] = ch
                 logger.info("Restored channel %s (%s)", ch.id, ch.topic)

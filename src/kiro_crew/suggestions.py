@@ -14,6 +14,7 @@ from aiohttp import web
 
 from kiro_crew.context import ContextBuilder
 from kiro_crew.llm_helpers import run_bg_oneliner
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 if TYPE_CHECKING:
@@ -63,7 +64,9 @@ class SuggestionsCache:
 
     suggestions: list[str] = field(default_factory=lambda: list(_FALLBACK_SUGGESTIONS))
     generated_at: float = 0.0
-    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # LoopBoundLock, not asyncio.Lock (#4800): the cache is stored on the
+    # long-lived DashboardState, which outlives any single event loop.
+    _lock: LoopBoundLock = field(default_factory=LoopBoundLock, repr=False)
     _task: asyncio.Task | None = field(default=None, repr=False)  # type: ignore[type-arg]
 
 
@@ -166,7 +169,10 @@ def _redact_suggestions(suggestions: list[str]) -> list[str]:
 
 async def generate_suggestions(state: DashboardState) -> list[str]:
     """Generate suggestions using the background kiro-cli session."""
-    context = _build_context(state)
+    # _build_context() calls list_sessions() + recent() — O(all sessions) disk IO.
+    # Offload to keep the event loop responsive (same pattern as this PR's other
+    # two offload sites in sessions.py).
+    context = await asyncio.to_thread(_build_context, state)
     if not context or len(context) < 50:
         logger.debug("Insufficient context for suggestions — using fallback")
         return list(_FALLBACK_SUGGESTIONS)

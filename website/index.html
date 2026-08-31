@@ -10,10 +10,20 @@
        `resizes-content` resizes the layout viewport instead, so the shell (already
        `h-dvh` with `overflow-hidden` and inner `min-h-0` scrollers) simply gets shorter
        and the focused input stays on screen. `dvh` alone cannot do this: it tracks
-       collapsible browser UI, not the keyboard.
-       Local: maximum-scale=1, user-scalable=no, viewport-fit=cover retained for
-       mobile PWA hold-to-talk and full-bleed layout. -->
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content" />
+  <!-- `interactive-widget=resizes-content`: Chrome 108+ and Safari 18+ (iOS).
+       By default the soft keyboard overlays the layout viewport;
+       `resizes-content` resizes the layout viewport instead, so the shell (already
+       `h-dvh` with `overflow-hidden` and inner `min-h-0` scrollers) simply gets shorter
+       and the focused input stays on screen. `dvh` alone cannot do this: it tracks
+       collapsible browser UI, not the keyboard. -->
+  <!-- viewport-fit=cover is required for env(safe-area-inset-*) to report
+       non-zero values on notched iPhones (Safari and the standalone PWA).
+       Screen-edge surfaces then inset themselves with the tailwindcss-safe-area
+       utilities; src/test/safeArea.guard.test.ts enforces that. -->
+  <!-- `maximum-scale=1, user-scalable=no`: the dashboard is an application shell, not a
+       zoomable document, and a pinch magnifies a `position: fixed` / `h-dvh` shell that
+       has no scroll axis to reach what the magnification pushed off-screen. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, interactive-widget=resizes-content, viewport-fit=cover" />
   <link rel="icon" href="/logo.png" type="image/png" />
   <link rel="manifest" href="/manifest.json" />
   <meta name="theme-color" content="#0d0f12" />
