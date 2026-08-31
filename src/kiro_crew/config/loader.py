@@ -4823,7 +4823,6 @@ _RETIRED_STT_PROVIDERS = ("whisper", "mlx", "parakeet", "faster")
 _VALID_STT_MODELS = tuple(m.name for m in _STT_CATALOG)
 
 
->>>>>>> upstream/main
 _VALID_CHANNEL_PREFIXES = ("C", "D", "G")
 
 

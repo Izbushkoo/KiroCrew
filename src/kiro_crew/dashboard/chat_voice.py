@@ -58,7 +58,7 @@ async def api_voice_config(request: web.Request) -> web.Response:
                 "piper_model": _vc.piper_model,
                 "piper_model_config": _vc.piper_model_config,
                 "piper_length_scale": _vc.piper_length_scale,
-                "openai_api_key": getattr(_vc, 'openai_api_key', ''),
+                "openai_api_key": _vc.openai_api_key,
             }
         )
 
@@ -86,10 +86,6 @@ async def api_voice_config(request: web.Request) -> web.Response:
     if "enabled" in body:
         _vc.global_enabled = bool(body["enabled"])
     if "autoSpeak" in body:
-<<<<<<< HEAD
-        _vc.global_enabled = bool(body["autoSpeak"])
-=======
->>>>>>> upstream/main
         _vc.auto_speak = bool(body["autoSpeak"])
     if "aws_profile" in body:
         _vc.aws_profile = str(body["aws_profile"]).strip()
@@ -136,7 +132,6 @@ async def api_voice_config(request: web.Request) -> web.Response:
                 "engine": _vc.default_engine,
                 "rate": _vc.default_rate,
                 "pitch": _vc.default_pitch,
-                "auto_speak": getattr(_vc, 'auto_speak', _vc.global_enabled),
                 "aws_profile": _vc.aws_profile,
                 "region": _vc.region,
                 "piper_binary": _vc.piper_binary,

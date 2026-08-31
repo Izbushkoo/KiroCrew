@@ -40,6 +40,7 @@ class TestVoiceConfig:
             piper_model="",
             piper_model_config="",
             piper_length_scale=1.0,
+            openai_api_key="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         state = _make_state(tmp_path)
@@ -74,6 +75,7 @@ class TestVoiceConfig:
             piper_model="",
             piper_model_config="",
             piper_length_scale=1.0,
+            openai_api_key="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         state = _make_state(tmp_path)
@@ -131,6 +133,7 @@ class TestVoiceConfig:
             piper_model="",
             piper_model_config="",
             piper_length_scale=1.0,
+            openai_api_key="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -163,6 +166,7 @@ class TestVoiceConfig:
             piper_model="~/m.onnx",
             piper_model_config="",
             piper_length_scale=1.0,
+            openai_api_key="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         state = _make_state(tmp_path)
@@ -192,6 +196,7 @@ class TestVoiceConfig:
             piper_model="",
             piper_model_config="",
             piper_length_scale=1.0,
+            openai_api_key="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -365,6 +370,7 @@ class TestVoiceConfig:
             piper_model="",
             piper_model_config="",
             piper_length_scale=1.0,
+            openai_api_key="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"

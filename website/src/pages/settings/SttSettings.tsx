@@ -44,12 +44,8 @@ interface SttConfig {
   enabled: boolean
   provider: string
   model: string
-<<<<<<< HEAD
-  mlx_model?: string
   openai_api_key?: string
   openai_model?: string
-=======
->>>>>>> upstream/main
   available: boolean
   streaming?: boolean
   silence_ms?: number

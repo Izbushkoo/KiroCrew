@@ -44,6 +44,7 @@ import tempfile
 import threading
 import wave
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 
 from kiro_crew import aws_consent, platform_compat, stt

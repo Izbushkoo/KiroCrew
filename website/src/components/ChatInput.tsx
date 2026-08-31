@@ -3390,6 +3390,7 @@ function ChatInput({
             )}
           </div>
           <div className="flex items-center gap-1 shrink-0">
+            {onVoiceToggle && (
               <button
                 ref={micBtnRef}
                 type="button"

@@ -5252,7 +5252,6 @@
       "install_teaser_hint": "needs Tailscale",
       "no_peers": "No other device has joined this Tailscale network yet, so nothing can open this address. Install Tailscale on your phone and sign in with the same account.",
       "peers_offline": "Your other devices have joined this network but none is online right now, so the address will not load until one connects."
->>>>>>> upstream/main
     }
   },
   "hooks": {
