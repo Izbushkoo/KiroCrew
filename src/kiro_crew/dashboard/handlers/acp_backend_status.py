@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import shutil
 from typing import Any, Dict, List
 
 from aiohttp import web
@@ -46,9 +48,22 @@ _CODE_OWNER_REQUIRED = "dashboard_owner_required"
 _OWNER_REQUIRED_MESSAGE = "dashboard owner required"
 
 _AUDIT_OPERATION = "acp_backend_status_access"
+_INSTALL_AUDIT_OPERATION = "acp_backend_install"
+
+_CODE_UNSUPPORTED_BACKEND = "acp_backend_install_unsupported"
+_CODE_NPM_NOT_FOUND = "acp_backend_install_npm_not_found"
+_CODE_INSTALL_FAILED = "acp_backend_install_failed"
+_CODE_INSTALL_TIMEOUT = "acp_backend_install_timeout"
+
+#: Generous but bounded: npm resolves and downloads a package tree over the
+#: network, which can be slow on a cold cache, but a hung install must not pin
+#: the request open forever.
+_INSTALL_TIMEOUT_SECS = 120
 
 
-async def _deny_non_owner(request: web.Request) -> web.Response | None:
+async def _deny_non_owner(
+    request: web.Request, *, operation: str = _AUDIT_OPERATION
+) -> web.Response | None:
     """Refuse a non-owner, mirroring the prerequisite handlers' 403 shape.
 
     Which components are installed on the host is host-configuration state and
@@ -64,7 +79,7 @@ async def _deny_non_owner(request: web.Request) -> web.Response | None:
     def _audit() -> None:
         sel().log_api_access(
             caller=audit_caller,
-            operation=_AUDIT_OPERATION,
+            operation=operation,
             outcome="denied",
             source="dashboard",
             resources=request.path,
@@ -129,3 +144,118 @@ async def api_acp_backend_status(request: web.Request) -> web.Response:
         return denial
     backends = await asyncio.to_thread(_snapshot)
     return web.json_response({"backends": backends})
+
+
+def _resolve_npm_bin() -> str | None:
+    """Find ``npm`` the same way the spawn resolvers find their binaries.
+
+    BLOCKING (filesystem/PATH search) -- call under ``asyncio.to_thread``. A
+    gateway running under systemd/launchd inherits a minimal ``PATH`` that
+    routinely omits nvm/mise/volta shims, so a bare ``shutil.which("npm")``
+    against the unmodified environment would report "not found" for an
+    operator who plainly has npm on an interactive shell.
+    """
+    from kiro_crew.env import augmented_path
+
+    search_path = augmented_path(os.environ.get("PATH", ""))
+    return shutil.which("npm", path=search_path)
+
+
+async def api_acp_backend_install(request: web.Request) -> web.Response:
+    """POST /api/acp-backends/install -- ``body: {"backend": "claude"}``.
+
+    The ONLY action this endpoint may ever automate: a fixed, named npm
+    package (``CLAUDE_ACP_NPM_PKG``) resolved from this module's own import,
+    never a client-supplied command -- the request selects among a closed set
+    of known backends, it does not name what runs. Installing the ``claude``
+    CLI itself, or logging it in, stays out of scope on purpose: see
+    ``kiro_prerequisite.py``'s "Kiro Crew neither installs nor authenticates
+    on the user's behalf" stance for kiro-cli, which applies here for the
+    identical reason -- a vendor CLI's installer and login flow is a
+    privileged surface this project has already decided not to own.
+    """
+    denial = await _deny_non_owner(request, operation=_INSTALL_AUDIT_OPERATION)
+    if denial is not None:
+        return denial
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    backend = body.get("backend") if isinstance(body, dict) else None
+
+    # Function-local: this module must not import kiro_crew.acp at module
+    # scope (it sits on the boot path -- see
+    # test_the_boot_path_does_not_import_acp_at_module_scope).
+    from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE
+
+    if backend == ACP_BACKEND_CLAUDE:
+        return await _install_claude_adapter()
+    return web.json_response(
+        {
+            "error": f"no automated install for backend {backend!r}",
+            "code": _CODE_UNSUPPORTED_BACKEND,
+        },
+        status=400,
+    )
+
+
+async def _install_claude_adapter() -> web.Response:
+    """``npm install --global <CLAUDE_ACP_NPM_PKG>`` -- the one command this
+    endpoint ever runs, named by import rather than taken from the request."""
+    from kiro_crew.acp.client import CLAUDE_ACP_NPM_PKG
+
+    npm_bin = await asyncio.to_thread(_resolve_npm_bin)
+    if not npm_bin:
+        return web.json_response(
+            {
+                "error": "npm was not found on this machine; install Node.js/npm first",
+                "code": _CODE_NPM_NOT_FOUND,
+            },
+            status=500,
+        )
+
+    proc = await asyncio.create_subprocess_exec(
+        npm_bin,
+        "install",
+        "--global",
+        CLAUDE_ACP_NPM_PKG,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _out, err = await asyncio.wait_for(proc.communicate(), timeout=_INSTALL_TIMEOUT_SECS)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.communicate()
+        logger.warning("npm install -g %s timed out", CLAUDE_ACP_NPM_PKG)
+        return web.json_response(
+            {"error": "npm install timed out", "code": _CODE_INSTALL_TIMEOUT},
+            status=500,
+        )
+
+    if proc.returncode != 0:
+        detail = (err or b"").decode(errors="replace").strip()
+        logger.warning(
+            "npm install -g %s failed (rc=%s): %s", CLAUDE_ACP_NPM_PKG, proc.returncode, detail
+        )
+        return web.json_response(
+            {"error": detail or "npm install failed", "code": _CODE_INSTALL_FAILED},
+            status=500,
+        )
+
+    # The running gateway's own spawn-resolution cache and this endpoint's
+    # 30s probe cache both predate the install; clear the probe cache so the
+    # NEXT GET /api/acp-backends reflects it immediately rather than up to 30s
+    # stale. The spawn-resolution cache (AcpClient._claude_acp_argv_cache) is
+    # per-process and is exactly what the ``restart_required`` row already
+    # discloses -- clearing it here would be a second, racier path to the same
+    # fact the payload already states honestly.
+    from kiro_crew.agent_sdk.backend_install import clear_probe_cache
+
+    clear_probe_cache()
+
+    return web.json_response({"ok": True})

@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -551,6 +551,178 @@ class TestRouteIsRegistered:
             for route in resource
         }
         assert ("/api/acp-backends", "GET") in routes
+        assert ("/api/acp-backends/install", "POST") in routes
+
+
+# ── The install endpoint ──
+#
+# The ONLY action this fork's fork-owned endpoint may automate: `npm install -g
+# <the Claude adapter's fixed package name>`. Never the claude CLI itself, and
+# never a client-supplied command — see the handler's own docstring for why
+# that boundary matches ``kiro_prerequisite.py``'s stance for kiro-cli.
+
+
+def _install_request(
+    *, backend: object = "claude", app: str = "", user: str = "owner-1", owner: str = "owner-1"
+):
+    req = MagicMock()
+    req.path = "/api/acp-backends/install"
+    store = {"app": app, "user": user}
+    req.get = lambda key, default=None: store.get(key, default)
+    state = MagicMock()
+    state.owner_id = owner
+    req.app = {"state": state}
+    req.json = AsyncMock(return_value={"backend": backend})
+    return req
+
+
+def _fake_npm_process(*, returncode=0, stdout=b"", stderr=b""):
+    proc = MagicMock()
+    proc.communicate = AsyncMock(return_value=(stdout, stderr))
+    proc.returncode = returncode
+    return proc
+
+
+class TestInstallEndpointOwnerGate:
+    def test_a_non_owner_is_refused_before_anything_is_spawned(self, monkeypatch):
+        from kiro_crew.dashboard.handlers import acp_backend_status as handler
+
+        monkeypatch.setattr(handler, "sel", lambda: MagicMock())
+        spawned: list[object] = []
+        monkeypatch.setattr(
+            handler.asyncio,
+            "create_subprocess_exec",
+            AsyncMock(side_effect=lambda *a, **kw: spawned.append(a)),
+        )
+
+        response = asyncio.run(
+            handler.api_acp_backend_install(_install_request(user="someone-else"))
+        )
+
+        assert response.status == 403
+        assert json.loads(response.text or "{}")["code"] == "dashboard_owner_required"
+        assert spawned == []
+
+
+class TestInstallEndpointBackendValidation:
+    def test_an_unsupported_backend_is_refused_without_touching_npm(self, monkeypatch):
+        from kiro_crew.dashboard.handlers import acp_backend_status as handler
+
+        called: list[object] = []
+        monkeypatch.setattr(
+            handler, "_resolve_npm_bin", lambda: called.append("resolved") or "/usr/bin/npm"
+        )
+
+        response = asyncio.run(
+            handler.api_acp_backend_install(_install_request(backend=ACP_BACKEND_KAS))
+        )
+
+        assert response.status == 400
+        body = json.loads(response.text or "{}")
+        assert body["code"] == "acp_backend_install_unsupported"
+        assert called == []
+
+    def test_a_missing_backend_field_is_refused(self, monkeypatch):
+        from kiro_crew.dashboard.handlers import acp_backend_status as handler
+
+        response = asyncio.run(handler.api_acp_backend_install(_install_request(backend=None)))
+        assert response.status == 400
+
+    def test_invalid_json_is_treated_as_an_unsupported_backend_not_a_500(self, monkeypatch):
+        from kiro_crew.dashboard.handlers import acp_backend_status as handler
+
+        req = _install_request()
+        req.json = AsyncMock(side_effect=ValueError("not json"))
+        response = asyncio.run(handler.api_acp_backend_install(req))
+        assert response.status == 400
+
+
+class TestInstallEndpointNpmMissing:
+    def test_reports_npm_not_found_without_spawning(self, monkeypatch):
+        from kiro_crew.dashboard.handlers import acp_backend_status as handler
+
+        monkeypatch.setattr(handler, "_resolve_npm_bin", lambda: None)
+        spawn = AsyncMock()
+        monkeypatch.setattr(handler.asyncio, "create_subprocess_exec", spawn)
+
+        response = asyncio.run(handler.api_acp_backend_install(_install_request()))
+
+        assert response.status == 500
+        assert json.loads(response.text or "{}")["code"] == "acp_backend_install_npm_not_found"
+        spawn.assert_not_called()
+
+
+class TestInstallEndpointSpawn:
+    """The actual `npm install -g <fixed package>` call and its three outcomes."""
+
+    def test_success_installs_the_fixed_package_and_clears_the_probe_cache(self, monkeypatch):
+        from kiro_crew.dashboard.handlers import acp_backend_status as handler
+
+        monkeypatch.setattr(handler, "_resolve_npm_bin", lambda: "/usr/local/bin/npm")
+        spawn = AsyncMock(return_value=_fake_npm_process(returncode=0))
+        monkeypatch.setattr(handler.asyncio, "create_subprocess_exec", spawn)
+        cleared: list[bool] = []
+        monkeypatch.setattr(probe, "clear_probe_cache", lambda: cleared.append(True))
+
+        response = asyncio.run(handler.api_acp_backend_install(_install_request()))
+
+        assert response.status == 200
+        assert json.loads(response.text or "{}") == {"ok": True}
+        assert cleared == [True]
+
+        from kiro_crew.acp.client import CLAUDE_ACP_NPM_PKG
+
+        spawn.assert_awaited_once_with(
+            "/usr/local/bin/npm",
+            "install",
+            "--global",
+            CLAUDE_ACP_NPM_PKG,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+    def test_a_nonzero_exit_is_reported_and_the_cache_is_left_alone(self, monkeypatch):
+        from kiro_crew.dashboard.handlers import acp_backend_status as handler
+
+        monkeypatch.setattr(handler, "_resolve_npm_bin", lambda: "/usr/local/bin/npm")
+        spawn = AsyncMock(
+            return_value=_fake_npm_process(returncode=1, stderr=b"npm ERR! network timeout")
+        )
+        monkeypatch.setattr(handler.asyncio, "create_subprocess_exec", spawn)
+        cleared: list[bool] = []
+        monkeypatch.setattr(probe, "clear_probe_cache", lambda: cleared.append(True))
+
+        response = asyncio.run(handler.api_acp_backend_install(_install_request()))
+
+        assert response.status == 500
+        body = json.loads(response.text or "{}")
+        assert body["code"] == "acp_backend_install_failed"
+        assert "npm ERR! network timeout" in body["error"]
+        assert cleared == []
+
+    def test_a_timeout_is_reported_and_kills_the_process(self, monkeypatch):
+        from kiro_crew.dashboard.handlers import acp_backend_status as handler
+
+        monkeypatch.setattr(handler, "_resolve_npm_bin", lambda: "/usr/local/bin/npm")
+        proc = _fake_npm_process()
+        killed: list[bool] = []
+        proc.kill = lambda: killed.append(True)
+        monkeypatch.setattr(handler.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc))
+
+        async def _boom(coro, **_kw):
+            # A real `wait_for` takes ownership of the coroutine it is handed
+            # and closes it on timeout; do the same here so the AsyncMock's
+            # unawaited-coroutine warning doesn't leak into this test's output.
+            coro.close()
+            raise asyncio.TimeoutError()
+
+        monkeypatch.setattr(handler.asyncio, "wait_for", _boom)
+
+        response = asyncio.run(handler.api_acp_backend_install(_install_request()))
+
+        assert response.status == 500
+        assert json.loads(response.text or "{}")["code"] == "acp_backend_install_timeout"
+        assert killed == [True]
 
 
 def test_the_probe_is_offloaded_off_the_event_loop(monkeypatch):

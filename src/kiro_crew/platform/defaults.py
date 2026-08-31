@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 if TYPE_CHECKING:
     from kiro_crew.platform.interfaces import ImportSource, McpScope
 
-from kiro_crew import security, sso_status
+from kiro_crew import acp_backends, security, sso_status
 from kiro_crew.platform.interfaces import (
     CapabilityResult,
     InterceptDecision,
@@ -41,19 +41,21 @@ from kiro_crew.platform.interfaces import (
 
 
 class DefaultProviderRegistry:
-    """Kiro-CLI-ACP only.  Leaves the dormant ACP_BACKEND_CLAUDE seam untouched."""
+    """Kiro-CLI-ACP, plus this fork's own re-registration of the dormant
+    ACP_BACKEND_CLAUDE seam (see ``acp/client.py:_is_claude``).
+
+    Upstream's public edition registers no extra ACP backends and leaves this
+    a no-op — the companion re-registers Claude. This fork wants Claude
+    selectable by default, so it does that registration itself here instead of
+    building a separate companion package for one line: the provider alone is
+    runnable but unreachable without also widening the selectable registry.
+    """
 
     def create_factory(self, cfg: Any) -> Callable[..., Any]:
         return cfg.create_provider_factory()
 
     def register_acp_backends(self) -> None:
-        # The public edition registers no extra ACP backends.  The companion
-        # re-registers a Claude backend here via the acp/client.py:_is_claude
-        # seam, and pairs it with
-        # ``acp_backends.register_selectable_backend(ACP_BACKEND_CLAUDE)`` so the
-        # dashboard switch, the PATCH allowlist and the config load path all see
-        # it — the provider alone is runnable but unreachable.
-        return None
+        acp_backends.register_selectable_backend(acp_backends.ACP_BACKEND_CLAUDE)
 
 
 class DefaultPublishRegistry:

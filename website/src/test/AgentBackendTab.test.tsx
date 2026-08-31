@@ -16,15 +16,21 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import React from 'react'
 
-const { patchConfigMock, kirocrewConfigMock, schemaMock, acpBackendsMock } = vi.hoisted(() => ({
+const { patchConfigMock, kirocrewConfigMock, schemaMock, acpBackendsMock, installAcpBackendMock } = vi.hoisted(() => ({
   patchConfigMock: vi.fn(() => Promise.resolve({})),
   kirocrewConfigMock: vi.fn(() => Promise.resolve({ agent: { acp_backend: '' } })),
   schemaMock: vi.fn(),
   acpBackendsMock: vi.fn(),
+  installAcpBackendMock: vi.fn(() => Promise.resolve({ ok: true })),
 }))
 
 vi.mock('../api/client', () => ({
-  api: { kirocrewConfig: kirocrewConfigMock, patchConfig: patchConfigMock, acpBackends: acpBackendsMock },
+  api: {
+    kirocrewConfig: kirocrewConfigMock,
+    patchConfig: patchConfigMock,
+    acpBackends: acpBackendsMock,
+    installAcpBackend: installAcpBackendMock,
+  },
 }))
 
 vi.mock('../components/settingRef/useConfigSchema', () => ({
@@ -79,6 +85,8 @@ beforeEach(() => {
   // behaviour: schema-only gating, nothing disabled or annotated by the probe.
   acpBackendsMock.mockClear()
   acpBackendsMock.mockRejectedValue(new Error('404 Not Found'))
+  installAcpBackendMock.mockClear()
+  installAcpBackendMock.mockResolvedValue({ ok: true })
 })
 
 describe('AgentBackendTab', () => {
@@ -432,6 +440,80 @@ describe('AgentBackendTab', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('offers an install button when the machine is missing the Claude adapter with a named command', async () => {
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow(''),
+        probeRow('claude', {
+          installed: 'missing',
+          missing_components: ['claude-agent-acp', 'claude'],
+          install_command: 'npm i -g @agentclientprotocol/claude-agent-acp',
+        }),
+        probeRow('kas'),
+      ],
+    })
+    schemaMock.mockReturnValue(schemaWith(['', 'claude', 'kas']))
+    wrap()
+    expect(await screen.findByRole('button', { name: 'Install Claude Code' })).toBeInTheDocument()
+  })
+
+  it('offers no install button when the server names no command', async () => {
+    // kas is missing here too, but `_probe_kas` never populates install_command —
+    // so nothing is safe to automate and no button may appear.
+    acpBackendsMock.mockResolvedValue({
+      backends: [probeRow(''), probeRow('kas', { installed: 'missing', missing_components: ['kiro-agent'] })],
+    })
+    wrap()
+    await waitFor(() => expect(button('KAS (kiro-agent)')).toBeDisabled())
+    expect(screen.queryByRole('button', { name: /Install/ })).not.toBeInTheDocument()
+  })
+
+  it('installs the adapter and refreshes the probe on success', async () => {
+    acpBackendsMock.mockResolvedValueOnce({
+      backends: [
+        probeRow(''),
+        probeRow('claude', {
+          installed: 'missing',
+          missing_components: ['claude-agent-acp'],
+          install_command: 'npm i -g @agentclientprotocol/claude-agent-acp',
+        }),
+        probeRow('kas'),
+      ],
+    })
+    schemaMock.mockReturnValue(schemaWith(['', 'claude', 'kas']))
+    wrap()
+    const installBtn = await screen.findByRole('button', { name: 'Install Claude Code' })
+
+    // The re-probe the install triggers (via invalidateQueries) reports it present.
+    acpBackendsMock.mockResolvedValue({ backends: [probeRow(''), probeRow('claude'), probeRow('kas')] })
+
+    fireEvent.click(installBtn)
+    await waitFor(() => expect(installAcpBackendMock).toHaveBeenCalledWith('claude'))
+    await waitFor(() => expect(button('Claude Code')).toBeEnabled())
+    expect(screen.queryByRole('button', { name: 'Install Claude Code' })).not.toBeInTheDocument()
+  })
+
+  it('surfaces a rejected install without touching the save error', async () => {
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow(''),
+        probeRow('claude', {
+          installed: 'missing',
+          missing_components: ['claude-agent-acp'],
+          install_command: 'npm i -g @agentclientprotocol/claude-agent-acp',
+        }),
+        probeRow('kas'),
+      ],
+    })
+    schemaMock.mockReturnValue(schemaWith(['', 'claude', 'kas']))
+    installAcpBackendMock.mockRejectedValueOnce(new Error('npm ERR! network'))
+    wrap()
+    const installBtn = await screen.findByRole('button', { name: 'Install Claude Code' })
+    fireEvent.click(installBtn)
+    expect(await screen.findByText('npm ERR! network')).toBeInTheDocument()
+    expect(screen.queryByText('Could not save the agent backend.')).not.toBeInTheDocument()
   })
 
   it('states that the set is decided at gateway start', async () => {

@@ -2713,6 +2713,16 @@ export const api = {
   // caller as a rejection, which is the intended signal: "no probe information",
   // to be treated as fail-open rather than as a verdict.
   acpBackends: () => fetch('/api/acp-backends').then(j) as Promise<{ backends: AcpBackendProbe[] }>,
+  // One-click install for the ONE component this fork automates (the Claude
+  // npm adapter) — see the handler's docstring for why the claude CLI itself
+  // and its login stay manual. `backend` selects among a closed set of known
+  // ids server-side; it never carries a command.
+  installAcpBackend: (backend: string) =>
+    post('/api/acp-backends/install', { backend }).then(j) as Promise<{
+      ok?: boolean
+      error?: string
+      code?: string
+    }>,
   // Optional integrations — backend endpoints are graceful no-ops on a public
   // install (AIM / kiro usage are stubbed). Kept so the UI compiles and
   // degrades gracefully (panels render empty when the feature is absent).

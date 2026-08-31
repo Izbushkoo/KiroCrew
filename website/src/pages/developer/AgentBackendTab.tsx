@@ -1,9 +1,10 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Bot, Sparkles, Terminal } from 'lucide-react'
+import { Bot, Download, Loader2, Sparkles, Terminal } from 'lucide-react'
 
 import { api } from '../../api/client'
 import type { AcpBackendProbe } from '../../api/client'
+import { Btn } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
 import { SettingsCard, SettingsButtonGroup } from '../../components/settings'
 import { useConfigSchema } from '../../components/settingRef/useConfigSchema'
@@ -118,6 +119,7 @@ const PROBE_REFRESH_MS = 30_000
 export function AgentBackendTab() {
   const qc = useQueryClient()
   const [saveError, setSaveError] = useState('')
+  const [installError, setInstallError] = useState('')
   const schema = useConfigSchema()
 
   const cfgQ = useQuery<{ agent?: { acp_backend?: string } }>({
@@ -158,6 +160,23 @@ export function AgentBackendTab() {
     // straight from the query, so a rejected PATCH needs no revert — the cache was
     // never moved off the server's answer.
     onError: () => setSaveError(i18nT('pages.developer.agentBackendTab.could_not_save_the_agent_backend')),
+  })
+
+  /**
+   * The ONE install this panel automates: the Claude npm adapter, via a fixed
+   * server-side command (see `api_acp_backend_install`'s docstring for why the
+   * claude CLI itself and its login stay a manual, instructional step below).
+   * `install_command` is non-empty only for that case, so `canAutoInstall`
+   * naturally covers nothing else today without a backend-id check here.
+   */
+  const installMut = useMutation({
+    mutationFn: (backend: string) => api.installAcpBackend(backend),
+    onSuccess: () => {
+      setInstallError('')
+      qc.invalidateQueries({ queryKey: ['acpBackends'] })
+    },
+    onError: (err: unknown) =>
+      setInstallError(err instanceof Error ? err.message : i18nT('pages.developer.agentBackendTab.install_failed')),
   })
 
   if (cfgQ.isLoading) {
@@ -238,6 +257,15 @@ export function AgentBackendTab() {
   const disabledOption = (value: string) =>
     unavailable(value) || notInstalled(value) || needsRestart(value)
 
+  /**
+   * The server named a command for THIS row — currently true only for Claude's
+   * adapter (kiro/kas never carry one; see `_probe_claude`). Not gated on the
+   * backend id here on purpose: a future row that starts naming a command
+   * lights this button up with no frontend edit, same as the rest of this
+   * panel's server-driven gating.
+   */
+  const canAutoInstall = (value: string) => notInstalled(value) && !!probe(value)?.install_command
+
   const NAME: Record<string, string> = {
     [KIRO]: i18nT('pages.developer.agentBackendTab.kiro_cli'),
     [CLAUDE]: i18nT('pages.developer.agentBackendTab.claude_code'),
@@ -283,6 +311,7 @@ export function AgentBackendTab() {
   return (
     <>
       <ErrorNotice message={saveError} onDismiss={() => setSaveError('')} />
+      <ErrorNotice message={installError} onDismiss={() => setInstallError('')} />
       <SettingsCard>
         <SettingsButtonGroup
           label={i18nT('pages.developer.agentBackendTab.agent_backend')}
@@ -326,9 +355,24 @@ export function AgentBackendTab() {
               </dt>
               <dd
                 id={statusId(value)}
-                className={`m-0 ${disabledOption(value) ? 'text-warn' : 'text-muted'}`}
+                className={`m-0 flex items-center gap-2 ${disabledOption(value) ? 'text-warn' : 'text-muted'}`}
               >
-                {status(value)}
+                <span>{status(value)}</span>
+                {canAutoInstall(value) && (
+                  <Btn
+                    onClick={() => installMut.mutate(value)}
+                    disabled={installMut.isPending}
+                    aria-label={i18nT('pages.developer.agentBackendTab.install_for', { agent: NAME[value] })}
+                    className="shrink-0 py-0.5 px-2 text-[11px]"
+                  >
+                    {installMut.isPending && installMut.variables === value ? (
+                      <Loader2 size={12} className="lucide-inline animate-spin" />
+                    ) : (
+                      <Download size={12} className="lucide-inline" />
+                    )}
+                    {i18nT('pages.developer.agentBackendTab.install')}
+                  </Btn>
+                )}
               </dd>
             </div>
           ))}
