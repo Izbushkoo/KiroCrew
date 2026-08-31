@@ -2518,7 +2518,9 @@
         "dictation_panel": true,
         "timeout_secs": 300,
         "transcribe_region": "us-east-1",
-        "transcribe_profile": ""
+        "transcribe_profile": "",
+        "openai_api_key": "",
+        "openai_model": "whisper-1"
       }
     },
     {
@@ -2549,7 +2551,8 @@
       "enumValues": [
         "local",
         "apple",
-        "transcribe"
+        "transcribe",
+        "openai"
       ],
       "defaultValue": "local"
     },
@@ -2711,6 +2714,34 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
+    },
+    {
+      "path": "stt.openai_api_key",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "OpenAI API Key",
+      "help": "API key for OpenAI STT provider.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
+      "path": "stt.openai_model",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "OpenAI Model",
+      "help": "Model name for OpenAI STT provider.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": "whisper-1"
     },
     {
       "path": "computer_use",

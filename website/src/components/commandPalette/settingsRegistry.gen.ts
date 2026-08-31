@@ -1776,6 +1776,40 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "configKey": "stt.model"
   },
   {
+    "id": "voice.model-2",
+    "label": "Model",
+    "description": "OpenAI TTS model",
+    "tab": "voice",
+    "type": "select",
+    "occurrence": 2
+  },
+  {
+    "id": "voice.openai-api-key",
+    "label": "OpenAI API Key",
+    "labelKey": "pages.settings.sttSettings.openai_api_key",
+    "description": "Requires your secret OpenAI API key (sk-proj-...)",
+    "tab": "voice",
+    "type": "input",
+    "occurrence": 1
+  },
+  {
+    "id": "voice.openai-api-key-tts",
+    "label": "OpenAI API Key (TTS)",
+    "description": "API key for OpenAI text-to-speech",
+    "tab": "voice",
+    "type": "input",
+    "occurrence": 1
+  },
+  {
+    "id": "voice.openai-model",
+    "label": "OpenAI Model",
+    "labelKey": "pages.settings.sttSettings.openai_model",
+    "description": "Select speech recognition model",
+    "tab": "voice",
+    "type": "select",
+    "occurrence": 1
+  },
+  {
     "id": "voice.pause-that-ends-a-phrase-ms",
     "label": "Pause that ends a phrase (ms)",
     "labelKey": "pages.settings.sttSettings.silence_ms",
@@ -1875,5 +1909,14 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "voice",
     "type": "select",
     "occurrence": 1
+  },
+  {
+    "id": "voice.voice-2",
+    "label": "Voice",
+    "labelKey": "pages.settings.voicePanel.voice",
+    "description": "OpenAI TTS voice",
+    "tab": "voice",
+    "type": "select",
+    "occurrence": 2
   }
 ]
