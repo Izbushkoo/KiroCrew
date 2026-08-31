@@ -1044,7 +1044,7 @@ async def api_stt_transcribe(request: web.Request) -> web.Response:
     tmp = os.path.join(tempfile.gettempdir(), f"kc_stt_{uuid.uuid4().hex}{ext}")
     try:
         try:
-            await part_stream.stream_part_to_file(
+            size = await part_stream.stream_part_to_file(
                 field,  # type: ignore[arg-type]
                 Path(tmp),
                 max_bytes=25 * 1024 * 1024,
