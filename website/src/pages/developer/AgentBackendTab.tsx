@@ -465,7 +465,6 @@ export function AgentBackendTab() {
                 id={statusId(value)}
                 className={`m-0 flex items-center gap-2 ${disabledOption(value) ? 'text-warn' : 'text-muted'}`}
               >
-<<<<<<< HEAD
                 <span>{status(value)}</span>
                 {canAutoInstall(value) && (
                   <Btn
@@ -482,10 +481,6 @@ export function AgentBackendTab() {
                     {i18nT('pages.developer.agentBackendTab.install')}
                   </Btn>
                 )}
-=======
-                {status(value)}
-                {caveat(value) && <div className="mt-0.5 text-muted">{caveat(value)}</div>}
->>>>>>> upstream/main
               </dd>
             </div>
           ))}
