@@ -1,10 +1,9 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Bot, Boxes, Download, Loader2, Sparkles, Terminal } from 'lucide-react'
+import { Bot, Boxes, Sparkles, Terminal } from 'lucide-react'
 
 import { api } from '../../api/client'
 import type { AcpBackendProbe } from '../../api/client'
-import { Btn } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
 import { SettingsCard, SettingsButtonGroup } from '../../components/settings'
 import { useConfigSchema } from '../../components/settingRef/useConfigSchema'
@@ -140,7 +139,6 @@ const PROBE_REFRESH_MS = 30_000
 export function AgentBackendTab() {
   const qc = useQueryClient()
   const [saveError, setSaveError] = useState('')
-  const [installError, setInstallError] = useState('')
   const schema = useConfigSchema()
 
   const cfgQ = useQuery<{ agent?: { acp_backend?: string } }>({
@@ -181,23 +179,6 @@ export function AgentBackendTab() {
     // straight from the query, so a rejected PATCH needs no revert — the cache was
     // never moved off the server's answer.
     onError: () => setSaveError(i18nT('pages.developer.agentBackendTab.could_not_save_the_agent_backend')),
-  })
-
-  /**
-   * The ONE install this panel automates: the Claude npm adapter, via a fixed
-   * server-side command (see `api_acp_backend_install`'s docstring for why the
-   * claude CLI itself and its login stay a manual, instructional step below).
-   * `install_command` is non-empty only for that case, so `canAutoInstall`
-   * naturally covers nothing else today without a backend-id check here.
-   */
-  const installMut = useMutation({
-    mutationFn: (backend: string) => api.installAcpBackend(backend),
-    onSuccess: () => {
-      setInstallError('')
-      qc.invalidateQueries({ queryKey: ['acpBackends'] })
-    },
-    onError: (err: unknown) =>
-      setInstallError(err instanceof Error ? err.message : i18nT('pages.developer.agentBackendTab.install_failed')),
   })
 
   if (cfgQ.isLoading) {
@@ -358,13 +339,48 @@ export function AgentBackendTab() {
   const disabledOption = (value: string) => notInstalled(value) || needsRestart(value)
 
   /**
-  const canAutoInstall = (value: string) => notInstalled(value) && !!probe(value)?.install_command
-
+   * A standing caveat about the harness itself, independent of whether it is
+   * installed. Unlike `status`, this does not change with the probe.
+   *
+   * The DEFAULT path is gated: Claude asks, `claude-agent-acp` turns that into
+   * `session/request_permission`, and Crew's own approval path decides. What escapes
+   * is narrower and worth stating precisely -- a tool ALREADY pre-approved in Claude's
+   * own settings never asks at all, because the SDK approves an allow-rule match
+   * before consulting the client. Those settings include a `.claude/settings.json`
+   * inside the project directory, which is the copy an operator did not write.
+   *
+   * That is documented, intended Claude behaviour rather than a defect here, but it
+   * means the guarantee differs per harness. An operator choosing between harnesses is
+   * choosing between governance models, so the panel names the difference instead of
+   * letting them find it in a shell command that never asked.
+   *
+   * Codex carries the OTHER thing a harness can be missing. Its adapter ships a Codex
+   * binary of its own, so `installed` answers the whole binary question and a session
+   * can still die on the first turn for want of a credential — which the install line
+   * then has nothing to say about. The remedy is two-branched (Codex's own sign-in, or
+   * a `model_provider` in `~/.codex/config.toml` where the credentials come from
+   * elsewhere entirely), so it is stated once rather than inferred from a failure.
+   *
+   * A caveat and not a probe line, deliberately. Reading those files would make this a
+   * measurement, and a measurement here gates the control: `missing` disables the chip,
+   * and the checkable paths are not the only ones that authenticate a Codex — an
+   * ambient key, a relocated `CODEX_HOME`, a `CODEX_ACP_BIN` adapter with its own
+   * configuration. Every one of those is an operator we would have disabled the switch
+   * for while they were already signed in, which the probe module names as the more
+   * expensive mistake. A standing sentence cannot be wrong in that direction.
+   */
   const caveat = (value: string): string => {
     if (value === CLAUDE) return i18nT('pages.developer.agentBackendTab.claude_uses_its_own_permissions')
     if (value === CODEX) return i18nT('pages.developer.agentBackendTab.codex_signs_in_separately')
     return ''
   }
+
+  /**
+   * Translated display names for the agents this frontend knows by name.
+   *
+   * Deliberately NOT the list of agents the panel renders — see `candidates`. An id
+   * absent here still gets a row; `nameOf` falls back to the server's `policy_id`.
+   */
   const NAME: Record<string, string> = {
     [KIRO]: i18nT('pages.developer.agentBackendTab.kiro_cli'),
     [CLAUDE]: i18nT('pages.developer.agentBackendTab.claude_code'),
@@ -434,7 +450,6 @@ export function AgentBackendTab() {
   return (
     <>
       <ErrorNotice message={saveError} onDismiss={() => setSaveError('')} />
-      <ErrorNotice message={installError} onDismiss={() => setInstallError('')} />
       <SettingsCard>
         <SettingsButtonGroup
           label={i18nT('pages.developer.agentBackendTab.agent_backend')}
@@ -463,24 +478,10 @@ export function AgentBackendTab() {
               </dt>
               <dd
                 id={statusId(value)}
-                className={`m-0 flex items-center gap-2 ${disabledOption(value) ? 'text-warn' : 'text-muted'}`}
+                className={`m-0 ${disabledOption(value) ? 'text-warn' : 'text-muted'}`}
               >
-                <span>{status(value)}</span>
-                {canAutoInstall(value) && (
-                  <Btn
-                    onClick={() => installMut.mutate(value)}
-                    disabled={installMut.isPending}
-                    aria-label={i18nT('pages.developer.agentBackendTab.install_for', { agent: NAME[value] })}
-                    className="shrink-0 py-0.5 px-2 text-[11px]"
-                  >
-                    {installMut.isPending && installMut.variables === value ? (
-                      <Loader2 size={12} className="lucide-inline animate-spin" />
-                    ) : (
-                      <Download size={12} className="lucide-inline" />
-                    )}
-                    {i18nT('pages.developer.agentBackendTab.install')}
-                  </Btn>
-                )}
+                {status(value)}
+                {caveat(value) && <div className="mt-0.5 text-muted">{caveat(value)}</div>}
               </dd>
             </div>
           ))}
