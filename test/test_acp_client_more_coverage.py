@@ -21,12 +21,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import kiro_crew.acp.client as acp_client
+from kiro_crew import model_registry as mr
 from kiro_crew.acp.client import (
     AcpAuthRequired,
     AcpClient,
     AcpError,
     AcpProcessDied,
     AcpTimeoutError,
+    AcpToolGateUnroutable,
     OversizeLineUnrecoverable,
     _direct_children,
     _drain_oversize_line,
@@ -44,6 +46,7 @@ from kiro_crew.acp.client import (
 )
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
     EVENT_AGENT_SWITCHED,
     EVENT_COMPLETE,
     EVENT_MCP_OAUTH_REQUEST,
@@ -595,10 +598,15 @@ class TestResetPaths:
         assert done.exception() is not None
 
     def test_reset_state_unlinks_claude_settings_and_survives_pipe_errors(self, tmp_path):
-        client = _client(tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        client = _client(
+            tmp_path, acp_backend=ACP_BACKEND_CLAUDE, permission_mode="bypassPermissions"
+        )
+        # Written the way a real session writes it, because the cleanup is now
+        # scoped to what this session seeded: a settings.local.json Crew never
+        # touched belongs to the user's project and is left alone.
+        client._write_claude_local_settings()
         stale = tmp_path / ".claude" / "settings.local.json"
-        stale.parent.mkdir(parents=True)
-        stale.write_text('{"permissions": {"defaultMode": "bypassPermissions"}}')
+        assert stale.exists()
 
         proc = MagicMock()
         proc.stdin.close.side_effect = OSError("already closed")
@@ -669,6 +677,70 @@ class TestEnsureReady:
             await client.ensure_ready()
 
         assert client._kill_process.await_count == 2  # once per attempt
+
+    @pytest.mark.asyncio
+    async def test_tool_gate_refusal_does_not_retry_the_spawn(self, tmp_path):
+        """A gate refusal is a configuration fact, so a respawn re-reads it.
+
+        ``AcpToolGateUnroutable`` documents itself Non-retryable, but it subclasses
+        ``AcpError``, so the generic transport ladder used to retry it: attempt 0
+        tore the child down, respawned, hit the identical refusal, and only then
+        raised. That is one wasted spawn plus teardown, and it spends the reconnect
+        budget the distinct type exists to protect.
+
+        Revert-verified: dropping the dedicated handler makes both counters 2.
+        """
+        client = _client(tmp_path)
+        spawns = {"n": 0}
+
+        async def _spawn():
+            spawns["n"] += 1
+            client._process = _live_process()
+
+        async def _init():
+            raise AcpToolGateUnroutable("codex routes tool calls around the gate")
+
+        def _reset():
+            # Faithful to production: the real _reset_state drops the process
+            # handle, which is what makes the retry actually RESPAWN. A bare
+            # MagicMock leaves it set, so _spawn runs once either way and the
+            # spawn assertion below could never fail.
+            client._process = None
+
+        client._spawn = _spawn
+        client._initialize_session = _init
+        client._snapshot_process_tree = AsyncMock()
+        client._kill_process = AsyncMock()
+        client._reset_state = _reset
+
+        with pytest.raises(AcpToolGateUnroutable):
+            await client.ensure_ready()
+
+        assert spawns["n"] == 1, "the refusal was retried with a fresh process"
+        assert client._kill_process.await_count == 1
+
+    def test_sandbox_preflight_translates_the_gate_refusal(self, monkeypatch):
+        """The RAW gate exception must not escape the preflight.
+
+        ``acp_tool_gate`` is a leaf module that cannot import this one, so its
+        ``ToolGateUnroutable`` is a plain ``Exception``. That makes it invisible to
+        BOTH handlers around the spawn: it is not an ``AcpError``, so the transport
+        ladder cannot see it, and it is not ``AcpToolGateUnroutable``, so the
+        dedicated non-retrying handler cannot either. Raised raw, a sandbox-floor
+        refusal escaped ``ensure_ready`` entirely and skipped the cleanup every
+        other refusal path runs.
+
+        Revert-verified: dropping the translation raises the raw type and fails here.
+        """
+        from kiro_crew import acp_tool_gate
+
+        def _refuse(backend, mode):
+            raise acp_tool_gate.ToolGateUnroutable("no sandbox backend on this host")
+
+        monkeypatch.setattr(acp_tool_gate, "enforce_sandbox_floor", _refuse)
+
+        with pytest.raises(AcpToolGateUnroutable, match="no sandbox backend"):
+            acp_client._sandbox_preflight("codex", "standard")
 
     @pytest.mark.asyncio
     async def test_shutdown_kills_and_resets(self, tmp_path):
@@ -896,6 +968,29 @@ class TestCommandsAndSteer:
         assert payload == {
             "sessionId": "sid",
             "command": {"command": "effort", "args": {"level": "high"}},
+        }
+
+    @pytest.mark.asyncio
+    async def test_command_result_preserves_structured_data(self, tmp_path):
+        client = _client(tmp_path)
+        client._session_id = "sid"
+        client.ensure_ready = AsyncMock()
+        client._send_request = AsyncMock(return_value=11)
+        expected = {
+            "message": "1 MCP server configured",
+            "data": {
+                "servers": [{"name": "linear", "status": "running", "toolCount": 2}],
+                "mode": "status",
+            },
+        }
+        client._wait_for_response = AsyncMock(return_value=expected)
+
+        assert await client.command_result("/mcp") == expected
+        method, payload = client._send_request.await_args[0]
+        assert method == METHOD_COMMANDS_EXECUTE
+        assert payload == {
+            "sessionId": "sid",
+            "command": {"command": "mcp", "args": {}},
         }
 
     @pytest.mark.asyncio
@@ -1556,3 +1651,103 @@ class TestToolInterruptedAudit:
 
         messages = " ".join(r.getMessage() for r in caplog.records)
         assert "SEL audit failed for tool_interrupted" in messages
+
+
+# ── Provider-advertised model cache wiring (client side) ──
+
+
+class TestAdvertisedModelCacheWiring:
+    """The client half of sourcing model selection from the provider's own
+    advertised list: the seed reads the cache, and a capture feeds it.
+
+    The module-global ``mr._ADVERTISED_MODELS`` is isolated per test.
+    """
+
+    def _read_seed(self, tmp_path: Path) -> dict:
+        return json.loads((tmp_path / ".claude" / "settings.local.json").read_text())
+
+    def test_seed_availableModels_from_advertised_cache(self, tmp_path, monkeypatch):
+        served = [
+            "global.anthropic.claude-opus-5[1m]",
+            "global.anthropic.claude-opus-4-8[1m]",
+        ]
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": served})
+        client = _client(tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        client._write_claude_local_settings()
+        assert self._read_seed(tmp_path)["availableModels"] == served
+
+    def test_seed_falls_back_to_registry_on_cold_cache(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
+        client = _client(tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        client._write_claude_local_settings()
+        assert self._read_seed(tmp_path)["availableModels"] == mr.seed_available_models(
+            "claude_code"
+        )
+
+    def test_claude_capture_feeds_and_flags_the_cache(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
+        client = _client(tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        client._capture_available_models(
+            {"models": {"availableModels": [{"modelId": "global.anthropic.claude-opus-5[1m]"}]}}
+        )
+        assert mr.advertised_models("claude_code") == ["global.anthropic.claude-opus-5[1m]"]
+        assert client._advertised_models_changed is True
+
+    def test_non_claude_capture_does_not_feed_the_cache(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
+        client = _client(tmp_path)  # default backend is kiro-cli
+        client._capture_available_models(
+            {"models": {"availableModels": [{"modelId": "claude-opus-4.8"}]}}
+        )
+        assert mr.advertised_models("claude_code") == []
+        assert client._advertised_models_changed is False
+
+    @pytest.mark.asyncio
+    async def test_set_model_folds_bare_id_onto_advertised_spelling(self, tmp_path, monkeypatch):
+        # The warm-pool 4.8 fix: a claim that switches model must send the
+        # versioned [1m] id the backend serves at 1M, not the bare spelling.
+        monkeypatch.setattr(
+            mr, "_ADVERTISED_MODELS", {"claude_code": ["global.anthropic.claude-opus-4-8[1m]"]}
+        )
+        client = _client(tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        client._session_id = "sid"
+        client._send_request = AsyncMock(return_value=1)
+        client.set_config_option = AsyncMock(return_value=None)
+        await client.set_model("claude-opus-4-8")
+        assert client._model == "global.anthropic.claude-opus-4-8[1m]"
+        assert client._resolved_model_id == "global.anthropic.claude-opus-4-8[1m]"
+
+    @pytest.mark.asyncio
+    async def test_set_model_reseeds_settings_on_claude(self, tmp_path, monkeypatch):
+        # The re-seed half: set_model refreshes settings.local.json so a pooled
+        # runtime's stale spawn-time seed is overwritten with the claimed model.
+        monkeypatch.setattr(
+            mr, "_ADVERTISED_MODELS", {"claude_code": ["global.anthropic.claude-opus-4-8[1m]"]}
+        )
+        client = _client(tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        client._session_id = "sid"
+        client._send_request = AsyncMock(return_value=1)
+        client.set_config_option = AsyncMock(return_value=None)
+        await client.set_model("claude-opus-4-8")
+        seed = json.loads((tmp_path / ".claude" / "settings.local.json").read_text())
+        assert seed["model"] == "global.anthropic.claude-opus-4-8[1m]"
+        assert "global.anthropic.claude-opus-4-8[1m]" in seed["availableModels"]
+
+    @pytest.mark.asyncio
+    async def test_set_model_on_non_member_backend_neither_folds_nor_reseeds(
+        self, tmp_path, monkeypatch
+    ):
+        # codex is a MODEL_VIA_CONFIG_OPTION backend but NOT a member of
+        # ADVERTISED_MODEL_SELECTION / SEED_LOCAL_SETTINGS, so a warm claim must
+        # switch the model verbatim: no fold onto a cached [1m] spelling, no
+        # settings.local.json. Guards the capability gating against a regression to
+        # "any config-option backend".
+        monkeypatch.setattr(
+            mr, "_ADVERTISED_MODELS", {"claude_code": ["global.anthropic.claude-opus-4-8[1m]"]}
+        )
+        client = _client(tmp_path, acp_backend=ACP_BACKEND_CODEX)
+        client._session_id = "sid"
+        client.set_config_option = AsyncMock(return_value=None)
+        await client.set_model("gpt-5-codex")
+        assert client._model == "gpt-5-codex"  # sent verbatim, no fold
+        assert not (tmp_path / ".claude" / "settings.local.json").exists()

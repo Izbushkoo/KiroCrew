@@ -81,6 +81,7 @@ from pathlib import Path
 from typing import Callable
 
 from kiro_crew import platform_compat
+from kiro_crew.platform.context import redact_via_context
 from kiro_crew.sandbox import run_limited, sandboxed_spawn_argv
 
 from ...spine import agent_discovery
@@ -971,7 +972,10 @@ class PytestBuildGate:
         tail = (proc.stdout or proc.stderr or "").strip().splitlines()[-1:] or [""]
         return GateResult(
             passed=False,
-            detail=f"suite red (exit {proc.returncode}): {tail[0][:160]}",
+            # Redact BEFORE the bound: a candidate's test run can echo a credential,
+            # and the slice can cut it mid-match into a fragment no downstream
+            # redaction pass recognises.
+            detail=f"suite red (exit {proc.returncode}): {redact_via_context(tail[0])[:160]}",
             failing_tests=failing,
         )
 
@@ -1375,13 +1379,21 @@ class RepoIsolation:
         gated recording the clone in the first place, so the setup-time check and this
         run-time check cannot drift apart and disagree. Fails CLOSED: any git error,
         timeout, or unreadable url reads as "push is NOT disabled" and the driver
-        refuses to start.
+        refuses to start — except the launcher-crash class below, which raises instead
+        of returning ``False`` (the run still refuses to start).
 
         BOTH urls, not just the push url: a live FETCH url is a live push target
         (``git push "$(git remote get-url origin)" HEAD`` ignores the push url entirely
         and writes to the fetch url — see ``clone_setup._disable_push``). Checking only
         the push url reported "disabled" for a clone that could still write to the remote;
         `_ok` checks both, and this drifted from it. Raised by the GPT review of this branch.
+
+        One nonzero probe exit is NOT read as a live remote: when the probe's own
+        sandbox launcher crashed before git executed, this propagates
+        ``clone_setup.IsolationProbeError`` instead of returning ``False``. The run
+        still refuses to start either way — the exception exists so the surfaced
+        reason names the sandbox failure rather than the misleading
+        "push is not disabled" (#8151).
         """
 
         from ...backend.clone_setup import _repository_is_isolated

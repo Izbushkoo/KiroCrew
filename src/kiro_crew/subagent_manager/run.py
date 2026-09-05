@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
+from ..subagent_persistence import (
+    publish_live_cleanup_identity,
+    remember_live_cleanup_identity,
+)
 from ._component import ManagerComponent
 
 if TYPE_CHECKING:
     from ..subagent import (
         _AGENT_NAME_RE,
         _CANCEL_RESUME_PREFIX,
-        _DIAG_DRAIN_TIMEOUT,
         _MAX_ERROR_DETAIL_LEN,
         _ON_DONE_TIMEOUT,
         _RESET_TIMEOUT,
+        _STATE_DRAIN_TIMEOUT,
         _SYSTEM_PREFIX,
         _TRANSIENT_CONTINUE_MSG,
         _TURN_LIMIT,
@@ -25,6 +30,7 @@ if TYPE_CHECKING:
         FALLBACK_CANDIDATE_ATTEMPTS,
         FALLBACK_STORY_ATTR,
         HOOK_EVENT_POST_TOOL_USE,
+        PROVIDER_LABEL_DEFAULT,
         TOOL_AUTO_APPROVE,
         TOOL_DENY,
         TRANSIENT_RETRIES,
@@ -51,7 +57,6 @@ if TYPE_CHECKING:
         annotate_model_fallback,
         append_fallback_story,
         apply_completion_keep,
-        asyncio,
         cap_result_file,
         configured_fallback_chain,
         evict_completed_agents,
@@ -73,6 +78,8 @@ if TYPE_CHECKING:
 class RunEventCoordinator(ManagerComponent):
     """Own run transitions while state remains facade-owned."""
 
+    _publish_identity = staticmethod(publish_live_cleanup_identity)
+    _remember_identity = staticmethod(remember_live_cleanup_identity)
     __slots__ = ()
 
     def _effective_turn_limit_impl(self, info: SubagentInfo) -> int:
@@ -82,6 +89,181 @@ class RunEventCoordinator(ManagerComponent):
         ``0`` at any level means "not set" and falls through to the next.
         """
         return info.max_turns or self._manager._default_turn_limit or _TURN_LIMIT
+
+    async def _write_state_off_loop_impl(
+        self, info: SubagentInfo, what: str, **fields: object
+    ) -> bool:
+        """Merge *fields* into this run's ``state.json``, off the event loop.
+
+        Every ``state.json`` writer inside a run goes through here, for two
+        reasons that are both load-bearing.
+
+        OFF-LOOP, because ``update_state`` ends in a synchronous fsync and a
+        slow FS must not freeze the gateway/heartbeat (#6288). Running in a pool
+        thread also means the write TAKES ``update_state``'s per-agent lock,
+        which off-loop callers hold and on-loop callers deliberately skip
+        (#7280).
+
+        DRAINED ON CANCELLATION, because cancelling a ``to_thread`` await
+        detaches the worker without stopping it, and ``update_state`` rewrites
+        the WHOLE file from the snapshot it already read — so a detached worker
+        rolls back every field written after that read, not merely the fields it
+        names. That is how a zombie erases the ``pid`` / ``session_id`` a
+        cancel-respawn recovery run writes on the loop, or the retention
+        ``keep`` that promote / release write on the loop (#6306, #6298, #6308).
+        Cancellation is therefore held open until the worker finishes — but
+        BOUNDED: ``cancel_all()`` gathers run tasks with no timeout, so an
+        unbounded drain on a wedged FS would hold gateway shutdown forever, and
+        this module's convention is that bounded shutdown plus recoverable state
+        beats unbounded shutdown (same posture as ``_REPORT_DRAIN_TIMEOUT``).
+        ``asyncio.wait`` never cancels its members, so repeated cancels of the
+        awaiting task keep the worker future intact while the drain loop waits
+        out the same deadline. For the whole window in which the worker may still
+        write -- from the cancellation until the worker settles, however the drain
+        exits -- the run HOLDS its conversation
+        (``SubagentManager._abandoned_state_writers``), so the two on-loop
+        ``keep`` writes are deferred past the worker instead of being rolled back
+        by it. The window starts at the cancellation rather than at the drain
+        deadline because on Python 3.10 a second outer cancel can finalize the run
+        mid-drain.
+
+        Returns ``update_state``'s own report: True when the merge was written,
+        False when it was SKIPPED because the state was unreadable — a caller
+        with a durability contract (the pre-spawn provenance write, #5394)
+        retries on False. Re-raises ``asyncio.CancelledError`` after draining,
+        so such a retry loop ends on cancellation instead of adding a second
+        writer for the same fields.
+        """
+        writer = asyncio.ensure_future(asyncio.to_thread(update_state, info.id, **fields))
+        try:
+            return bool(await asyncio.shield(writer))
+        except asyncio.CancelledError:
+            # Hold this run's conversation for the WHOLE window in which the
+            # worker may still write, which starts here and not at the drain
+            # deadline: on Python 3.10 a second outer cancel can deliver _run's
+            # finalization mid-drain, so the run can go `done` while the writer
+            # is live, and a continuation reaching a released gate would then
+            # write `keep` for that writer's stale whole-file rewrite to erase
+            # (#6298). `keep` is written on the loop and takes no per-agent lock,
+            # so ordering is the only thing protecting it. The worker's own
+            # done-callback releases the hold, so it lasts exactly as long as the
+            # worker does -- milliseconds on a healthy FS. Recorded on the
+            # MANAGER, not on `info`: `evict_completed_agents` prunes completed
+            # runs out of `_agents`, and an eviction must not release the hold.
+            self._manager._abandoned_state_writers.add(info.id)
+
+            def _settled(
+                fut: "asyncio.Future[Any]",
+                _mgr: Any = self._manager,
+                _aid: str = info.id,
+                _what: str = what,
+            ) -> None:
+                # The worker has landed (drained or abandoned): the conversation
+                # is safe to promote or release again.
+                _mgr._abandoned_state_writers.discard(_aid)
+                # It may also have raised; retrieve it so it never surfaces as an
+                # asynchronous "exception was never retrieved" warning.
+                if not fut.cancelled() and fut.exception() is not None:
+                    logger.debug(
+                        "Best-effort %s write failed for %s during cancel drain",
+                        _what,
+                        _aid,
+                        exc_info=fut.exception(),
+                    )
+
+            writer.add_done_callback(_settled)
+            # Latch for _run's recovery gate: on Python 3.10, wait_for's
+            # _cancel_and_wait awaits a bare future that a SECOND outer cancel
+            # can interrupt, delivering _run's CancelledError handler while this
+            # drain is still in flight — before expiry suppression lands. The
+            # latch lets the gate see the live drain and skip scheduling a
+            # recovery writer the worker could race. 3.11+ delivers the outer
+            # cancel only after this child task completes, so there the latch is
+            # always observed False.
+            info._state_drain_active = True
+            try:
+                deadline = time.monotonic() + _STATE_DRAIN_TIMEOUT
+                while not writer.done():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        logger.warning(
+                            "%s write for %s did not drain in %.0fs on cancellation — "
+                            "abandoning worker (its stale whole-file rewrite may roll "
+                            "back a recovery run's state)",
+                            what,
+                            info.id,
+                            _STATE_DRAIN_TIMEOUT,
+                        )
+                        # The abandoned worker is a live stale writer whose
+                        # rewrite is whole-file, so it can roll back the pid /
+                        # session_id a cancel-respawn recovery run writes ON the
+                        # loop (no per-agent lock there) — and a lost pid means
+                        # an orphan the reaper can no longer reach. Consume the
+                        # one-shot recovery so this cancellation finalizes
+                        # instead of respawning: losing one best-effort
+                        # auto-continue on an FS already wedged past the
+                        # deadline is strictly cheaper than resurrecting stale
+                        # state. Uniform across sites — the blast radius is set
+                        # by the whole-file rewrite, not by which fields this
+                        # particular caller named. The conversation hold above
+                        # outlives this branch and is released by _settled.
+                        info._cancel_retry_used = True
+                        break
+                    try:
+                        await asyncio.wait({writer}, timeout=remaining)
+                    except asyncio.CancelledError:
+                        pass  # repeated cancel: keep draining to the deadline
+            finally:
+                info._state_drain_active = False
+            raise
+
+    async def _remember_identity_off_loop(
+        self,
+        info: SubagentInfo,
+        *,
+        session_id: str,
+        provider: str,
+        cwd: str = "",
+        keep: bool | None = None,
+        conversation_key: str = "",
+    ) -> None:
+        """Persist protected cleanup identity off-loop and drain cancellation.
+
+        The live generation is already published synchronously, but restart
+        durability depends on this protected write. ``to_thread`` workers survive
+        cancellation, so shield the worker and delay re-raising until it settles;
+        otherwise terminal teardown can finish and restart before the authority
+        record exists.
+        """
+        writer = asyncio.ensure_future(
+            asyncio.to_thread(
+                self._remember_identity,
+                info.id,
+                session_id=session_id,
+                provider=provider,
+                cwd=cwd,
+                keep=keep,
+                conversation_key=conversation_key,
+            )
+        )
+        try:
+            await asyncio.shield(writer)
+        except asyncio.CancelledError:
+            info._state_drain_active = True
+            try:
+                while not writer.done():
+                    try:
+                        await asyncio.wait({writer})
+                    except asyncio.CancelledError:
+                        pass
+                if not writer.cancelled():
+                    try:
+                        writer.result()
+                    except Exception:
+                        pass
+            finally:
+                info._state_drain_active = False
+            raise
 
     def update_completion_keep_impl(self, mode: str, max_chars: int) -> None:
         """Update the live completion-keep mode and char budget.
@@ -205,12 +387,12 @@ class RunEventCoordinator(ManagerComponent):
                     not info.user_stopped
                     and not self._manager._shutting_down
                     and not info._cancel_retry_used
-                    # A live diagnostics-write drain means a worker is still
+                    # A live state-write drain means a worker is still
                     # (or may still be) writing state.json: respawning a
                     # recovery writer now re-opens the stale-overwrite race
-                    # (#6306; reachable on 3.10 via a second outer cancel
-                    # interrupting wait_for's _cancel_and_wait).
-                    and not info._diag_drain_active
+                    # (#6306, #6308; reachable on 3.10 via a second outer
+                    # cancel interrupting wait_for's _cancel_and_wait).
+                    and not info._state_drain_active
                     and info.tool_count == 0
                 ):
                     # UNEXPECTED cancellation (not user Stop, not shutdown):
@@ -434,8 +616,15 @@ class RunEventCoordinator(ManagerComponent):
         )
         loop.create_task(self._manager._fire_event("subagent_queued", info, {"queued": depth}))
 
-    async def _run_inner_impl(self, info: SubagentInfo, session_key: str) -> None:
+    async def _run_inner_impl(
+        self,
+        info: SubagentInfo,
+        session_key: str,
+    ) -> None:
         """Inner execution — called within timeout wrapper."""
+        setattr(info, "_session_id", "")
+        setattr(info, "_session_provider", "")
+        setattr(info, "_session_cwd", "")
         # Mark the real start of execution BEFORE any await so the startup
         # watchdog measures from here, not from registration (which may include
         # an arbitrary spawn-approval wait). Must be the first statement.
@@ -603,23 +792,48 @@ class RunEventCoordinator(ManagerComponent):
                 approval_policy=parent_policy,
                 **extra_kwargs,
             )
-            # Fail CLOSED on a continuation that did not actually resume:
-            # get_or_create silently falls back to a FRESH session when
-            # session/load fails (lock held, corrupt files, backend refusal).
-            # Executing the follow-up on that fresh session would silently run
-            # it context-free — worse than an honest error the parent can react
-            # to (re-spawn with a summary). conversation_key is only set by
-            # continue_conversation, so first spawns are unaffected.
-            if info.conversation_key and not _resumed:
-                raise RuntimeError(
-                    "resume_failed: session/load did not restore conversation "
-                    f"{info.conversation_key} — refusing to execute the "
-                    "follow-up without its prior context. The conversation "
-                    "may be locked by a live process or its files corrupt; "
-                    "re-spawn with a fresh task carrying a summary."
-                )
-            # Detect CC provider to skip permission event loop
             is_cc = self._manager._is_cc_provider(client)
+
+        # Capture cleanup identity immediately after successful session
+        # acquisition. Every later step can fail and tombstone the run, so
+        # delaying this until the state write leaves provider files unidentified.
+        try:
+            cleanup_session_id = (
+                str(client.session_id or "") if hasattr(client, "session_id") else ""
+            )
+            cleanup_provider = self._manager._provider_label_of(client)
+            cleanup_cwd = ""
+            if is_cc:
+                cleanup_cwd = info.cwd
+                if not cleanup_cwd:
+                    inner = getattr(client, "client", None)
+                    work_dir = getattr(inner, "_work_dir", None)
+                    if work_dir:
+                        cleanup_cwd = str(work_dir)
+            setattr(info, "_session_id", cleanup_session_id)
+            setattr(info, "_session_provider", cleanup_provider)
+            setattr(info, "_session_cwd", cleanup_cwd)
+            self._publish_identity(
+                info.id,
+                session_id=cleanup_session_id,
+                provider=cleanup_provider,
+                cwd=cleanup_cwd,
+                keep=info.keep,
+                conversation_key=session_key if info.keep else "",
+            )
+        except Exception:
+            logger.debug("Failed to capture live cleanup identity for %s", info.id, exc_info=True)
+
+        # Fail CLOSED on a continuation that did not actually resume. Identity is
+        # already captured so the abnormal tombstone can reclaim the fresh session.
+        if info.conversation_key and not _resumed:
+            raise RuntimeError(
+                "resume_failed: session/load did not restore conversation "
+                f"{info.conversation_key} — refusing to execute the "
+                "follow-up without its prior context. The conversation "
+                "may be locked by a live process or its files corrupt; "
+                "re-spawn with a fresh task carrying a summary."
+            )
         # Intentionally check info.agent (not resolved `agent`) so only
         # explicitly requested agents skip _SYSTEM_PREFIX (defense-in-depth).
         named_agent = bool(info.agent and _AGENT_NAME_RE.fullmatch(info.agent))
@@ -694,21 +908,24 @@ class RunEventCoordinator(ManagerComponent):
             info.resolved_model = _spawn_model
         # Persist provenance to disk BEFORE the spawn event so a gateway restart
         # in the window between the event and the later session_id state write
-        # cannot lose it — orphan recovery reads these from disk. Off-loop
-        # (to_thread): update_state does a synchronous fsync, so
-        # a slow FS must not freeze the gateway/heartbeat. Best-effort with ONE
-        # bounded retry: this write is the SINGLE owner of these two fields on
-        # the spawn path (#5394) — the later session_id write no longer doubles
-        # as a fallback, so a transient failure gets its second chance HERE
-        # rather than from a second writer downstream. update_state reports a
-        # silently-skipped merge (unreadable state) as False, which counts as a
+        # cannot lose it — orphan recovery reads these from disk. Off-loop and
+        # drained on cancellation via _write_state_off_loop (#6288, #6308; see
+        # that helper for why a detached worker is the hazard). Best-effort with
+        # ONE bounded retry: this write is the SINGLE owner of these two fields
+        # on the spawn path (#5394) — the later session_id write no longer
+        # doubles as a fallback, so a transient failure gets its second chance
+        # HERE rather than from a second writer downstream. update_state reports
+        # a silently-skipped merge (unreadable state) as False, which counts as a
         # failure for the retry — only a REPORTED write ends the loop. A
-        # persistence hiccup must still never block the spawn.
+        # persistence hiccup must still never block the spawn. A cancellation
+        # ends the loop instead of retrying: `except Exception` does not catch
+        # CancelledError, so the helper's post-drain re-raise propagates rather
+        # than starting a second writer for the same fields.
         for _provenance_attempt in range(2):
             try:
-                _wrote = await asyncio.to_thread(
-                    update_state,
-                    info.id,
+                _wrote = await self._manager._write_state_off_loop(
+                    info,
+                    "model provenance",
                     requested_model=info.requested_model,
                     resolved_model=info.resolved_model,
                 )
@@ -717,6 +934,22 @@ class RunEventCoordinator(ManagerComponent):
                 logger.debug("Provenance write skipped (unreadable state) for %s", info.id)
             except Exception:
                 logger.debug("Failed to persist model provenance for %s", info.id, exc_info=True)
+        # The live generation was published synchronously at acquisition so
+        # terminal tombstones are cancellation-safe. Persist the sidecar only
+        # after the drained provenance write: cancellation during provenance must
+        # not prevent its required model fields from landing, and cancellation
+        # here still leaves the live tombstone snapshot complete.
+        try:
+            await self._remember_identity_off_loop(
+                info,
+                session_id=str(getattr(info, "_session_id", "")),
+                provider=str(getattr(info, "_session_provider", "")),
+                cwd=str(getattr(info, "_session_cwd", "")),
+                keep=info.keep,
+                conversation_key=session_key if info.keep else "",
+            )
+        except Exception:
+            logger.debug("Failed to persist cleanup identity for %s", info.id, exc_info=True)
         await self._manager._fire_event(
             "subagent_spawn",
             info,
@@ -736,55 +969,45 @@ class RunEventCoordinator(ManagerComponent):
         )
         # Stream results to disk for orchestrated chat.
 
-        # Record PID for orphan recovery
+        # Record PID for orphan recovery. Off-loop and drained on cancellation
+        # via _write_state_off_loop (#6288, #7302): update_state ends in a
+        # synchronous fsync, and the reaper, every chat turn and the heartbeat
+        # share this loop. Off-loop also means the write TAKES update_state's
+        # per-agent lock, which on-loop callers skip (#7280), so it can no longer
+        # interleave with another pool writer's read-merge-rewrite.
         try:
-
             pid = self._manager._sessions.get_pid(session_key)
             if pid:
                 info._pid = pid  # make available for _write_tombstone
-                update_state(info.id, pid=pid, pid_recorded_at=time.time())
+                await self._manager._write_state_off_loop(
+                    info, "PID record", pid=pid, pid_recorded_at=time.time()
+                )
         except Exception:
             logger.debug("Failed to record PID for %s", info.id, exc_info=True)
 
-        # Record session_id and provider type for session file cleanup
+        # Persist the cleanup identity captured immediately after session
+        # acquisition, together with mutable retention intent.
         try:
-            session_id = client.session_id if hasattr(client, "session_id") else ""
-            provider_type = self._manager._provider_label_of(client)
             state_update: dict[str, object] = {
-                "session_id": session_id,
-                "provider": provider_type,
+                "session_id": str(getattr(info, "_session_id", "")),
+                "provider": str(getattr(info, "_session_provider", "")),
                 # Model provenance (requested_model/resolved_model) is NOT
                 # re-written here: the crash-safe write BEFORE the
                 # subagent_spawn event above is the single owner of those two
                 # fields on the spawn path, and a transient failure there is
-                # handled by that write's own bounded retry (#5394). This write
-                # still performs the same read-merge-rewrite either way, so the
-                # point is one authoritative writer, not saved I/O. The CC-path
-                # refinement below still updates resolved_model when it first
-                # becomes known.
-                # keep marks this run's session files as resume material: the
-                # orphan reconciler and tombstone pruner skip file deletion
-                # for keep runs (restart-safe — read from disk, not memory).
+                # handled by that write's own bounded retry (#5394).
                 "keep": info.keep,
                 "conversation_key": session_key if info.keep else "",
             }
-            # Store CWD for CC cleanup (needed to derive project-key path).
-            # info.cwd is only set when a caller passes an explicit cwd
-            # override (disabled by default), so for the common case derive
-            # the project dir from the provider's own work dir — that is the
-            # same path sent as ACP `cwd`, hence the encoded project key under
-            # ~/.claude/projects. Without this, CC cleanup is skipped (no cwd)
-            # and the transcript leaks.
-            if is_cc:
-                cc_cwd = info.cwd
-                if not cc_cwd:
-                    inner = getattr(client, "client", None)
-                    work_dir = getattr(inner, "_work_dir", None)
-                    if work_dir:
-                        cc_cwd = str(work_dir)
-                if cc_cwd:
-                    state_update["cwd"] = cc_cwd
-            update_state(info.id, **state_update)
+            cleanup_cwd = str(getattr(info, "_session_cwd", ""))
+            if cleanup_cwd:
+                state_update["cwd"] = cleanup_cwd
+            # Same off-loop, drained write as the PID record above (#6288,
+            # #7302). This one also carries `keep`, the field the two remaining
+            # on-loop writers (promote / release) contend for -- taking the
+            # per-agent lock here is what orders it against any other pool
+            # writer.
+            await self._manager._write_state_off_loop(info, "session record", **state_update)
         except Exception:
             logger.debug("Failed to record session_id for %s", info.id, exc_info=True)
 
@@ -993,10 +1216,11 @@ class RunEventCoordinator(ManagerComponent):
                         info.resolved_model = _live_model
                         # Persist the CC-path refinement so a restart after the
                         # first turn still recovers the served model. Off-loop
-                        # (to_thread): synchronous fsync must not block the loop.
+                        # and drained on cancellation via _write_state_off_loop
+                        # (#6288, #6308).
                         try:
-                            await asyncio.to_thread(
-                                update_state, info.id, resolved_model=_live_model
+                            await self._manager._write_state_off_loop(
+                                info, "refined model", resolved_model=_live_model
                             )
                         except Exception:
                             logger.debug(
@@ -1072,99 +1296,14 @@ class RunEventCoordinator(ManagerComponent):
                 info.last_tool = event.title or ""
                 self._manager._note_tool_dispatch(info, event)
                 # Persist turn state for orphan recovery diagnostics. Off-loop
-                # (to_thread): update_state does a synchronous fsync, so a slow
-                # FS must not freeze the gateway/heartbeat (#6288; same shape
-                # as the provenance and CC-refinement writes above). Drained on
-                # cancellation: cancelling a to_thread await detaches the
-                # worker, and update_state is an unlocked read-merge-replace,
-                # so a stale detached worker could overwrite newer state
-                # written by a cancel-respawn recovery run. Hold cancellation
-                # open until the worker finishes — but BOUNDED: cancel_all()
-                # gathers run tasks with no timeout, so an unbounded drain on
-                # a wedged FS would hold gateway shutdown forever, and this
-                # module's convention is that bounded shutdown plus
-                # recoverable state beats unbounded shutdown (same posture as
-                # _REPORT_DRAIN_TIMEOUT). On expiry the worker is abandoned
-                # with a warning; the residual stale-write window then only
-                # exists on an FS already wedged past the deadline.
-                # asyncio.wait never cancels its members, so repeated cancels
-                # of this task keep the worker future intact while the drain
-                # loop keeps waiting out the same deadline.
-                _diag_write = asyncio.ensure_future(
-                    asyncio.to_thread(
-                        update_state, info.id, turns=turns, last_tool=event.title or ""
-                    )
-                )
+                # and drained on cancellation via _write_state_off_loop (#6288,
+                # #6306) — the highest-frequency of the three off-loop state
+                # writers, so the one most likely to be in flight when a
+                # cancellation lands.
                 try:
-                    await asyncio.shield(_diag_write)
-                except asyncio.CancelledError:
-                    # Latch for _run's recovery gate: on Python 3.10,
-                    # wait_for's _cancel_and_wait awaits a bare future that a
-                    # SECOND outer cancel can interrupt, delivering _run's
-                    # CancelledError handler while this drain is still in
-                    # flight — before expiry suppression lands. The latch lets
-                    # the gate see the live drain and skip scheduling a
-                    # recovery writer the worker could race. 3.11+ delivers
-                    # the outer cancel only after
-                    # this child task completes, so there the latch is always
-                    # observed False.
-                    info._diag_drain_active = True
-                    try:
-                        _drain_deadline = time.monotonic() + _DIAG_DRAIN_TIMEOUT
-                        while not _diag_write.done():
-                            _remaining = _drain_deadline - time.monotonic()
-                            if _remaining <= 0:
-                                logger.warning(
-                                    "diagnostics write for %s did not drain in %.0fs on "
-                                    "cancellation — abandoning worker (its write may race "
-                                    "a recovery run's)",
-                                    info.id,
-                                    _DIAG_DRAIN_TIMEOUT,
-                                )
-                                # The abandoned worker is a live stale writer: a
-                                # cancel-respawn recovery run would write fresh
-                                # PID/session state that the zombie's read-merge-
-                                # replace could then roll back. Consume the
-                                # one-shot recovery so this cancellation finalizes
-                                # instead of respawning — losing one best-effort
-                                # auto-continue on an FS already wedged past the
-                                # deadline is strictly cheaper than resurrecting
-                                # stale state.
-                                info._cancel_retry_used = True
-
-                                # The zombie may still raise later; retrieve it so
-                                # it never surfaces as an asynchronous "exception
-                                # was never retrieved" warning.
-                                def _log_abandoned_diag(
-                                    fut: "asyncio.Future[Any]", _aid: str = info.id
-                                ) -> None:
-                                    if not fut.cancelled() and fut.exception() is not None:
-                                        logger.debug(
-                                            "Abandoned diagnostics write for %s failed",
-                                            _aid,
-                                            exc_info=fut.exception(),
-                                        )
-
-                                _diag_write.add_done_callback(_log_abandoned_diag)
-                                break
-                            try:
-                                await asyncio.wait({_diag_write}, timeout=_remaining)
-                            except asyncio.CancelledError:
-                                pass  # repeated cancel: keep draining to the deadline
-                        if _diag_write.done() and not _diag_write.cancelled():
-                            # Retrieve (never surfaces as an unretrieved-exception
-                            # warning) and log, matching the CC-refinement sibling.
-                            _diag_exc = _diag_write.exception()
-                            if _diag_exc is not None:
-                                logger.debug(
-                                    "Best-effort diagnostics write failed for %s during "
-                                    "cancel drain",
-                                    info.id,
-                                    exc_info=_diag_exc,
-                                )
-                    finally:
-                        info._diag_drain_active = False
-                    raise
+                    await self._manager._write_state_off_loop(
+                        info, "diagnostics", turns=turns, last_tool=event.title or ""
+                    )
                 except Exception:
                     pass
                 await self._manager._fire_event(
@@ -1599,7 +1738,10 @@ class RunEventCoordinator(ManagerComponent):
         return self._manager._sessions.is_session_sharing_eligible(info.parent_session_key)
 
     async def _create_shared_session_impl(
-        self, info: SubagentInfo, session_key: str, agent: str
+        self,
+        info: SubagentInfo,
+        session_key: str,
+        agent: str,
     ) -> "LLMProvider":
         """Create a subagent session on the parent's AcpRuntime.
 
@@ -1610,6 +1752,7 @@ class RunEventCoordinator(ManagerComponent):
         AcpSessionProvider. Marks info._session_sharing=True so cleanup calls
         provider.shutdown() instead of SessionManager.release/reset.
         """
+
         runtime = self._manager._get_parent_runtime(info.parent_session_key)
         if runtime is None:
             runtime = await self._manager._sessions.get_subagent_runtime(info.parent_session_key)
@@ -1620,15 +1763,54 @@ class RunEventCoordinator(ManagerComponent):
             agent=agent or None,
         )
         provider = AcpSessionProvider(handle, runtime)
-        # This consumer implements the low-fidelity child downgrade (interactive
-        # approver when configured, reject when headless) — opt in so the
-        # handle-level fail-close gate yields those events instead of rejecting.
+        # The handle exists now. Publish ownership before any cancellable await so
+        # force-reap always takes the shared-session branch and destroys this handle
+        # instead of resetting a nonexistent dedicated session.
         provider.child_fidelity_aware = True
         info._session_sharing = True
         info._shared_provider = provider
+        # Capture cleanup identity before persistence or later setup can fail,
+        # otherwise the live handle becomes an untracked ghost.
+        cleanup_session_id = str(handle.session_id or "")
+        cleanup_provider = PROVIDER_LABEL_DEFAULT
+        setattr(info, "_session_id", cleanup_session_id)
+        setattr(info, "_session_provider", cleanup_provider)
+        self._publish_identity(
+            info.id,
+            session_id=cleanup_session_id,
+            provider=cleanup_provider,
+            keep=info.keep,
+            conversation_key=session_key if info.keep else "",
+        )
+        try:
+            await self._remember_identity_off_loop(
+                info,
+                session_id=cleanup_session_id,
+                provider=cleanup_provider,
+                keep=info.keep,
+                conversation_key=session_key if info.keep else "",
+            )
+        except (OSError, ValueError, RecursionError):
+            logger.debug(
+                "Shared-session identity persistence failed for %s",
+                info.id,
+                exc_info=True,
+            )
         if runtime.pid:
             info._pid = runtime.pid
-            update_state(info.id, pid=runtime.pid, pid_recorded_at=time.time())
+            try:
+                # Keep the shared handle alive on a storage error, but route the
+                # write through the run-owned off-loop drain so cancellation
+                # cannot detach a stale whole-file writer (#6288, #7302).
+                await self._manager._write_state_off_loop(
+                    info, "PID record", pid=runtime.pid, pid_recorded_at=time.time()
+                )
+            except Exception:
+                logger.debug(
+                    "Shared-session PID persistence failed for %s",
+                    info.id,
+                    exc_info=True,
+                )
         logger.info(
             "Subagent %s using session sharing on runtime PID %s (session %s, key %s)",
             info.id,

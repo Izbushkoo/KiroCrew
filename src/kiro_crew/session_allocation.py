@@ -19,6 +19,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from kiro_crew.metrics.sessions import (
+    END_REASON_EVICTED,
+    discard_session_start,
+    record_session_ended,
+    record_session_started,
+)
+
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
 else:
@@ -32,6 +39,10 @@ ProviderFactory = Callable[..., LLMProvider]
 
 class SessionClosingError(RuntimeError):
     """A turn was requested after manager shutdown began."""
+
+
+class SessionBusyError(RuntimeError):
+    """A caller requested an immediate turn claim while the session was held."""
 
 
 class SpeculativeResumeRefused(RuntimeError):
@@ -89,6 +100,7 @@ class AllocationDeps:
     load_watchdog_settings: Callable[[str], object]
     advertised_model_ids: Callable[[Any], list[str]]
     model_is_unusable: Callable[[str, list[str]], bool]
+    resolve_pin_spelling: Callable[[str, list[str]], str]
     to_provider_id: Callable[[str, str], str]
     to_acp_id: Callable[[str], str]
     inc_session_created: Callable[[], None]
@@ -146,7 +158,13 @@ class _AllocationOwner(Protocol):
         cwd: str | None = None,
     ) -> Any: ...
 
-    async def _reacquire_and_validate(self, key: str, session: Any) -> bool: ...
+    async def _reacquire_and_validate(
+        self,
+        key: str,
+        session: Any,
+        *,
+        wait_if_busy: bool = True,
+    ) -> bool: ...
 
     async def _evict_stale_session(self, key: str, session: Any) -> None: ...
 
@@ -199,7 +217,6 @@ def _collect_parent_runtime_kwargs(
         ("_sandbox_mode", "sandbox_mode"),
         ("_extra_env", "extra_env"),
         ("_mcp_gateway_overlay", "mcp_gateway_overlay"),
-        ("_mcp_gateway_settings_mcp_json", "mcp_gateway_settings_mcp_json"),
         ("_mcp_gateway_socket", "mcp_gateway_socket"),
         ("backend", "acp_backend"),
     ):
@@ -465,8 +482,18 @@ class SessionAllocationService:
                 )
         return await owner.get_subagent_runtime(parent_session_key, agent=agent)
 
-    async def _reacquire_and_validate(self, key: str, session: Any) -> bool:
+    async def _reacquire_and_validate(
+        self,
+        key: str,
+        session: Any,
+        *,
+        wait_if_busy: bool = True,
+    ) -> bool:
         """Acquire with the global lock released, then validate exact identity."""
+        if not wait_if_busy and session.semaphore.locked():
+            raise SessionBusyError(key)
+        # An idle Semaphore(1) acquires without suspension, so this is the
+        # authoritative non-waiting claim boundary after the locked check.
         await session.semaphore.acquire()
         try:
             async with self._lock:
@@ -490,6 +517,9 @@ class SessionAllocationService:
             if self._sessions.get(key) is session:
                 del self._sessions[key]
                 dead = session.provider
+                # Same tick as the removal. Left unrecorded, the start crumb
+                # survives and the next boot calls this a crash.
+                await record_session_ended(key, end_reason=END_REASON_EVICTED)
         if dead is not None:
             await asyncio.to_thread(self._deps.unlink_session_queue, session)
             try:
@@ -565,6 +595,18 @@ class SessionAllocationService:
                 )
                 self._sessions[key] = session
                 won_race_session = session
+                try:
+                    await record_session_started(key)
+                except BaseException:
+                    # This await is the only suspension point between registering
+                    # the session and returning it. Cancelled here, the caller
+                    # hard-kills the provider while the entry stays visible, so a
+                    # claimant can be handed a session whose process is already
+                    # dying -- and the crumb would outlive it into a false crash.
+                    if self._sessions.get(key) is session:
+                        del self._sessions[key]
+                    await discard_session_start(key)
+                    raise
         if duplicate is not None:
             try:
                 await duplicate.shutdown()
@@ -991,6 +1033,43 @@ class SessionAllocationService:
         cache[agent] = (model, directory_mtime, now)
         return model
 
+    @staticmethod
+    def _is_member_key(key: str) -> bool:
+        """Whether *key* addresses a crew member's pinned DM session.
+
+        Wrapper so the pool-bypass arm stays readable and the import stays off
+        module top level (circular import: members' module graph is heavy and
+        imports config, which sits below this module).
+        """
+        from kiro_crew.members import is_member_session_key
+
+        return is_member_session_key(key)
+
+    async def _crew_pins_effort(self, agent: str | None, crew_agent: object) -> bool:
+        """True when the crew this session runs as pins its own reasoning effort.
+
+        Read off the event loop: ``load_config`` parses (and deep-copies, even on
+        a cache hit) the whole config, which is not work to do inline. Only the
+        warm-pool decision calls this, so the cost lands once per cold start
+        rather than once per turn, and never on a session that was already
+        skipping the pool for a cheaper reason.
+
+        Failure answers False -- the pre-field behaviour. An unreadable config
+        must not stop a session from starting, and pooling it is only wrong for a
+        crew that pins an effort, which is exactly what could not be read.
+        """
+        try:
+            config = await asyncio.to_thread(self._deps.load_config)
+            crew = crew_agent if isinstance(crew_agent, str) else None
+            return bool(config.crew_pinned_effort(agent, crew))
+        except Exception:
+            self._deps.logger.warning(
+                "Could not read the crew effort pin for agent=%r; pooling as before",
+                agent,
+                exc_info=True,
+            )
+            return False
+
     def _dispatch_hard_kill(self, provider: LLMProvider) -> None:
         """Dispatch blocking provider teardown away from the event-loop thread."""
         kill = self._deps.get_sync_kill_provider()
@@ -1016,6 +1095,7 @@ class SessionAllocationService:
         extra_env: dict[str, str] | None = None,
         speculative: bool = False,
         speculative_resume: bool = False,
+        wait_if_busy: bool = True,
         _won_race_retries: int = 0,
         **extra_factory_kwargs: Any,
     ) -> tuple[LLMProvider, bool, bool]:
@@ -1064,6 +1144,10 @@ class SessionAllocationService:
                             stale_provider = session.provider
                             stale_session = session
                             del self._sessions[key]
+                            # Same tick as the removal. Left unrecorded, the
+                            # start crumb survives and the next boot calls this
+                            # a crash rather than an eviction.
+                            await record_session_ended(key, end_reason=END_REASON_EVICTED)
                     if alive:
                         session.last_used = time.monotonic()
                         if (
@@ -1074,7 +1158,7 @@ class SessionAllocationService:
                             owner._session_map.set(
                                 key,
                                 session.provider.session_id,
-                                provider="claude_code",
+                                provider=constants.provider_label_claude,
                                 cwd=session.provider.cwd,
                             )
                         # The semaphore may be held for a full turn; claim it
@@ -1100,7 +1184,11 @@ class SessionAllocationService:
 
         if claimed is not None:
             session = claimed
-            if await owner._reacquire_and_validate(key, session):
+            if await owner._reacquire_and_validate(
+                key,
+                session,
+                wait_if_busy=wait_if_busy,
+            ):
                 first_turn = session.first_turn
                 if not speculative:
                     session.first_turn = self._deps.first_turn_nothing_armed
@@ -1149,12 +1237,32 @@ class SessionAllocationService:
             pool_decision = "bypass_resume"
         elif is_stateless:
             pool_decision = "bypass_stateless"
+        elif self._is_member_key(key):
+            # A pooled child was spawned with no session key, so it runs the
+            # factory's DEFAULT backend and none of the member construction
+            # route (per-session dispatch-tool mount, member backend). A warm
+            # hit would silently hand a member DM a session that cannot mount
+            # its tools; cold-starting through the factory is what makes the
+            # member route real. String check — as cheap as the arms above.
+            pool_decision = "bypass_member"
         elif cwd_blocks_pool:
             pool_decision = "bypass_cwd"
         elif extra_factory_kwargs.get("reasoning_effort_override"):
             pool_decision = "bypass_effort"
         elif extra_env:
             pool_decision = "bypass_env"
+        elif await self._crew_pins_effort(agent, extra_factory_kwargs.get("crew_agent")):
+            # Same reason as bypass_effort above, for the effort a CREW pins
+            # rather than one a caller passed: a pooled child was spawned under
+            # whatever effort overlay was current when the pool filled, and the
+            # claim path re-keys the model but never re-pushes effort — so a warm
+            # hit would silently run this crew at the wrong depth. Cold-starting
+            # is what makes the pin real.
+            #
+            # Last in the chain on purpose: it is the only arm that needs to read
+            # config, so every cheaper reason to skip the pool is settled first
+            # and a bypassing session never pays for the lookup.
+            pool_decision = "bypass_effort"
         else:
             pool_decision = ""
 
@@ -1212,9 +1320,22 @@ class SessionAllocationService:
                                 )
                             except Exception:  # pragma: no cover - defensive
                                 advertised = []
+                            _send_model = switch_model
                             if advertised and self._deps.model_is_unusable(
                                 switch_model, advertised
                             ):
+                                # A literal miss can be a stale `<namespace>::`
+                                # qualifier on a model the backend fully serves
+                                # (#8521): resolve to the advertised spelling and
+                                # send THAT — the same fold the cold-start spawn
+                                # and the display verdict use, so a warm claim
+                                # runs exactly what a cold start of the same pin
+                                # runs. A pin absent under either spelling still
+                                # takes the withhold below.
+                                _send_model = self._deps.resolve_pin_spelling(
+                                    switch_model, advertised
+                                )
+                            if not _send_model:
                                 self._deps.logger.warning(
                                     "Pool post-claim: model %s is not available to this "
                                     "account; leaving the claimed process on %s",
@@ -1222,10 +1343,10 @@ class SessionAllocationService:
                                     pool_model,
                                 )
                             else:
-                                await cast(Any, provider).client.set_model(switch_model)
+                                await cast(Any, provider).client.set_model(_send_model)
                                 self._deps.logger.info(
                                     "Pool post-claim: switched model to %s",
-                                    switch_model,
+                                    _send_model,
                                 )
                 self._deps.logger.info(
                     "Claimed warm-pool process for %s (agent=%s)",
@@ -1347,6 +1468,16 @@ class SessionAllocationService:
                     ):
                         owner._session_map.clear_sid(key)
                     self._sessions[key] = session
+                    try:
+                        await record_session_started(key)
+                    except BaseException:
+                        # See open_task_session: a cancellation here would leave a
+                        # registered session whose provider the caller is about to
+                        # kill, plus a crumb the next boot reads as a crash.
+                        if self._sessions.get(key) is session:
+                            del self._sessions[key]
+                        await discard_session_start(key)
+                        raise
                     self._deps.logger.info(
                         "New session: %s agent=%s resumed=%s provider_switch=%s (total=%d)",
                         key,
@@ -1373,7 +1504,7 @@ class SessionAllocationService:
                             owner._session_map.set(
                                 key,
                                 sid,
-                                provider="claude_code",
+                                provider=constants.provider_label_claude,
                                 cwd=provider_cwd,
                             )
 
@@ -1402,7 +1533,11 @@ class SessionAllocationService:
                         key,
                         exc_info=True,
                     )
-            if await owner._reacquire_and_validate(key, won_race_session):
+            if await owner._reacquire_and_validate(
+                key,
+                won_race_session,
+                wait_if_busy=wait_if_busy,
+            ):
                 first_turn = won_race_session.first_turn
                 if not speculative:
                     won_race_session.first_turn = self._deps.first_turn_nothing_armed
@@ -1427,6 +1562,7 @@ class SessionAllocationService:
                 extra_env=extra_env,
                 speculative=speculative,
                 speculative_resume=speculative_resume,
+                wait_if_busy=wait_if_busy,
                 _won_race_retries=_won_race_retries + 1,
                 **extra_factory_kwargs,
             )

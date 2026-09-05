@@ -43,10 +43,13 @@ interface, the public edition is complete standalone.
 | `governance` | **concrete carrier** | `load_security_policy()` result or `None` | bundled Level-1 ceiling |
 | `slack_gate` | adapter | `DefaultSlackEnterpriseGate` (default-open) | fail-closed enterprise allowlist |
 | `identity` | adapter | `DefaultIdentityProvider` (`sso_status.py` stub; `whoami`/`issuer` **RESERVED**) | enterprise SSO / directory |
+| `agent_identity` | adapter | `DefaultAgentIdentityProvider` (disabled: `enabled() -> False`; no workload, no Gateway spec, no tokens). Distinct from operator-SSO `identity`. `IdentityProvider.whoami` / `issuer` stay RESERVED and are not consumed to satisfy this seam. A later stack PR may swap this adapter when an optional extra opts in; this PR composes only the Default. | edition workload identity + token vending |
 | `embeddings` | adapter | **RESERVED** — `DefaultEmbeddingSource`; the public runtime is the bundled in-process llama-cpp model, so no method is consumed (swap via `embeddings.register_embedding_backend`) | — (slot inert) |
 | `mcp_tooling` | adapter | `DefaultMcpToolingProvider` (all methods empty) | enterprise MCP server + skills + provider MCP scopes |
 | `agent_catalog` | adapter | `DefaultAgentCatalogProvider` (`builtin_agents()` → `[]`) | edition agent-catalog rows |
 | `prompt_sources` | adapter | `DefaultPromptSourceProvider` (`prompt_source_roots()` → `[]`) | edition prompt/SOP roots |
+| `skill_discovery` | adapter | `DefaultSkillDiscoveryProvider` (`skill_providers()` → `[]`) | edition skill discovery providers for the multi-provider search |
+| `denied_rules` | adapter | `DefaultDeniedRuleProvider` (`denied_rules()` → `[]`) | edition denied-command rules that are default-on but USER-DISABLEABLE (distinct from `security`, the un-weakenable overlay floor) |
 | `import_sources` | adapter | `DefaultImportSourceProvider` (`import_sources()` → `[]`) | edition onboarding-import sources |
 | `capability_manager` | adapter | `DefaultCapabilityManager` (`available()` → `False`) | operations-based external package manager: MCP servers, skills, agent packages, and client plugins |
 | `external_access` | adapter | `DefaultExternalAccessPolicy` (`admits_registry()` / `admits_cloud_deployment()` → `True`) | allowlist installable content to an internal registry; withhold cloud deployment |
@@ -101,11 +104,22 @@ Core code reads adapters directly when it has the context, or via
 
 `installed_context()` returns the INSTALLED context or `None` as a bare
 attribute read — it never resolves, never raises, and does no I/O. Use it ONLY
-where the answer for "no context" is already the conservative one (the
-exempt-host lookup below is the one such caller), because it skips the config
-load and entry-point discovery that `current_context()` performs on every call
-while unbooted. A caller that must honour a companion's policy has to go through
-`current_context()` and take the fail-closed `PlatformCompositionError`.
+where the answer for "no context" is already the conservative one, because it
+skips the config load and entry-point discovery that `current_context()`
+performs on every call while unbooted. A caller that must honour a companion's
+policy has to go through `current_context()` and take the fail-closed
+`PlatformCompositionError`.
+
+Whether the no-context answer is conservative is a property of the CALLER, so
+the accessor cannot check it and this paragraph cannot enforce it — while it was
+the only guard, the caller set grew from one to three and the sentence here still
+said "the one such caller". Every call site is therefore declared in
+`context.PEEK_CALLERS` with that reason, and `test_platform_cpp_seam_coverage.py`
+fails the build on an undeclared peek AND on an entry whose call site is gone.
+Today's three: the exempt-host lookup (below), `redact_log_via_context` (above),
+and `governance.active_policy_distribution`. The gate is a review forcing
+function, not a proof — it cannot verify that a written justification is true,
+only that one was written where a reviewer will read it.
 
 ## Boot sequence
 
@@ -309,6 +323,8 @@ added pre-launch landed under this same `1`, with no bump:
   before the core applies its sandbox);
 - the `knowledge` (connector registry), `dashboard` (route/service/login-handler
   contributor), and `jail` (process-isolation) extension points;
+- the `agent_identity` slot (`AgentIdentityProvider` — agent workload identity
+  and token vending, distinct from operator-SSO `identity`);
 - wiring an *existing* but previously-unconsumed Protocol method into a call site
   (e.g. `ProviderRegistry.create_factory` going live, `AppsLoader` bundling
   feature apps) — no shape change, so no bump regardless;
@@ -331,6 +347,60 @@ dependencies = ["kirocrew"]
 ```
 The `kirocrew-enterprise` binary sets `KIROCREW_PROFILE=enterprise` and delegates to the
 core `main` — the explicit composition-root path that a security review reads.
+
+### Distribution build version
+
+A distribution that repackages one core release as several builds of its own
+(an enterprise bundle vending `0.6.0.10`, `0.6.0.11`, … of the same `0.6.0`)
+names the build it shipped in a `BUILD_VERSION` file placed **beside
+`kiro_crew/__init__.py`** at packaging time (declared as optional package data;
+absent in this repo and in the wheels it publishes). `kiro_crew/__init__`
+resolves it **at import**, replacing `__version__` for every reader — the About
+page's version chip (`version_display`), `/api/status`, `/api/health`,
+`kirocrew --version`, the diagnostics report, and the governance minimum-version
+floor (`update_required`), which a fleet writes in the distribution's build
+numbers. Two readers deliberately do not change: the anonymous usage beacon
+(`beacon.release` clamps to `major.minor.patch` for cardinality, so a stamped
+build sends the same value as its base), and the About page's changelog, where
+`changelog.running_release` folds the stamp back onto its three-segment release
+so the build marks the `0.6.0` row rather than opening an empty `0.6.0.12` row. Import time is the only point that works:
+`dashboard/handlers/updates.py`, `dashboard/ws.py`, `config/loader.py` and
+`cli_server.py` bind `from kiro_crew import __version__` copies that nothing
+later can reach, so this is deliberately not a `PlatformContext` field — a
+context is composed after those imports.
+
+A file in the package rather than an environment variable, on purpose: the
+version feeds an enterprise ceiling (the minimum-version floor) that the local
+operator must not be able to weaken, and an env var is theirs to set. The file
+sits in the same site-packages tree as the code and carries exactly its trust —
+whoever can write it can write `__init__.py` — so it adds no bypass the bytes did
+not already have, and it is the same model the release lanes use when they
+rewrite the version literal for a nightly or insider build. Being in the bytes,
+it is also what a shadow-venv probe or any fresh interpreter naturally reports.
+
+Fail-closed on shape: only the core base itself, or the base followed by exactly
+one `.N` ASCII-numeric segment over a bare numeric base, is honoured (the read is
+capped, and an oversized, undecodable or unreadable file falls back to the base).
+A different base, a prerelease stamp, a non-numeric or second segment, or a
+suffix over an `rc` / nightly base is a build this core is not; it is ignored
+with one warning and the base stays, so a process can never claim bytes it does
+not run. The contract is the file — its name and that shape — not a Python API;
+the helpers in `kiro_crew/__init__` are private. The accepted shape parses as a
+PEP 440 release wherever the version is compared (`_is_newer` orders `0.6.0.12`
+above `0.6.0` and below `0.6.1`; `release_channel.channel` still reads
+`stable`), and `base_version` — the stable-channel display fold — preserves the
+stamped string, which is what lets the chip show it.
+
+Update lane. A distribution owns its own update path, normally the command
+provider selected by `check_command` / `apply_command` update pins, which never
+consults the public release feed. Should a stamped build reach the feed check,
+`channel_move_pending` compares by **release** (`changelog.release_of_build`
+folds `0.6.0.12` to `0.6.0`), so a stamped build on the lane that shipped its
+release is on that lane, not permanently "ahead" of it; the `update_available`
+verdict needs no fold (`0.6.0` is not newer than `0.6.0.12`). The wheel's
+dist-info metadata is not touched by the stamp — `pip` and `importlib.metadata`
+still report the base — so a downstream that builds its own wheel and needs
+those to differ must bump its own project version as well.
 
 ## Consumption-site wiring
 
@@ -404,6 +474,25 @@ delegates to that same global. Wired sites:
   lazily-composed standalone default resolved per stderr line on the event loop.
   Closing this residual means handing gatewayd a composed context, the same
   remedy that module already names for the ceiling, and is a separate change.
+- **Which spelling a gate-side log line uses is gated in CI**
+  (`test_security_posture.TestGateSideLogRedactorSpelling`). The egress
+  classification (`security_posture._REDACTION_SINKS` vs
+  `NON_EGRESS_REDACTION_MODULES`) is a different axis and cannot cover this one:
+  all three sites converged above sat correctly bucketed as non-egress, with
+  accurate reasons, while reading the companion-blind baseline pass. The gate
+  scans for the PROPERTY — a baseline redactor's result reaching a log or audit
+  write, either nested in the call or through a local assigned from one in the
+  same scope — rather than for a filename or a subject name, because a grep
+  scoped to files mentioning stderr is exactly what missed `task_planner.py` and
+  `name_grant.py`. `_BASELINE_LOG_SITE_CENSUS` records the per-module residual
+  measured when the gate went up (76 sites in 26 modules, `acp/client.py` the
+  largest at 7); it is a census, NOT an approved-exception list and NOT a to-do
+  list, since for a process that never composes — gatewayd above — the baseline
+  is the honest answer. Growth in any module, or a first site in a module absent
+  from it, fails until someone either calls `redact_log_via_context` or raises
+  that number and records which PROCESS the site runs in and why the baseline is
+  correct there. A count that has fallen must be lowered, so a converted module
+  does not leave free slots behind.
 - Exfil exact-host heuristic exemption (`CredentialPolicy.exempt_exact_hosts()`) —
   `security.scan_exfiltration_urls` / `redact_exfiltration_urls` read the
   companion-supplied exact-host set and, for a URL whose domain is an EXACT
@@ -922,6 +1011,21 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   companion returns its resolved package prompt roots. **Split out of
   `McpToolingProvider` into its own Protocol** (a distinct concern). v1 addition;
   `Default` returns `[]`.
+- `SkillDiscoveryProvider.skill_providers() -> List[SkillProvider]` — WIRED: the
+  dashboard discover registry (`handlers/discover._build_registry`) registers each
+  returned provider after the built-in one, gated per provider by the same
+  `external_access.admits_registry("skill", name, api_base)` decision the built-in
+  provider passes through — a managed allowlist applies uniformly, with no
+  edition-specific carve-out. ADD-only and de-duped by name (the built-in wins a
+  collision, so an edition cannot silently replace an identity the policy
+  admitted). Each returned object implements the
+  `kiro_crew.skill_providers.base.SkillProvider` protocol and SHOULD expose an
+  `api_base` naming its catalog endpoint (the identity an allowlist is written
+  against; a provider without one is gated on an empty base). Provider-sourced
+  result fields flow through the existing `_redact_external` scrub before
+  reaching the dashboard. Read fail-closed through `safe_context_call` (fallback
+  `[]`). Default `[]`, so the public edition searches only the built-in catalog.
+  v1 addition; `Default` returns `[]`.
 - `ImportSourceProvider.import_sources() -> List[ImportSource]` — WIRED:
   `onboarding_import._sources()` unions the returned descriptors over the core
   builtins for every scan, apply, and id-validation path, so a registered source
@@ -956,10 +1060,13 @@ hardcode was removed, so a package-installed agent is now classified
 and `"builtin"` for the rest) rather than the former `"aim"` literal. Importers
 (`subagent`, `mcp_core`, `conductor_skill`, dashboard agents) were updated to the
 new module/class names.
-- `browser/auth.py::register_browser_auth_provider(provider)` — module-level
-  registration hook (twin of `register_acp_backends`); every `browser/auth`
-  helper delegates to it when present, else the OSS default. `browser/cli.py`
-  auth subcommands now delegate through the helpers.
+- **`register_browser_auth_provider(provider)` — removed with the playwright-cli
+  migration.** The module that carried this seam is gone, so there is no
+  browser-auth provider hook to register at all: browsing runs through the
+  external `playwright-cli` binary (`kiro_crew/browser_cli/`), and a logged-in
+  session reaches that binary through the CLI's own surfaces (`state-save` /
+  `state-load`, `attach --extension`) rather than through an in-process
+  provider.
 - `hooks.register_internal_read_path(read_id, rel_path)` — guarded seam adding a
   fixed-path entry to `_INTERNAL_READ_ALLOWLIST` (rejects `..`/absolute/
   non-sensitive/repoint).
@@ -975,12 +1082,17 @@ new module/class names.
   section is not dropped on `save()`/PATCH. Excluded from the JSON schema
   (`build_json_schema` skips leading-underscore fields). Data-preservation half
   of the eventual `ConfigSchemaContributor`; Settings-visibility half is TODO.
-- ACP claude seam (all inside the dormant `_is_claude` path, inert on kiro-cli):
-  `AcpClient._claude_session_mcp_servers()` (Default `[]`) feeds both
-  `session/new` + `session/load` `mcpServers`; `_spawn` calls the
-  companion-attached `_write_claude_local_settings()` (via `getattr`) on the
-  PRIMARY spawn path; `AcpClient`/`AcpProvider` take a `permission_mode` kwarg
-  (Default `None`); `acp/types.py` adds `CC_PERMISSION_MODE_DEFAULT` /
+- ACP claude seam (inert on kiro-cli, and implemented in the core now that CC is
+  selectable): `AcpClient._session_mcp_servers()` translates the materialized
+  kiro agent spec (`acp/session_mcp.py`) and feeds both `session/new` +
+  `session/load` `mcpServers` — gated on membership in
+  `ACP_BACKENDS_SESSION_MCP_ARRAY`, not on `_is_claude`, since reading no agent
+  file is a property of the transport rather than of Anthropic; `_spawn` calls
+  `_write_claude_local_settings()` (still identity-gated — it writes a literal
+  `.claude/` path) on the PRIMARY
+  spawn path (permission mode, `availableModels`, resolved model — snapshotted and
+  restored by `_reset_state`); `AcpClient`/`AcpProvider` take a `permission_mode`
+  kwarg (Default `None`); `acp/types.py` adds `CC_PERMISSION_MODE_DEFAULT` /
   `CC_PERMISSION_MODE_AUTO`.
 - Slack message-gate seams (let an edition compose a fail-closed
   challenge-and-redirect posture without editing the core; `InterceptDecision`

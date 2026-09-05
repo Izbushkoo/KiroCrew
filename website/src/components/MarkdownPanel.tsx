@@ -13,7 +13,7 @@ import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import SelectionToolbar, { type SelectionAction } from './SelectionToolbar'
 import MarkdownOutlineRail from './MarkdownToc'
 import { useFileWatch } from '../hooks/useFileWatch'
-import { useGatewayPlatform } from '../hooks/useGatewayPlatform'
+import { useBranding } from '../hooks/useBranding'
 import { usePersistedBool } from '../hooks/usePersistedBool'
 import { countLines } from './FileChangeChips'
 import { store } from '../store'
@@ -185,6 +185,11 @@ interface Props {
   onClose: () => void
   liveWatch?: boolean
   onSubmitComments?: (message: string) => void
+  /** Gateway connection flag. Gates the batch comment submit (mirrors
+   *  ChatInput's Send gating) so pending comments can't be composed and
+   *  cleared while the chat send path would silently refuse the message.
+   *  Defaults true for embeddings without a chat send path. */
+  connected?: boolean
   onRefresh?: (filePath: string) => Promise<void>
   reserveWidth?: number
   /** Restored file-tab preference. Undefined allows the initial modified-file
@@ -236,6 +241,7 @@ import { PierreFilePair, type PierreEditorHandle, type RevealTarget } from '../p
 import { i18nT } from '../i18n/t'
 import { useDocumentImeLatch, useImeGuard } from '../hooks/useImeGuard'
 import { useScrollMemory } from '../hooks/useScrollMemory'
+import FilePathMenu, { revealOrOpen, useRevealLabel, useCanOpenFile } from './FilePathMenu'
 
 /**
  * File types that render through a dedicated viewer instead of a text editor.
@@ -298,17 +304,6 @@ async function downloadFile(filePath: string) {
  * rejected request (a path the SEL guard treats as sensitive, or `open` on a
  * directory) surfaces the server's own message.
  */
-async function revealOrOpen(filePath: string, action: 'open' | 'reveal') {
-  try {
-    const res = await api.revealPath(filePath, action)
-    if (res?.copy) alert(i18nT('components.markdownPanel.path_copied_to_clipboard_no_desktop_available'))
-  } catch (err) {
-    // eslint-disable-next-line no-console -- surface reveal failures for diagnostics
-    console.error('revealPath failed', err)
-    alert((err as Error).message)
-  }
-}
-
 /** 26px square icon toggle for the file toolbar (borderless, accent when on). */
 /** Below this panel width the browser rail overlays the content instead of
  *  splitting it: a 240-300px rail inside a ~320px panel leaves the editor a few
@@ -447,14 +442,20 @@ export function OverflowMenu({ filePath, content, onRefresh, refreshDisabled, re
   const closeTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined)
   useEffect(() => () => { clearTimeout(closeTimerRef.current) }, [])
   const navigate = useNavigate()
-  const gatewayPlatform = useGatewayPlatform()
-  // Name the real application where the gateway HAS one, generic otherwise —
-  // `/api/reveal` shells out on the gateway, so its platform is the one to name.
-  const revealLabel = gatewayPlatform === 'darwin'
-    ? i18nT('components.markdownPanel.open_in_finder')
-    : gatewayPlatform === 'windows'
-      ? i18nT('components.markdownPanel.open_in_file_explorer')
-      : i18nT('components.markdownPanel.show_in_file_manager')
+  // Open/Reveal shell out on the gateway, so they only make sense when the
+  // browser is on that same machine. Remote/tunneled sessions (directLocal
+  // false) see the clipboard/download fallbacks only — matching the shared
+  // FilePathMenu, which self-gates on the same flag.
+  const { directLocal } = useBranding()
+  // Open uses the shared gate (FilePathMenu.useCanOpenFile): directLocal AND a
+  // non-Windows gateway — a local Windows user must not get an Open row here
+  // that the shared menu hides. This panel only renders file content, so no
+  // kind is passed (dir suppression is moot). Reveal keeps the laxer
+  // directLocal-only gate because reveal works on Windows.
+  const canOpen = useCanOpenFile()
+  // Platform-aware reveal label from the shared owner (FilePathMenu) so this
+  // overflow and FileViewer's overflow name the identical action identically.
+  const revealLabel = useRevealLabel()
   const knowledge = useFileKnowledgeState(filePath)
   const artifact = useFileArtifactState(filePath, content)
   const delayedClose = () => { closeTimerRef.current = setTimeout(() => setOpen(false), 800) }
@@ -565,13 +566,21 @@ export function OverflowMenu({ filePath, content, onRefresh, refreshDisabled, re
           {/* File-location group: hand the file to the desktop, then the
               clipboard/download fallbacks for hosts that have no desktop.
               Iconless like its neighbours — the group reads as a list of
-              destinations, and two glyphs among five would look arbitrary. */}
-          <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { void revealOrOpen(filePath, 'open'); setOpen(false) }}>
-            {i18nT('components.markdownPanel.open_with_default_app')}
-          </button>
-          <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { void revealOrOpen(filePath, 'reveal'); setOpen(false) }}>
-            {revealLabel}
-          </button>
+              destinations, and two glyphs among five would look arbitrary.
+              Open uses the shared canOpen gate (directLocal + non-Windows);
+              Reveal uses directLocal alone — a remote session cannot usefully
+              drive Finder on the gateway, so it sees the fallbacks only. Same
+              gates the shared FilePathMenu applies. */}
+          {canOpen && (
+            <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { void revealOrOpen(filePath, 'open'); setOpen(false) }}>
+              {i18nT('components.markdownPanel.open_with_default_app')}
+            </button>
+          )}
+          {directLocal && (
+            <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { void revealOrOpen(filePath, 'reveal'); setOpen(false) }}>
+              {revealLabel}
+            </button>
+          )}
           <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { copyToClipboard(filePath); setOpen(false) }}>
             {i18nT('components.markdownPanel.copy_path')}
           </button>
@@ -807,9 +816,9 @@ function DiffViewBlock({ diffMode, fileName, originalContent, content, lineNums,
 }
 
 /** Shared comment overlay — popover + comment list */
-const CommentOverlayBlock = memo(function CommentOverlayBlock({ popover, addComment, setPopover, onSubmitComments, comments, editComment, removeComment, submitAllComments, containerRef, scrollRef }: {
+const CommentOverlayBlock = memo(function CommentOverlayBlock({ popover, addComment, setPopover, onSubmitComments, comments, editComment, removeComment, submitAllComments, containerRef, scrollRef, connected = true }: {
   popover: { x: number; y: number } | null; addComment: (text: string) => void; setPopover: (v: null) => void
-  onSubmitComments?: (message: string) => void; comments: InlineComment[]; editComment: (id: string, text: string) => void; removeComment: (id: string) => void; submitAllComments: (extraPrompt?: string) => void; containerRef?: React.RefObject<HTMLElement | null>; scrollRef?: React.RefObject<HTMLElement | null>
+  onSubmitComments?: (message: string) => void; comments: InlineComment[]; editComment: (id: string, text: string) => void; removeComment: (id: string) => void; submitAllComments: (extraPrompt?: string) => void; containerRef?: React.RefObject<HTMLElement | null>; scrollRef?: React.RefObject<HTMLElement | null>; connected?: boolean
 }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   return (
@@ -819,7 +828,7 @@ const CommentOverlayBlock = memo(function CommentOverlayBlock({ popover, addComm
           onCancel={() => { setPopover(null); window.getSelection()?.removeAllRanges() }} />
       )}
       {onSubmitComments && (
-        <CommentList comments={comments} onEdit={editComment} onRemove={removeComment} onSubmitAll={submitAllComments} enableExtraPrompt />
+        <CommentList comments={comments} onEdit={editComment} onRemove={removeComment} onSubmitAll={submitAllComments} enableExtraPrompt connected={connected} />
       )}
     </>
   )
@@ -837,7 +846,7 @@ export interface MarkdownPanelHandle {
   requestNavigate: (nav: (stillClean: () => boolean) => void) => void
 }
 
-export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPanel({ filePath, content, onContentChange, onDiskContent, onSave, onClose, liveWatch, onSubmitComments, onRefresh, reserveWidth, initialDiffMode, onDiffModeChange, embedded, active = true, savedBaseline, revealLine, onRevealConsumed, browserRail, railOpen, onRailToggle, scrollMemoryKey }: Props, ref) {
+export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPanel({ filePath, content, onContentChange, onDiskContent, onSave, onClose, liveWatch, onSubmitComments, connected = true, onRefresh, reserveWidth, initialDiffMode, onDiffModeChange, embedded, active = true, savedBaseline, revealLine, onRevealConsumed, browserRail, railOpen, onRailToggle, scrollMemoryKey }: Props, ref) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const ime = useImeGuard()
   const qc = useQueryClient()
@@ -1357,11 +1366,18 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     setComments(prev => prev.map(c => c.id === id ? { ...c, text } : c))
   }, [])
 
+  /**
+   * Compose + hand off the pending comment batch, then clear it. Bails while
+   * the gateway is offline: the downstream send path silently refuses
+   * messages in that state, so clearing here would destroy the user's
+   * comments with no error. The Submit All button is disabled offline too —
+   * this is the behavioral backstop.
+   */
   const submitAllComments = useCallback((extraPrompt?: string) => {
-    if (!onSubmitComments || comments.length === 0) return
+    if (!connected || !onSubmitComments || comments.length === 0) return
     onSubmitComments(formatCommentsMessage(filePath, comments, displayContent, extraPrompt))
     setComments([])
-  }, [onSubmitComments, comments, filePath, displayContent])
+  }, [connected, onSubmitComments, comments, filePath, displayContent])
 
   const dismissHint = useCallback(() => {
     setHintDismissed(true)
@@ -1714,6 +1730,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
         <div className="shrink-0 border-b border-border">
           <div className="flex items-center gap-2 h-[38px] px-3">
             <FileText size={14} className="text-muted shrink-0" />
+            <FilePathMenu filePath={filePath}>
             <span className="flex items-center min-w-0" title={filePath}>
               {crumbs.map((c, i) => (
                 <span key={i} className="flex items-center min-w-0 text-[12px]">
@@ -1722,6 +1739,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
                 </span>
               ))}
             </span>
+            </FilePathMenu>
             {diffMode && !diffUnavailable && (diffStats.added > 0 || diffStats.removed > 0) && (
               <span className="text-[11px] font-mono font-semibold shrink-0">
                 {diffStats.added > 0 && <span className="text-ok">+{diffStats.added}</span>}
@@ -1823,7 +1841,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
         )}
       </div>
       {!fullscreen && !editing && <SelectionToolbar containerRef={sidePanelScrollRef} actions={selectionActions} />}
-      {!fullscreen && <CommentOverlayBlock popover={popover} addComment={addComment} setPopover={clearPopover} onSubmitComments={onSubmitComments} comments={comments} editComment={editComment} removeComment={removeComment} submitAllComments={submitAllComments} />}
+      {!fullscreen && <CommentOverlayBlock popover={popover} addComment={addComment} setPopover={clearPopover} onSubmitComments={onSubmitComments} comments={comments} editComment={editComment} removeComment={removeComment} submitAllComments={submitAllComments} connected={connected} />}
     </DetailPanel>
     {fullscreen && createPortal(
       // The onKeyDown here implements a focus trap for the modal dialog; a
@@ -1887,7 +1905,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
           {isMarkdown && !editing && <MarkdownOutlineRail containerRef={fullscreenBodyRef} />}
         </div>
         {!editing && <SelectionToolbar containerRef={fullscreenBodyRef} actions={selectionActions} />}
-        <CommentOverlayBlock popover={popover} addComment={addComment} setPopover={clearPopover} onSubmitComments={onSubmitComments} comments={comments} editComment={editComment} removeComment={removeComment} submitAllComments={submitAllComments} scrollRef={fullscreenBodyRef} />
+        <CommentOverlayBlock popover={popover} addComment={addComment} setPopover={clearPopover} onSubmitComments={onSubmitComments} comments={comments} editComment={editComment} removeComment={removeComment} submitAllComments={submitAllComments} connected={connected} scrollRef={fullscreenBodyRef} />
         {/* Footer */}
         <Clickable className="shrink-0 flex items-center px-3 h-6 text-[11px] text-muted font-mono truncate cursor-pointer hover:text-text transition-colors" title={i18nT('components.markdownPanel.click_to_copy_path')} onClick={() => copyToClipboard(filePath)}>{filePath}</Clickable>
       </div>,

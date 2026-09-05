@@ -20,11 +20,16 @@ _TO_DICT_KEYS = (
     "agent",
     "effective_agent",
     "model",
+    "model_withheld",
     "reasoning_effort",
     "mode",
     "surface",
     "workspace",
     "project",
+    # Remote-execution binding: present on EVERY slot, so the frontend can tell
+    # "runs locally" from "the field is missing on an older gateway".
+    "executor",
+    "instance_id",
     "artifact",
     "messages",
     "running",
@@ -46,6 +51,7 @@ _TO_DICT_KEYS = (
     "source_links",
     "source_links_total",
     "todo",
+    "mcp_report",
     "has_options",
     "options",
     "prompt_preview",
@@ -68,6 +74,7 @@ _TO_DICT_KEYS = (
     "linked_session_key",
     "app",
     "origin",
+    "created_by",
 )
 
 

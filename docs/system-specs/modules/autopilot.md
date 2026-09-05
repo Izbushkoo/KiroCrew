@@ -131,10 +131,15 @@ appears to skip the gate entirely.
 `parseOptions` (`website/src/pages/chat/AssistantMessage.tsx:49`) takes the
 **last** `[OPTION(S): …]` marker for the button list, strips **every** marker
 from the displayed text so a stray earlier marker cannot leak as raw syntax, and
-sets `isPlan` when both a plan header and a stage marker are present. A click on
-a plan option in an orchestrator slot goes straight to
-`api.planAction(slot, action)` (`ChatPage.tsx:5097`) instead of filling the input
-box.
+sets `isPlan` when both a plan header and a stage marker are present. Every
+plan-chip gesture in an orchestrator slot — single click, double-click, and the
+Send-now segment — goes straight to `api.planAction(slot, action)` instead of
+filling the composer or sending the label as chat text. The send gestures pass
+the row identity captured on the first click of the gesture, so a footer that
+replaces the reused chip between the two clicks of a double-click is refused
+rather than approving a stage the user never saw. A typed `Cancel` is not
+special-cased server-side, so routing those two send gestures through the same
+gate is what makes the stop control actually stop the plan.
 
 ## Stage Gates
 
@@ -369,7 +374,7 @@ however long the plan runs.
 
 | Area | Location |
 |------|----------|
-| Tracker limits, timeout, `timeout_human`, caps, stale-session cleanup | `tests/test_context_management.py` |
+| Tracker limits, timeout, `timeout_human`, caps, stale-session cleanup | `test/test_context_management.py` |
 | Stage loop guard lifetime, shrink clamp, plan-action routing, plan detection scoped to planning turns, widget-origin `go all` refusal | `test/test_dashboard_chat.py` |
 | Prompt binds the "Autopilot" name | `test/test_prompt_autopilot_binding_rule.py` |
 | `parseOptions` marker/plan parsing | `website/src/test/AssistantMessage.test.tsx` |

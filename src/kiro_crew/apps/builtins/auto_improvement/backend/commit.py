@@ -20,6 +20,7 @@ import subprocess
 import threading
 from pathlib import Path
 
+from kiro_crew.platform.context import redact_via_context
 from kiro_crew.security import redact
 
 from ..profiles.github_repo.pr_recipe import _prefer_authenticated_remote
@@ -31,7 +32,7 @@ from ..spine.push_policy import (
     scan_content_for_secrets,
 )
 from . import store
-from .clone_setup import _repository_is_isolated, resolve_origin_url
+from .clone_setup import IsolationProbeError, _repository_is_isolated, resolve_origin_url
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,13 @@ def materialize_queued_diff(
         if fetch.returncode != 0:
             return {
                 "ok": False,
-                "error": f"could not fetch {branch}: {(fetch.stderr or '')[:160]}",
+                # Redact BEFORE the bound: git echoes the authenticated remote URL —
+                # userinfo and all — on an auth failure, and a slice can cut the
+                # credential mid-match into a fragment the downstream serving route's
+                # redaction pass no longer recognises.
+                "error": (
+                    f"could not fetch {branch}: " f"{redact_via_context(fetch.stderr or '')[:160]}"
+                ),
             }
     else:
         # No configured url: the push cannot succeed either, so this degrades to
@@ -154,7 +161,10 @@ def materialize_queued_diff(
     if checkout.returncode != 0:
         return {
             "ok": False,
-            "error": f"could not check out {branch}: {(checkout.stderr or '')[:160]}",
+            "error": (
+                f"could not check out {branch}: "
+                f"{redact_via_context(checkout.stderr or '')[:160]}"
+            ),
         }
 
     apply_proc = subprocess.run(
@@ -173,7 +183,10 @@ def materialize_queued_diff(
         _git(clone, "reset", "--hard", base_ref_local)
         return {
             "ok": False,
-            "error": f"the queued diff did not apply: {(apply_proc.stderr or '')[:160]}",
+            "error": (
+                f"the queued diff did not apply: "
+                f"{redact_via_context(apply_proc.stderr or '')[:160]}"
+            ),
         }
     return {"ok": True, "base": base_ref_local}
 
@@ -197,7 +210,10 @@ def commit_staged_for_draft(*, clone: Path, body_path: Path, fp: str) -> dict[st
     if commit.returncode != 0:
         return {
             "ok": False,
-            "error": f"could not commit the staged diff: {(commit.stderr or '')[:160]}",
+            "error": (
+                f"could not commit the staged diff: "
+                f"{redact_via_context(commit.stderr or '')[:160]}"
+            ),
         }
     return {"ok": True, "sha": (_git(clone, "rev-parse", "HEAD").stdout or "").strip()}
 
@@ -245,8 +261,13 @@ def _commit_finding_locked(fp: str) -> dict[str, object]:
     # push. Rechecking only after creating the provisional commit is unsound: once that
     # check fails, rollback Git would itself trust the repository just declared unsafe,
     # while returning without rollback leaves a rejected commit as a future baseline.
-    if not _repository_is_isolated(clone):
-        return {"ok": False, "error": "repository isolation check failed — re-run setup"}
+    try:
+        if not _repository_is_isolated(clone):
+            return {"ok": False, "error": "repository isolation check failed — re-run setup"}
+    except IsolationProbeError as exc:
+        # A crashed probe is a sandbox failure, not an isolation verdict — re-running
+        # setup cannot fix it, so surface the real reason instead (#8151).
+        return {"ok": False, "error": str(exc)}
 
     diff_text = diff_path.read_text(encoding="utf-8")
     if not diff_text.strip():
@@ -266,7 +287,10 @@ def _commit_finding_locked(fp: str) -> dict[str, object]:
     commit = _git(clone, "-c", "commit.gpgsign=false", "commit", "-m", message)
     if commit.returncode != 0:
         _git(clone, "reset", "--hard", base_ref_local)
-        return {"ok": False, "error": f"commit failed: {(commit.stderr or '')[:160]}"}
+        return {
+            "ok": False,
+            "error": f"commit failed: {redact_via_context(commit.stderr or '')[:160]}",
+        }
     sha = (_git(clone, "rev-parse", "HEAD").stdout or "").strip()
 
     # Scan the CONTENT before it leaves the host. `_commit_message` is already redacted;
@@ -327,7 +351,10 @@ def _commit_finding_locked(fp: str) -> dict[str, object]:
     push = _git(clone, "push", url, f"HEAD:refs/heads/{branch}", timeout=_PUSH_TIMEOUT_S)
     if push.returncode != 0:
         _git(clone, "reset", "--hard", base_ref_local)
-        return {"ok": False, "error": f"push failed: {(push.stderr or '')[:200]}"}
+        return {
+            "ok": False,
+            "error": f"push failed: {redact_via_context(push.stderr or '')[:200]}",
+        }
 
     return {"ok": True, "fp": fp, "branch": branch, "sha": sha}
 

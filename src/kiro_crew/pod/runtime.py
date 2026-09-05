@@ -31,8 +31,12 @@ try:  # POSIX only; pods are refused on hosts without it (require_backend)
 except ImportError:  # pragma: no cover - Windows
     fcntl = None  # type: ignore[assignment]
 
-from kiro_crew.atomic_write import atomic_write
-from kiro_crew.loopback_http import loopback_urlopen
+from kiro_crew import pinned_fs
+from kiro_crew import seed as seed_mod
+from kiro_crew.atomic_write import atomic_write, atomic_write_at
+from kiro_crew.dashboard.urls import dashboard_socket_name
+from kiro_crew.instances import run_marker
+from kiro_crew.loopback_http import loopback_urlopen, unix_socket_urlopen
 from kiro_crew.platform_compat import (
     IS_LINUX,
     IS_MACOS,
@@ -45,6 +49,7 @@ from kiro_crew.pod import launchd
 from kiro_crew.pod import provision as prov
 from kiro_crew.pod import unit as unit_mod
 from kiro_crew.pod.config import PodConfig
+from kiro_crew.seed import SeedError
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 # Pod names become systemd instance names and path segments; keep them strict.
@@ -737,6 +742,24 @@ def pod_home(cfg: PodConfig, name: str) -> Path:
     return cfg.home_dir(name)
 
 
+def pod_socket_path(cfg: PodConfig, name: str, port: int) -> Path:
+    """Path of pod *name*'s private dashboard unix socket.
+
+    The pod's gateway binds ``dashboard_socket_path(port)`` resolved against ITS
+    ``KIROCREW_HOME``, which is :func:`pod_home` -- so the socket lands in the
+    pod's isolated home, not in the host's data home. Calling
+    ``dashboard_socket_path`` from here would resolve THIS process's home and
+    name a socket the pod never binds, which is why only the file name comes from
+    the shared definition and the directory comes from the pod.
+
+    That directory is the security property: it is created owner-only
+    (``make_owner_only_dir``) and the socket is ``chmod 0600``, so no other local
+    user can answer here -- unlike the pod's TCP port, which any local user can
+    bind once the pod releases it.
+    """
+    return pod_home(cfg, name) / dashboard_socket_name(port)
+
+
 # --------------------------------------------------------------------------- #
 # systemd --user helpers.
 # --------------------------------------------------------------------------- #
@@ -1149,6 +1172,47 @@ def loaded_teardown_hook(cfg: PodConfig, name: str) -> bool | None:
     return bool((cp.stdout or "").strip())
 
 
+def _install_pod_dropin(cfg: PodConfig, name: str) -> subprocess.CompletedProcess | None:
+    """Pin pod *name* to its checkout binary, or return a start-blocking failure."""
+    checkout = read_env_file(cfg, name).get("CHECKOUT", "")
+    if not checkout:
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr=(
+                f"pod {name!r} has no pinned checkout, so its boot cannot use the "
+                f"worktree's own kirocrew. Run `kirocrew pod up {name}` from inside "
+                "the checkout."
+            ),
+        )
+    try:
+        unit_mod.install_dropin(cfg, name, Path(checkout).expanduser())
+    except (OSError, ValueError) as exc:
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr=f"could not write the boot override for pod {name!r}: {exc}",
+        )
+    cp = systemctl("daemon-reload")
+    if cp.returncode == 0:
+        return None
+    unit_mod.remove_dropin(cfg, name)
+    detail = f" {cp.stderr.strip()}" if (cp.stderr or "").strip() else ""
+    return subprocess.CompletedProcess(
+        args=[],
+        returncode=cp.returncode or 1,
+        stdout=cp.stdout or "",
+        stderr=(
+            f"wrote the boot override for pod {name!r} but `systemctl --user "
+            f"daemon-reload` failed (rc={cp.returncode}), so systemd would still "
+            "boot the globally installed kirocrew. Refusing to start it; retry or "
+            f"run `kirocrew pod install`.{detail}"
+        ),
+    )
+
+
 def start_pod(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
     """Bring pod *name* up through whichever service manager this host uses."""
     with pod_name_mutex(cfg, name):
@@ -1168,6 +1232,9 @@ def start_pod(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
             refused = _refresh_stale_unit(cfg)
             if refused is not None:
                 return refused
+        refused = _install_pod_dropin(cfg, name)
+        if refused is not None:
+            return refused
         return systemctl("start", pod_unit(cfg, name))
 
 
@@ -1306,6 +1373,12 @@ def stop_pod(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
                 ),
             )
         rc = cleanup_home(cfg, name)
+        dropin_path = unit_mod.dropin_path(cfg, name)
+        had_dropin = dropin_path.exists() or dropin_path.is_symlink()
+        dropin_gone = unit_mod.remove_dropin(cfg, name)
+        reload_cp: subprocess.CompletedProcess | None = None
+        if had_dropin and dropin_gone:
+            reload_cp = systemctl("daemon-reload")
         if rc != 0 or leftover.exists():
             return subprocess.CompletedProcess(
                 args=[],
@@ -1316,6 +1389,30 @@ def stop_pod(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
                     f"teardown is incomplete, so this pod is NOT zero-residue. "
                     f"Reclaim it with `kirocrew pod down {name}` once nothing is "
                     "writing there."
+                ),
+            )
+        if not dropin_gone:
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout=cp.stdout or "",
+                stderr=(
+                    f"pod stopped and its HOME was reclaimed, but the boot override at "
+                    f"{unit_mod.dropin_path(cfg, name)} could not be removed — this pod "
+                    f"is NOT zero-residue. Delete it, then run `systemctl --user "
+                    "daemon-reload`."
+                ),
+            )
+        if reload_cp is not None and reload_cp.returncode != 0:
+            detail = f" {reload_cp.stderr.strip()}" if (reload_cp.stderr or "").strip() else ""
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=reload_cp.returncode or 1,
+                stdout=cp.stdout or "",
+                stderr=(
+                    "pod stopped and its on-disk override was removed, but `systemctl "
+                    "--user daemon-reload` failed, so systemd may still retain it in "
+                    f"memory — this pod is NOT zero-residue.{detail}"
                 ),
             )
         return cp
@@ -1501,59 +1598,121 @@ class PodOwnershipUnproven(PodError):
     """
 
 
-def port_owner(cfg: PodConfig, name: str, port: int) -> str:
-    """Who holds *port*: :data:`OWNER_POD`, :data:`OWNER_FOREIGN`, or
-    :data:`OWNER_UNPROVEN`.
+def _pod_pid_record_path(cfg: PodConfig, name: str, port: int) -> Path:
+    """Path of pod *name*'s gateway pid sidecar inside its isolated home."""
+    return cfg.home_dir(name) / run_marker.RUN_DIR_NAME / run_marker.pid_file_name(port)
 
-    The proof is pid identity, the same shape ``port_resolution._gateway_owns_port``
-    uses for the live gateway: the process listening on the port must be the pod's
-    own (:func:`main_pid`). Three branches are worth naming.
 
-    **Ownership is scoped to the address the probe talked to.** A port NUMBER can
-    carry several LISTEN sockets on different local addresses, so "some process of
-    ours holds this port" is not the question -- the question is who a
-    ``127.0.0.1`` connect reaches. ``loopback_owner_pids`` answers exactly that,
-    mirroring the kernel's most-specific-bind dispatch. Taking every pid on the
-    port instead would let a pod bound to one specific local address vouch for a
-    foreign listener holding ``127.0.0.1`` on the same port -- the squatter would
-    be trusted BECAUSE the real pod exists elsewhere on that number. This scope
-    must stay in step with the address :func:`_probe_health` dials.
+def _pod_recorded_pid(cfg: PodConfig, name: str, port: int) -> int | None:
+    """Gateway PID recorded in pod *name*'s isolated home, PROVEN to still name
+    that same process, or ``None``.
 
-    **A pod with no process, on a port somebody holds, is FOREIGN -- not
-    unproven.** This is the whole bug. A pod whose gateway lost the bind race has
-    no process at all, so there is no pid to match; if the answer were "cannot
-    tell" the squatter's 200 would still be reported as this pod's health, which
-    is exactly the state this function exists to name. A non-empty listener list
-    plus a pod that authoritatively has no pid IS proof the responder is someone
-    else.
+    A bare pid is not an identity. ``clear_marker`` runs only on a graceful
+    shutdown, so a crashed or SIGKILLed pod leaves its sidecar behind, and the
+    number in it can afterwards be recycled onto an unrelated process. The
+    gateway therefore records its start-time identity in a ``.start`` sidecar
+    beside the pid (``run_marker.pid_start_token``), and this reader re-derives
+    that identity live: a recycled pid answers with its OWN start time, which
+    cannot match the one the pod's gateway recorded.
 
-    **Undecidable stays undecidable.** No ``lsof``/``netstat``, a throwing
-    lookup, or a service manager that cannot be asked all return
-    :data:`OWNER_UNPROVEN`. Each caller then decides for itself: :func:`health`
-    keeps its pre-identity behaviour, because refusing would turn every pod on
-    such a host into a permanently unhealthy one -- a self-inflicted outage in
-    place of a misreport -- while :func:`mint_token`, which hands over a
-    credential, requires positive proof. That mirrors
-    ``cli_server._replacement_is_serving`` applying its listener check "only where
-    it can pass", and ``port_resolution._gateway_owns_port`` failing closed on the
-    path that sends the secret.
+    Fails CLOSED on every way of not knowing -- no record, no start identity (a
+    pod whose checkout predates the binding), or a host that will not report a
+    start time at all, which includes a Windows box with no implementation. An
+    unproven record must read as "no record", never as one that agrees.
     """
-    if not IS_POSIX or not listening_pid_tool_available():
+    record = run_marker.read_pid_record_path(_pod_pid_record_path(cfg, name, port))
+    if record is None:
+        return None
+    pid, recorded_start = record
+    if not recorded_start:
+        return None
+    live_start = run_marker.pid_start_token(pid)
+    if not live_start or live_start != recorded_start:
+        return None
+    return pid
+
+
+def _unproven_remedy(cfg: PodConfig, name: str, port: int) -> str:
+    """How to fix an unproven ownership verdict -- the two causes differ.
+
+    A record that is absent, malformed, or names a pid whose start identity no
+    longer matches is crash residue or a stale generation, and a restart writes a
+    fresh, provable one. A record that carries NO start identity is a different
+    failure with the opposite remedy: a pod's gateway is its checkout's own venv
+    binary, so a worktree branched before the start-identity sidecar existed
+    writes no token, and restarting it writes none either -- telling the operator
+    to restart would send them round a loop that cannot terminate.
+    """
+    record = run_marker.read_pid_record_path(_pod_pid_record_path(cfg, name, port))
+    if record is not None and not record[1]:
+        return (
+            f"The record names a pid but carries no start identity, and a restart "
+            f"cannot add one: a pod's gateway is its worktree's own venv binary, so "
+            f"this checkout predates the start-identity sidecar. Update that "
+            f"worktree to a build that writes one and re-provision it "
+            f"(`kirocrew pod provision {name}`), then `kirocrew pod down {name} && "
+            f"kirocrew pod up {name}`."
+        )
+    return (
+        f"A record left behind by a crash cannot attest, so restarting it is what "
+        f"re-establishes the proof: `kirocrew pod down {name} && "
+        f"kirocrew pod up {name}`."
+    )
+
+
+def port_owner(cfg: PodConfig, name: str, port: int) -> str:
+    """Attest who serves *port* for pod *name*.
+
+    The proof is agreement between two independent pod-owned facts: the gateway
+    PID sidecar in the pod's isolated ``0700`` home and the service manager's
+    current ``MainPID`` (or launchd PID). The pod unit is ``Type=simple`` and
+    execs the gateway in place, so that PID is the process that bound the port,
+    and the sidecar is written only AFTER that bind succeeds. A pod that lost
+    the bind race therefore has no agreeing record to offer.
+
+    That agreement is only worth anything because the record proves its own
+    freshness: :func:`_pod_recorded_pid` answers with a pid ONLY when the
+    process it names still has the start-time identity the record was written
+    with, so a sidecar left behind by a crash cannot attest once its pid has
+    been recycled. Without that binding the number alone could name somebody
+    else, which is the only reason listener attribution was ever load-bearing.
+
+    Listener attribution is CORROBORATION, not a precondition. Its view is
+    scoped to the 127.0.0.1 listener the HTTP client reaches, so a pid on the
+    port that is not ours is positive proof of a foreign responder and outranks
+    any record. But when the host has no usable listener evidence -- no lookup
+    tool, a lookup that failed, or a lookup that simply could not see the socket
+    -- a provably fresh PID-record/MainPID agreement is sufficient. That is the
+    normal supported path on a minimal Linux host, and on any host where the
+    caller cannot see another process's sockets (an unprivileged process asking
+    ``lsof`` about a gateway started by the user's service manager, which is
+    exactly how ``pod api`` runs). Requiring attribution there would withhold
+    the credential from every healthy pod forever.
+
+    Listener attribution is still never sufficient ON ITS OWN: a pid that holds
+    the port but has no fresh record behind it stays :data:`OWNER_UNPROVEN`.
+    """
+    if not IS_POSIX:
         return OWNER_UNPROVEN
+    try:
+        recorded = _pod_recorded_pid(cfg, name, port)
+        ours = main_pid(cfg, name)
+    except Exception:
+        return OWNER_UNPROVEN
+    attested = recorded is not None and ours is not None and recorded == ours
+    verdict = OWNER_POD if attested else OWNER_UNPROVEN
+
+    if not listening_pid_tool_available():
+        return verdict
     try:
         pids = set(loopback_owner_pids(find_port_listeners(port)))
     except Exception:
-        return OWNER_UNPROVEN
+        return verdict
     if not pids:
-        # Something answered HTTP but no LISTEN socket covering loopback is
-        # visible. The two observations disagree, so claim nothing.
-        return OWNER_UNPROVEN
-    try:
-        ours = main_pid(cfg, name)
-    except Exception:
-        # Could not ask the service manager — see the docstring.
-        return OWNER_UNPROVEN
-    return OWNER_POD if ours is not None and ours in pids else OWNER_FOREIGN
+        return verdict
+    if ours is None or ours not in pids:
+        return OWNER_FOREIGN
+    return verdict
 
 
 def _probe_health(port: int, timeout: int = 3) -> int:
@@ -1634,11 +1793,11 @@ def mint_token(cfg: PodConfig, name: str, ttl: str = "2h") -> str:
                 f"belong to whatever owns that port."
             )
         raise PodOwnershipUnproven(
-            f"withholding a credential for pod {name!r}: could not prove which "
-            f"process holds :{port} (no lsof/netstat on this host, or the service "
-            f"manager could not be asked), and this call would put the pod's own "
-            f"secret on the wire to whatever answered. Install lsof so ownership "
-            f"can be proven, or pin a free PORT= in {cfg.env_file(name)}."
+            f"withholding a credential for pod {name!r}: could not prove "
+            f"ownership of :{port} from the gateway pid record and the service "
+            f"manager's current MainPID, so this call cannot prove which "
+            f"process would receive the pod's secret. "
+            f"{_unproven_remedy(cfg, name, port)}"
         )
     url = f"http://127.0.0.1:{port}/api/token/local?ttl={urllib.parse.quote(str(ttl))}"
     req = urllib.request.Request(url, headers={"X-Local-Secret": secret})
@@ -1652,6 +1811,215 @@ def mint_token(cfg: PodConfig, name: str, ttl: str = "2h") -> str:
     if not token:
         raise PodError(f"gateway returned empty token on :{port} ({name})")
     return token
+
+
+# --------------------------------------------------------------------------- #
+# Authenticated API front door. The caller never handles the pod credential:
+# mint_token() proves ownership, then this module adds the query token expected
+# by dashboard.token_auth — and sends it over the pod's private unix socket, so
+# only the pod that owns the credential can ever receive it.
+# --------------------------------------------------------------------------- #
+API_METHODS: tuple[str, ...] = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE")
+API_READ_METHODS: tuple[str, ...] = ("GET", "HEAD")
+API_TIMEOUT_SECS = 30
+API_BODY_MAX_BYTES = 32 * 1024 * 1024
+
+
+def api_path(path: str) -> str:
+    """Return *path* as a rooted ``/api`` path without any credential.
+
+    Full URLs are accepted but their authority is discarded: every request is
+    still sent to the selected pod on loopback. A caller-supplied ``token`` query
+    parameter is refused before host access; the error never repeats its value or
+    the credential-bearing URL.
+    """
+    raw = path.strip()
+    try:
+        parts = urllib.parse.urlsplit(raw)
+    except ValueError as exc:
+        raise PodError("invalid request path (value withheld)") from exc
+    if parts.scheme or parts.netloc:
+        raw = urllib.parse.urlunsplit(("", "", parts.path, parts.query, ""))
+        try:
+            parts = urllib.parse.urlsplit(raw)
+        except ValueError as exc:  # defensive: the authority was already removed
+            raise PodError("invalid request path (value withheld)") from exc
+    try:
+        query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    except ValueError as exc:
+        raise PodError("invalid request query (value withheld)") from exc
+    if any(key == "token" for key, _value in query):
+        raise PodError(
+            "the request path carries a `token` query parameter; refusing to "
+            "forward or display it. `pod api` mints the pod credential itself — "
+            "remove that parameter and retry."
+        )
+    normalized = parts.path or "/"
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+    if normalized != "/api" and not normalized.startswith("/api/"):
+        normalized = "/api" + normalized
+    if parts.query:
+        normalized += "?" + parts.query
+    return normalized
+
+
+def _authenticated_url(port: int, path: str, token: str) -> str:
+    parts = urllib.parse.urlsplit(api_path(path))
+    query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    query.append(("token", token))
+    target = urllib.parse.urlunsplit(
+        parts._replace(query=urllib.parse.urlencode(query), fragment="")
+    )
+    return f"http://127.0.0.1:{port}{target}"
+
+
+def _read_capped(stream: object, method: str, path: str, name: str) -> str:
+    """Read and decode one response without buffering more than the hard cap."""
+    try:
+        chunk = stream.read(API_BODY_MAX_BYTES + 1)  # type: ignore[attr-defined]
+    except (OSError, http.client.HTTPException) as exc:
+        raise PodError(
+            f"{method} {api_path(path)} on pod {name!r}: the response body could "
+            f"not be read ({type(exc).__name__}).\n"
+            f"  Is it healthy? kirocrew pod status {name}\n"
+            f"  Its logs:      kirocrew pod logs {name}"
+        ) from exc
+    if len(chunk) > API_BODY_MAX_BYTES:
+        raise PodError(
+            f"{method} {api_path(path)} on pod {name!r} returned more than "
+            f"{API_BODY_MAX_BYTES} bytes; refusing to buffer it. Narrow the request."
+        )
+    return chunk.decode("utf-8", "replace")
+
+
+def _scrub_token_string(text: str, token: str) -> str:
+    """Remove printable encodings of *token* from one string."""
+    escaped = "".join(f"\\u{ord(char):04x}" for char in token)
+    forms = {
+        token,
+        urllib.parse.quote(token, safe=""),
+        urllib.parse.quote_plus(token, safe=""),
+        escaped,
+        escaped.upper().replace("\\U", "\\u"),
+    }
+    for form in sorted(forms, key=len, reverse=True):
+        if form:
+            text = text.replace(form, "<token>")
+    return text
+
+
+def _scrub_json_tokens(value: object, token: str) -> object:
+    """Recursively scrub every JSON string key and value."""
+    if isinstance(value, str):
+        return _scrub_token_string(value, token)
+    if isinstance(value, list):
+        return [_scrub_json_tokens(item, token) for item in value]
+    if isinstance(value, dict):
+        return {
+            _scrub_token_string(key, token): _scrub_json_tokens(item, token)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _scrub_token(text: str, token: str) -> str:
+    """Remove raw, encoded, and JSON-escaped forms of *token* from text."""
+    if not token:
+        return text
+    try:
+        parsed = json.loads(text)
+    except (ValueError, RecursionError):
+        return _scrub_token_string(text, token)
+    try:
+        scrubbed = _scrub_json_tokens(parsed, token)
+    except RecursionError:
+        return "<response omitted: JSON nesting exceeds scrubber limit>"
+    return json.dumps(scrubbed, ensure_ascii=False)
+
+
+def pod_api(
+    cfg: PodConfig,
+    name: str,
+    method: str,
+    path: str,
+    *,
+    data: str = "",
+    allow_write: bool = False,
+) -> tuple[int, str]:
+    """Make one authenticated request to pod *name* and return status/body.
+
+    The request is delivered over the pod's own dashboard unix socket and nowhere
+    else. Its port is not a transport here, only the ``Host`` the gateway sees:
+    the credential this function mints is valid as an ``mc_token_<port>`` cookie,
+    so delivering it on a fresh TCP connection would hand it to whatever holds
+    that port by then -- a pod that exits between the mint and the send leaves
+    the port free for any local user to bind. The socket cannot be answered by
+    another user, because it lives in the pod's owner-only home.
+    """
+    validate_name(name)
+    method = method.upper()
+    normalized = api_path(path)  # validation happens before any host access
+    if method not in API_METHODS:
+        raise PodError(f"unsupported method {method!r} (expected one of: {', '.join(API_METHODS)})")
+    if method not in API_READ_METHODS and not allow_write:
+        raise PodError(
+            f"refusing to send {method} to pod {name!r}: `pod api` permits only "
+            f"{', '.join(API_READ_METHODS)} unless --allow-write is passed.\n"
+            f"  Retry: kirocrew pod api {name} {method} {normalized} --allow-write"
+        )
+    if not is_active(cfg, name):
+        raise PodError(
+            f"pod {name!r} is not running, so there is nothing to call.\n"
+            f"  Start it:   kirocrew pod up {name}\n"
+            f"  What is up: kirocrew pod ls"
+        )
+    port = derive_port(cfg, name)
+    socket_path = pod_socket_path(cfg, name, port)
+    if not socket_path.exists():
+        # Refuse BEFORE minting: `mint_token` sends the pod's `.local_secret` to
+        # obtain a credential, so a request that cannot be delivered must not pay
+        # for one. Existence is checked only to produce this actionable message
+        # -- correctness does not rest on it, because the send below has no TCP
+        # path to fall back to if the file disappears in between.
+        raise PodError(
+            f"refusing to send {method} {normalized} to pod {name!r}: its private API "
+            f"socket is not there ({socket_path}).\n"
+            f"  `pod api` will not retry on 127.0.0.1:{port}. That port is ordinary "
+            f"loopback, so a process that is not this pod can hold it, and the "
+            f"credential this command mints would be sent to whatever answered.\n"
+            f"  Is it healthy? kirocrew pod status {name}\n"
+            f"  Its logs:      kirocrew pod logs {name}\n"
+            f"  Restart it:    kirocrew pod down {name} && kirocrew pod up {name}"
+        )
+    token = mint_token(cfg, name)
+    url = _authenticated_url(port, normalized, token)
+    body = data.encode("utf-8") if data else None
+    headers = {"Content-Type": "application/json"} if data else {}
+    request = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        # Over the pod's own unix socket, never TCP: `unix_socket_urlopen` has no
+        # TCP handler, so a dead or replaced listener cannot receive this token.
+        # Caller input contributes only the path, never the host or the socket.
+        with unix_socket_urlopen(  # nosemgrep
+            request, timeout=API_TIMEOUT_SECS, socket_path=socket_path
+        ) as response:
+            raw = _read_capped(response, method, normalized, name)
+            return response.status, _scrub_token(raw, token)
+    except urllib.error.HTTPError as exc:
+        raw = _read_capped(exc, method, normalized, name)
+        return exc.code, _scrub_token(raw, token)
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        # urllib may include request.full_url in exception text. Do not render
+        # exception values at all: the authenticated URL is credential-bearing.
+        raise PodError(
+            f"{method} {normalized} on pod {name!r} did not complete over its API "
+            f"socket ({socket_path}): {type(exc).__name__}.\n"
+            f"  Not retried on 127.0.0.1:{port} — the credential must not be sent "
+            f"to a process that is not this pod.\n"
+            f"  Is it healthy? kirocrew pod status {name}\n"
+            f"  Its logs:      kirocrew pod logs {name}"
+        ) from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -1694,6 +2062,32 @@ SEED_DISABLED_SECTIONS: tuple[str, ...] = (
 )
 
 
+def _force_seed_agent_security(data: dict) -> None:
+    """Keep a copied config from disabling the pod agent's isolation floor.
+
+    A fixture or explicit seed directory is data, not authority to unconfine the
+    agent that will inspect it. ``auto`` selects the platform backend and fails
+    closed when none exists; both opt-outs are reset so a copied live config
+    cannot turn that refusal into unsandboxed execution or suppress its warning.
+    Other agent settings survive for realistic fixtures.
+    """
+    if not isinstance(data.get("agent"), dict):
+        data["agent"] = {}
+    agent = data["agent"]
+    agent["sandbox"] = "auto"
+    agent["sandbox_allow_unsandboxed_exec"] = False
+    agent["sandbox_allow_no_isolation"] = False
+
+
+def _apply_seed_config_floor(data: dict) -> None:
+    """Disable self-activating sections and restore the agent sandbox floor."""
+    for section in SEED_DISABLED_SECTIONS:
+        if not isinstance(data.get(section), dict):
+            data[section] = {}
+        data[section]["enabled"] = False
+    _force_seed_agent_security(data)
+
+
 def sanitized_seed_config(seed_dir: Path) -> dict | None:
     """Read ``<seed_dir>/config.json`` and return it with ``enabled`` forced to
     False on every ``SEED_DISABLED_SECTIONS`` section, or None if it can't be
@@ -1717,14 +2111,204 @@ def sanitized_seed_config(seed_dir: Path) -> dict | None:
         return None
     if not isinstance(data, dict):
         return None
-    # Force OFF every self-activating section (SEED_DISABLED_SECTIONS carries the
-    # roster and the reasoning). Overwrite a non-dict section value too, so the
-    # enabled=False guarantee can't be skipped by a falsy value.
-    for section in SEED_DISABLED_SECTIONS:
-        if not isinstance(data.get(section), dict):
-            data[section] = {}
-        data[section]["enabled"] = False
+    _apply_seed_config_floor(data)
     return data
+
+
+def is_scenario_ref(value: str) -> bool:
+    """Return whether a seed value is a fixture name rather than a directory path."""
+    if not value or value.startswith(("~", ".")):
+        return False
+    if "/" in value or "\\" in value or os.sep in value:
+        return False
+    return True
+
+
+def resolve_seed_scenario(value: str) -> str:
+    """Validate that *value* names a shipped fixture."""
+    available = seed_mod.available_fixtures()
+    if value in available:
+        return value
+    listed = ", ".join(available) if available else "(none)"
+    raise PodError(
+        f"unknown seed scenario {value!r}. Available scenarios: {listed}.\n"
+        f"  To seed from a directory instead, pass a path: "
+        f"--seed ./{value} or --seed /abs/path/{value}"
+    )
+
+
+def _open_seed_regular_file(home_fd: int, name: str) -> int:
+    """Open seed metadata without letting a FIFO block before type validation."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(name, flags, dir_fd=home_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"seeded home entry {name!r} is not a regular file")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _prepare_seeded_home_fd(home_fd: int) -> None:
+    """Finish pod-owned setup without reopening the seeded home by name."""
+    try:
+        fd = _open_seed_regular_file(home_fd, "config.json")
+    except FileNotFoundError:
+        data: dict = {}
+    except OSError as exc:
+        raise PodError(f"could not open seeded config.json: {exc}") from exc
+    else:
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8", errors="strict") as handle:
+                fd = -1
+                text = handle.read(1024 * 1024 + 1)
+        except (OSError, UnicodeError) as exc:
+            raise PodError(f"could not read seeded config.json: {exc}") from exc
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        if len(text) > 1024 * 1024:
+            raise PodError("seeded config.json exceeds the 1 MiB pod setup limit")
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            raise PodError(f"seeded config.json is not valid JSON: {exc}") from exc
+        if not isinstance(data, dict):
+            raise PodError("seeded config.json must contain a JSON object")
+
+    _apply_seed_config_floor(data)
+    atomic_write_at(home_fd, "config.json", json.dumps(data, indent=2), fsync=True, mode=0o600)
+
+    try:
+        os.mkdir("workspace", 0o700, dir_fd=home_fd)
+    except FileExistsError:
+        pass
+    workspace_fd = os.open("workspace", pinned_fs.dir_flags(), dir_fd=home_fd)
+    os.close(workspace_fd)
+
+
+def _fixture_name_from_manifest_text(text: str) -> str:
+    """Read the one package-owned scalar used as the seed completion marker."""
+    for line in text.splitlines():
+        if not line.startswith("fixture-name:"):
+            continue
+        recorded = line.partition(":")[2].strip()
+        if len(recorded) >= 2 and recorded[0] == recorded[-1] and recorded[0] in "\"'":
+            recorded = recorded[1:-1]
+        return recorded
+    return ""
+
+
+def _seeded_scenario_from_fd(home_fd: int) -> str | None:
+    """Return the completion marker from a pinned pod-home descriptor."""
+    fd = -1
+    try:
+        fd = _open_seed_regular_file(home_fd, seed_mod.FIXTURE_MANIFEST)
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
+            fd = -1
+            return _fixture_name_from_manifest_text(handle.read(64 * 1024))
+    except OSError:
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def seed_home_from_scenario(cfg: PodConfig, name: str, scenario: str) -> bool:
+    """Populate pod *name* from *scenario* through a pinned home descriptor.
+
+    The final home is created/opened relative to a pinned pod-root descriptor and
+    every fixture entry is copied through that held directory. Nothing is
+    published by renaming a deterministic staging name, so swapping a path entry
+    cannot redirect writes into another pod. The fixture manifest is copied last
+    and remains the completion marker: a failed partial copy is refused on the
+    next ``up`` rather than treated as a completed seed.
+    """
+    home_dir = cfg.home_dir(name)
+    resolve_seed_scenario(scenario)
+
+    if not pinned_fs.supports_pinned_tree_walk():
+        raise PodError(
+            "this host cannot pin a fixture copy to directory descriptors; "
+            "refusing an unpinned pod seed"
+        )
+
+    try:
+        root_fd = pinned_fs.create_and_open_dir_pinned(
+            home_dir.parent,
+            what="pod root",
+            refusal=PodError,
+        )
+    except (OSError, PodError) as exc:
+        if isinstance(exc, PodError):
+            raise
+        raise PodError(f"could not inspect or prepare pod home {home_dir}: {exc}") from exc
+
+    home_fd = -1
+    try:
+        try:
+            os.mkdir(home_dir.name, 0o700, dir_fd=root_fd)
+        except FileExistsError:
+            pass
+        try:
+            home_fd = os.open(home_dir.name, pinned_fs.dir_flags(), dir_fd=root_fd)
+        except OSError as exc:
+            raise PodError(
+                f"pod home {home_dir} is not a plain directory; refusing to seed it: {exc}"
+            ) from exc
+        try:
+            entries = os.listdir(home_fd)
+            if entries:
+                recorded = _seeded_scenario_from_fd(home_fd)
+                if recorded != scenario:
+                    found = f"scenario {recorded!r}" if recorded else "no completion marker"
+                    raise PodError(
+                        f"pod home {home_dir} is populated but holds {found}, not "
+                        f"requested scenario {scenario!r}; refusing to boot or "
+                        "overwrite it. Run `kirocrew pod down "
+                        f"{name}` before retrying the seed."
+                    )
+                _prepare_seeded_home_fd(home_fd)
+                return False
+            seed_mod.copy_fixture_into_dir_fd(scenario, home_fd)
+            _prepare_seeded_home_fd(home_fd)
+            seed_mod.publish_fixture_manifest(scenario, home_fd)
+            held = os.fstat(home_fd)
+            named = os.stat(home_dir.name, dir_fd=root_fd, follow_symlinks=False)
+            if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+                raise PodError(
+                    f"pod home {home_dir} changed while it was being seeded; "
+                    "refusing to boot any path now present at that name"
+                )
+        except (SeedError, OSError) as exc:
+            raise PodError(
+                f"seeding pod {name!r} from scenario {scenario!r} failed: {exc}. "
+                f"A partial home may remain at {home_dir}; reclaim it with "
+                f"`kirocrew pod down {name}` before retrying."
+            ) from exc
+    finally:
+        if home_fd >= 0:
+            os.close(home_fd)
+        os.close(root_fd)
+    return True
+
+
+def seeded_scenario_in_home(cfg: PodConfig, name: str) -> str | None:
+    """Return the fixture name recorded in a seeded pod home, if present."""
+    home = cfg.home_dir(name)
+    try:
+        home_fd = pinned_fs.open_dir_pinned(
+            home,
+            what="seeded pod home",
+            refusal=PodError,
+        )
+    except (OSError, PodError):
+        return None
+    try:
+        return _seeded_scenario_from_fd(home_fd)
+    finally:
+        os.close(home_fd)
 
 
 def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> dict[str, str]:
@@ -1779,6 +2363,25 @@ def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> 
         # resolution behaviour. Placing it inside the pod HOME means `pod down`'s
         # teardown removes it with everything else.
         "KIROCREW_WORKSPACE": str(home_dir / "workspace"),
+        # Pin the bind address to the SAME loopback every pod-plane client dials.
+        # `health()` and `mint_token()` connect to `http://127.0.0.1:<port>`, and
+        # the ownership attestation vouches for
+        # "the process our sidecar names" — never for which ADDRESS that process
+        # bound. An inherited KIROCREW_BIND (the official image exports
+        # `0.0.0.0`; a user shell can carry `::1`) flows through the systemd
+        # --user manager env into the pod gateway, which reads it in
+        # dashboard/urls.py. On `::1` the gateway would serve the IPv6 loopback
+        # while 127.0.0.1:<port> stays free for a foreign local process to bind
+        # — a fresh, truthful attestation would then authorize a mint whose HTTP
+        # request lands on the foreigner. Pinning collapses the listener and the
+        # attestation onto one address; it also stops a stray `0.0.0.0` from
+        # exposing a pod beyond the host.
+        #
+        # `pod_api()` is deliberately NOT in that list: it spells the same URL,
+        # but only so the gateway's Host check sees what it would on TCP — the
+        # connection itself goes over the pod's unix socket, which no bind address
+        # can redirect. It needs no pin, and that is the point.
+        "KIROCREW_BIND": "127.0.0.1",
         # The pod's OWN venv leads PATH, ahead of cfg.gateway_path (which starts
         # with ~/.local/bin). Without this a bare `kirocrew` inside a pod — an
         # agent bash turn, a subprocess, `_kirocrew_bin()`'s "console-script on
@@ -2229,9 +2832,25 @@ def boot(cfg: PodConfig, name: str) -> int:
             f"(expected one of: {', '.join(sorted(CRONS_TRUE))}); scheduler stays off"
         )
 
-    # Write the pod's isolated, tunnel-disabled config with owner-only perms.
-    # Creates the HOME (0o700) too. Never copies DB/sessions/crons.
-    write_pod_config(home_dir, seed)
+    # A named scenario owns the whole home and must land before the create-only
+    # config writer. Directory seeds keep their existing config-only behavior.
+    scenario = seed if is_scenario_ref(seed) else ""
+    if scenario:
+        try:
+            fresh = seed_home_from_scenario(cfg, name, scenario)
+        except PodError as exc:
+            print(f"FATAL: {exc}")
+            return 3
+        print(
+            f"kirocrew-pod: seeded home from scenario {scenario!r}"
+            if fresh
+            else f"kirocrew-pod: home already populated — scenario {scenario!r} not re-applied"
+        )
+    if not scenario:
+        # Named scenarios finish config/workspace setup through the pinned home
+        # descriptor before their completion marker is published. Directory
+        # seeds keep the existing config-only path.
+        write_pod_config(home_dir, seed)
 
     print(f"kirocrew-pod: name={name} port={port} home={home_dir} checkout={checkout}")
 

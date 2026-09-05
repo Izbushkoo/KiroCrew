@@ -21,7 +21,7 @@
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ArrowLeft, Clock, ExternalLink, Pencil, UserPlus, Users, Webhook, X } from 'lucide-react'
+import { ArrowLeft, Circle, Clock, ExternalLink, Pencil, UserPlus, Users, Webhook } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
 import { useTranslation } from 'react-i18next'
 import { api, type MemberActivityEntry, type MemberRosterRow, type WebhookTokenEntry } from '../../api/client'
@@ -32,14 +32,19 @@ import { useAppDispatch, useAppSelector } from '../../store'
 import { markSlotRead } from '../../store/dashboardSlice'
 import CrewAvatar from '../../components/CrewAvatar'
 import ChatPane from '../../components/ChatPane'
+import DetailPanel from '../../components/DetailPanel'
 import ErrorBoundary from '../../components/ErrorBoundary'
+import { useIsMobile } from '../../hooks/useIsMobile'
 import { SearchInput } from '../../components/ui'
 import { AnimatePresence, motion } from 'framer-motion'
 import { sidePanelDockMotion } from '../chat/sidePanelMount'
+import { CHAT_PANE_MIN_W } from '../chat/SidePanel'
 import ResizeHandle from '../../components/ResizeHandle'
 import { useColumnResize } from '../../hooks/useColumnResize'
 import { loadColumnWidth } from '../../lib/columnWidth'
 import { compareText } from '../../i18n/format'
+import { tabStatus, type TabStatus } from '../../lib/sessionTabs'
+import { lastActivityEpoch } from '../chat/sessionOrder'
 
 /** The crew manager surface — the ONLY write path for member configuration.
  *  The explicit tab wins over CapabilitiesPage's remembered last tab. */
@@ -50,8 +55,34 @@ const ROSTER_MIN = 200
 const ROSTER_MAX = 420
 const ROSTER_DEFAULT = 264
 const ROSTER_WIDTH_KEY = 'mc-members-roster-width'
-/** Punctuation, not prose: joins an activity label to its project name. */
+/** Detail drawer width bounds. The default matches the pre-DetailPanel fixed
+ *  300px so the migration changes capability (drag-to-resize), not the resting
+ *  look. Width persists under its own key, independent of the roster's. */
+const DRAWER_MIN = 240
+const DRAWER_DEFAULT = 300
+const DRAWER_WIDTH_KEY = 'mc-members-drawer-width'
+/** Space DetailPanel must keep clear for its left-side siblings when dragged
+ *  wide: the live roster width is added at the call site. The thread minimum
+ *  is chat's own CHAT_PANE_MIN_W (the members thread IS a ChatPane), plus this
+ *  page's three inter-column gap-2s (24px), so one constant owns the
+ *  usable-pane floor and a future change there carries over. */
+const THREAD_MIN_RESERVE = CHAT_PANE_MIN_W + 24
+/** Punctuation, not prose: joins an activity label to its project name, and a
+ *  driving row's title to its status word in the hover title. */
 const PROJECT_SEPARATOR = ' \u00b7 '
+/** Driving-sessions rows shown before the list folds behind "Show all". */
+const DRIVING_VISIBLE = 5
+/** How each shared tab status renders on a driving row. The ORDER lives in
+ *  `tabStatus` (lib/sessionTabs.ts) — this only maps its verdict to a dot
+ *  class, an i18n label, and whether the label is spoken aloud in the row.
+ *  `unread` cannot occur here (no unread set is passed) and reads as idle. */
+const DRIVING_STATUS: Record<TabStatus, { cls: string; text: string; label: string; spoken: boolean }> = {
+  permission: { cls: 'fill-warn text-warn', text: 'text-warn', label: 'pages.chatSidebar.needs_approval', spoken: true },
+  question: { cls: 'fill-info text-info', text: 'text-info', label: 'pages.chatSidebar.needs_your_answer', spoken: true },
+  running: { cls: 'fill-ok text-ok', text: 'text-ok', label: 'pages.membersPage.drawer_working', spoken: false },
+  unread: { cls: 'fill-muted text-muted', text: 'text-muted', label: 'pages.membersPage.driving_idle', spoken: false },
+  idle: { cls: 'fill-muted text-muted', text: 'text-muted', label: 'pages.membersPage.driving_idle', spoken: false },
+}
 // Module-level so the resize hook's memoised resolver isn't invalidated every render.
 const loadRosterWidth = () => loadColumnWidth(ROSTER_WIDTH_KEY, ROSTER_MIN, ROSTER_MAX, ROSTER_DEFAULT)
 
@@ -89,6 +120,12 @@ export default function MembersPage() {
   // Live presence rides the already-subscribed WS `slots` frames — the roster
   // endpoint only fills the cold-start gap (its `running` is a snapshot).
   const liveSlots = useAppSelector((s) => s.dashboard.slots)
+  // Whether a real slots snapshot has arrived. Before it, an empty `slots` is
+  // ambiguous (the store itself refuses to treat a pre-first-frame empty frame
+  // as authoritative), so the driving-sessions block must not assert "not
+  // driving" on a cold open or a WS reconnect — it shows a skeleton instead,
+  // the same three-state discipline the Recent-activity section keeps.
+  const slotsLoaded = useAppSelector((s) => s.dashboard.slotsLoaded)
   const liveRunning = useMemo(() => {
     const byKey: Record<string, boolean> = {}
     for (const s of liveSlots) if (s.mode === 'member') byKey[s.key] = !!s.running
@@ -132,6 +169,10 @@ export default function MembersPage() {
   // The chat side panel's right-dock mount preset — module-pure, so one
   // constant serves every render.
   const drawerMotion = sidePanelDockMotion('right')
+  // Drives the drawer's two shells: fixed overlay + dock motion below md,
+  // DetailPanel's own docked width animation on md+ (same breakpoint as the
+  // width-gated drawerOpen initializer above).
+  const isMobile = useIsMobile()
   const sortedMembers = useMemo(() => {
     const ordered = [...members].sort(
       (a, b) =>
@@ -142,6 +183,31 @@ export default function MembersPage() {
   }, [members, filter])
   const activeSlot = active ? slots[active.name] ?? '' : ''
   const activeError = active ? errors[active.name] ?? '' : ''
+
+  // Sessions this member is driving: every live slot whose `created_by` is the
+  // member's DM slot key. A member dispatches its real work into worker
+  // sessions it opens via session_create and steers via session_send, and the
+  // backend fences a member caller to the slots it created — so "created by"
+  // IS "driven by", and the durable birth attribution is the whole source of
+  // truth (no transcript scraping for the `[sent by session …]` prefix). Rides
+  // the already-subscribed WS `slots` frames, which is also what gives each row
+  // its live status — the same running / needs-approval / needs-input signals
+  // the sidebar dot reads. Newest activity first; a closed worker leaves the
+  // live slots and therefore this list, which is the honest reading of
+  // "driving right now".
+  const activeMemberKey = activeSlot || active?.slot_key || ''
+  const drivingSessions = useMemo(() => {
+    if (!activeMemberKey) return []
+    return liveSlots
+      .filter((s) => !!s.created_by && s.created_by === activeMemberKey)
+      .sort((a, b) => lastActivityEpoch(b) - lastActivityEpoch(a))
+  }, [liveSlots, activeMemberKey])
+  // Collapsed past DRIVING_VISIBLE rows. Keyed to the member: the fold is a
+  // reading position in ONE member's list, so switching members starts the
+  // next list folded rather than inheriting the previous member's expansion.
+  const [drivingExpandedFor, setDrivingExpandedFor] = useState('')
+  const drivingExpanded = drivingExpandedFor === activeMemberKey
+  const visibleDriving = drivingExpanded ? drivingSessions : drivingSessions.slice(0, DRIVING_VISIBLE)
 
   // Recent-activity pointers for the drawer, fetched when it opens for a
   // member and cached for the page's lifetime. Keyed by the exact member
@@ -325,7 +391,15 @@ export default function MembersPage() {
   )
 
   return (
-    <div className="flex h-full min-h-0 gap-2 p-2" data-testid="members-page">
+    // pb-2 on the root is the one shared bottom inset: the card columns and
+    // the detail drawer all end 8px above the window edge (the chat SidePanel's
+    // mb-2). No right padding here — the drawer docks FLUSH to the window's
+    // right edge; the card columns' pr-2 lives on the inner wrapper below. The
+    // drawer must stay a DIRECT child of this row: DetailPanel measures its
+    // parent to cap the drag width against roster + thread.
+    <div className="flex h-full min-h-0 pb-2" data-testid="members-page">
+      {/* Card columns (roster + thread) keep the page's original insets. */}
+      <div className="flex flex-1 min-w-0 gap-2 pr-2">
       {/* Member list. Below md the page is single-pane: the roster IS the
           page until a member is picked, then the thread takes over and the
           header's back button returns here. Two fixed rails (264+300px)
@@ -408,7 +482,12 @@ export default function MembersPage() {
                 aria-current={m.name === activeName ? 'true' : undefined}
               >
                 <span className="relative shrink-0">
-                  <CrewAvatar seed={m.name} size={36} />
+                  <CrewAvatar
+                    seed={m.name}
+                    avatar={m.avatar}
+                    size={36}
+                    working={isRunning(m) ? 'subtle' : undefined}
+                  />
                   {/* Presence dot renders only while the member is working —
                       an idle member shows nothing rather than a gray dot,
                       which read as a broken/disabled state. */}
@@ -484,7 +563,12 @@ export default function MembersPage() {
               >
                 <ArrowLeft size={16} className="lucide-inline" />
               </button>
-              <CrewAvatar seed={active.name} size={30} />
+              <CrewAvatar
+                seed={active.name}
+                avatar={active.avatar}
+                size={30}
+                working={isRunning(active) ? 'full' : undefined}
+              />
               <div className="min-w-0 flex-1">
                 <div className="text-[13.5px] font-semibold truncate">{active.name}</div>
               </div>
@@ -534,60 +618,37 @@ export default function MembersPage() {
           </>
         )}
       </section>
+      </div>
 
       {/* Detail drawer — read-only observation; writes live in the crew manager.
-          Below md it overlays the thread instead of claiming 300px of row
-          width, and it starts closed there (the width-gated useState above).
-          Mount/unmount reuses the chat page's side-panel motion preset
-          (sidePanelDockMotion + the same 0.18s ease), so the two right panels
-          open with one gesture AND one animation. On mobile the aside is
-          position:fixed (out of flow), so the width tween is inert there and
-          only the opacity fade applies — acceptable, not a defect. */}
+          The shell is the shared DetailPanel wearing the chat SidePanel's
+          frame: a left-rounded card docked FLUSH to the window's right edge,
+          top/bottom/left borders, an 8px bottom inset, and an elevated header
+          band — so the two right panels read as one family. Same
+          header idiom (close + identity + title), same body padding, and the
+          same drag-to-resize handle with a persisted width. On md+
+          DetailPanel's own width spring is the one mount animation. Below md
+          the drawer overlays the thread instead of claiming row width (and
+          starts closed there — the width-gated useState above); that branch
+          keeps the side-panel dock motion on a fixed-position wrapper, where
+          drag-resize is moot because the overlay spans a fixed 300px. */}
       <AnimatePresence>
-        {active && drawerOpen && (
-          <motion.div
-            key="member-drawer-motion"
-            initial={drawerMotion.initial}
-            animate={drawerMotion.animate}
-            exit={drawerMotion.exit}
-            transition={{ duration: 0.18, ease: [0.2, 0, 0, 1] }}
-            className="h-full overflow-visible flex justify-end md:shrink-0"
-          >
-            <aside
-              id="member-drawer"
-              className="fixed top-safe bottom-safe right-safe z-40 w-[300px] max-w-full bg-bg-elevated border-l border-border p-4 overflow-y-auto md:static md:z-auto md:shrink-0 md:border md:rounded-xl md:shadow-sm"
-              data-testid="member-drawer"
-              aria-label={t('pages.membersPage.details')}
-            >
-          {/* Member header — who this drawer is about, mirroring the detail
-              mock: avatar, name, and a live status line (working now, or the
-              last time anything happened on the thread). */}
-          <div className="flex items-center gap-3 mb-3">
-            <CrewAvatar seed={active.name} size={40} />
-            <div className="min-w-0 flex-1">
-              <div className="text-sm font-semibold truncate">{active.name}</div>
-              <div className="text-[11px] truncate" data-testid="member-drawer-status">
-                {isRunning(active) ? (
-                  <span className="text-ok">{t('pages.membersPage.drawer_working')}</span>
-                ) : active.last_active_ts ? (
-                  <span className="text-muted">{timeAgo(active.last_active_ts)}</span>
-                ) : (
-                  <span className="text-muted">{'\u00a0'}</span>
-                )}
-              </div>
-            </div>
-            {/* Drawer-local close, MOBILE ONLY: below md the overlay covers
-                the header's toggle, so without this the drawer cannot be
-                closed there. On md+ the header toggle is the one close
-                gesture, same as the chat page's side panel. */}
-            <button
-              onClick={() => setDrawerOpen(false)}
-              className="md:hidden inline-flex items-center p-1 -mr-1 rounded hover:bg-accent/40"
-              aria-label={t('app.close')}
-              data-testid="member-drawer-close"
-            >
-              <X size={14} className="lucide-inline" />
-            </button>
+        {active && drawerOpen && (() => {
+          const body = (
+            /* Keeps the old aside's id: the roster header's Details toggle
+               points here via aria-controls. */
+            <div id="member-drawer" data-testid="member-drawer" aria-label={t('pages.membersPage.details')}>
+          {/* Live status line — working now, or the last time anything
+              happened on the thread. Identity (avatar + name) moved into the
+              DetailPanel header, so the body opens with the status alone. */}
+          <div className="text-[11px] truncate mb-3" data-testid="member-drawer-status">
+            {isRunning(active) ? (
+              <span className="text-ok">{t('pages.membersPage.drawer_working')}</span>
+            ) : active.last_active_ts ? (
+              <span className="text-muted">{timeAgo(active.last_active_ts)}</span>
+            ) : (
+              <span className="text-muted">{'\u00a0'}</span>
+            )}
           </div>
           {/* Honest counters only — both derive from the recorded activity
               log. Semantic stats the backend cannot attest (PRs, triages,
@@ -606,6 +667,80 @@ export default function MembersPage() {
               <div className="text-[11px] text-muted">{t('pages.membersPage.stat_week')}</div>
             </div>
           </div>
+          {/* Sessions this member is driving — the worker sessions it opened
+              and steers. Live rows off the WS slots frames (see the
+              drivingSessions memo); each row is a jump into that session.
+              The status dot is the sidebar's vocabulary: approval (warn) >
+              needs input (info) > running (ok) > idle (muted). */}
+          <div className="text-[11px] font-semibold tracking-wide text-muted mb-1.5">
+            {t('pages.membersPage.driving_sessions')}
+          </div>
+          {drivingSessions.length === 0 && !slotsLoaded ? (
+            <div className="mb-4 space-y-1.5" data-testid="member-driving-loading" aria-hidden>
+              <div className="h-3 rounded bg-accent/40 animate-pulse" />
+              <div className="h-3 w-3/4 rounded bg-accent/40 animate-pulse" />
+            </div>
+          ) : drivingSessions.length === 0 ? (
+            <div className="text-[11px] text-muted mb-4" data-testid="member-driving-empty">
+              {t('pages.membersPage.driving_none')}
+            </div>
+          ) : (
+            <div className="mb-4">
+              <ul className="list-none m-0 p-0 space-y-0.5" data-testid="member-driving-sessions">
+                {visibleDriving.map((s) => {
+                  // Precedence is the shared tab-status contract (approval and
+                  // question outrank running); no unread set here, so the
+                  // fourth state is plain idle.
+                  const kind = tabStatus(s, [], s.key)
+                  const status = DRIVING_STATUS[kind]
+                  const label = t(status.label)
+                  // Slot timestamps are ISO strings; timeAgo wants epoch seconds.
+                  const activityTs = lastActivityEpoch(s)
+                  const title = s.title || s.key
+                  return (
+                    <li key={s.key}>
+                      <button
+                        type="button"
+                        onClick={() => navigate(`/chat?sid=${encodeURIComponent(s.key)}`)}
+                        className="w-full text-left flex items-center gap-2 text-[11px] px-1.5 py-1 -mx-1.5 rounded hover:bg-accent/40"
+                        title={title + PROJECT_SEPARATOR + label}
+                        data-testid="member-driving-row"
+                        data-status={kind}
+                      >
+                        <Circle size={8} className={`shrink-0 ${status.cls}`} aria-hidden />
+                        <span className="min-w-0 truncate flex-1">{title}</span>
+                        {/* The two states parked on the user get words, not
+                            just a colour — the sidebar's own idiom for the
+                            same signals; running/idle stay dot-only (the
+                            label is in the hover title and for AT). */}
+                        {status.spoken ? (
+                          <span className={`shrink-0 font-medium ${status.text}`}>{label}</span>
+                        ) : (
+                          <span className="sr-only">{label}</span>
+                        )}
+                        {activityTs > 0 && (
+                          <span className="text-muted shrink-0 whitespace-nowrap">{timeAgo(activityTs)}</span>
+                        )}
+                      </button>
+                    </li>
+                  )
+                })}
+              </ul>
+              {drivingSessions.length > DRIVING_VISIBLE && (
+                <button
+                  type="button"
+                  onClick={() => setDrivingExpandedFor(drivingExpanded ? '' : activeMemberKey)}
+                  className="mt-1 text-[11px] text-muted hover:text-text"
+                  aria-expanded={drivingExpanded}
+                  data-testid="member-driving-toggle"
+                >
+                  {drivingExpanded
+                    ? t('pages.membersPage.driving_show_less')
+                    : t('pages.membersPage.driving_show_all', { count: drivingSessions.length })}
+                </button>
+              )}
+            </div>
+          )}
           <div className="text-[11px] font-semibold tracking-wide text-muted mb-1.5">
             {t('pages.membersPage.recent_activity')}
           </div>
@@ -730,9 +865,54 @@ export default function MembersPage() {
             <Pencil size={12} className="lucide-inline" />
             {t('pages.membersPage.edit_in_crew_manager')}
           </button>
-        </aside>
-          </motion.div>
-        )}
+            </div>
+          )
+          const panelProps = {
+            icon: <CrewAvatar seed={active.name} avatar={active.avatar} size={22} />,
+            title: active.name,
+            onClose: () => setDrawerOpen(false),
+            initialWidth: DRAWER_DEFAULT,
+            minWidth: DRAWER_MIN,
+            storageKey: DRAWER_WIDTH_KEY,
+          }
+          return isMobile ? (
+            <motion.div
+              key="member-drawer-motion"
+              initial={drawerMotion.initial}
+              animate={drawerMotion.animate}
+              exit={drawerMotion.exit}
+              transition={{ duration: 0.18, ease: [0.2, 0, 0, 1] }}
+              className="fixed top-safe bottom-safe right-safe z-40 w-[300px] max-w-full bg-bg-elevated border-l border-border"
+            >
+              {/* `embedded`: fill the fixed wrapper AND drop the resize
+                  handle — the overlay spans a fixed 300px, and a live handle
+                  here would persist a mobile-clamped width over the user's
+                  chosen desktop width. Edge chrome (left border, elevated bg)
+                  lives on the wrapper above. */}
+              <DetailPanel {...panelProps} embedded>
+                {body}
+              </DetailPanel>
+            </motion.div>
+          ) : (
+            /* The frame is the chat SidePanel's exact recipe (SidePanel.tsx
+               root + strip): left-rounded card with top/bottom/left borders,
+               flush against the window's right edge, 8px bottom inset, and an
+               elevated header band that carries the top-left corner; the 8px
+               bottom inset comes from the page root's pb-2. reserveWidth keeps
+               the live roster width plus a usable thread minimum clear, so
+               dragging the panel wide can never collapse the DM thread to zero
+               (same contract as ChatPage's panelReserve). */
+            <DetailPanel
+              key="member-drawer-panel"
+              {...panelProps}
+              reserveWidth={roster.width + THREAD_MIN_RESERVE}
+              frameClassName="border-l border-t border-b border-border rounded-l-xl bg-bg"
+              headerClassName="border-border bg-bg-elevated rounded-tl-xl"
+            >
+              {body}
+            </DetailPanel>
+          )
+        })()}
       </AnimatePresence>
     </div>
   )

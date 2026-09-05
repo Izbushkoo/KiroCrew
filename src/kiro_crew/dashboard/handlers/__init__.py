@@ -76,6 +76,8 @@ from kiro_crew.dashboard.handlers.agents import (  # noqa: E402, F401
     api_config_schema,
     api_default_agent,
     api_effort_levels,
+    api_kirocrew_agent_avatar_get,
+    api_kirocrew_agent_avatar_upload,
     api_kirocrew_agent_delete,
     api_kirocrew_agent_resolved_model,
     api_kirocrew_agent_update,
@@ -92,7 +94,9 @@ from kiro_crew.dashboard.handlers.connections import (  # noqa: E402, F401
     api_connections_disconnect,
     api_connections_mint,
     api_connections_mint_state,
+    api_connections_premint,
     api_connections_status,
+    api_connections_test,
     api_mcp_oauth_relay,
 )
 from kiro_crew.dashboard.handlers.cron import (  # noqa: E402, F401
@@ -110,6 +114,7 @@ from kiro_crew.dashboard.handlers.cron import (  # noqa: E402, F401
     api_cron_history_detail,
     api_cron_run,
     api_cron_script_source,
+    api_cron_secret_grant,
     api_cron_to_chat,
     api_cron_update,
     api_crons,
@@ -186,6 +191,7 @@ from kiro_crew.dashboard.handlers.hooks import (  # noqa: E402, F401
 from kiro_crew.dashboard.handlers.kiro_prerequisite import (  # noqa: E402, F401
     api_kiro_prerequisite_repair_specs,
     api_kiro_prerequisite_status,
+    api_kiro_prerequisite_update_cli,
 )
 from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
     _bg_mcp_probe,
@@ -299,6 +305,7 @@ from kiro_crew.dashboard.handlers.messaging import (  # noqa: E402, F401
     api_spawn_retry,
     api_spawn_status,
     api_spawn_steer,
+    api_spawn_stop_all,
     api_teams_activity,
     api_teams_config_get,
     api_teams_config_save,
@@ -316,6 +323,7 @@ from kiro_crew.dashboard.handlers.prompts import (  # noqa: E402, F401
     _redact_prompt,
     api_prompt_detail,
     api_prompts,
+    api_prompts_create,
     api_skill_detail,
     api_skill_file,
     api_skill_inject_on_trigger,
@@ -362,6 +370,7 @@ from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
     api_session_archive_read,
     api_session_delete,
     api_session_detail,
+    api_session_directive,
     api_session_keepalive,
     api_session_tool_policy,
     api_sessions,
@@ -517,6 +526,13 @@ _prompt_cache: list[dict[str, Any]] | None = None
 _prompt_cache_ts: float = 0
 
 
+def _invalidate_prompt_cache() -> None:
+    """Drop the prompt-list cache so the next ``/api/prompts`` read reflects a
+    write immediately instead of after the TTL expires."""
+    global _prompt_cache  # noqa: PLW0603
+    _prompt_cache = None
+
+
 def _list_aim_prompts() -> list[dict[str, Any]]:
     """Discover agent SOPs from edition-contributed prompt roots and user prompts.
 
@@ -640,6 +656,7 @@ from kiro_crew.dashboard.handlers.core import (  # noqa: E402, F401
     api_session_agents_list,
     api_shutdown,
     api_stt_config,
+    api_stt_ffmpeg_download,
     api_stt_prepare,
     api_stt_prewarm,
     api_stt_status,
@@ -647,6 +664,7 @@ from kiro_crew.dashboard.handlers.core import (  # noqa: E402, F401
     api_theme_boot,
     api_theme_config,
     api_token_local,
+    api_version,
     index,
     logo,
     pwa_file,

@@ -13,7 +13,7 @@ test collected from any testpath, because what they protect is the
 developer's machine rather than the correctness of one suite. Everything that is
 merely suite-specific isolation stays in ``test/conftest.py``.
 
-The floor has seven parts, and each one exists because the "remember to isolate
+The floor has eight parts, and each one exists because the "remember to isolate
 this" contract failed at least once:
 
 * **Services.** ``$XDG_CONFIG_HOME`` is redirected and the stdlib spawn funnels
@@ -29,6 +29,14 @@ this" contract failed at least once:
   ``JIRA_TOKEN_<HEX>`` keys are restored after every test, so a fabricated
   ``.env`` cannot silently override the next test's credentials in the same
   worker.
+* **The inherited shell environment.** The entries ``name_grant`` refuses as
+  inherited preloads are removed for each test's duration and restored
+  afterwards: the ``_ENV_PRELOAD_VARS`` names (``BASH_ENV``, ``ENV``, ...) and
+  exported bash functions (``BASH_FUNC_*`` keys, or the legacy bare-name
+  spelling whose value starts with ``() {``). RHEL-family hosts export ``which``
+  as a function from ``/etc/profile.d/which2.sh``, and that refusal is checked
+  before every narrower code, so 79 of 163 name-grant tests observed the wrong
+  refusal on those hosts while Ubuntu CI stayed green (issue #8395).
 * **The agent-spec home.** ``kiro_agents_dir()`` is a LAZY resolver, so neither of
   the two above reaches it, and a test that reaches the spec write path rewrites
   the machine-wide ``<kiro home>/agents/kirocrew.json`` -- the file that decides
@@ -470,11 +478,41 @@ def _isolate_sandbox_mount_source_roots(_sandbox_mount_source_root, monkeypatch)
     # ``_mount_pinned_source_names`` itself; ``TestMountPinnedSourceNames``
     # imports the function by name at module import, so the parser's own unit
     # tests are unaffected by this module-attribute patch.
+    _SANDBOX_SWEEP_ORIGINALS.setdefault(
+        "_mount_pinned_source_names", sandbox_mod._mount_pinned_source_names
+    )
     monkeypatch.setattr(
         sandbox_mod,
         "_mount_pinned_source_names",
-        lambda proc_root="/proc": (set(), False),
+        lambda proc_root="/proc", **_kw: (set(), False),
     )
+    # Third half, same floor, for the LEGACY (pre-prefix ``tmp*``) sweep. It
+    # resolves its own narrower root chain -- the launcher's two tmpfs roots,
+    # deliberately excluding the redirected system tempdir -- so without this it
+    # would scan the developer's real /run/user/$UID and /dev/shm, and there it
+    # matches names no Kiro Crew build has created since #6268: an unpinned test
+    # could delete a stranger's temp entry on the host. The bind scan is
+    # defaulted fail-closed for the same reason as the pin scan above: a test
+    # that forgets to fix its answer gets an INERT sweep (coverage unproven ->
+    # removes nothing, stamps nothing) rather than one reading host /proc.
+    _SANDBOX_SWEEP_ORIGINALS.setdefault("_launcher_tmpfs_roots", sandbox_mod._launcher_tmpfs_roots)
+    monkeypatch.setattr(
+        sandbox_mod,
+        "_launcher_tmpfs_roots",
+        lambda: [str(_sandbox_mount_source_root)],
+    )
+    _SANDBOX_SWEEP_ORIGINALS.setdefault(
+        "_bound_source_basenames", sandbox_mod._bound_source_basenames
+    )
+
+    def _unproven_bound_sources(proc_root="/proc", *, coverage=None, **_kw):
+        # Fail closed on BOTH claims the legacy gate accepts, so no test can
+        # reach the developer's real runtime tmpfs through it.
+        if coverage is not None:
+            coverage.covered = False
+        return (set(), False)
+
+    monkeypatch.setattr(sandbox_mod, "_bound_source_basenames", _unproven_bound_sources)
 
 
 @pytest.fixture(autouse=True)
@@ -559,6 +597,82 @@ def _no_credential_env_residue():
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = before[key]
+
+
+@pytest.fixture(autouse=True)
+def _scrub_inherited_preload_env(monkeypatch):
+    """Hide the entries ``name_grant`` refuses as inherited preloads, then restore them.
+
+    RHEL-family distributions (Amazon Linux 2023, RHEL, CentOS Stream, Fedora) ship
+    ``/etc/profile.d/which2.sh``, which exports ``which`` as a shell function -- so
+    ``BASH_FUNC_which%%`` sits in ``os.environ`` of any login shell before pytest even
+    starts. ``name_grant._inherited_preload()`` fires its AMBIGUOUS_ENV refusal on
+    exactly that shape, and that refusal is checked before every narrower code, so on
+    such a host 79 of the 163 tests in ``test/test_name_grant.py`` observed
+    ``inherited_env_can_redefine_programs`` instead of the code they assert, while
+    Ubuntu CI (no ``which2.sh``) stayed green (issue #8395). The detector's OTHER half
+    is host state just as easily: a login profile exporting ``BASH_ENV``, or a
+    container image setting ``ENV``, reproduces the same failure shape with no
+    ``which2.sh`` anywhere. The PRODUCT behaviour is correct -- an inherited preload
+    genuinely can redefine a program the agent runs -- the gap was that this floor
+    pins the data home, the credential env and the temp base, but not the environment
+    the run inherited.
+
+    The predicate is IMPORTED from ``name_grant`` rather than restated, so the scrub
+    and the detector cannot drift apart, and it mirrors BOTH halves the detector
+    checks: the ``_ENV_PRELOAD_VARS`` names (matched truthy, exactly as the detector's
+    ``os.environ.get(var)`` reads them -- an empty value triggers no refusal and is
+    left alone), and the exported-function pair (the ``BASH_FUNC_`` key prefix, plus
+    the legacy bare-name spelling whose value starts with ``() {``). It is also
+    deliberately no WIDER than that predicate: this is not a general "no exported
+    functions" floor -- how wide the detector should be is ``name_grant``'s design
+    question, and the scrub merely mirrors its answer. The import is deliberately
+    UNGUARDED, like ``_no_credential_env_residue``'s: an ImportError escape hatch
+    would disarm the scrub silently on a broken checkout and hand back the exact
+    79-failure pattern this fixture exists to remove, as a wall of wrong refusal
+    codes instead of one clear error.
+
+    The removals are recorded on the test's shared ``monkeypatch`` instance rather
+    than hand-rolled, and that is load-bearing, not convenience. Same-scope autouse
+    fixtures are ordered so that OTHER monkeypatch users run first (alphabetically in
+    practice), so a hand-rolled save/restore here tears down BEFORE monkeypatch's
+    undo -- and for a test that ``monkeypatch.setenv``-overrides the SAME key the
+    host inherited (recorded "was absent", because this scrub had removed it), the
+    undo then deletes the inherited value the hand-rolled restore had just put back,
+    leaking the removal out of the test. On one shared undo stack the nesting is
+    correct BY CONSTRUCTION: the test's later record is undone first (its delete
+    tolerates the key already being gone), then this fixture's ``delenv`` record
+    restores the inherited value. ``test_name_grant.py::TestInheritedHostEnvironment``
+    pins exactly that same-key case, and
+    ``test_host_isolation_floor.py::TestInheritedShellEnvironmentIsScrubbed`` drives
+    one real cycle of this fixture directly.
+
+    The deliberate AMBIGUOUS_ENV tests lose nothing: they construct their entries
+    inside the test body, after the scrub. The teardown sweep below is the
+    ``_no_credential_env_residue`` half of the contract: a matching entry still
+    present at teardown is either a raw ``os.environ`` write (no undo record --
+    swept here, stays gone) or a monkeypatch-managed one (its undo re-deletes
+    tolerantly or restores what it recorded), so nothing this fixture scrubbed and
+    nothing a test leaked survives past the test on this worker.
+    """
+    from kiro_crew.name_grant import (
+        _BASH_FUNC_KEY_PREFIX,
+        _BASH_FUNC_VALUE_PREFIX,
+        _ENV_PRELOAD_VARS,
+    )
+
+    def _is_inherited_preload(key: str, value: str) -> bool:
+        if key in _ENV_PRELOAD_VARS:
+            return bool(value)
+        return key.startswith(_BASH_FUNC_KEY_PREFIX) or value.startswith(_BASH_FUNC_VALUE_PREFIX)
+
+    for key in [k for k, v in os.environ.items() if _is_inherited_preload(k, v)]:
+        monkeypatch.delenv(key)
+    try:
+        yield
+    finally:
+        for key in [k for k, v in os.environ.items() if _is_inherited_preload(k, v)]:
+            os.environ.pop(key, None)
 
 
 @pytest.fixture(autouse=True)
@@ -2526,3 +2640,151 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         "cwd=<a directory under tmp_path> to the spawn, and scope any assertion "
         "about the file to where that child actually ran."
     )
+
+
+# ── Check-run annotations that name the failing test (issue #7296) ──────────
+#
+# A red shard is read from its check run's ANNOTATIONS, not from the log: that
+# is what the PR page shows, what a fork contributor sees, and all that survives
+# in a triage report. Nothing in this repo wrote one, so the annotations came
+# from the `python` problem matcher that `actions/setup-python` registers by
+# default, whose pattern is a traceback frame (`File "...", line N, in f`)
+# followed by `raise SomeError('msg')`.
+#
+# MEASURED on the six Backend Tests jobs cited in #7296: that pattern matched
+# pytest's WARNINGS SUMMARY every time and a pytest failure not once. All six
+# reds were annotated only `Event loop is closed` at line 545 -- which is
+# `asyncio/base_events.py:545` inside `_check_closed`, reached from a
+# `PytestUnraisableExceptionWarning` about a garbage-collected coroutine, i.e. a
+# WARNING. The reds themselves were ordinary named failures (a `git add`
+# timeout, a missing diag.jsonl, sandbox-dependent project tests) and appeared
+# in no annotation at all. Four unrelated PRs were triaged as an event-loop
+# teardown flake on the strength of that, and the class had been "fixed" four
+# times before.
+#
+# Replacing the matcher with a better matcher is not the fix. `--color=yes` is
+# in the addopts, so the summary line a matcher would have to scrape reads
+# `\x1b[31mFAILED\x1b[0m test/x.py::\x1b[1mtest_y\x1b[0m - AssertionError: ...`
+# with escape sequences INSIDE the node id. The report objects already carry the
+# path, the line and the node id as data, so the annotation is emitted from them
+# here and nothing is parsed back out of rendered output.
+
+#: Failures that get their own annotation before the rest are only counted.
+#: GitHub keeps a bounded number per check run and drops the excess with no
+#: notice, so past this point the annotation list stops being something anyone
+#: reads and the short test summary in the log is the better artifact.
+_MAX_ANNOTATED_FAILURES = 10
+
+#: Annotation messages are cut to this many characters. A full assertion diff is
+#: a page long, does not fit the check-run UI, and is already in the log.
+_MAX_ANNOTATION_CHARS = 400
+
+
+def _gha_escape(value: str, *, is_property: bool) -> str:
+    """Escape *value* for a GitHub Actions workflow command.
+
+    The runner splits a command on ``,`` and on ``::``, and every pytest node id
+    contains ``::`` -- unescaped, the annotation is truncated at the first one
+    and names the FILE instead of the test, which is most of the defect this
+    exists to fix. Property values need the two structural characters escaped on
+    top of the data set, per the workflow-commands spec.
+    """
+    escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    if is_property:
+        escaped = escaped.replace(":", "%3A").replace(",", "%2C")
+    return escaped
+
+
+def _report_location(report: object) -> tuple[str, int | None]:
+    """Repository-relative path and 1-based line for *report*, best effort.
+
+    ``report.location`` is a ``(path, lineno, domain)`` triple whose line is
+    0-BASED, while an annotation line is 1-based. A collection error carries no
+    line at all, and a guessed one points the reader at the wrong statement, so
+    ``None`` means "omit ``line=``" rather than "line 1".
+    """
+    location = getattr(report, "location", None) or ()
+    path = location[0] if len(location) >= 1 and isinstance(location[0], str) else ""
+    if not path:
+        path = str(getattr(report, "fspath", "") or "")
+    raw_line = location[1] if len(location) >= 2 else None
+    line = raw_line + 1 if isinstance(raw_line, int) and raw_line >= 0 else None
+    return path, line
+
+
+def _cut(reason: str) -> str:
+    """*reason* trimmed to :data:`_MAX_ANNOTATION_CHARS`."""
+    reason = reason.strip()
+    if len(reason) > _MAX_ANNOTATION_CHARS:
+        return reason[: _MAX_ANNOTATION_CHARS - 3] + "..."
+    return reason
+
+
+def _failure_reason(report: object) -> str:
+    """One-line reason for *report*, cut to :data:`_MAX_ANNOTATION_CHARS`.
+
+    Prefers the line pytest marks with ``E`` in the first column, which is the
+    error itself. ``longrepr.reprcrash.message`` looks like the obvious source
+    and is right for an assertion, but for a FIXTURE error it is the preamble --
+    MEASURED, an annotation built from it reads ``file <path>, line 5`` and
+    spends its whole width saying nothing, while the ``E`` line two rows down
+    says ``fixture 'x' not found``. Source lines in the same block are indented,
+    so anchoring at column 0 does not mistake a statement for the verdict.
+
+    ``reprcrash`` is the fallback, then the first rendered line; a report with
+    none of the three still gets an annotation, because the node id was the part
+    that was missing.
+    """
+    rendered = str(getattr(report, "longreprtext", "") or "")
+    for raw in rendered.splitlines():
+        if raw.startswith("E ") and raw[1:].strip():
+            return _cut(raw[1:])
+    crash = getattr(getattr(report, "longrepr", None), "reprcrash", None)
+    reason = str(getattr(crash, "message", "") or "")
+    if not reason.strip():
+        reason = rendered
+    lines = [line for line in reason.strip().splitlines() if line.strip()]
+    if not lines:
+        return "no failure detail in the report"
+    return _cut(lines[0])
+
+
+def pytest_terminal_summary(
+    terminalreporter: object, exitstatus: int, config: pytest.Config
+) -> None:
+    """Emit one ``::error`` annotation per failing test. See the note above.
+
+    Controller-only: under xdist a worker's reports are sent back and counted
+    here, so annotating from the worker too would double every line. Gated on
+    ``GITHUB_ACTIONS`` because outside Actions these lines are noise nothing
+    interprets, and a green run writes nothing at all.
+    """
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    if hasattr(config, "workerinput"):  # pragma: no cover - xdist worker
+        return
+    stats = getattr(terminalreporter, "stats", None) or {}
+    reports = [report for key in ("failed", "error") for report in stats.get(key, [])]
+    if not reports:
+        return
+    write = getattr(terminalreporter, "write_line", None)
+    if write is None:  # pragma: no cover - no terminal reporter (e.g. -p no:terminal)
+        return
+    for report in reports[:_MAX_ANNOTATED_FAILURES]:
+        nodeid = str(getattr(report, "nodeid", "") or "") or "<unknown test>"
+        path, line = _report_location(report)
+        properties = []
+        if path:
+            properties.append(f"file={_gha_escape(path, is_property=True)}")
+        if line is not None:
+            properties.append(f"line={line}")
+        properties.append(f"title={_gha_escape(nodeid, is_property=True)}")
+        message = _gha_escape(f"{nodeid} - {_failure_reason(report)}", is_property=False)
+        write(f"::error {','.join(properties)}::{message}")
+    hidden = len(reports) - _MAX_ANNOTATED_FAILURES
+    if hidden > 0:
+        write(
+            f"::notice::{len(reports)} tests failed or errored on this job; the first "
+            f"{_MAX_ANNOTATED_FAILURES} are annotated. The remaining {hidden} are in "
+            "this job's short test summary."
+        )

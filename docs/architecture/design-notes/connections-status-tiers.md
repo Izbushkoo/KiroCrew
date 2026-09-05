@@ -34,11 +34,19 @@ is a statement about kiro-cli's local artifacts, and those artifacts outlive a
 revocation performed AT THE PROVIDER: the tokenless reachability probe answers
 `needs_auth` either way, so a remotely-revoked grant keeps its Connected badge
 until the runtime actually fails a call (or the artifacts are removed locally).
-This is the honest ceiling of local facts — falsifying it would require a
-token-bearing liveness call, which belongs to the warm-runtime seam this slice
-deliberately does not build (kiro-cli owns token custody; Kiro Crew never
-holds a credential to probe with). The inverse direction — a grant present but
-the badge stale-downgraded — self-heals within one 30-second poll.
+The inverse direction — a grant present but the badge stale-downgraded —
+self-heals within one 30-second poll.
+
+The explicit **Test** action is the opt-in liveness check and does not change the
+badge's polling contract. Owner-only `POST /api/connections/test` starts a
+promptless kiro-cli ACP session, so bearer injection stays inside kiro-cli. Its
+native `/mcp` result establishes whether the provider initialized and completed
+`tools/list`; native `/tools` then identifies which of that provider's tools the
+active agent actually exposes. It returns `usable`, `no_tools`, or `failed` with
+a stable `code` and `toolCount`, always as HTTP 200. Invalid request and owner
+denials retain their existing non-2xx machine-coded JSON contracts. The action
+never calls a provider tool, never reads grant bytes, and does not alter mint,
+warm-process, or OAuth-guard state.
 
 Status vocabulary, all judged from local facts:
 
@@ -60,10 +68,21 @@ existing contract exactly: the POST reserves a row and returns
 `{ok, slug, state, token}`, the GET is the card's authoritative feed for a
 card-initiated mint (`idle|minting|waiting|granted|failed|expired`, with
 `oauth_url` only while `waiting`), and the frontend keeps polling it at its own
-cadence. The status endpoint is **additive** and never mints: it observes the
-mint table to distinguish `awaiting_consent` from `not_connected`, and that is
-the whole of its relationship to minting. Approval-URL ownership stays with the
-mint engine.
+cadence. Approval-URL ownership stays with the mint engine.
+
+A cold mint whose URL is rejected by `oauth_url_contains_credential` disposes
+that dedicated process, protected PID, and ephemeral spec, then creates one
+fresh dedicated attempt with a new provider OAuth state. The retry keeps the
+caller's row token, so the initiating tab continues to own the result. A second
+rejection is terminal and surfaces the existing `failed` / `mint_url_rejected`
+state; no other failure class retries. Warm URLs pass the same credential gate
+before they become adoptable. A rejected warm claim is released, so a later
+Connect follows the cold path and reaches this single retry owner rather than
+carrying a second policy in the warm engine or dashboard handler.
+
+The status endpoint is **additive** and never mints: it observes the mint table
+to distinguish `awaiting_consent` from `not_connected`, and that is the whole of
+its relationship to minting.
 
 ## connectedSince is source-backed
 
@@ -157,17 +176,53 @@ gateway failure never surfaces as a Cancel that appeared not to work.
 ## Mint outcome telemetry
 
 Every `connections_oauth_mint` audit event records the facts of its route
-directly: `reason=already_granted` when a live grant was re-verified without
-spawning, and `url_minted=<bool>` on a completed spawn — `True` when the
-dedicated kiro-cli spawn produced an approval URL, `False` when it found no
-challenge (an open endpoint, or a grant that landed concurrently). The route a
-Connect took is derivable from those fields; no separate label is emitted. A
-latency-tier vocabulary belongs to the warm-runtime seam (a URL already held; an
-activation on a shared warm process) and ships with that seam, where its routes
-exist as code and its consumers exist as dashboards.
+directly: `reason=validated_grant` when an on-disk grant was re-verified and
+proven usable without spawning a fresh consent flow, and `url_minted=<bool>` on
+a completed spawn — `True` when the dedicated kiro-cli spawn produced an
+approval URL, `False` when it found no challenge (an open endpoint, or a grant
+that landed concurrently). The route a Connect took is derivable from those
+fields; no separate label is emitted. A latency-tier vocabulary belongs to the
+warm-runtime seam (a URL already held; an activation on a shared warm process)
+and ships with that seam, where its routes exist as code and its consumers
+exist as dashboards.
 
 Note that `Provider.tier` in the registry (1–3) is provider *categorization* and
 is unrelated to mint latency.
+
+## A grant on disk is not a grant that works
+
+`grant_observed` (the artifact-pair stat both this module and `mint.py` share)
+answers "does the pair exist", never "does it still work". The pair survives a
+provider-side revoke and a dead refresh token exactly as it survives a live
+one, because nothing in that stat asks kiro-cli to actually use it. Reporting a
+mint `granted` on presence alone let a Connect click on an already-configured
+provider flip the card to Connected instantly, only for the explicit Test
+action's real authenticated check to reveal the pair was already dead and the
+card to fall back to "not authorized" — a lie the card told for however long it
+took the user to notice.
+
+So a Connect or Reconnect mint that finds an existing artifact pair no longer
+reports `granted` on that alone. It spawns the identical single-server
+ephemeral session a fresh mint would spawn, and asks kiro-cli's own `/mcp` +
+`/tools` — the same promptless, model-free command pair the Test button already
+uses, classified through the same predicate (`tool_test._classify`) so both
+surfaces agree on what "usable" means. A `usable` verdict reports `granted`
+with `reason=validated_grant`; anything else — `no_tools`, `failed`, a spawn
+that never completes — falls through to the ordinary fresh-mint spawn loop
+below rather than returning early. That fallthrough is deliberate: the
+validation spawn already proved the existing pair does not answer, so the next
+thing Connect should do is exactly what a user clicking it expects — open a
+real consent page — rather than surface a coarse error for a mint the button
+was never asked to abandon.
+
+**This validation is a mint-time decision, never a poll-time one.** The
+30-second status poll (`collect_connection_statuses`) still answers from the
+cheap artifact stat alone, because that badge only has to be *eventually*
+honest and a per-poll authenticated spawn would turn an idle dashboard tab into
+a standing cost with no click behind it. Validation runs exactly once, at the
+moment a Connect or Reconnect click asks the mint to decide whether a URL is
+needed — the one place the cost is bounded by a real user action and the one
+place the answer changes what the click actually does.
 
 ## Runtime baseline
 

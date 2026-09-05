@@ -63,6 +63,19 @@ describe('AwsConsentGate', () => {
     await waitFor(() => expect(onConsentChange).toHaveBeenCalled())
   })
 
+  it('does not invalidate the Polly catalogue for another AWS service', async () => {
+    vi.mocked(api.awsConsent).mockResolvedValue(
+      status({ service: 's3', serviceLabel: 'Amazon S3' }),
+    )
+    const { queryClient } = renderWithProviders(<AwsConsentGate service="s3" />)
+    queryClient.setQueryData(['voiceVoices'], { voices: [{ id: 'Ruth' }] })
+
+    fireEvent.click(await screen.findByRole('button', { name: /confirm and enable/i }))
+    await waitFor(() => expect(api.grantAwsConsent).toHaveBeenCalledWith('s3', expect.any(Object)))
+
+    expect(queryClient.getQueryState(['voiceVoices'])?.isInvalidated).toBe(false)
+  })
+
   it('shows the service, region, credential source and account before confirming', async () => {
     vi.mocked(api.awsConsent).mockResolvedValue(status())
     renderWithProviders(<AwsConsentGate service="polly" />)
@@ -165,5 +178,47 @@ describe('AwsConsentGate', () => {
     renderWithProviders(<AwsConsentGate service="polly" />)
 
     expect(await screen.findByText('(provider default)')).toBeTruthy()
+  })
+
+  it('a failed status read renders a notice instead of nothing', async () => {
+    // Rendering null here made a broken gate look like a gate with nothing to
+    // ask, on the surface that decides whether a paid service may bill.
+    vi.mocked(api.awsConsent).mockRejectedValue(new Error('consent store unreadable'))
+    renderWithProviders(<AwsConsentGate service="polly" />)
+
+    const notice = await screen.findByTestId('aws-consent-polly-error')
+    expect(notice).toHaveTextContent('consent store unreadable')
+    // Off by default: the gate cannot know whether its host holds a draft.
+    expect(screen.queryByRole('button', { name: /ask the agent/i })).toBeNull()
+  })
+
+  it('a failed status read offers a retry that re-reads the status', async () => {
+    // With the grant/withdraw controls gone this notice is the card's only
+    // surface, so the retry lives on the card itself rather than on the host.
+    vi.mocked(api.awsConsent)
+      .mockRejectedValueOnce(new Error('consent store unreadable'))
+      .mockResolvedValue(status())
+    renderWithProviders(<AwsConsentGate service="polly" />)
+
+    await screen.findByTestId('aws-consent-polly-error')
+    fireEvent.click(screen.getByTestId('aws-consent-polly-error-retry'))
+
+    await waitFor(() => expect(api.awsConsent).toHaveBeenCalledTimes(2))
+    // The second read succeeded: the ask replaces the notice.
+    expect(await screen.findByRole('button', { name: /confirm and enable/i })).toBeTruthy()
+    expect(screen.queryByTestId('aws-consent-polly-error')).toBeNull()
+  })
+
+  it('a refused confirmation is said under the card, with the hand-off when the host opts in', async () => {
+    vi.mocked(api.awsConsent).mockResolvedValue(status())
+    vi.mocked(api.grantAwsConsent).mockRejectedValue(new Error('account mismatch'))
+    renderWithProviders(<AwsConsentGate service="polly" askAgent />)
+
+    fireEvent.click(await screen.findByRole('button', { name: /confirm and enable/i }))
+    const notice = await screen.findByTestId('aws-consent-polly-write-error')
+    expect(notice).toHaveTextContent('account mismatch')
+    expect(screen.getByRole('button', { name: /ask the agent/i })).toBeTruthy()
+    // The ask is still there: nothing was recorded.
+    expect(screen.getByRole('button', { name: /confirm and enable/i })).toBeTruthy()
   })
 })

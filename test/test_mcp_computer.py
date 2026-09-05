@@ -49,7 +49,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from kiro_crew import mcp_computer
+from kiro_crew import mcp_computer, mcp_core
 from kiro_crew.computer_use import backend as cu_backend
 from kiro_crew.computer_use import index as cu_index
 from kiro_crew.computer_use import policy as cu_policy
@@ -409,7 +409,7 @@ def test_oversized_text_is_rejected():
 
 
 def test_shim_uses_the_strict_session_resolver_not_the_lenient_one():
-    """``_resolve_session_key_strict`` only.
+    """Strict identity only, routed through the shared reflexive-tool gate.
 
     The lenient resolver walks ``/proc`` ancestors over ``session_pid_<pid>.txt``,
     which ``mcp_core`` itself documents as "agent-writable and therefore
@@ -417,6 +417,7 @@ def test_shim_uses_the_strict_session_resolver_not_the_lenient_one():
     over the module's source so a future edit cannot quietly swap the resolver.
     """
     src = inspect.getsource(mcp_computer)
+    assert "require_strict_session_key" in src
     assert "_resolve_session_key_strict" in src
     # The lenient name must not appear as a CALL. (It is a prefix of the strict
     # name, so compare call forms rather than substrings.)
@@ -434,10 +435,11 @@ def test_an_unresolved_session_key_PROCEEDS_with_an_empty_identity(
 
     * the unattended-surface rule was removed by product decision, so there is no
       longer a surface class to protect;
-    * neither accepted identity source EXISTS for a GUI-launched kiro-cli on macOS.
-      ``KIROCREW_SESSION_KEY`` is injected only by the ACP spawn path and
-      ``KIROCREW_HOST_PID`` only by the Linux sandbox launcher — so the refusal made
-      the feature unusable on its only supported platform, which is how it was found.
+    * neither accepted identity source EXISTS for a GUI-launched kiro-cli on macOS —
+      both come from a launcher above the process, and a GUI launch has none (the
+      ``mcp_computer`` module docstring names which launcher supplies each) — so the
+      refusal made the feature unusable on its only supported platform, which is how
+      it was found.
 
     The call reaches the gateway. What is lost is audit ATTRIBUTION, not a control —
     and the key it carries is a per-PROCESS placeholder rather than the empty string,
@@ -445,7 +447,7 @@ def test_an_unresolved_session_key_PROCEEDS_with_an_empty_identity(
     """
     _enable(keystone)
     posted: list[Any] = []
-    monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: "")
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "")
     monkeypatch.setattr(mcp_computer, "_invoke", lambda *a, **k: posted.append(a) or {"text": "ok"})
     result = mcp_computer._call_tool_inner(TOOL_LIST_APPS, {})
     assert not result.startswith(ERROR_PREFIX), result
@@ -480,7 +482,7 @@ def test_resolved_session_key_is_forwarded_in_body_and_header(
         seen.update({"session_key": session_key, "name": name, "args": args})
         return {"text": "App=…"}
 
-    monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: _SESSION)
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: _SESSION)
     monkeypatch.setattr(mcp_computer, "_invoke", _invoke)
     assert mcp_computer._call_tool_inner(TOOL_LIST_APPS, {}) == "App=…"
     assert seen["session_key"] == _SESSION
@@ -496,7 +498,7 @@ def test_non_latin1_session_key_is_refused_with_an_actionable_message(
     surface as a raw ``UnicodeEncodeError`` instead of "rename the tab".
     """
     _enable(keystone)
-    monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: "dashboard:tab—1")
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:tab—1")
     monkeypatch.setattr(mcp_computer, "_invoke", lambda *a, **k: {"text": "ok"})
     result = mcp_computer._call_tool_inner(TOOL_LIST_APPS, {})
     assert result.startswith(ERROR_PREFIX)
@@ -540,7 +542,7 @@ def test_transport_failure_is_reported_as_an_actionable_error(
 ):
     """An unreachable gateway must be diagnosable, not an opaque internal error."""
     _enable(keystone)
-    monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: _SESSION)
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: _SESSION)
     monkeypatch.setattr(
         mcp_computer,
         "_invoke",
@@ -560,7 +562,7 @@ def test_gateway_refusal_text_is_relayed_verbatim(keystone: Path, monkeypatch: p
     """
     _enable(keystone)
     refusal = f"{ERROR_PREFIX}Blocked by governance policy: capability disabled"
-    monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: _SESSION)
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: _SESSION)
     monkeypatch.setattr(mcp_computer, "_invoke", lambda *a, **k: {"text": refusal})
     assert mcp_computer._call_tool_inner(TOOL_CLICK, {}) == refusal
 
@@ -570,7 +572,7 @@ def test_empty_gateway_body_is_an_error_not_a_silent_success(
 ):
     """A body with neither text nor error must not read as success."""
     _enable(keystone)
-    monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: _SESSION)
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: _SESSION)
     monkeypatch.setattr(mcp_computer, "_invoke", lambda *a, **k: {})
     result = mcp_computer._call_tool_inner(TOOL_LIST_APPS, {})
     assert result.startswith(ERROR_PREFIX)
@@ -1932,6 +1934,18 @@ class TestTheSkillContractMatchesTheRuntime:
 
     _SPEC = Path(__file__).resolve().parents[1] / "docs/system-specs/modules/computer-use.md"
 
+    def test_the_spec_names_every_screenshot_spool_writer(self):
+        """The security contract must cover every place that persists pixels."""
+        text = self._SPEC.read_text(encoding="utf-8")
+        writers = {
+            "service._persist_image",
+            "capture_macos.persist_jpeg",
+            "capture_windows.persist_jpeg",
+        }
+        missing = {writer for writer in writers if writer not in text}
+        assert not missing, missing
+        assert "invocation-owned partial frame" in text
+
     def test_the_skill_does_not_advertise_an_optional_element_index(self):
         text = self._SKILL.read_text(encoding="utf-8")
         assert "element_index?" not in text
@@ -2153,7 +2167,7 @@ class TestUnresolvedSessionsAreNamespaced:
         set_current_caller(None)
         set_current_tenant_nonce("cafebabe")
 
-        assert mcp_computer._resolve_session_key_strict() == ""
+        assert mcp_core._resolve_session_key_strict() == ""
         assert mcp_computer._unresolved_session_key().startswith(
             mcp_computer.UNRESOLVED_SESSION_PREFIX
         )
@@ -2168,7 +2182,7 @@ class TestUnresolvedSessionsAreNamespaced:
         set_current_caller(CallerContext(session_key="dashboard:main"))
         set_current_tenant_nonce("cafebabe")
         try:
-            assert mcp_computer._resolve_session_key_strict() == "dashboard:main"
+            assert mcp_core._resolve_session_key_strict() == "dashboard:main"
         finally:
             set_current_caller(None)
 
@@ -2206,23 +2220,12 @@ class TestUnresolvedSessionsAreNamespaced:
         attribution the strict resolver exists to provide."""
         _enable(keystone)
         posted: list[Any] = []
-        monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: "dashboard:main")
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:main")
         monkeypatch.setattr(
             mcp_computer, "_invoke", lambda *a, **k: posted.append(a) or {"text": "ok"}
         )
         mcp_computer._call_tool_inner(TOOL_LIST_APPS, {})
         assert posted and posted[0][0] == "dashboard:main"
-
-    def test_the_fix_added_no_refusal(self):
-        """The constraint this had to be solved under, asserted directly.
-
-        The obvious fix — and the one prescribed — is ``if not key: refuse``. That
-        line is why the feature did not work on macOS at all, so it must not return
-        under a different justification.
-        """
-        src = inspect.getsource(mcp_computer)
-        assert "could not be identified" not in src
-        assert "ERR_NO_SESSION" not in src
 
 
 class TestTheDriftWalkHonoursTheSnapshotBudget:

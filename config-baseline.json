@@ -25,6 +25,7 @@
         "mcp_registry_mode": false,
         "mcp_quarantine_after_failures": 3,
         "acp_backend": "",
+        "member_acp_backend": "kas",
         "default_agent": "",
         "sweep_agents_backups": false,
         "sandbox": "auto",
@@ -55,7 +56,7 @@
         "chat_turn_timeout_secs": 7200,
         "session_start_timeout_secs": 90,
         "tool_approval_timeout_secs": 600,
-        "session_control": false,
+        "session_control": true,
         "subagent_cost_gb": 0.5,
         "subagent_cpu_cost_cores": 1.0,
         "subagent_auto_max": 32,
@@ -271,6 +272,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
+    },
+    {
+      "path": "agent.member_acp_backend",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Crew member ACP backend",
+      "help": "Backend for crew-member DM sessions: 'kas' (default) or 'claude'. Members dispatch work into worker sessions through session-control tools mounted per session over the wire, which the kiro-cli v2 backend cannot carry — a value resolving to kiro leaves member threads as plain chat (no dispatch tools), logged at session start.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": "kas"
     },
     {
       "path": "agent.default_agent",
@@ -757,10 +772,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Session Control",
-      "help": "Let one chat session open a new session, and stop or read another session of yours. No session writes into another session's conversation: reading returns a transcript tail, stopping cancels an in-flight turn, and a created session starts empty for you to type into. Off by default: the three tools ride on a server you may already have assigned for other work, so reaching another session waits for you to grant it here rather than arriving with an upgrade. Sessions can only reach peers in the same workspace; incognito, app-scoped and scheduled sessions are never addressable.",
+      "help": "Let one chat session open a new session, and stop, read or send to another session of yours. Reading returns a transcript tail, stopping cancels an in-flight turn, a created session starts empty for you to type into, and a send runs text as the target's next turn. On by default, because the grant that decides who can do this is the agent config: the tools come from the kirocrew-dashboard MCP server, so an agent that does not mount it never has them, exactly like any other MCP server. Turn this off to withdraw the capability from every agent at once without editing each spec. Sessions can only reach peers in the same workspace; incognito, app-scoped and scheduled sessions are never addressable, and a crew member or a scheduled run reaches only sessions it created itself.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": false
+      "defaultValue": true
     },
     {
       "path": "agent.subagent_cost_gb",
@@ -1407,6 +1422,8 @@
         "embedding_provider": "llama_cpp",
         "embedding_dim": 1024,
         "embedding_threads": 4,
+        "embedding_bulk_threads": 1,
+        "embedding_bulk_duty": 0.2,
         "embed_model_url": "",
         "embed_model_path": "",
         "embed_model_id": "",
@@ -1464,6 +1481,34 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 4
+    },
+    {
+      "path": "memory.embedding_bulk_threads",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Embedding Threads (bulk)",
+      "help": "CPU threads for BACKGROUND corpus embedding — the re-embed sweep that gives imported memories semantic reach, plus imports and consolidation — as opposed to a query you are waiting on. Defaults to 1: nothing waits on this work (those rows are keyword-searchable meanwhile), so it is tuned to stay invisible rather than finish early. Raise it to get through a large backlog sooner; interactive search keeps its own pool either way. 0 means inherit Embedding Threads. Clamped to the machine's core count.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 1
+    },
+    {
+      "path": "memory.embedding_bulk_duty",
+      "kind": "core",
+      "type": "number",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Embedding Duty Cycle (bulk)",
+      "help": "Fraction of wall time a background embedding sweep targets for computing. At the default 0.2 it idles four times as long as it works, so a sweep over a freshly imported memory costs about a fifth of one core instead of several — the same total work, spread thin enough that fans never react. The sweep resumes across restarts, so it need not finish in one session. A target rather than a ceiling: one unusually slow row is capped at a 30-second pause and so runs hotter than the configured share. 1.0 runs flat out. Clamped to [0.05, 1.0]; a sweep a user explicitly starts from Settings is never paced.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 0.2
     },
     {
       "path": "memory.embed_model_url",
@@ -1686,18 +1731,13 @@
         "embed_content_budget": 0,
         "pool_idle_ttl_secs": 300,
         "auto_add_documents": false,
-        "auto_register_project_docs": false,
-        "auto_ingest_chunk_budget": 150,
         "folder_ingest_chunk_budget": 300,
         "dedup_every_n_sweeps": 12,
         "doc_ingest_hosts": [],
         "sweep_chunk_budget": 500,
-        "max_sources": 50,
         "embed_rate_limit": 120,
         "extraction_model": "",
-        "extraction_pool_size": 3,
-        "auto_discover_folder": false,
-        "auto_discover_dirname": "knowledge-docs"
+        "extraction_pool_size": 3
       }
     },
     {
@@ -1818,34 +1858,6 @@
       "defaultValue": false
     },
     {
-      "path": "knowledge.auto_register_project_docs",
-      "kind": "core",
-      "type": "boolean",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "Auto-Register Project Documents",
-      "help": "Register the documents of each project you work in as a Knowledge source automatically, so a project's design docs, specs and READMEs become searchable without adding the folder by hand. Only documents are taken (.md/.pdf/.docx/.org above a small size floor, excluding agent instructions, generated files and repository boilerplate) -- never source code. There is no confirmation step once enabled: the document filter and the per-sweep chunk budget below bound the cost, and deleting the source keeps it deleted. Off by default, because registering a repository is a decision to spend extraction calls on it -- turning this on opts in every project you open.",
-      "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": false
-    },
-    {
-      "path": "knowledge.auto_ingest_chunk_budget",
-      "kind": "core",
-      "type": "integer",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "Auto-Ingest Chunk Budget",
-      "help": "Chunks an automatically-registered source may ingest per watcher sweep. Each chunk costs one LLM extraction call, so this is what actually bounds the cost of auto-registration -- file filters bound pollution, not spend. Newest documents land first and the rest trickle in on later sweeps, so a new project never arrives as a burst. 0 removes the bound.",
-      "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": 150
-    },
-    {
       "path": "knowledge.folder_ingest_chunk_budget",
       "kind": "core",
       "type": "integer",
@@ -1916,20 +1928,6 @@
       "defaultValue": 500
     },
     {
-      "path": "knowledge.max_sources",
-      "kind": "core",
-      "type": "integer",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "Max Sources",
-      "help": "Maximum number of Knowledge sources that may be registered. Prevents unbounded auto-discovery from registering hundreds of sources when many projects are open. Registration attempts past the cap are skipped (auto) or rejected (manual). 0 removes the bound.",
-      "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": 50
-    },
-    {
       "path": "knowledge.embed_rate_limit",
       "kind": "core",
       "type": "integer",
@@ -1970,34 +1968,6 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 3
-    },
-    {
-      "path": "knowledge.auto_discover_folder",
-      "kind": "core",
-      "type": "boolean",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "Auto-Discover Documents Folder",
-      "help": "Watch for a documents folder inside the active workspace and register it as a Knowledge source automatically, so files dropped there become searchable without adding the source by hand. The folder is never created for you: its absence means you have not opted in, and it is picked up within one watcher sweep of being created -- no restart needed. Off by default because ingestion spends LLM extraction on every supported file in the folder.",
-      "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": false
-    },
-    {
-      "path": "knowledge.auto_discover_dirname",
-      "kind": "core",
-      "type": "string",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "Documents Folder Name",
-      "help": "Name of the folder inside the workspace that auto-discovery looks for. A single path segment -- separators and traversal are rejected so the source cannot be redirected outside the workspace. Avoid 'knowledge': that is where the Library's own SQLite store lives and it always exists, which would defeat discovery.",
-      "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": "knowledge-docs"
     },
     {
       "path": "skills",
@@ -2460,7 +2430,7 @@
       "sensitive": true,
       "tags": [],
       "label": "OTLP Endpoint",
-      "help": "Opt-in OpenTelemetry OTLP/HTTP metrics endpoint (e.g. http://localhost:4318/v1/metrics). EMPTY = no network egress (default). When set, aggregated metrics are ALSO pushed to this collector in addition to the local JSONL sink; requires the kirocrew[otlp] package extra to be installed (rec #1: OTLP opt-in only, no egress by default).",
+      "help": "Opt-in OpenTelemetry OTLP/HTTP metrics endpoint (e.g. http://localhost:4318/v1/metrics). EMPTY = no network egress (default). When set, aggregated metrics are ALSO pushed to this collector in addition to the local JSONL sink; requires the OTLP exporter from the otlp package extra to be installed (rec #1: OTLP opt-in only, no egress by default).",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
@@ -2886,6 +2856,7 @@
         "max_backends": 64,
         "stub_servers": [],
         "poolable_servers": [],
+        "stub_overrides": {},
         "pool_identity_env": [],
         "prewarm_count": 0,
         "read_buffer_limit_bytes": 67108864,
@@ -3061,6 +3032,34 @@
       "defaultValue": null
     },
     {
+      "path": "mcp_gateway.stub_overrides",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Stub Overrides",
+      "help": "Per-server deviations from stub_servers: a name mapped to true is stubbed even when the roster omits it, false leaves it direct even when the roster carries it. Holds what you CHANGED, not the result, so a name you never touched keeps following the roster — which is what lets an edition that ships its own stub_servers grow that list without overwriting your choices, and lets you turn one server off without pinning yourself to today's roster. Written by MCP Management when a toggle disagrees with the roster, and dropped again when you toggle it back to agree. Empty by default.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {}
+    },
+    {
+      "path": "mcp_gateway.stub_overrides.*",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
       "path": "mcp_gateway.pool_identity_env",
       "kind": "core",
       "type": "array",
@@ -3188,7 +3187,7 @@
       "enumValues": null,
       "defaultValue": {
         "enabled": false,
-        "warm_set_cap": 5,
+        "warm_set_cap": 0,
         "tunnel_base_port": 7778,
         "ssh_compression": true,
         "connect_timeout_secs": null,
@@ -3221,10 +3220,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Warm Set Cap",
-      "help": "Max number of remote instances kept warm (iframe mounted + tunnel live) at once. Least-recently-used instances beyond this are evicted and reconnected on demand. Bounds memory/socket use (each warm instance is a full dashboard SPA).",
+      "help": "Max number of remote instances kept warm (iframe mounted + tunnel live) at once. Least-recently-used instances beyond this are evicted and reconnected on demand. Bounds memory/socket use (each warm instance is a full dashboard SPA). 0 (the default) is automatic: the cap follows how many crews are configured, so up to an internal ceiling no crew you added is evicted and the cap widens by itself when you add one -- eviction cold-boots the pane and reads as a disconnect, so a cap below the number of crews in use makes tab switching look like a connection flap. Past that ceiling eviction resumes; an explicit value is honoured exactly, including one below the number of configured crews.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 5
+      "defaultValue": 0
     },
     {
       "path": "instances.tunnel_base_port",
@@ -5495,6 +5494,57 @@
       "defaultValue": ""
     },
     {
+      "path": "wakatime",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "wakatime"
+      ],
+      "label": "WakaTime",
+      "help": "WakaTime dev-time tracking integration settings.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {
+        "enabled": false,
+        "api_base_url": ""
+      }
+    },
+    {
+      "path": "wakatime.enabled",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "wakatime"
+      ],
+      "label": "Enabled",
+      "help": "Enable the WakaTime integration (send coding-activity heartbeats and read back stats). Requires the WAKATIME_API_KEY credential stored in the dashboard secrets vault.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
+      "path": "wakatime.api_base_url",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "wakatime"
+      ],
+      "label": "API Base URL",
+      "help": "Override the WakaTime API base URL for a self-hosted, API-compatible backend (Wakapi, Hackatime). Empty uses the public WakaTime API at https://wakatime.com/api/v1.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
       "path": "teams",
       "kind": "core",
       "type": "object",
@@ -7099,6 +7149,20 @@
       "defaultValue": ""
     },
     {
+      "path": "agents.*.reasoning_effort",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Reasoning Effort",
+      "help": "Default reasoning effort for sessions on this crew. Empty inherits: the global agent.reasoning_effort (or, for a background worker crew, its role effort). A per-session pick still overrides this. Only reasoning-capable models accept a level; on any other model the pin is ignored, exactly as the global default is.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
       "path": "agents.*.description",
       "kind": "core",
       "type": "string",
@@ -7195,6 +7259,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
+    },
+    {
+      "path": "agents.*.avatar",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Avatar",
+      "help": "Per-crew avatar override. Empty means the face is derived from the crew's name. {'kind': 'ghost', 'traits': {...}} pins explicit ghost traits chosen in the avatar builder; {'kind': 'image'} means an uploaded picture served from the per-crew avatar endpoint.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {}
     },
     {
       "path": "default_agent",
@@ -7352,6 +7430,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true
+    },
+    {
+      "path": "connections_ui",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Connections UI",
+      "help": "Show the Connections gallery (held for a later release).",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "timezone",

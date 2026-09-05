@@ -115,9 +115,11 @@ def _derive_step(
     1. ``pinned`` — an administrator's ceiling forbids tailnet access. Dead end;
        nothing below is actionable, and offering a toggle would be a lie.
     2. ``install`` / ``start_daemon`` / ``sign_in`` / ``enable_magicdns`` — the
-       four ways there is no usable tailnet name, kept apart because "install
-       Tailscale", "start it", "sign in" and "turn MagicDNS on" are four
-       different errands.
+       ways there is no usable tailnet name, kept apart because "install
+       Tailscale", "start it", "sign in" and "turn MagicDNS on" are different
+       errands. ``start_daemon`` covers both a daemon that does not answer and
+       one that answers as stopped (``BackendState "Stopped"``): the errand is
+       the same, and the verbatim probe detail tells the two apart.
     3. ``enable_https`` — the name exists but the tailnet has not granted
        certificate provisioning for it. This is a tailnet-wide administrator
        consent and cannot safely be performed by a gateway process.
@@ -140,6 +142,15 @@ def _derive_step(
     if not probe.installed:
         return "install"
     if not probe.reachable:
+        return "start_daemon"
+    # A stopped daemon (``BackendState "Stopped"``) answers status reads but the
+    # tailnet is down: nothing can reach this host and serve writes cannot take
+    # effect, so every later branch — including ``ready`` — would be a lie. Same
+    # errand as an unreachable daemon (get Tailscale running), so it reuses that
+    # step; the card renders the probe's detail, which names the stopped state
+    # precisely. The step's "no tailnet name" copy holds because ``probe_daemon``
+    # always returns ``name=""`` for the Stopped state.
+    if probe.stopped:
         return "start_daemon"
     if not probe.logged_in:
         return "sign_in"
@@ -576,11 +587,19 @@ def _effective_mobile_setup(cfg: KiroCrewConfig, login: str) -> tuple[bool, list
 
 
 def _running_tailnet_trust_ready(request: web.Request, login: str) -> bool:
-    """Whether this process can enforce a persistent phone session right now."""
+    """Whether this process can enforce a persistent phone session right now.
+
+    Asks ``enforces_identity`` rather than spelling the conjunction out again:
+    the property exists so every site answering "is tailnet identity in force"
+    answers the same way, and a fifth hand-written spelling is the drift it was
+    added to prevent. Behaviour here is unchanged either way -- an unreadable
+    policy carries an empty allowlist, so ``login_allowed`` already refused --
+    but a future change to what enforcement means now reaches this site too.
+    """
     trust = request.app.get("tailnet_trust")
     if not isinstance(trust, tailnet.TailnetTrust):
         return False
-    return trust.trust_identity and tailnet.login_allowed(login, trust.allowed_logins)
+    return trust.enforces_identity and tailnet.login_allowed(login, trust.allowed_logins)
 
 
 async def api_tailnet_mobile_configure(request: web.Request) -> web.Response:

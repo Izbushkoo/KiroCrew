@@ -186,6 +186,38 @@ describe('UserMessage', () => {
     expect(screen.queryByText('Steered into the running turn')).not.toBeInTheDocument()
   })
 
+  // #7246: the badge asserts the message reached the RUNNING turn, which only a
+  // backend `steering_consumed` echo proves. A steer whose bytes were merely
+  // accepted (`written`), or which the turn ended without taking and the teardown
+  // requeued (`requeued`), was never injected -- so neither may render the badge.
+  it('does not render the steer badge for a written-but-unconfirmed steer', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, steerState: 'written' }} messageTs="steer-written" renderContent={renderContent} />)
+    expect(screen.queryByText('Steered into the running turn')).not.toBeInTheDocument()
+  })
+
+  it('does not render the steer badge for a requeued steer', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, steerState: 'requeued' }} messageTs="steer-requeued" renderContent={renderContent} />)
+    expect(screen.queryByText('Steered into the running turn')).not.toBeInTheDocument()
+  })
+
+  it('renders the steer badge once the backend confirms consumption', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, steerState: 'consumed' }} messageTs="steer-consumed" renderContent={renderContent} />)
+    expect(screen.getByText('Steered into the running turn')).toBeInTheDocument()
+  })
+
+  // The client mints its own bubble as `{ steer: true, optimistic: true }` with no
+  // state before the server has answered at all -- the least confirmed a steer can
+  // be. It must not fall through to the legacy state-less case and claim success.
+  it('does not render the steer badge on the client optimistic bubble', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, optimistic: true }} messageTs="steer-optimistic" renderContent={renderContent} />)
+    expect(screen.queryByText('Steered into the running turn')).not.toBeInTheDocument()
+  })
+
+  it('renders the steer badge on a reconciled optimistic bubble the backend confirmed', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, optimistic: true, steerState: 'consumed' }} messageTs="steer-optimistic-consumed" renderContent={renderContent} />)
+    expect(screen.getByText('Steered into the running turn')).toBeInTheDocument()
+  })
+
   it('applies the accent bubble treatment only to a steered message', () => {
     const { container: steered } = render(<UserMessage content="steered" meta={{ steer: true }} messageTs="steer-ts-2" renderContent={renderContent} />)
     const steerBubble = steered.querySelector('.msg-content') as HTMLElement
@@ -231,6 +263,28 @@ describe('UserMessage', () => {
     const second = render(<UserMessage content="steer me" meta={{ steer: true, clientTs: 'client-ts-guard' }} messageTs="server-ts-guard" renderContent={renderContent} />)
     expect(second.container.querySelector(ringSelector)).toBeNull()
   })
+
+  // The PRODUCTION path, which the test above sidesteps by mounting without
+  // `optimistic`. A real steer mounts as `{ steer: true, optimistic: true }` with
+  // no `steerState` -- the least-confirmed state, where the entrance must NOT
+  // play -- and `steerState: 'consumed'` is patched onto the SAME row later. That
+  // patch carries no key change, so React reuses the instance and there is no
+  // remount: a mount-only `useState` initializer would stay false forever and the
+  // entrance would never play at all. Reading the ring overlay because it renders
+  // only while the entrance is playing.
+  it('plays the steer entrance when consumed arrives after the optimistic mount', () => {
+    const ringSelector = '.border-2.border-accent'
+    const { container, rerender } = render(
+      <UserMessage content="steer me later" meta={{ steer: true, optimistic: true }} messageTs="ts-late-consume" renderContent={renderContent} />,
+    )
+    // Nothing is confirmed yet, so no entrance -- this is the state the change exists to protect.
+    expect(container.querySelector(ringSelector)).toBeNull()
+
+    rerender(
+      <UserMessage content="steer me later" meta={{ steer: true, steerState: 'consumed' }} messageTs="ts-late-consume" renderContent={renderContent} />,
+    )
+    expect(container.querySelector(ringSelector)).not.toBeNull()
+  })
 })
 
 describe('action footer on touch devices', () => {
@@ -254,9 +308,9 @@ describe('action footer on touch devices', () => {
   it('enlarges the actions to 40px touch targets where the pointer cannot hover', () => {
     render(<UserMessage content="hello" renderContent={renderContent} />)
     const cls = footer().className
-    expect(cls).toContain('[@media(hover:none)]:[&_button]:p-2.5')
-    expect(cls).toContain('[@media(hover:none)]:[&_svg]:h-5')
-    expect(cls).toContain('[@media(hover:none)]:[&_svg]:w-5')
+    expect(cls).toContain('[@media(hover:none)]:[&_button]:p-3')
+    expect(cls).toContain('[@media(hover:none)]:[&_svg]:h-4')
+    expect(cls).toContain('[@media(hover:none)]:[&_svg]:w-4')
     // Three 40px actions plus a localized timestamp can exceed a narrow
     // phone's width, so the grown row must wrap rather than clip.
     expect(cls).toContain('[@media(hover:none)]:flex-wrap')
@@ -265,5 +319,21 @@ describe('action footer on touch devices', () => {
   it('keeps the compact sizing on the buttons for pointer devices', () => {
     render(<UserMessage content="hello" renderContent={renderContent} />)
     expect(screen.getByTitle('Copy').className).toContain('p-0.5')
+  })
+
+  // The pin toggle is a stateful control: assistive tech needs its on/off
+  // state via aria-pressed, not only the title/aria-label text swap.
+  it('exposes aria-pressed on the pin toggle reflecting the pinned prop', () => {
+    const { rerender } = render(
+      <UserMessage content="hi" renderContent={renderContent} messageTs="ts-pin" onTogglePin={() => {}} />
+    )
+    const unpinned = screen.getByTitle('Pin message')
+    expect(unpinned).toHaveAttribute('aria-pressed', 'false')
+
+    rerender(
+      <UserMessage content="hi" renderContent={renderContent} messageTs="ts-pin" pinned onTogglePin={() => {}} />
+    )
+    const pinned = screen.getByTitle('Unpin message')
+    expect(pinned).toHaveAttribute('aria-pressed', 'true')
   })
 })

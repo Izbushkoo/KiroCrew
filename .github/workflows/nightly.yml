@@ -118,20 +118,35 @@ jobs:
           echo "Nightly (semver): ${BASE}-nightly.${STAMP_DATE}t${STAMP_TIME}"
           echo "Wheel (PEP 440):  ${BASE}.dev${STAMP_FULL}"
 
+  # The production dependency audit gates PUBLICATION, not the build. It reaches
+  # the npm registry, whose slow hours once failed the nightly for hours at a
+  # stretch and blocked every build behind it -- which is why it was removed
+  # from this workflow entirely. Removing it went too far: main has no
+  # dependency-audit gate of its own, so a high/critical production
+  # vulnerability that lands there shipped to nightly-channel users unaudited
+  # until the next tagged release.
+  #
+  # Hanging it off the PUBLISH jobs instead of the build jobs restores the
+  # control without restoring the outage: a slow or flaky registry now delays
+  # publication of an already-built nightly rather than failing the build, and
+  # the artifacts stay in the run for a re-run to publish once the audit
+  # answers. Deliberately NOT a `needs:` of build-wheel / build-desktop /
+  # build-windows -- that arrangement is what blocked the builds before, and
+  # test_dependency_vulnerability_gate.py pins it that way.
   dependency-vulnerability-gate:
     name: Production Dependency Vulnerability Gate
     uses: ./.github/workflows/dependency-vulnerability.yml
 
   build-wheel:
     name: Build Wheel
-    needs: [version, dependency-vulnerability-gate]
+    needs: [version]
     uses: ./.github/workflows/build-wheel.yml
     with:
       wheel_version: ${{ needs.version.outputs.wheel_version }}
 
   build-desktop:
     name: Build Desktop
-    needs: [version, dependency-vulnerability-gate]
+    needs: [version]
     uses: ./.github/workflows/build-desktop.yml
     with:
       version: ${{ needs.version.outputs.nightly_version }}
@@ -144,7 +159,7 @@ jobs:
   # sign-and-notarize via this caller's result.
   build-windows:
     name: Build Windows Desktop
-    needs: [version, dependency-vulnerability-gate]
+    needs: [version]
     permissions:
       contents: read
       id-token: write
@@ -166,7 +181,7 @@ jobs:
   # never blocks the CLI release. See docs/build/release.md.
   publish-cli:
     name: Publish CLI (nightly channel)
-    needs: [version, build-wheel]
+    needs: [version, build-wheel, dependency-vulnerability-gate]
     permissions:
       contents: read
       id-token: write
@@ -204,9 +219,9 @@ jobs:
   # existed. True per-arch publish independence needs the publishers to run
   # past a partial build failure and let their own artifact download decide;
   # tracked in #2645 rather than reshaped here.
-  publish-linux-x64:
-    name: Publish Linux Desktop (nightly channel · x64)
-    needs: [version, build-desktop]
+  publish-linux-appimage-x64:
+    name: Publish Linux appimage (nightly channel · x64)
+    needs: [version, build-desktop, dependency-vulnerability-gate]
     permissions:
       contents: read
       id-token: write
@@ -216,13 +231,15 @@ jobs:
       channel: nightly
       version: ${{ needs.version.outputs.nightly_version }}
       arch: x64
+      format: appimage
       publish: true
-      appimage_artifact: build-linux-x64
-    secrets: inherit
+      build_artifact: build-linux-x64
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
 
-  publish-linux-arm64:
-    name: Publish Linux Desktop (nightly channel · arm64)
-    needs: [version, build-desktop]
+  publish-linux-appimage-arm64:
+    name: Publish Linux appimage (nightly channel · arm64)
+    needs: [version, build-desktop, dependency-vulnerability-gate]
     permissions:
       contents: read
       id-token: write
@@ -232,9 +249,113 @@ jobs:
       channel: nightly
       version: ${{ needs.version.outputs.nightly_version }}
       arch: arm64
+      format: appimage
       publish: true
-      appimage_artifact: build-linux-arm64
-    secrets: inherit
+      build_artifact: build-linux-arm64
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
+
+  publish-linux-deb-x64:
+    name: Publish Linux deb (nightly channel · x64)
+    needs: [version, build-desktop, dependency-vulnerability-gate]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/publish-linux.yml
+    with:
+      channel: nightly
+      version: ${{ needs.version.outputs.nightly_version }}
+      arch: x64
+      format: deb
+      publish: true
+      build_artifact: build-linux-x64
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
+
+  publish-linux-deb-arm64:
+    name: Publish Linux deb (nightly channel · arm64)
+    needs: [version, build-desktop, dependency-vulnerability-gate]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/publish-linux.yml
+    with:
+      channel: nightly
+      version: ${{ needs.version.outputs.nightly_version }}
+      arch: arm64
+      format: deb
+      publish: true
+      build_artifact: build-linux-arm64
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
+
+  publish-linux-rpm-x64:
+    name: Publish Linux rpm (nightly channel · x64)
+    needs: [version, build-desktop, dependency-vulnerability-gate]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/publish-linux.yml
+    with:
+      channel: nightly
+      version: ${{ needs.version.outputs.nightly_version }}
+      arch: x64
+      format: rpm
+      publish: true
+      build_artifact: build-linux-x64
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
+
+  publish-linux-rpm-arm64:
+    name: Publish Linux rpm (nightly channel · arm64)
+    needs: [version, build-desktop, dependency-vulnerability-gate]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/publish-linux.yml
+    with:
+      channel: nightly
+      version: ${{ needs.version.outputs.nightly_version }}
+      arch: arm64
+      format: rpm
+      publish: true
+      build_artifact: build-linux-arm64
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
+
+  # ── Windows installer publish ─────────────────────────────────────────
+  # Depends on build-windows rather than build-desktop: the installer is
+  # Authenticode-signed DURING its build (an NSIS installer compresses its own
+  # already-signed executables), so it comes from that lane's artifact.
+  #
+  # build-windows carries soft_fail, which means its job `result` is `success`
+  # even when the build failed and uploaded nothing. This job therefore does
+  # not trust the result: publish-windows.yml probes for the artifact and skips
+  # cleanly when it is absent. That keeps a Windows-only failure from blocking
+  # the mac and Linux lanes, which is the same per-platform independence
+  # soft_fail exists to protect.
+  publish-windows-x64:
+    name: Publish Windows Desktop (nightly channel · x64)
+    needs: [version, build-windows, dependency-vulnerability-gate]
+    permissions:
+      contents: read
+      # A called workflow cannot exceed the caller job's grants, so the probe's
+      # actions:read has to be granted here too or the lane 403s.
+      actions: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/publish-windows.yml
+    with:
+      channel: nightly
+      version: ${{ needs.version.outputs.nightly_version }}
+      publish: true
+      installer_artifact: build-windows-x64
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
 
   # ── Docker image publish ──────────────────────────────────────────────
   # Builds the multi-arch gateway image FROM THE SAME WHEEL publish-cli
@@ -245,7 +366,7 @@ jobs:
   # alone (see test_workflow_permissions.py).
   publish-docker:
     name: Publish Docker Image (nightly channel)
-    needs: [version, build-wheel]
+    needs: [version, build-wheel, dependency-vulnerability-gate]
     permissions:
       contents: read
       packages: write
@@ -271,7 +392,7 @@ jobs:
   # attestation (signed + stapled bytes).
   sign-and-notarize:
     name: Sign + Notarize macOS
-    needs: [version, build-wheel, build-desktop]
+    needs: [version, build-wheel, build-desktop, dependency-vulnerability-gate]
     permissions:
       id-token: write
       contents: read

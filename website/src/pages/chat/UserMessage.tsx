@@ -8,6 +8,7 @@ import { useSearchHighlight, useCurrentOcc } from '../../hooks/SearchHighlightCo
 import { useImeGuard } from '../../hooks/useImeGuard'
 import { applySearchHighlights } from '../../utils/domHighlight'
 import { scrollCurrentMatchIntoView } from '../../utils/searchScroll'
+import { containedSelectionRange } from '../../utils/selectionContainment'
 import { type PasteBlock, expandAll as expandPasteTokens } from '../../utils/pasteTokens'
 
 import { i18nT } from '../../i18n/t'
@@ -54,9 +55,37 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
 
   // A steered message was injected into the running turn (meta.steer set by the
   // steer_push WS echo). Render it distinctly and animate it in exactly once.
+  //
+  // The badge asserts the message reached the RUNNING turn, so only a state the
+  // backend has confirmed may render it. `written` means the bytes were accepted
+  // and nothing more, and `requeued` means the turn ended without taking them and
+  // the message runs as its own turn -- neither is an injection, so both render as
+  // an ordinary user message (#7246).
+  //
+  // A row with no `steerState` is treated as legacy and keeps the original
+  // rendering -- EXCEPT the client's own optimistic bubble, which is minted with
+  // `{ steer: true, optimistic: true }` and no state before the server has
+  // answered at all. That is the least confirmed a steer can be, so letting it
+  // fall through to the legacy case would show the success badge at exactly the
+  // moment nothing is known, which is the claim this change exists to stop.
+  const steerState = (meta as { steerState?: string } | undefined)?.steerState
+  const steerOptimistic = !!(meta as { optimistic?: boolean } | undefined)?.optimistic
   const isSteer = !!(meta && (meta as { steer?: boolean }).steer)
-  const [playSteer] = useState(() => {
-    if (!isSteer) return false
+    && steerState !== 'written'
+    && steerState !== 'requeued'
+    && !(steerOptimistic && !steerState)
+  // Fired from an EFFECT rather than a `useState` initializer, because the state
+  // this depends on arrives AFTER mount. The optimistic bubble mounts with
+  // `{ steer: true, optimistic: true }` and no `steerState`, so `isSteer` is
+  // false at that instant by design -- and a mount-only initializer would freeze
+  // `playSteer` at false, then never re-run when `steerState: 'consumed'` is
+  // patched onto the SAME row (the transition carries no key change, so React
+  // reuses the instance and there is no remount to re-evaluate it). The entrance
+  // would simply never play. Keyed on the effect's own guard so it still plays
+  // exactly once.
+  const [playSteer, setPlaySteer] = useState(false)
+  useEffect(() => {
+    if (!isSteer || playSteer) return
     // Stable identity across the steer lifecycle: the optimistic bubble mounts
     // with a client ts (messageTs), then the steer_push reconcile stashes that
     // client ts as meta.clientTs and swaps messageTs to the server ts. Keying
@@ -64,10 +93,10 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     // virtualization remount after the reconcile still hits the set and the
     // entrance animation plays exactly once.
     const key = ((meta as { clientTs?: string })?.clientTs) || messageTs || content
-    if (animatedSteers.has(key)) return false
+    if (animatedSteers.has(key)) return
     animatedSteers.add(key)
-    return true
-  })
+    setPlaySteer(true)
+  }, [isSteer, playSteer, meta, messageTs, content])
 
   useEffect(() => {
     if (editing && taRef.current) {
@@ -118,8 +147,13 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     const sel = window.getSelection()
     if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return
     const range = sel.getRangeAt(0)
-    if (!userRef.current?.contains(range.commonAncestorContainer)) return
-    const frag = range.cloneContents()
+    // A multi-click of the bubble's LAST line normalizes to a boundary point
+    // past the bubble, so ancestor containment alone would bail here and ship
+    // the chip label this handler exists to replace (#7891). The clamped range
+    // keeps the whitespace overhang out of the cloned fragment.
+    const contained = userRef.current && containedSelectionRange(range, userRef.current)
+    if (!contained) return
+    const frag = contained.cloneContents()
     const chips = frag.querySelectorAll('[data-paste-seq]')
     if (!chips.length) return
     const bySeq = new Map(pastes.map(p => [p.seq, p]))
@@ -276,6 +310,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
             className="text-muted hover:text-text p-0.5 rounded transition-colors"
             title={pinned ? i18nT('pages.chat.userMessage.unpin_message') : i18nT('pages.chat.userMessage.pin_message')}
             aria-label={pinned ? i18nT('pages.chat.userMessage.unpin_message') : i18nT('pages.chat.userMessage.pin_message')}
+            aria-pressed={!!pinned}
           >
             {pinned ? <PinOff size={14} /> : <Pin size={14} />}
           </button>

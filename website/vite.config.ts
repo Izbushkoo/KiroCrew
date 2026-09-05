@@ -165,6 +165,55 @@ function vendorRuntimePlugin(): Plugin {
  * `vite build` only (not dev server). The public/ directory is copied
  * verbatim by Vite so `define` replacements don't apply to it.
  */
+/**
+ * Self-host Excalidraw's canvas fonts. Without `window.EXCALIDRAW_ASSET_PATH`
+ * the library resolves its lazily-loaded text-tool fonts (Excalifont, Xiaolai,
+ * …) against a third-party CDN (esm.sh) — verified by a network probe against
+ * a live pod — which breaks air-gapped dashboards and violates the same
+ * no-network rule that `lib/excalidrawScene.ts` documents for the read-only
+ * renderer. SketchDialog sets the asset path to `/vendor/excalidraw/`; this
+ * plugin makes that path real: build emits every font file from the npm
+ * package into `dist/vendor/excalidraw/fonts/**`, and the dev server serves
+ * the same files straight from node_modules.
+ */
+function excalidrawFontsPlugin(): Plugin {
+  const FONTS_ROOT = path.resolve(__dirname, 'node_modules/@excalidraw/excalidraw/dist/prod/fonts')
+  const SERVE_PREFIX = '/vendor/excalidraw/fonts/'
+  const listFonts = (): string[] => {
+    const out: string[] = []
+    for (const family of readdirSync(FONTS_ROOT)) {
+      for (const file of readdirSync(path.join(FONTS_ROOT, family))) {
+        out.push(`${family}/${file}`)
+      }
+    }
+    return out
+  }
+  return {
+    name: 'kirocrew-excalidraw-fonts',
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        const url = (req.url || '').split('?')[0]
+        if (!url.startsWith(SERVE_PREFIX)) return next()
+        const rel = decodeURIComponent(url.slice(SERVE_PREFIX.length))
+        // Path-traversal guard: the joined path must stay under FONTS_ROOT.
+        const abs = path.resolve(FONTS_ROOT, rel)
+        if (!abs.startsWith(FONTS_ROOT + path.sep) || !existsSync(abs)) return next()
+        res.setHeader('Content-Type', 'font/woff2')
+        res.end(readFileSync(abs))
+      })
+    },
+    generateBundle() {
+      for (const rel of listFonts()) {
+        this.emitFile({
+          type: 'asset',
+          fileName: `vendor/excalidraw/fonts/${rel}`,
+          source: readFileSync(path.join(FONTS_ROOT, rel)),
+        })
+      }
+    },
+  }
+}
+
 function swVersionPlugin(): Plugin {
   return {
     name: 'kirocrew-sw-version',
@@ -190,7 +239,18 @@ function swVersionPlugin(): Plugin {
         // Falls back to version alone if git is unavailable (CI edge case).
         let sha = ''
         try { sha = execSync('git rev-parse --short HEAD', { encoding: 'utf-8' }).trim() } catch {}
-        const buildHash = sha ? `${pkg.version}-${sha}` : pkg.version
+        // A dirty tree means HEAD does not describe these bytes: two builds
+        // from different uncommitted states would stamp the SAME version, so
+        // the service worker never byte-changes and clients keep the previous
+        // deploy's shell cache alive. Suffix a timestamp so every dirty build
+        // is its own cache generation; clean builds stay reproducible.
+        let dirty = ''
+        try {
+          if (execSync('git status --porcelain', { encoding: 'utf-8' }).trim()) {
+            dirty = `-dev${Date.now().toString(36)}`
+          }
+        } catch {}
+        const buildHash = (sha ? `${pkg.version}-${sha}` : pkg.version) + dirty
         content = content.replace('%%SW_BUILD_HASH%%', buildHash)
         writeFileSync(swPath, content)
       } catch (e: unknown) {
@@ -506,7 +566,7 @@ function appWindowUrls(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), swVersionPlugin(), editionExtensionPlugin(), bundleReportPlugin(), appWindowUrls(), precompressPlugin()],
+  plugins: [react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), excalidrawFontsPlugin(), swVersionPlugin(), editionExtensionPlugin(), bundleReportPlugin(), appWindowUrls(), precompressPlugin()],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
@@ -789,6 +849,11 @@ export default defineConfig({
           // this off `js-yaml`, which is mermaid's and belongs in mermaid's chunk.
           if (/[\\/]node_modules[\\/]yaml[\\/]/.test(id)) {
             return 'vendor-yaml'
+          }
+          // Routed out because this change's sidebar growth pushed the App chunk past the
+          // ceiling the `yaml` note above names; eager at every use site, no lazy boundary to defeat.
+          if (/[\\/]node_modules[\\/]dompurify[\\/]/.test(id)) {
+            return 'vendor-dompurify'
           }
         },
       },

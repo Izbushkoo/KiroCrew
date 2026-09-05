@@ -5,7 +5,7 @@ author: rnoack
 created: 2026-08-29
 last-audited: 2026-08-29
 audited-at: 202770d13
-doc-pr:
+doc-pr: 7033
 implementation-prs: []
 tracking-issues: []
 supersedes: []
@@ -24,7 +24,7 @@ superseded-by: []
   this one adds a row, that one changes how rows are written),
   `rfc-tool-derived-diff-cards.md` (the nearest precedent for promoting a
   transcript-derived affordance into the dashboard),
-  [#6853](https://github.com/kirodotdev/KiroCrew/pull/6853) (open — exposes
+  [#6853](https://github.com/kirodotdev/KiroCrew/pull/6853) (merged — exposes
   `reset_conversation` as a boundary-deferred session directive; the context-side
   counterpart to this RFC's view-side marker, see §2.3).
 
@@ -94,7 +94,7 @@ The two compose rather than compete: **mark the section for the view, reset the
 conversation for the context.**
 
 That pairing is not hypothetical. [#6853](https://github.com/kirodotdev/KiroCrew/pull/6853)
-(open, not yet merged) adds `reset_conversation` as a session directive and MCP
+has landed on `main`, adding `reset_conversation` as a session directive and MCP
 tool, and it reaches the effect the four guards above block by **queuing the
 discard for a later turn boundary** rather than applying it inline — the same
 shape this RFC uses for a marker (§5.4, §5.5). Its own motivation is this
@@ -102,16 +102,17 @@ document's use case: *"use when a session walks a list of independent items one
 at a time … and carrying item N's context into item N+1 buys nothing but
 tokens."*
 
-So if #6853 lands, both halves become self-service from inside the turn that
-wants them, through one boundary-deferred directive each. Two differences worth
-keeping straight: `reset_conversation` is user-surface gated
+So the context half is already self-service from inside the turn that wants it;
+adopting this RFC makes the view half self-service too, through one
+boundary-deferred directive each. Two differences worth keeping straight:
+`reset_conversation` is user-surface gated
 (`_USER_SURFACE_DIRECTIVES`) and so also works on messaging channels, whereas a
 section marker is inherently dashboard-only because it is a rendering; and the
 two effects are independent — a caller may want a clean view without a clean
 context, or the reverse.
 
-This RFC does not depend on #6853. Without it the view half is still
-self-service and the context half stays an out-of-band action.
+This RFC does not depend on #6853. The view half stands on its own; #6853 having
+landed makes the pairing available, not required.
 
 ## 3. Goals
 
@@ -151,7 +152,7 @@ if role == "system" and cls_val:
 ```
 
 — `dashboard/chat_persistence.py:1914-1916`. Meanwhile `ConversationLog.append`
-persists any truthy `cls` (`history.py:2815`). A `cls`-carried marker on any role
+persists any truthy `cls` (`history.py`, `append`). A `cls`-carried marker on any role
 other than `system` is silently dropped on the dashboard's persist path. `meta`
 persists for every role (`chat_persistence.py:1917-1918`), which is where the
 label belongs.
@@ -172,7 +173,8 @@ every time a break was drawn.
 A new role is cheap on the wire: `ChatMessage.role` is an open `string`
 (`website/src/types/index.ts:950-952`), and the transcript read path has no role
 allowlist — `_read_messages_locked` skips only the `_type: "metadata"` header and
-appends every other JSON line verbatim (`history.py:4987-4989`).
+appends every other JSON line verbatim (`history_projection.py`,
+`TranscriptReadProjection`).
 
 One thing to *not* do: leave the new role out of `_QUESTION_RETIRING_ROLES`
 (`dashboard/state.py:2063`, currently `{user, nudge}`, mirrored by the frontend's
@@ -231,7 +233,7 @@ if exclude_last_n > 0:
 ```
 
 — `context.py:1524-1525` (`_replay_rows`), identically at `:1571-1572`
-(`_recall_rows`), and `history.py:2966-2968` (`recent()`, whose docstring at
+(`_recall_rows`), and `history.py` (`recent`, whose docstring at
 `:2950` says "drops that many trailing raw entries BEFORE role filtering").
 
 So any row appended after the current-turn user row becomes the physical tail,
@@ -247,7 +249,7 @@ This is why `/note` defers its visible line, and the machinery already exists:
 already call it (`chat_runner.py:3988`, `:4406`; `chat_orchestrator.py:244`,
 `:839`). **Reuse it; do not add a second notion of "held".**
 
-That is worth stating precisely, because a second one is already in flight:
+That is worth stating precisely, because a second one already exists:
 [#6853](https://github.com/kirodotdev/KiroCrew/pull/6853) defers its discard
 through `slot._pending_discard_conversation_key`, consumed at a boundary in
 `chat_runner.py`, not through `_deferred_notes`. The two are not obviously
@@ -503,7 +505,8 @@ absent.
 `_recall_rows` (`:1552`) — an old session resumed by a new gateway, or the
 reverse, sees no prompt change.
 
-**Read path.** No role allowlist (`history.py:4987-4989`), so an older gateway
+**Read path.** No role allowlist (`history_projection.py`,
+`TranscriptReadProjection`), so an older gateway
 reading a transcript containing markers parses them as ordinary rows.
 
 ## 9. Security considerations
@@ -630,7 +633,7 @@ marker would vanish on one of the two write paths.
 1. **`exclude_last_n`: positional or role-aware?** `flush_deferred_notes`'s
    docstring (`dashboard/state.py:3956-3961`) explains the hazard in terms of
    recall-eligible rows; the code slices raw-positionally (`context.py:1525`,
-   `:1572`; `history.py:2967`). Making the exclusion skip the last
+   `:1572`; `history.py`, `recent`). Making the exclusion skip the last
    *recall-eligible* row would match the stated intent and make mid-turn appends
    safe outright, retiring the deferral machinery for both `/note` and this
    feature. **Not proposed here** — it changes a hot path on behalf of a view
@@ -663,7 +666,7 @@ marker would vanish on one of the two write paths.
    `/note` deferral (`_deferred_notes`, flushed by `flush_deferred_notes`), while
    [#6853](https://github.com/kirodotdev/KiroCrew/pull/6853) introduces a second
    boundary path (`slot._pending_discard_conversation_key`, consumed in
-   `chat_runner.py`) that additionally waits on sub-agents. If both land there are
-   two answers to "what happens at a turn boundary", which is the kind of pair
-   that drifts. Whether they should be one seam is a maintainer call, and it is
-   not a prerequisite for either change.
+   `chat_runner.py`) that additionally waits on sub-agents. If a marker lands
+   there are two answers to "what happens at a turn boundary", which is the kind
+   of pair that drifts. Whether they should be one seam is a maintainer call, and
+   it is not a prerequisite for either change.

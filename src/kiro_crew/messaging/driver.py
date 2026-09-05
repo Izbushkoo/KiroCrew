@@ -45,6 +45,11 @@ from kiro_crew.messaging.renderer import (
     OutputEvent,
     Renderer,
 )
+from kiro_crew.monitoring.completion import (
+    MonitorCompletionHook,
+    disposition_for_stop_reason,
+    is_monitor_completion_evidence,
+)
 from kiro_crew.security import StreamRedactor, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
@@ -308,6 +313,12 @@ class TurnDriver:
         transports. Injected by the caller with its own session key bound, so
         the driver stays channel-neutral. When omitted, directive markers are
         ignored exactly as before.
+    closing_gate:
+        Optional synchronous gate invoked immediately before the provider stream
+        starts. Callers use it to reject a lease that shutdown can no longer
+        drain, and may also reject a structured monitor whose conversation
+        generation changed. It must not await: the gate, monitor acceptance, and
+        the stream's synchronous turn registration are one event-loop span.
     """
 
     def __init__(
@@ -325,6 +336,7 @@ class TurnDriver:
         audit_session_key: str = "",
         audit_agent: str = "kirocrew",
         closing_gate: Callable[[], None] | None = None,
+        monitor_completion: MonitorCompletionHook | None = None,
     ) -> None:
         self.provider = provider
         self.renderer = renderer
@@ -351,6 +363,7 @@ class TurnDriver:
         # EVENT_TOOL_RESULT for a tool call whose trusted ``_meta.kiro``
         # identity was recorded at EVENT_TOOL_CALL — the forgery gate.
         self.directive_consumer = directive_consumer
+        self.monitor_completion = monitor_completion
         # Terminal stop reason of the last run() — read by the dispatcher's
         # post-turn bookkeeping (e.g. COMPACTION_FAILED -> session reset).
         self.last_stop_reason: str = ""
@@ -388,6 +401,21 @@ class TurnDriver:
         # sub-agent isolation, mirroring the dashboard consumer's
         # ``_native_tc_card`` refusal.
         native_tool_call_ids: set[str] = set()
+        # Directive tool_call_ids this turn has ALREADY consumed. Consumption
+        # pops ``pending_directives``, so without this a later result frame for
+        # an applied directive is indistinguishable from one that never had an
+        # identity — and would log the "NOT APPLIED" diagnostic for a directive
+        # that in fact applied. Diagnostic-only bookkeeping: nothing reads it to
+        # authorize anything.
+        consumed_directives: set[str] = set()
+        # Identity OBSERVED on each tool_call frame, for the NOT-APPLIED
+        # diagnostic only. It cannot be read off the result frame: the
+        # tool_call_update path builds its event with no identity fields, so
+        # they are always "" there. Two short strings per call, same per-turn
+        # lifetime as the maps beside it. Nothing reads this to authorize
+        # anything — the grant still comes solely from directive_tool_for at
+        # call time.
+        seen_tool_identity: dict[str, tuple[str, str]] = {}
         # Purpose text from each tool_call, keyed by its tool_call_id, so a
         # permission request can be paired with the purpose of the tool IT asks
         # about. The permission payload carries the title but no purpose, and the
@@ -433,25 +461,15 @@ class TurnDriver:
                 )
 
         await self.renderer.on_turn_start()
-        # Lease-dispatch race gate, placed HERE because this is the only line at
-        # which it is actually atomic. The dispatcher claimed the session long
-        # before this, and everything since -- the context build, and the
-        # `on_turn_start` platform round-trip immediately above -- is awaited. A
-        # gate at the call site therefore still leaves that round-trip open: a
-        # restart landing in it sets `_closing` and takes `close_all`'s drain
-        # snapshot while no turn is registered, and the prompt below then opens
-        # BEHIND that snapshot, where teardown kills it mid-turn holding its
-        # native lock and the user gets an empty response instead of a notice.
-        #
-        # Synchronous, with no await between this call and the `async for` below.
-        # `provider.stream(...)` registers the turn before its own first await
-        # (AcpClient.stream_events clears _turn_done up front), so the gate and
-        # the registration form one span ordered against `_closing`. This is the
-        # same shape the dashboard runner and the native Slack handler use, and
-        # the reason the gate is one line here rather than four at the call
-        # sites. Raises SessionClosingError, which each dispatcher catches.
+        if self.monitor_completion is not None:
+            if not await self.monitor_completion.authorize():
+                return accumulated
+        # The closing gate remains yield-free with stream registration. Monitor
+        # acceptance below is synchronous, so it cannot reopen that race.
         if self.closing_gate is not None:
             self.closing_gate()
+        if self.monitor_completion is not None:
+            self.monitor_completion.mark_accepted()
         async for event in self.provider.stream(message):
             kind = event.kind
             if kind == EVENT_TEXT_CHUNK:
@@ -500,6 +518,11 @@ class TurnDriver:
                     )
                     if canonical:
                         pending_directives[event.tool_call_id] = canonical
+                    else:
+                        seen_tool_identity[event.tool_call_id] = (
+                            getattr(event, "mcp_server_name", "") or "",
+                            getattr(event, "tool_name", "") or "",
+                        )
             elif kind == EVENT_SUBAGENT_ACTIVITY:
                 # Native sub-agent lifecycle marker. Its only role in this
                 # driver is the isolation gate above: remember which
@@ -518,7 +541,13 @@ class TurnDriver:
                 # ignored. Without a consumer this event stays inert,
                 # preserving the pre-consumer behavior exactly.
                 if self.directive_consumer is not None:
-                    await self._consume_directive(event, pending_directives, native_tool_call_ids)
+                    await self._consume_directive(
+                        event,
+                        pending_directives,
+                        native_tool_call_ids,
+                        consumed_directives,
+                        seen_tool_identity,
+                    )
             elif kind == EVENT_PERMISSION_REQUEST:
                 # Untrusted sender: no tool runs, full stop. This precedes even
                 # the PreToolUse gate's auto_approve branch and the
@@ -692,6 +721,20 @@ class TurnDriver:
                 # sent end_turn) and needs a session reset the driver cannot
                 # perform itself (it holds no session key).
                 self.last_stop_reason = event.stop_reason or ""
+                if self.monitor_completion is not None and is_monitor_completion_evidence(
+                    event.stop_reason,
+                    synthetic=event.synthetic_completion,
+                ):
+                    try:
+                        await self.monitor_completion.complete(
+                            disposition_for_stop_reason(event.stop_reason),
+                            event.usage,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "monitor turn completion callback failed",
+                            exc_info=True,
+                        )
                 pending = compaction_filter.flush()
                 if pending:
                     await dispatch_frames(steering_filter.feed(pending))
@@ -704,7 +747,12 @@ class TurnDriver:
         return accumulated
 
     async def _consume_directive(
-        self, event: Any, pending: dict[str, str], native_tool_call_ids: set[str]
+        self,
+        event: Any,
+        pending: dict[str, str],
+        native_tool_call_ids: set[str],
+        consumed: set[str] | None = None,
+        seen_identity: dict[str, tuple[str, str]] | None = None,
     ) -> None:
         """Decode one directive-tool result and apply it via the consumer.
 
@@ -719,6 +767,27 @@ class TurnDriver:
         consumer = self.directive_consumer
         tool = pending.get(event.tool_call_id or "", "")
         if consumer is None or not tool:
+            # DIAGNOSTIC ONLY (never a grant) — mirrors the dashboard consumer.
+            # A marker with no recorded identity is the right outcome for a
+            # forged result AND what a backend emitting no ``_meta.kiro``
+            # produces for a real directive; the gate is silent, so log enough
+            # to tell those apart.
+            if (
+                consumer is not None
+                and (event.tool_call_id or "") not in (consumed or ())
+                and session_directive.has_marker(event.tool_output)
+            ):
+                logger.warning(
+                    "session-directive NOT APPLIED: marker present but the tool "
+                    "call carried no core-MCP identity "
+                    "(tool_call_id=%s, mcp_server_name=%r, tool_name=%r, "
+                    "expected mcp_server_name=%r). Either a forged marker, or "
+                    "this ACP backend does not emit _meta.kiro identity.",
+                    event.tool_call_id,
+                    (seen_identity or {}).get(event.tool_call_id or "", ("", ""))[0],
+                    (seen_identity or {}).get(event.tool_call_id or "", ("", ""))[1],
+                    session_directive.CORE_MCP_SERVER,
+                )
             return
         if event.tool_call_id in native_tool_call_ids:
             # Sub-agent ISOLATION: a native child's tool calls surface as flat
@@ -728,6 +797,8 @@ class TurnDriver:
             # (terminal for this call) and audit the refusal so the denial is
             # never a silent drop, mirroring the dashboard consumer.
             pending.pop(event.tool_call_id, None)
+            if consumed is not None and event.tool_call_id:
+                consumed.add(event.tool_call_id)
             sel().log_api_access(
                 caller="turn_driver",
                 operation="session_directive",
@@ -754,6 +825,8 @@ class TurnDriver:
                     # delivery limit): nothing was applied and the result text
                     # already told the model so. Terminal for this call.
                     pending.pop(event.tool_call_id, None)
+                    if consumed is not None and event.tool_call_id:
+                        consumed.add(event.tool_call_id)
                     logger.info(
                         "session-directive REFUSED for %r (tool_call_id=%s): "
                         "payload over the %d-char delivery limit; nothing applied",
@@ -775,6 +848,8 @@ class TurnDriver:
                     )
             return
         pending.pop(event.tool_call_id, None)
+        if consumed is not None and event.tool_call_id:
+            consumed.add(event.tool_call_id)
         try:
             await consumer(tool, args)
         except Exception:

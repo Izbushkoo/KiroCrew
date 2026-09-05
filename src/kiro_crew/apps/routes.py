@@ -31,6 +31,7 @@ import yarl
 from aiohttp import web
 
 from kiro_crew import platform_compat
+from kiro_crew.apps import official_catalog
 from kiro_crew.apps.backend import (
     get_app_backend_port,
     list_app_processes,
@@ -82,7 +83,9 @@ from kiro_crew.apps.manager import (
     update_app,
 )
 from kiro_crew.apps.manifest import Dependencies, PlatformConfig
+from kiro_crew.apps.official_category_order import forget_cache as forget_category_order_cache
 from kiro_crew.apps.official_category_order import load_category_order
+from kiro_crew.apps.official_editorial import forget_cache as forget_editorial_cache
 from kiro_crew.apps.official_editorial import load_sections
 from kiro_crew.apps.registry import (
     _REGISTRY_TRUST_TIERS,
@@ -125,9 +128,9 @@ from kiro_crew.config.loader import (
 )
 from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable
 from kiro_crew.executors import subprocess_executor
-from kiro_crew.hooks import _fd_real_path
 from kiro_crew.pinned_fs import (
     PinnedPathRefusal,
+    fd_real_path,
     is_reparse_point,
     open_in_pinned_parent,
     supports_pinned_walk,
@@ -525,11 +528,11 @@ async def handle_publish_providers(request: web.Request) -> web.Response:
                 squatter.get("app", "?"),
                 DEPLOY_WEB_PROVIDER_ID,
             )
-        return web.json_response({
-            "providers": [
-                p for p in providers if p.get("id") != DEPLOY_WEB_PROVIDER_ID
-            ],
-        })
+        return web.json_response(
+            {
+                "providers": [p for p in providers if p.get("id") != DEPLOY_WEB_PROVIDER_ID],
+            }
+        )
     try:
         from kiro_crew.deploy import profiles as _deploy_profiles
 
@@ -565,9 +568,7 @@ async def handle_get_app(request: web.Request) -> web.Response:
         if name == "deploy-web":
             raise web.HTTPTemporaryRedirect(location="/api/deploy/list")
         return web.json_response({"error": f"app {name!r} not installed"}, status=404)
-    return web.json_response(
-        await asyncio.to_thread(_stamp_installed_trust_repository, info)
-    )
+    return web.json_response(await asyncio.to_thread(_stamp_installed_trust_repository, info))
 
 
 async def handle_get_manifest(request: web.Request) -> web.Response:
@@ -696,9 +697,7 @@ async def handle_install_app(request: web.Request) -> web.Response:
     # so a concurrent uninstall cannot deregister between our copy and our
     # register, leaving a running backend for a removed app.
     async with app_lifecycle_lock(lock_name):
-        startup_refusal = await _refuse_while_startup_hook_runs(
-            lock_name, action="install"
-        )
+        startup_refusal = await _refuse_while_startup_hook_runs(lock_name, action="install")
         if startup_refusal is not None:
             return startup_refusal
 
@@ -737,9 +736,7 @@ async def handle_install_app(request: web.Request) -> web.Response:
     )
 
 
-async def _refuse_while_startup_hook_runs(
-    name: str, *, action: str
-) -> web.Response | None:
+async def _refuse_while_startup_hook_runs(name: str, *, action: str) -> web.Response | None:
     """Refuse destructive lifecycle work while retained app code is still live."""
     stopped = await stop_retained_startup_hooks(name, bounded=True)
     if stopped:
@@ -840,9 +837,7 @@ async def handle_update_app(request: web.Request) -> web.Response:
     # ``.{name}-data-tmp`` path, so an interleaving can destroy it.
     # (The registry branch above holds the same lock around install_from_registry.)
     async with app_lifecycle_lock(name):
-        startup_refusal = await _refuse_while_startup_hook_runs(
-            name, action="update"
-        )
+        startup_refusal = await _refuse_while_startup_hook_runs(name, action="update")
         if startup_refusal is not None:
             return startup_refusal
 
@@ -1106,9 +1101,7 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
         # A retained startup hook still owns the old app's AppContext. Bound the
         # wait and refuse the uninstall if it remains live; deleting files or
         # withdrawing trust first would falsely report that old code is gone.
-        startup_refusal = await _refuse_while_startup_hook_runs(
-            name, action="uninstall"
-        )
+        startup_refusal = await _refuse_while_startup_hook_runs(name, action="uninstall")
         if startup_refusal is not None:
             return startup_refusal
 
@@ -1666,9 +1659,7 @@ async def handle_disable_app(request: web.Request) -> web.Response:
     # resources — must not interleave with a concurrent install/update/
     # uninstall/enable of the same app.
     async with app_lifecycle_lock(name):
-        startup_refusal = await _refuse_while_startup_hook_runs(
-            name, action="disable"
-        )
+        startup_refusal = await _refuse_while_startup_hook_runs(name, action="disable")
         if startup_refusal is not None:
             return startup_refusal
 
@@ -1806,7 +1797,6 @@ async def handle_open_app(request: web.Request) -> web.Response:
         return web.json_response({"error": denied, "code": "app_execution_denied"}, status=403)
 
     # Detect cloud/remote — no DISPLAY and not macOS desktop
-    import os
     import platform
 
     is_local = (
@@ -1882,9 +1872,7 @@ async def handle_registry(request: web.Request) -> web.Response:
         return_exceptions=True,
     )
     if isinstance(order_result, BaseException):
-        logger.warning(
-            "ignoring the published category order", exc_info=order_result
-        )
+        logger.warning("ignoring the published category order", exc_info=order_result)
         category_order: list = []
     else:
         category_order = order_result
@@ -1901,6 +1889,45 @@ async def handle_registry(request: web.Request) -> web.Response:
             "editorialSections": sections,
         }
     )
+
+
+async def handle_registry_refresh(request: web.Request) -> web.Response:
+    """POST /api/app-store/refresh — drop the published-document caches.
+
+    Drops the on-disk caches of all three published documents (catalog,
+    category order, editorial), so the NEXT ``GET /api/apps/registry`` is
+    rebuilt from fresh fetches. This exists because the caches degrade
+    SILENTLY: a failed fetch overwrites the catalog cache with a failure
+    sentinel and the store quietly falls back to the seed listing, and without
+    an explicit refresh the user's only remedy is waiting out ``CACHE_TTL``.
+
+    Deliberately OUTSIDE ``/api/apps/``: token_auth's ``_app_owns_path``
+    grants an app token implicit ownership of everything under
+    ``/api/apps/<its-own-name>/``, so a path like
+    ``/api/apps/registry/refresh`` would hand any app that names itself
+    ``registry`` the power to purge the shared catalog caches without
+    declaring the permission. Under ``/api/app-store/`` no app name can
+    collide, so an app token reaches this endpoint only through an explicit
+    ``permissions.api`` grant.
+
+    Two more deliberate shapes:
+
+    - A POST, not a ``?refresh=1`` on the GET: deleting caches and triggering
+      outbound fetches is a state change, and a state-changing GET is reachable
+      by cross-site top-level navigation with a valid SameSite=Lax cookie --
+      exactly the request the CSRF middleware never sees.
+    - It only DROPS caches -- it never fetches. The follow-up GET pays the
+      fetch on the exact same code path as a cold start, so refresh cannot
+      behave differently from the load it is trying to repair.
+    """
+    # Off the event loop like every other disk touch on these routes; three
+    # unlinks gathered because none depends on another.
+    await asyncio.gather(
+        asyncio.to_thread(official_catalog.forget_cache),
+        asyncio.to_thread(forget_category_order_cache),
+        asyncio.to_thread(forget_editorial_cache),
+    )
+    return web.json_response({"ok": True})
 
 
 async def handle_registry_install(request: web.Request) -> web.Response:
@@ -2344,11 +2371,7 @@ def _read_declared_art(name: str, file_path: str) -> tuple[bytes, str] | None:
         # and a reused fd number makes that a worse bug than the one being fixed. The
         # inline spelling is what the sibling sites above use for the same reason:
         # their refusal is a return value, not a raise.
-        if (
-            not stat.S_ISREG(st.st_mode)
-            or st.st_nlink != 1
-            or st.st_size > _ART_MAX_BYTES
-        ):
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size > _ART_MAX_BYTES:
             return None
         with os.fdopen(fd, "rb", closefd=False) as fh:
             data = fh.read(_ART_MAX_BYTES + 1)
@@ -2388,9 +2411,7 @@ async def handle_app_art_file(request: web.Request) -> web.Response:
     # declared path anyway, so answering here keeps a hostile request off the
     # thread pool entirely.
     if not file_path or ".." in file_path or file_path.startswith("/"):
-        return web.json_response(
-            {"error": "invalid path", "code": "art_path_invalid"}, status=400
-        )
+        return web.json_response({"error": "invalid path", "code": "art_path_invalid"}, status=400)
     ext = Path(file_path).suffix.lower()
     if ext not in _ART_IMAGE_EXTENSIONS:
         return web.json_response(
@@ -2404,9 +2425,7 @@ async def handle_app_art_file(request: web.Request) -> web.Response:
         # status to map which paths a manifest names. One `code` for the same
         # reason: a caller that could tell them apart from the code would have the
         # mapping the shared status withholds.
-        return web.json_response(
-            {"error": "not found", "code": "art_not_found"}, status=404
-        )
+        return web.json_response({"error": "not found", "code": "art_not_found"}, status=404)
     data, validator = full_path
     content_type = _CONTENT_TYPES.get(ext, "application/octet-stream")
     # `no-cache`, not a long max-age: an app update rewrites these bytes in place
@@ -2537,6 +2556,20 @@ _UI_STREAM_CHUNK = 256 * 1024
 #: bounds git fetches). Refusals and body-less 304s hold a slot only for
 #: microseconds; 8 comfortably covers a dashboard loading assets in parallel.
 _UI_STREAM_SEMAPHORE = asyncio.Semaphore(8)
+
+#: Wall-clock ceiling on the body-writing phase of one UI-file response, and
+#: therefore on how long one client can hold a `_UI_STREAM_SEMAPHORE` permit
+#: while paced by its own read speed. Without it the 8 permits are a
+#: head-of-line queue an UNAUTHENTICATED caller controls: 8 sockets that
+#: connect, receive one chunk and then stop reading pin every permit (and
+#: descriptor) indefinitely, and every app UI on the host stops loading. The
+#: value matches `_BLOB_FETCH_TIMEOUT` / `_PROXY_TIMEOUT` in this file — 30s is
+#: the ceiling this module already treats as "no longer a live client", and it
+#: is ~100x the budget a real transfer needs (`_UI_MAX_BYTES` is 8 MiB, so even
+#: the largest servable file only needs ~280 KB/s to finish, over a loopback
+#: connection to the dashboard). Expiry cancels the write loop; the enclosing
+#: `finally` still closes the descriptor and the permit is released.
+_UI_STREAM_TIMEOUT = 30  # seconds
 
 
 def _open_ui_file(name: str, file_path: str) -> tuple[int, os.stat_result] | str:
@@ -2675,7 +2708,7 @@ def _open_ui_file(name: str, file_path: str) -> tuple[int, os.stat_result] | str
         # the POSIX hosts the tests run on) and require it to still sit under
         # the resolved root. Fail closed when it cannot be read — on this
         # branch the descriptor is the only trustworthy witness.
-        fd_real = _fd_real_path(fd)
+        fd_real = fd_real_path(fd)
         if fd_real is None:
             os.close(fd)
             return "not_found"
@@ -2693,11 +2726,7 @@ def _open_ui_file(name: str, file_path: str) -> tuple[int, os.stat_result] | str
         # has no link to refuse. Checked on the DESCRIPTOR, which is what makes
         # it race-free. Inline rather than `pinned_fs.refuse_hardlink_alias`
         # for the same double-close reason `_read_declared_art` documents.
-        if (
-            not stat.S_ISREG(st.st_mode)
-            or st.st_nlink != 1
-            or st.st_size > _UI_MAX_BYTES
-        ):
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size > _UI_MAX_BYTES:
             os.close(fd)
             return "not_found"
     except OSError:
@@ -2804,13 +2833,21 @@ async def handle_app_ui_file(request: web.Request) -> web.StreamResponse:
             # `to_thread` hops on the shared default executor — no second
             # acquisition here: a nested acquire under the same semaphore
             # would deadlock once 8 holders each waited for a 9th permit.
-            while remaining > 0:
-                chunk = await asyncio.to_thread(os.read, fd, min(_UI_STREAM_CHUNK, remaining))
-                if not chunk:
-                    break
-                remaining -= len(chunk)
-                await resp.write(chunk)
-            await resp.write_eof()
+            # Bounded by wall clock as well as by `remaining`: the permit is
+            # held across this loop, so a client that stops reading would
+            # otherwise hold it (and its fd) forever — 8 such clients wedge the
+            # route for everyone. On expiry the `TimeoutError` propagates, the
+            # `finally` below closes the descriptor, the permit is released, and
+            # aiohttp drops a connection whose announced `content_length` can no
+            # longer be honoured.
+            async with asyncio.timeout(_UI_STREAM_TIMEOUT):
+                while remaining > 0:
+                    chunk = await asyncio.to_thread(os.read, fd, min(_UI_STREAM_CHUNK, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    await resp.write(chunk)
+                await resp.write_eof()
             return resp
         finally:
             # Off the loop: `os.close` is on the no-blocking-call-on-event-loop
@@ -2831,6 +2868,17 @@ async def handle_app_dev_mode(request: web.Request) -> web.Response:
 
     Metadata-only change (installed.json); the dev-mode watcher picks it up
     within one poll interval, so no gateway restart is needed.
+
+    This route deliberately carries NO way to confirm an out-of-install ui
+    root: app UI bundles run as same-origin modules with the dashboard's own
+    credentials, so any request-body confirmation flag would be data the app
+    controls, not operator attestation — an app could self-grant serving an
+    arbitrary non-sensitive directory over the unauthenticated UI route by
+    POSTing to its own toggle. Enabling dev mode on such a root therefore
+    always answers 400 here (``code:
+    "dev_mode_out_of_install_confirmation_required"``, naming the CLI
+    command); confirmation is supplied only from the gateway host via
+    ``kirocrew app dev <name> --confirm-out-of-install-root``.
     """
     from kiro_crew.apps.dev_mode import set_dev_mode
 
@@ -3185,9 +3233,7 @@ async def _fetch_git_blob(
                     "git fetch failed for %s/%s: %s",
                     _strip_git_target_userinfo(repo),
                     file_path,
-                    _loggable_git_transport_output(
-                        "\n".join(fetch_log), credentialed=True
-                    ),
+                    _loggable_git_transport_output("\n".join(fetch_log), credentialed=True),
                 )
                 return False
         else:
@@ -3213,9 +3259,7 @@ async def _fetch_git_blob(
                 env=clone_env,
             )
             try:
-                _, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=_BLOB_FETCH_TIMEOUT
-                )
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=_BLOB_FETCH_TIMEOUT)
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.communicate()
@@ -3859,9 +3903,7 @@ async def handle_registries(request: web.Request) -> web.Response:
         # vetted full git URL. Reuse the blob-proxy validator, which rejects
         # shell metacharacters / traversal and owner/repo shorthand.
         if not _is_safe_repo_identifier(repo):
-            return _deny(
-                f"invalid repo URL or name: {public_repo!r}", f"repo={public_repo}"
-            )
+            return _deny(f"invalid repo URL or name: {public_repo!r}", f"repo={public_repo}")
         if repo in _blocked_repos:
             return _deny(
                 f"{public_repo!r} is the core registry — no need to add it",
@@ -4071,6 +4113,10 @@ def register_app_routes(app: web.Application) -> None:
     app.router.add_put("/api/apps/registries", handle_registries)
     app.router.add_post("/api/apps/registries/refresh", handle_registries_refresh)
     app.router.add_get("/api/apps/blob", handle_blob_proxy)
+    # Outside /api/apps/ on purpose: _app_owns_path would grant an app named
+    # `registry` implicit ownership of /api/apps/registry/* -- see the
+    # handler's docstring.
+    app.router.add_post("/api/app-store/refresh", handle_registry_refresh)
     app.router.add_post("/api/apps/registry/install", handle_registry_install)
     app.router.add_post("/api/apps/registry/install-stream", handle_registry_install_stream)
     app.router.add_post("/api/apps/install", handle_install_app)

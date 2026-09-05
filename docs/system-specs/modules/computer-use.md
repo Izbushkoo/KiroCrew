@@ -176,12 +176,16 @@ call, because there is no per-surface ceiling left for it to select.
 
 That is enforced in the SHIM as well as the gateway, and it has to be: neither
 accepted source exists for a GUI-launched kiro-cli on **macOS**, the only platform
-with a driver. `KIROCREW_SESSION_KEY` is injected only by the ACP spawn path
-(`acp/client.py`), and `KIROCREW_HOST_PID` only by the Linux sandbox launcher
-(`sandbox.py:666`). An earlier revision refused in the shim on the reasoning that an
-unproven key is indistinguishable from an unattended surface — with the unattended
-rule gone, that left the feature returning *"the calling session could not be
-identified"* for every ordinary dashboard chat on macOS. Found by using it.
+with a driver. `KIROCREW_SESSION_KEY` reaches a child only from a launcher that
+already knows which session it is spawning for — the ACP spawn path
+(`acp/client.py`) and the script-cron launcher (`cron_script.py`, which spawns one
+process per job under `cron:<job id>`) — and `KIROCREW_HOST_PID` only from the Linux
+sandbox launcher (`sandbox.py:666`). A GUI-launched kiro-cli has no such launcher
+above it, so it carries neither. An earlier revision refused in the shim on the
+reasoning that an unproven key is indistinguishable from an unattended surface —
+with the unattended rule gone, that left the feature returning *"the calling
+session could not be identified"* for every ordinary dashboard chat on macOS.
+Found by using it.
 
 The STRICT resolver is still the one called: the lenient variant walks a file
 `mcp_core` documents as "agent-writable and therefore forgeable", and an empty audit
@@ -342,8 +346,9 @@ and touches no other application, so it is neither observe nor mutate). The
 class labels above are the code-owned `governance._CU_ACTION_CLASSES` table —
 see [governance.md](governance.md).
 
-Both spool writers (`service._persist_image` and `capture_macos.persist_jpeg`) name
-their files with `tempfile.mkstemp`, not a millisecond timestamp. `_shot_lock`
+All three spool writers (`service._persist_image`, `capture_macos.persist_jpeg`
+and `capture_windows.persist_jpeg`) name their files with `tempfile.mkstemp`, not
+a millisecond timestamp. `_shot_lock`
 serializes writers within one service instance but cannot serialize a second
 PROCESS — the gateway, the CLI and the permission-probe child all spool into the
 same `tempfile.gettempdir()` directory — so a timestamp-only name let two captures
@@ -352,7 +357,9 @@ leaving its caller holding a screenshot of an application it never asked about
 (a cross-capture pixel leak, reviewer finding). `mkstemp` also creates the file
 `0o600` from the outset, so there is no window in which it exists world-readable
 before `restrict_to_owner` runs. The timestamp stays in the *prefix* because the
-ring trim orders by name.
+ring trim orders by name. If descriptor adoption or the write fails, each writer
+removes its invocation-owned partial frame before degrading; it never sweeps a
+neighbouring capture owned by another call or process.
 
 **`computer_list_apps` only omits an app it cannot name.** It used to carry a
 per-app governance filter (`gate.app_is_disclosable` against the `computer_use.apps`
@@ -1581,10 +1588,14 @@ a result.
 `computer_use/screencast.py` + `website/src/components/ComputerUseLiveView.tsx`.
 The machine being driven is often not the machine the operator is looking at (a
 cloud Mac, a session reached over the reverse SSH tunnel, or another Space), so a
-floating picture-in-picture panel mirrors what the agent sees. Same shape as the
-browse mirror (`browser/screencast.py` → `/api/browser/frame` → WS →
-`BrowserLiveView`), for the same reason: it rides an existing capture rather than
-opening a new one.
+floating picture-in-picture panel mirrors what the agent sees. It rides an
+existing capture rather than opening a new one: `emit_snapshot_frame` POSTs the
+already-encoded JPEG to the loopback `/api/computer-use/frame` ingress, which
+rebroadcasts it to OWNER websockets as a `computer_use_frame` event. The
+in-gateway browse mirror this shape was modelled on is gone — browsing now runs
+through the external `playwright-cli` binary (`kiro_crew/browser_cli/`), which
+serves its own dashboard (`playwright-cli show`, supervised by
+`browser_cli/view.py`) instead of relaying frames through the gateway.
 
 **It is a RELAY, not a capture.** `capture_snapshot_image` hands the JPEG it just
 encoded for the model to `emit_snapshot_frame`. There is no timer, no second
@@ -2313,8 +2324,9 @@ dead button that only reproduces in a packaged build.
 
 ## The CLI (`kirocrew computer`) — and what is deliberately not ported
 
-`computer_use/cli.py`. Three verbs, hand-rolled dispatch mirroring
-`browser/cli.py`. Full command reference in [cli.md](cli.md).
+`computer_use/cli.py`. Three verbs, hand-rolled dispatch rather than argparse
+subparsers (the parent CLI forwards `REMAINDER`). Full command reference in
+[cli.md](cli.md).
 
 | Verb | For | Gated on the primary enable? |
 |---|---|---|

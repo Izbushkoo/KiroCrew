@@ -1,4 +1,5 @@
 import { createSlice, createAsyncThunk, createSelector, type PayloadAction } from '@reduxjs/toolkit'
+import { whenScrollQuiet } from '../lib/scrollQuiet'
 import { api } from '../api/client'
 import { addSlotOptimistic, updateSlot, removeSlotOptimistic, markSlotRead, fetchSlots, slotSurfaceKey, sseSlots, sseConnected } from './dashboardSlice'
 import { resolveDefaultColor } from '../utils/sessionColors'
@@ -97,6 +98,45 @@ function isRedeliveredMessage(
     if (msgs[i].meta?.mid === mid) return true
   }
   return false
+}
+
+/** Remove duplicate messages that share the same delivery identity —
+ *  `meta.mid` plus `role` plus `ts`.
+ *
+ *  On non-streaming channels (e.g. Weixin/iLink), the slot's turn-complete
+ *  broadcast and a concurrent `refreshSlot` HTTP fetch can race — each
+ *  delivering the same assistant row with the same server-minted `mid` — and
+ *  the merge helpers (`mergePreservedClientTs`, `mergePreservedThinking`) do
+ *  not collapse rows by `mid` because their contracts are narrower (timestamp
+ *  preservation, reasoning re-injection). This final pass keeps the LAST
+ *  occurrence of each identity (the freshest merge outcome) and drops earlier
+ *  duplicates, making the dedup idempotent and safe on already-clean arrays.
+ *
+ *  Identity is deliberately mid AND role AND ts, not mid alone: the same row
+ *  delivered through both doors carries an identical role and server `ts`, so
+ *  the legitimate race duplicates still collapse — while a DISTINCT row that
+ *  illegitimately reuses a mid (e.g. a crafted `meta.mid` in a POST /api/chat
+ *  body, which `_ChatSlot.append` preserves rather than re-minting) is
+ *  appended at a different time and therefore never hides an earlier
+ *  legitimate transcript row. */
+function deduplicateByMid(msgs: ChatMessage[]): ChatMessage[] {
+  const seen = new Set<string>()
+  // Walk backwards so the LAST (newest) occurrence wins.
+  const result: ChatMessage[] = []
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const mid = msgs[i].meta?.mid
+    if (typeof mid === 'string' && mid) {
+      // JSON-array key rather than a delimiter-joined template: no delimiter
+      // can collide with field content, and no string literal trips the
+      // zero-tolerance i18n added-lines gate on this internal identity key.
+      const key = JSON.stringify([mid, msgs[i].role, msgs[i].ts ?? null])
+      if (seen.has(key)) continue
+      seen.add(key)
+    }
+    result.push(msgs[i])
+  }
+  result.reverse()
+  return result
 }
 
 /** Tail window (rows) for a backward `sendId` scan. Shared by the echo
@@ -696,6 +736,33 @@ interface ChatState {
   history: SessionInfo[]
   historyHasMore: boolean
   historyOffset: number
+  /** The last resume that did not land the user in a session they can use, or
+   *  null. This is the ONE post-resolve check for every resume entry point
+   *  (#5925): the predicates live in `resumeFromHistory`'s own cases, so a
+   *  caller does not have to re-derive "did this resume actually work" to give
+   *  feedback -- and the two command-palette providers, which are plain modules
+   *  with no component of their own, get feedback they could not render
+   *  themselves.
+   *
+   *  `reason` separates the two ways a resume disappoints, because they need
+   *  different sentences: `surface` means it succeeded but landed on a surface
+   *  the chat page cannot display, `failed` means it did not succeed at all
+   *  (a rejected request, or a fulfilled payload that says `ok: false`). Before
+   *  the `failed` half existed, the rarer path was the very dead click this
+   *  field was added to kill.
+   *
+   *  Raw facts, not a sentence: the render site localizes the surface label
+   *  from `key`, which only it knows how to read. Lifecycle matches the
+   *  per-component notice #3640 shipped -- cleared on dismiss or on the next
+   *  resume attempt. */
+  unresumableResume: { key: string; title: string; surface: string; reason: 'surface' | 'failed' } | null
+  /** requestId of the most recent `resumeFromHistory.pending`. Latest-click-
+   *  wins for the notice above: rapid clicks each start a resume, and an
+   *  EARLIER one resolving after a LATER one must not narrate a row the user
+   *  has already moved past. Supersedes the sidebar's component-local
+   *  sequence ref, which could only order ITS OWN clicks -- a palette resume
+   *  racing a sidebar resume was unordered before. */
+  lastResumeRequestId: string | null
   pendingInput: string | null
   /** Transient feedback for agent-rebind failures shared by the picker and
    *  global cycle shortcuts. The App shell owns rendering and expiry. */
@@ -909,6 +976,8 @@ const initialState: ChatState = {
   history: [],
   historyHasMore: false,
   historyOffset: 0,
+  unresumableResume: null,
+  lastResumeRequestId: null,
   pendingInput: null,
   agentSwitchNotice: null,
   creatingSlot: false,
@@ -1204,6 +1273,80 @@ export const fetchHistory = createAsyncThunk(
  *  with is simply page one of the same pagination `loadOlderMessages` runs. */
 export const OLDER_PAGE_LIMIT = 100
 
+/** Page size for walking BACK through history (loadOlderMessages), distinct
+ * from the slot-open first page. The open page is latency-critical — it is the
+ * slot-switch paint, which is exactly what #5404 bounded — so it stays small.
+ * A back-walk page is read while the walk's own spinner shows and each page
+ * costs a full round trip (painful over a phone tunnel), so bigger pages cut
+ * the walk's dominant cost: a 13-page walk becomes 5. */
+export const OLDER_WALK_PAGE_LIMIT = 300
+
+/** The handler's own ceiling (`min(int(limit), 500)` in chat_handlers). Asking
+ *  for more is silently clamped, so a caller that needs to KNOW whether its
+ *  window covered the cache has to compare against this, not against what it
+ *  asked for. */
+export const SLOT_DETAIL_MAX_LIMIT = 500
+
+/**
+ * Rows to request when switching to a slot, or `undefined` for the unbounded
+ * shape.
+ *
+ * A switch used to go UNBOUNDED for any slot with rows already painted, and the
+ * comment beside it carried its own measurement: 6.2MB/~1s unbounded against
+ * 0.7MB/57ms bounded. So the FIRST visit to a session was the fast one and every
+ * return to it paid for the whole chained transcript — on a 43MB session that is
+ * the reported "switching chats got slow and janky", and it got worse as more
+ * history became reachable.
+ *
+ * The reason for going unbounded was real but narrower than the rule: a bounded
+ * page is a WINDOW, and if the server grew past it the window could sit entirely
+ * newer than the cache, leaving a hole in the middle of the transcript. That is
+ * a question of COVERAGE, not of boundedness — so ask for the cache plus one
+ * page, which covers everything held unless the server grew by more than a page
+ * since (impossible while idle; a streaming slot still goes unbounded). The
+ * caller verifies coverage against the response and re-fetches unbounded only
+ * when the bound was actually hit.
+ */
+export function slotSwitchFetchLimit(input: {
+  streaming: boolean
+  cached: number
+  pageLimit?: number
+  maxLimit?: number
+}): number | undefined {
+  const pageLimit = input.pageLimit ?? OLDER_PAGE_LIMIT
+  const maxLimit = input.maxLimit ?? SLOT_DETAIL_MAX_LIMIT
+  if (input.streaming) return undefined
+  if (input.cached <= 0) return pageLimit
+  return Math.min(maxLimit, input.cached + pageLimit)
+}
+
+/**
+ * Whether a bounded switch response may have failed to cover the cache.
+ *
+ * The hazard the unbounded shape existed to avoid is a HOLE: the window sitting
+ * entirely newer than the cache, so the merge leaves a gap mid-transcript. That
+ * can only happen if the server GREW by at least a window's worth while this tab
+ * was looking elsewhere — a smaller window still overlaps, and a window larger
+ * than the corpus reaches its start.
+ *
+ * So the discriminator is growth since this tab's last view of the slot
+ * (`slotServerTotal`, retained per key), not the size of the response. An
+ * unknown prior total cannot prove overlap, so it retries — declining to guess,
+ * the same rule `retainServerTotal` itself follows.
+ */
+export function slotSwitchNeedsUnboundedRetry(input: {
+  requestedLimit: number | undefined
+  cached: number
+  serverTotal: number | undefined
+  priorServerTotal: number | undefined
+}): boolean {
+  const { requestedLimit, cached, serverTotal, priorServerTotal } = input
+  if (requestedLimit === undefined) return false
+  if (cached <= 0) return false
+  if (typeof serverTotal !== 'number' || typeof priorServerTotal !== 'number') return true
+  return serverTotal - priorServerTotal >= requestedLimit
+}
+
 // Aborts the in-flight older-history fetch, or null when none is running.
 // Module-level because switchSlot must reach a fetch it did not start.
 let _abortLoadOlder: (() => void) | null = null
@@ -1357,6 +1500,60 @@ function writeSlotPage(
   state.slotPaneHasMore[k] = hasMore
 }
 
+/** Occurrences of each usable `meta.mid` in a row list.
+ *
+ *  `meta` on an inbound message is CALLER-supplied and an id is minted only when
+ *  one is ABSENT, so a client can post the same `mid` twice and an id is NOT a
+ *  unique key. Counting is what lets a caller tell "this id names the row I mean"
+ *  from "this id names SOME row" -- the distinction a membership test cannot make.
+ */
+function midOccurrences(rows: Array<{ meta?: Record<string, unknown> }>): Map<string, number> {
+  const counts = new Map<string, number>()
+  for (const row of rows) {
+    const mid = row.meta?.mid
+    if (typeof mid === 'string' && mid.length > 0) counts.set(mid, (counts.get(mid) ?? 0) + 1)
+  }
+  return counts
+}
+
+/** Does this id name exactly ONE row on each side, and are those two rows the same row?
+ *
+ *  The one identity rule every bounded-page comparison in this file runs on. An id
+ *  that names two rows is a predicate, not a reference: acting on it cuts or
+ *  substitutes at whichever occurrence happened to be found first.
+ *
+ *  `requireTs` exists because DECLINING costs different things at the two call
+ *  sites, and the safe default is therefore different:
+ *
+ *    - `refreshSlot`'s pre-fulfil check pays ONE ROUND TRIP for a decline (it
+ *      refetches unbounded), so it can afford the strict form and passes
+ *      `requireTs: true`: both rows must carry a `ts` and it must match. That is
+ *      what rules out two genuinely different rows sharing a caller-supplied id.
+ *    - `olderHeadAbovePage` pays the KEPT HEAD for a decline -- the scrollback it
+ *      exists to protect. Demanding a `ts` there would drop the head for legacy
+ *      rows that carry none, turning a guard into the very data loss it guards
+ *      against. So the default only requires that the two rows do not CONTRADICT
+ *      each other: a missing `ts` on either side is not evidence of a mismatch.
+ */
+function idAnchorsOneRow(
+  id: unknown,
+  view: Array<{ ts?: string; meta?: Record<string, unknown> }>,
+  page: Array<{ ts?: string; meta?: Record<string, unknown> }>,
+  viewCounts: Map<string, number>,
+  pageCounts: Map<string, number>,
+  opts?: { requireTs?: boolean },
+): boolean {
+  if (typeof id !== 'string' || id.length === 0) return false
+  if (viewCounts.get(id) !== 1 || pageCounts.get(id) !== 1) return false
+  const inView = view.find(m => m.meta?.mid === id)
+  const inPage = page.find(m => m.meta?.mid === id)
+  if (!inView || !inPage) return false
+  const bothTimestamped = typeof inView.ts === 'string' && inView.ts.length > 0
+    && typeof inPage.ts === 'string' && inPage.ts.length > 0
+  if (opts?.requireTs && !bothTimestamped) return false
+  return bothTimestamped ? inView.ts === inPage.ts : true
+}
+
 /** The prior rows that sit ABOVE a bounded page's first row, plus the index the
  *  cut fell at (-1 when there is none).
  *
@@ -1366,29 +1563,64 @@ function writeSlotPage(
  *  paths diverged: `warmSlotCache` kept the head while `switchSlot` discarded
  *  it, collapsing a paged-in window to the newest page on switch-away-and-back.
  *
- *  Identity is `meta.mid` ONLY. Two rows can share a `ts`, so a ts match can cut
- *  at the wrong row and drop one; no mid means decline (an empty head), never
- *  guess. Callers hold `thinking` rows out: reasoning is broadcast-only, carries
- *  no identity, and is re-placed by `mergePreservedThinking` afterwards.
+ *  Identity is `meta.mid`, and it must name exactly ONE row on each side --
+ *  `idAnchorsOneRow`, the same invariant `refreshSlot` and the slot-detail
+ *  handler's overlay run on. A bare `findIndex` cut at the FIRST row carrying the
+ *  id, and `meta.mid` is caller-supplied (an id is minted only when absent), so a
+ *  client posting one twice made the cut land on the wrong occurrence and drop the
+ *  history above it. An ambiguous id therefore declines exactly like a missing one:
+ *  `cutIdx -1`, empty head, which every caller already handles.
+ *
+ *  No mid means decline (an empty head), never guess. Callers hold `thinking` rows
+ *  out: reasoning is broadcast-only, carries no identity, and is re-placed by
+ *  `mergePreservedThinking` afterwards.
  */
 function olderHeadAbovePage(
   prior: ChatMessage[],
   page: ChatMessage[],
 ): { cutIdx: number; olderHead: ChatMessage[] } {
   const pageOldestMid = page[0]?.meta?.mid
-  const cutIdx = typeof pageOldestMid === 'string' && pageOldestMid
+  const anchored = idAnchorsOneRow(
+    pageOldestMid, prior, page, midOccurrences(prior), midOccurrences(page),
+  )
+  const cutIdx = anchored
     ? prior.findIndex(m => m.meta?.mid === pageOldestMid)
     : -1
   return { cutIdx, olderHead: cutIdx > 0 ? prior.slice(0, cutIdx) : [] }
 }
 
+/** Roles the server never writes to history. `permission` is in the backend's own
+ *  `_TRANSIENT_ROLES`; `queued`/`streaming`/`thinking` exist only in this client.
+ *  `error`/`mcp_oauth` are deliberately absent -- those ARE persisted.
+ *
+ *  One set, because two consumers ask the same question for opposite reasons and a
+ *  second copy would let them drift: `serverRowCount` counts durable rows to shift
+ *  a paging OFFSET, and `hasUnidentifiedDurableRow` looks for a durable row the
+ *  bound cannot see. A role missing from one copy would silently mis-shift a cursor
+ *  in the first and silently drop scrollback in the second. */
+const CLIENT_ONLY_ROLES: ReadonlySet<string> = new Set(['queued', 'streaming', 'thinking', 'permission'])
+
+/** Does this row survive in the server's transcript? */
+function isDurableRow(m: ChatMessage): boolean {
+  return !CLIENT_ONLY_ROLES.has(m.role)
+}
+
 /** How many rows of a kept older head came from SERVER history, for shifting the
  *  paging cursor. The cursor is a row OFFSET, so client-only rows must not count
- *  toward it. `thinking` is already held out by the caller. `permission` is in the
- *  backend's `_TRANSIENT_ROLES` and is never persisted, so it holds no offset --
- *  unlike `error`/`mcp_oauth`, which ARE written to history and must keep counting. */
+ *  toward it. Callers already strip `thinking`, so including it in the shared set
+ *  costs nothing here and keeps one definition of durable. */
 function serverRowCount(rows: ChatMessage[]): number {
-  return rows.filter(m => m.role !== 'queued' && m.role !== 'streaming' && m.role !== 'permission').length
+  return rows.filter(isDurableRow).length
+}
+
+/** Is there a row the server PERSISTS but that carries no `meta.mid`?
+ *
+ *  Such a row is invisible to a `mid`-counted bound and unreachable to a
+ *  `mid`-keyed cut: it cannot be counted into the limit, and it cannot be anchored
+ *  into a kept head. It is nonetheless on screen. Legacy history written before
+ *  `mid` existed is the real case. */
+function hasUnidentifiedDurableRow(rows: ChatMessage[]): boolean {
+  return rows.some(m => isDurableRow(m) && !(typeof m.meta?.mid === 'string' && m.meta.mid.length > 0))
 }
 
 /** The `(hasMore, cursor)` pair to install after keeping an older head above a
@@ -1448,10 +1680,12 @@ function retainServerTotal(state: ChatState, key: string, total: number | undefi
 
 async function fetchSlotDetail(key: string, limit?: number) {
   // A limit takes the handler's most-recent-N slice. `undefined` keeps the
-  // unbounded shape, which two callers still need: refreshSlot replaces the
-  // active transcript in place (a bound would shrink history the user already
-  // paged in), and a STREAMING warm/switch fetch (deliberate, though the handler
-  // collapses before slicing). Omit the arg when unbounded to keep the one-arg shape.
+  // unbounded shape, which a STREAMING warm/switch fetch still takes
+  // (deliberate, though the handler collapses before slicing). refreshSlot
+  // replaces the active transcript in place, so it cannot take a FIXED bound
+  // (that would shrink history the user already paged in) — it passes a
+  // COUNT-MATCHED one instead, see REFRESH_LIMIT_CEILING. Omit the arg when
+  // unbounded to keep the one-arg shape.
   const d = await (limit === undefined ? api.chatSlotDetail(key) : api.chatSlotDetail(key, limit))
   type QueueItem = string | { content: string; id: string }
   return { key, nextBefore: d.next_before || 0, messages: filterMessages(d.messages || []), running: d.running || false, stopping: d.stopping || false, hasMore: d.has_more || false, total: d.total || 0, queue: ((d.queue || []) as QueueItem[]).map((q: QueueItem) => typeof q === 'string' ? { content: q, queueId: crypto.randomUUID(), ts: new Date().toISOString() } : { content: q.content, queueId: q.id, ts: new Date().toISOString() }), context: d.context_pct != null ? { pct: d.context_pct, used: d.context_used_tokens ?? undefined, window: d.context_window_tokens ?? undefined } : undefined }
@@ -1532,13 +1766,34 @@ export const switchSlot = createAsyncThunk<
     // still describes the OUTGOING slot. `slotRun` is keyed per slot, so it
     // answers for the incoming one. Guarded because a partial preloaded state
     // can omit `slotRun` entirely, and throwing here would skip the fetch.
-    const state = (getState() as { chat: ChatState }).chat
-    const streaming = (state.slotRun?.[key]?.state ?? 'idle') !== 'idle'
     // A bounded page is a WINDOW, and unseen server growth can push that window clear
     // of a small cache entirely, so only a slot with nothing painted may be bounded.
-    const cached = state.slotMessages?.[safeKey(key)]?.length ?? 0
     try {
-      return await fetchSlotDetail(key, streaming || cached > 0 ? undefined : OLDER_PAGE_LIMIT)
+      // Bounded ONLY for a slot with nothing painted (a fresh switch, boot).
+      // Streaming or painted slots stay unbounded: a bounded page is a WINDOW,
+      // and unseen server growth can push it clear of a small cache entirely —
+      // the shrink contract in chatSlice.boundedRefetchShrink.test.ts pins
+      // this with a live capture. The fresh-slot bound keeps the switch/boot
+      // cost at one page (measured 6.2MB/~1s unbounded vs 0.7MB/57ms bounded).
+      const state = (getState() as { chat: ChatState }).chat
+      const streaming = (state.slotRun?.[key]?.state ?? 'idle') !== 'idle'
+      const cached = state.slotMessages?.[safeKey(key)]?.length ?? 0
+      const limit = slotSwitchFetchLimit({ streaming, cached })
+      const first = await fetchSlotDetail(key, limit)
+      // Coverage check, not a second guess at the limit: only growth larger than
+      // the window this tab just asked for can leave a hole between the window
+      // and the cache. Everything else already overlaps.
+      if (
+        slotSwitchNeedsUnboundedRetry({
+          requestedLimit: limit,
+          cached,
+          serverTotal: first.total,
+          priorServerTotal: state.slotServerTotal?.[safeKey(key)],
+        })
+      ) {
+        return await fetchSlotDetail(key)
+      }
+      return first
     } catch (e) {
       // A thrown error crosses the thunk boundary as `miniSerializeError(e)`,
       // which keeps string fields only -- `ApiError.status` (a number) never
@@ -2181,12 +2436,131 @@ function mergePreservedClientTs<M extends { role: string; content: string; ts?: 
   )
 }
 
+/** Upper bound on the count-matched `refreshSlot` limit, matching the ceiling
+ *  the slot-detail handler clamps `limit` to. A request above it comes back
+ *  SHORT of what was asked for, which for an in-place replacement means the
+ *  view SHRINKS — so a transcript paged back past this keeps the unbounded
+ *  shape rather than truncate. */
+export const REFRESH_LIMIT_CEILING = 500
+
 export const refreshSlot = createAsyncThunk(
   'chat/refreshSlot',
   async (key: string, { getState }) => {
     const state = (getState() as { chat: ChatState }).chat
     if (state.activeSlot !== key) return null
-    return fetchSlotDetail(key)
+    // COUNT-MATCHED bound, not a fixed one. The recurring refresh (reconnect,
+    // chat_done, variant switch) no longer pulls the whole chained transcript
+    // every time — but because it REPLACES `messages` wholesale, a fixed
+    // bound would delete scrollback the user paged in. Asking for at least as
+    // many rows as the view already HOLDS is bounded and cannot shrink it, since
+    // the handler's slice is the most-recent-N. PANE_HYDRATE_LIMIT is the FLOOR
+    // (a floor cannot truncate) so a near-empty slot still asks for a sensible
+    // page instead of one row.
+    //
+    // An EMPTY view is the one case that stays unbounded: there is no count to
+    // match, so any number here would be the fixed bound this design rejects,
+    // and this refresh is then the client's only read of a transcript it holds
+    // nothing of (a reconnect after `clearMessages`, a refresh racing slot
+    // activation). Bounding it would install a window nothing asked for.
+    // Only rows the SERVER transcript carries can be counted against a limit the
+    // HANDLER applies to server rows. `state.messages` also holds client-only rows
+    // -- a `thinking` block, a `permission` card, a `queued` bubble -- and counting
+    // those inflates the request past the view's own span, which drags the page
+    // BELOW the view's oldest row. `meta.mid` is the server's own per-row stamp,
+    // the same server-row notion `serverRowCount` and the reducer's
+    // `priorServerRows` are built on.
+    const view = state.messages
+    /* `isDurableRow` is load-bearing here, not decoration. A client-only row can
+     * carry a `mid` too, and counting one inflates `held` -- which does not merely
+     * over-request, it makes `want === held` hold when the DURABLE span is smaller,
+     * silently bypassing the floor guard below whose whole argument is that at
+     * `want === held` a page of `held` rows cannot hide an unidentified row. The
+     * limit reaches a handler that slices DISK, and disk has no client-only rows, so
+     * only durable ones may be counted against it. */
+    const serverRows = view.filter(
+      m => isDurableRow(m) && typeof m.meta?.mid === 'string' && m.meta.mid.length > 0,
+    )
+    const held = serverRows.length
+    const want = Math.max(held, PANE_HYDRATE_LIMIT)
+    /* The FLOOR is the one over-request, and mixed history is where it bites.
+     *
+     * At `want === held` the page cannot strand a durable row: `spansView` only
+     * passes when all `held` identified rows are INSIDE a page of exactly `held`
+     * rows, which leaves no room for an unidentified row to be the page's oldest --
+     * and `overlapsView` already requires the page's oldest row to anchor. So the
+     * count-matched request is safe whatever the identities are.
+     *
+     * `want > held` breaks that arithmetic. With few identified rows the floor pulls
+     * a page of 50 that holds all of them (so `spansView` passes) plus older
+     * UNIDENTIFIED rows -- and the page's oldest row is then one the `mid`-keyed cut
+     * cannot anchor, so the reducer keeps no head while the view holds rows above it.
+     * They would be in no page and no head, which is the scrollback loss this bound
+     * exists to avoid. Legacy rows written before the backend stamped `mid` are the
+     * real case.
+     *
+     * So the floor declines on a window it cannot fully identify. Modern transcripts
+     * -- every live session, which is the recurring cost #4690 is about -- keep the
+     * bound, because their rows all carry a `mid`. */
+    const floorOverRequests = want > held
+    const bounded =
+      held > 0 &&
+      want <= REFRESH_LIMIT_CEILING &&
+      !(floorOverRequests && hasUnidentifiedDurableRow(view))
+    if (!bounded) return fetchSlotDetail(key)
+    const page = await fetchSlotDetail(key, want)
+    /* Is this page safe to hand a reducer that REPLACES the transcript with it?
+     * It is, on any one of three counts -- and each is a different relationship
+     * between the page's range and the view's, not a restatement:
+     *
+     *   1. the page reaches the START of history (`!hasMore`), so it covers the
+     *      view whatever the identities are;
+     *   2. the page CONTAINS the view's oldest row, so it spans everything the
+     *      view holds -- the floor's over-request lands here, and a superset can
+     *      lose nothing;
+     *   3. the page's own oldest row is IN the view, so the ranges overlap and
+     *      `olderHeadAbovePage` can cut a head to keep above it.
+     *
+     * None of the three: the server gained at least `held` rows during the gap, so
+     * page and view are FULLY DISJOINT and the reducer -- correctly declining to
+     * guess a cut it has no identity for -- would drop every loaded row. Refetch
+     * unbounded there. One extra round trip in exactly the case a slice cannot be
+     * stitched, which keeps the alternative off the table: splicing a disjoint
+     * page onto the view publishes a transcript with a silent hole in it.
+     */
+    /* Counts, not membership. A `Set.has` / `Array.some` answers "SOME row carries
+     * this id", and a caller-repeated `meta.mid` makes that true while pointing at
+     * a DIFFERENT occurrence than the one meant -- so the page reads as safe and
+     * the reducer then cuts at the wrong row and drops visible history. Both tests
+     * below therefore go through the one anchor invariant. */
+    /* Validate against the view as it is NOW, not the snapshot the limit was sized
+     * from. `view` was read before the await, and `loadOlderMessages` can resolve
+     * inside it: the rows it prepends are exactly the scrollback a wrong decision
+     * strands, and they can also make an anchor that was unique in the old view
+     * AMBIGUOUS in the new one. Judging a page against a view that no longer exists
+     * is how it gets accepted and then cut wrong.
+     *
+     * The limit itself is not re-derived -- the request is already in flight and a
+     * page that is now too small simply fails the checks below and refetches
+     * unbounded, which is the safe direction. Re-reading is only about the DECISION.
+     *
+     * A slot switch during the await makes the whole answer moot, so it declines the
+     * same way the pre-fetch check does. */
+    const after = (getState() as { chat: ChatState }).chat
+    if (after.activeSlot !== key) return null
+    const viewNow = after.messages
+    const serverRowsNow = viewNow.filter(
+      m => isDurableRow(m) && typeof m.meta?.mid === 'string' && m.meta.mid.length > 0,
+    )
+    const viewCounts = midOccurrences(viewNow)
+    const pageCounts = midOccurrences(page.messages)
+    const anchors = (id: unknown): boolean =>
+      idAnchorsOneRow(id, viewNow, page.messages, viewCounts, pageCounts, { requireTs: true })
+    /* `serverRowsNow` can be empty even though the pre-fetch `held` was positive --
+     * a `clearMessages` landing in the await empties the view -- so the oldest-row
+     * anchor is guarded rather than indexed blind. */
+    const spansView = serverRowsNow.length > 0 && anchors(serverRowsNow[0].meta?.mid)
+    const overlapsView = anchors(page.messages[0]?.meta?.mid)
+    return !page.hasMore || spansView || overlapsView ? page : fetchSlotDetail(key)
   },
 )
 
@@ -2222,7 +2596,7 @@ export const warmSlotCache = createAsyncThunk(
 
 export const createSlot = createAsyncThunk<
   ChatSlot,
-  { agent?: string; model?: string; mode?: string; memory_mode?: string; clean_mode?: boolean; folder_id?: string | null; title?: string; color_index?: number | null; color_hex?: string | null; project?: string | null; activate?: boolean } | string | undefined,
+  { agent?: string; model?: string; mode?: string; memory_mode?: string; clean_mode?: boolean; folder_id?: string | null; title?: string; color_index?: number | null; color_hex?: string | null; project?: string | null; activate?: boolean; instanceId?: string } | string | undefined,
   { fulfilledMeta: { originActiveSlot: string | null; activate: boolean } }
 >(
   'chat/createSlot',
@@ -2241,6 +2615,11 @@ export const createSlot = createAsyncThunk<
     const explicitColor = typeof opts === 'string' ? undefined : opts?.color_index
     const explicitHex = typeof opts === 'string' ? undefined : opts?.color_hex
     const project = typeof opts === 'string' ? undefined : opts?.project
+    // Bind the new session to a connected crew for EXECUTION. Sent at birth, not
+    // patched on afterwards: the backend has to open the peer's slot before it
+    // creates the local one, so a failure leaves nothing behind — patching later
+    // would put a session in the sidebar that looks ready and refuses every send.
+    const instanceId = typeof opts === 'string' ? undefined : opts?.instanceId
     // `activate: false` creates the session WITHOUT stealing focus, so a caller
     // that must finish setting the slot up (e.g. scoping it to a worktree) can
     // do so before the user is able to type into it. Defaults to true — every
@@ -2252,7 +2631,7 @@ export const createSlot = createAsyncThunk<
     // pending (e.g. New Chat spun on "Creating" under memory pressure and they
     // moved to another tab), the new slot must NOT hijack the view.
     const originActiveSlot = (getState() as RootState).chat.activeSlot
-    const slot = await api.createChatSlot(undefined, agent, model, mode, memory_mode, title, clean_mode, undefined, folderId || undefined)
+    const slot = await api.createChatSlot(undefined, agent, model, mode, memory_mode, title, clean_mode, undefined, folderId || undefined, instanceId)
     const dashState = (getState() as RootState).dashboard
     // An explicit color (e.g. carried from a slot being recreated on a
     // mode switch) wins; otherwise fall back to the default-color policy.
@@ -2408,10 +2787,12 @@ export const resumeFromHistory = createAsyncThunk(
 export const forkSlot = createAsyncThunk(
   'chat/forkSlot',
   async (
-    { slot, atIndex, prompt, mode, direction }: { slot: string; atIndex?: number; prompt?: string; mode?: string; direction?: 'head' | 'tail' },
+    { slot, atIndex, messageId, prompt, mode, direction }: { slot: string; atIndex?: number; messageId?: string; prompt?: string; mode?: string; direction?: 'head' | 'tail' },
     { dispatch },
   ) => {
-    const d = await api.forkChatSlot(slot, atIndex, prompt, mode, direction)
+    const d = messageId
+      ? await api.forkChatSlot(slot, atIndex, prompt, mode, direction, messageId)
+      : await api.forkChatSlot(slot, atIndex, prompt, mode, direction)
     if (d.ok) {
       dispatch(addSlotOptimistic({ key: d.key, title: d.title || d.key, messages: d.messages || 0, running: false, folder_id: d.folder_id }))
     }
@@ -2424,6 +2805,18 @@ export const deleteHistorySession = createAsyncThunk(
   async (key: string) => { await api.deleteSession(key); return key },
 )
 
+/** Abort any in-flight older-page fetch. Wired to transcript MOTION: the
+ *  settle gates guard the DISPATCH moment, but a page dispatched during a
+ *  reading pause lands 1-2s later — mid-fling on a phone, where the prepend
+ *  compensation fights the momentum curve (reproduced on the momentum rig as
+ *  ±3000px content jumps during coast). Aborting on motion means a landing
+ *  can only ever commit while the scroller is still; the walk re-dispatches
+ *  when stillness returns. An abort rejection carries no payload, so the
+ *  rejected reducer sets no error flag. */
+export function abortActiveOlderFetch(): void {
+  _abortLoadOlder?.()
+}
+
 export const loadOlderMessages = createAsyncThunk(
   'chat/loadOlder',
   async (_, { getState, rejectWithValue }) => {
@@ -2435,7 +2828,24 @@ export const loadOlderMessages = createAsyncThunk(
     const abort = () => controller.abort()
     _abortLoadOlder = abort
     try {
-      const d = await api.chatSlotDetail(slot, OLDER_PAGE_LIMIT, state.slotOldestIndex, controller.signal)
+      // Landing size is a LAYOUT BURST: on a phone (slow CPU, slow network)
+      // a 300-row landing is a long task during which the anchor
+      // compensation paints late and the reader visibly loses their place
+      // ('突然加载一大堆就不在原来的位置'). Narrow viewports take smaller,
+      // cheaper landings; the walk simply takes more of them.
+      const isNarrow = typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+        && window.matchMedia('(max-width: 640px)').matches
+      const walkLimit = isNarrow ? OLDER_PAGE_LIMIT : OLDER_WALK_PAGE_LIMIT
+      const d = await api.chatSlotDetail(slot, walkLimit, state.slotOldestIndex, controller.signal)
+      // LANDING BUFFER: the fetch overlaps the reader's gesture, but the
+      // MUTATION must not -- splicing rows mid-glide races the pre-paint
+      // anchor machinery against the gesture's own pixel-addressed window
+      // recompute (phone rig: kilopixel per-landing jumps whose anchor
+      // consume mis-bound and stood down). Hold the payload until the
+      // scroller has been quiet for a beat; bounded, so a reader who never
+      // pauses still gets the page (see scrollQuiet.ts).
+      await whenScrollQuiet(controller.signal)
+      if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError')
       return { slot, nextBefore: d.next_before || 0, messages: filterMessages(d.messages || []), hasMore: d.has_more || false, total: d.total || 0 }
     } catch (e) {
       // Rethrow a cancellation so the reducer can tell it from a real failure;
@@ -2557,8 +2967,17 @@ const countActiveSubagents = (m?: Record<string, SubagentActivity>) => {
   return n
 }
 
-/** Predicate: subagent is blocked awaiting a spawn approval. */
-const isAwaitingSpawnApproval = (a: SubagentActivity) =>
+/**
+ * Predicate: subagent is blocked awaiting a spawn approval.
+ *
+ * Exported because the RENDERERS need the same question answered, and every
+ * component that re-derived it from `status` alone got a different answer: the
+ * wave chip and the launch card both counted a parked run as running (#7318).
+ * `approval_id` is the load-bearing half — `sseSubagentPending` is the only
+ * writer of `'pending'` and always sets it, so its absence means a card built
+ * some other way and must not be claimed as blocked on the user.
+ */
+export const isAwaitingSpawnApproval = (a: SubagentActivity) =>
   a.status === 'pending' && !!a.approval_id
 
 /** Counts subagents pending spawn approval in a subagent map. */
@@ -2902,6 +3321,11 @@ const chatSlice = createSlice({
       // App shell's expiry effect instead of inheriting the previous timer.
       state.agentSwitchNotice = action.payload === null ? null : { message: action.payload }
     },
+    /** Dismiss the unresumable-surface notice (#5925). Deliberately does NOT
+     *  clear `lastResumeRequestId`: that ordering token belongs to the resume
+     *  in flight, and forgetting it would let an older resume's late answer
+     *  re-open a notice the user just closed. */
+    clearUnresumableResume(state) { state.unresumableResume = null },
     setQuestionCard(state, action: PayloadAction<{ slot: string; ask_id?: string; card_id?: string; questions: ChatState['pendingQuestions'][string]['questions']; fresh?: boolean }>) {
       // Defensive init: existing test fixtures build partial preloaded state
       // without this key.
@@ -3280,6 +3704,39 @@ const chatSlice = createSlice({
         return false
       }
       if (!confirm(state.messages)) confirm(state.slotMessages[safeKey(slot)])
+    },
+    /** Resolve an optimistic steer bubble against the steer POST's own receipt.
+     *
+     *  `meta.steer` draws the "Steered into the running turn" badge, so it is an
+     *  affirmative claim, and only `steered: true` makes it true. `queued: true`
+     *  means the text sits in the slot queue, and EVERY arm reporting it has
+     *  already broadcast a `queue_push` — including the turn teardown, which is
+     *  why the requeued arm does not re-broadcast. That card owns the text, so
+     *  the bubble is REMOVED or the same message renders twice. A receipt with
+     *  neither flag raced `chat_done` onto a new turn: only the flag drops.
+     *
+     *  Both modes need the bubble still `optimistic` — once an echo or
+     *  `confirmOptimisticSend` cleared that, the server owns the row. Scans BOTH
+     *  arrays as `confirmOptimisticSend` does; `sendId` is unique per send. */
+    resolveOptimisticSteer(state, action: PayloadAction<{ slot: string; sendId: string; outcome: 'queued' | 'turn' }>) {
+      const { slot, sendId, outcome } = action.payload
+      if (isUnsafeKey(slot)) return
+      const resolve = (msgs: ChatMessage[] | undefined): boolean => {
+        if (!msgs) return false
+        const floor = Math.max(0, msgs.length - RECONCILE_WINDOW)
+        for (let i = msgs.length - 1; i >= floor; i--) {
+          const m = msgs[i]
+          if (m.role !== 'user' || m.meta?.sendId !== sendId) continue
+          if (!m.meta?.steer || !m.meta?.optimistic) return true
+          if (outcome === 'queued') { msgs.splice(i, 1); return true }
+          const meta = { ...(m.meta || {}) }
+          delete meta.steer
+          m.meta = meta
+          return true
+        }
+        return false
+      }
+      if (!resolve(state.messages)) resolve(state.slotMessages[safeKey(slot)])
     },
     /** Age the slot's folder-suggestion card by one delivered user send, and
      *  drop it once it has had its run (> FOLDER_SUGGESTION_MAX_TURNS).
@@ -3984,8 +4441,14 @@ const chatSlice = createSlice({
     },
     sseSubagentSnapshot(state, action: PayloadAction<{ id: string; slot: string; task: string; agent: string; model?: string; requested_model?: string; child_session?: string; streaming: string; last_tool: string; started: number; tool_count?: number; stalled?: boolean; idle_secs?: number }>) {
       const d = action.payload
-      if (isUnsafeKey(d.slot) || isUnsafeKey(d.id)) return
-      const subs = d.slot && d.slot !== state.activeSlot
+      // A snapshot without an owning slot is an orphan, not evidence that it
+      // belongs to whichever chat this browser happens to show. Popout windows
+      // cold-subscribe to the complete replay after activating their own slot;
+      // treating `slot: ''` as the active map made every such window adopt all
+      // unresolved-parent agents. Fail closed: ownerless runs remain available
+      // through the global spawn inventory, but never appear inside a chat.
+      if (!d.slot || isUnsafeKey(d.slot) || isUnsafeKey(d.id)) return
+      const subs = d.slot !== state.activeSlot
         ? (state.slotActivity[safeKey(d.slot)] ??= { toolLog: [], subagents: {} }).subagents
         : state.subagents
       const existing = subs[d.id]
@@ -4012,6 +4475,14 @@ const chatSlice = createSlice({
         // the plain "no activity" fallback reachable for an older gateway.
         idleSecs: stalled ? d.idle_secs : undefined,
         stalledAt: stalled && typeof d.idle_secs === 'number' ? Date.now() : undefined,
+        // Snapshot rebuilds the entry from scratch, so a `retrying` flag a live
+        // subagent_retrying/subagent_recovering frame set just before this
+        // replay landed would be dropped — the ⟳ recovering cue would vanish
+        // until the next live frame. Carry it forward for the same reason the
+        // model pill does above: a reconnect must not blank live-only state.
+        // A snapshot never turns retrying ON (it has no attempt field); it only
+        // preserves what a live frame already set.
+        retrying: existing?.retrying,
         approval_id: existing?.approval_id, approving: existing?.approving,
       }
     },
@@ -4523,16 +4994,27 @@ const chatSlice = createSlice({
       }
       state.messages.push(ensureMsgId({ role, content, cls: cls || '', ts, meta: effectiveMeta, kind }))
     },
-    /** Patch an existing message identified by ts. Used by the `chat_message_update`
-     * server event to flip an mcp_oauth banner from "needs auth" to "authenticated"
-     * after kiro-cli emits server_initialized. Patches both the active messages
-     * array and the slotMessages cache so a slot the user isn't currently
-     * viewing still shows the correct banner state on switch-back. */
-    sseChatMessagePatchByTs(state, action: PayloadAction<{ slot: string; ts: string; meta?: Record<string, unknown>; content?: string }>) {
-      const { slot, ts, meta, content } = action.payload
-      if (!slot || !ts) return
+    /** Patch an existing message, identified by `mid` when the server sends one and
+     * by `ts` otherwise. Used by the `chat_message_update` server event to flip an
+     * mcp_oauth banner from "needs auth" to "authenticated" after kiro-cli emits
+     * server_initialized, and to retire a banner a newer request superseded.
+     * Patches both the active messages array and the slotMessages cache so a slot
+     * the user isn't currently viewing still shows the correct banner state on
+     * switch-back.
+     *
+     * `ts` is NOT a row identity — two restored rows can carry the same one (see
+     * `meta.mid`, which exists for exactly this reason) — so a ts-keyed lookup
+     * resolves the first match and two patches for two colliding rows would both
+     * land on one of them, leaving the other stale. `mid` is preferred where
+     * present; `ts` stays as the fallback for legacy rows written before the id
+     * existed and for callers that do not send one. */
+    sseChatMessagePatchByTs(state, action: PayloadAction<{ slot: string; ts: string; mid?: string; meta?: Record<string, unknown>; content?: string }>) {
+      const { slot, ts, mid, meta, content } = action.payload
+      if (!slot || (!ts && !mid)) return
       const apply = (msgs: ChatMessage[]) => {
-        const idx = msgs.findIndex(m => m.ts === ts)
+        const idx = mid
+          ? msgs.findIndex(m => m.meta?.mid === mid)
+          : msgs.findIndex(m => m.ts === ts)
         if (idx < 0) return
         const target = msgs[idx]
         if (meta) target.meta = { ...(target.meta || {}), ...meta }
@@ -4877,6 +5359,7 @@ const chatSlice = createSlice({
         next = reseated.list
         parked[safeKey(key)] = [...reseated.remaining, ...orphaned]
         next = hydrateQueuedBubbles(next, queue)
+        next = deduplicateByMid(next)
         // Switching back to an already-loaded slot re-fetches a history that is
         // usually identical; skipping the write keeps every existing reference.
         if (!sameTranscript(existing, next)) state.messages = next
@@ -4981,7 +5464,32 @@ const chatSlice = createSlice({
           const s = v == null ? '' : String(v)
           return transcriptTsMs(s) ?? 0
         }
-        const merged = [...messages.filter(m => m.role !== 'permission'), ...statePerms.values()]
+        /* This page is now COUNT-MATCHED (see refreshSlot), not the whole
+         * transcript, so the window it returns can SLIDE: when the server gained
+         * rows while this client was away -- which is precisely the reconnect this
+         * refresh exists to recover from -- the most-recent-N slice begins NEWER
+         * than the transcript's own oldest loaded row, and assigning it wholesale
+         * would delete that scrollback. Matching the count keeps the row COUNT, not
+         * the row IDENTITIES.
+         *
+         * So keep any prior head sitting above the page's first row, through the
+         * one shared cut `switchSlot`/`warmSlotCache` use, so a third reducer
+         * cannot re-derive it and diverge (:1360). `thinking` is held out (no
+         * identity, broadcast-only) and re-placed by `mergePreservedThinking`
+         * below; `permission` is held out because `statePerms` re-injects the
+         * client's own copies with their resolved flags, and keeping them here too
+         * would seat each card twice. Identity is `meta.mid` only, so an
+         * unidentified page declines the cut rather than guessing -- the same
+         * boundary the two existing head-keeping reducers already stand on.
+         */
+        const priorServerRows = state.messages.filter(m => m.role !== 'thinking' && m.role !== 'permission')
+        const { olderHead } = olderHeadAbovePage(priorServerRows, messages)
+        /* The cursor is a row OFFSET, so a kept head shifts it down by its own
+         * server-row count. Both boundary cases (head proves completeness / the two
+         * counts disagree) are owned by `pagingCursorAfterKeptHead`, not clamped. */
+        const keptCursor = pagingCursorAfterKeptHead(
+          hasMore, nextBefore, serverRowCount(olderHead))
+        const merged = [...olderHead, ...messages.filter(m => m.role !== 'permission'), ...statePerms.values()]
         const mergedWithPastes = mergePreservedPastes(state.messages, merged)
         // Only sort if permissions were re-injected (they need positional merge).
         // Backend messages arrive in order; sorting with mixed ts formats reorders them.
@@ -4993,11 +5501,24 @@ const chatSlice = createSlice({
         // Coverage from the PURE fetched page (`messages`): `sorted` carries
         // re-injected preserved permission cards, which must not vouch for
         // history the snapshot never covered.
-        state.messages = mergePreservedThinking(state.messages, mergePreservedClientTs(state.messages, sorted), messages)
+        /* `windowComplete` defaults to TRUE, which was accurate while this fetch was
+         * unbounded and is a claim a count-matched page cannot make. It gates the
+         * `ambiguous()` skip, so an over-claim lets a text-anchored block seat on a
+         * duplicate answer inside the window while its real anchor sits above it.
+         * Same value as the `reinsertThinkingOrphans` call below and as
+         * `switchSlot.fulfilled` -- the retained head is part of the loaded window,
+         * so raw `hasMore` would park reasoning whose anchor is already on screen. */
+        state.messages = deduplicateByMid(mergePreservedThinking(state.messages, mergePreservedClientTs(state.messages, sorted), messages, !keptCursor.hasMore))
         // A refresh rebuilds `messages` wholesale, so parked reasoning has to be re-seated
         // here too — otherwise it stays invisible until the next slot switch.
+        // (Re-seating only ADDS client-only thinking rows, which by contract
+        // never carry a server-minted mid, so the deduplicateByMid pass above
+        // stays authoritative for the rebuilt history.)
         const parkedOnRefresh = (state.thinkingOrphans ??= {})
-        const seatedOnRefresh = reinsertThinkingOrphans(state.messages, parkedOnRefresh[safeKey(key)] ?? [], !hasMore)
+        // `windowComplete` describes the LOADED window, not the fetch: `messages`
+        // now carries the retained head, so a raw `hasMore` would park reasoning
+        // whose anchor is already on screen.
+        const seatedOnRefresh = reinsertThinkingOrphans(state.messages, parkedOnRefresh[safeKey(key)] ?? [], !keptCursor.hasMore)
         state.messages = seatedOnRefresh.list
         parkedOnRefresh[safeKey(key)] = seatedOnRefresh.remaining
         // Re-hydrate queued bubbles through the SAME shared path as
@@ -5010,7 +5531,7 @@ const chatSlice = createSlice({
         state.slotRunning = running
         state.slotStopping = action.payload.stopping ?? false
         state.pendingTurnSlot = null
-        setPagingCursor(state, hasMore, nextBefore)
+        setPagingCursor(state, keptCursor.hasMore, keptCursor.nextBefore)
         seedContextUsage(state, key, action.payload.context)
       })
       .addCase(warmSlotCache.fulfilled, (state, action) => {
@@ -5230,14 +5751,42 @@ const chatSlice = createSlice({
           state.subagents = {}
         }
       })
+      .addCase(resumeFromHistory.pending, (state, action) => {
+        // A new attempt supersedes whatever the previous one narrated, and its
+        // requestId becomes the only answer allowed to write the notice below.
+        state.lastResumeRequestId = action.meta.requestId
+        state.unresumableResume = null
+      })
       .addCase(resumeFromHistory.fulfilled, (state, action) => {
         // A resume that resolved to a surface ChatPage cannot display must not
         // mutate this slice at all: consuming the history row while the notice
         // says "can't be opened" reads as data loss, and switching activeSlot
         // to an undisplayable slot is the silent bounce #3624 exists to stop.
-        // The wire resume itself already happened (the caller's notice handles
-        // telling the user); the row stays reachable in Older Sessions.
-        if (action.payload.ok && !isChatPageSurface(action.payload.surface)) return
+        // The wire resume itself already happened; the row stays reachable in
+        // Older Sessions.
+        //
+        // `!ok` shares this early return for the same reason -- nothing was
+        // resumed, so nothing here may move -- but it is a DIFFERENT story to
+        // tell, hence the `reason` split. Both are recorded rather than left
+        // for each caller to re-derive: this is the one place that already
+        // knows the resume did not leave the user in a usable session, so
+        // every entry point -- sidebar row, ChatPage's "Continue a previous
+        // chat" list, the notification panel, and the two palette providers
+        // that have no component to render into -- reads the same answer
+        // (#5925).
+        if (!action.payload.ok || !isChatPageSurface(action.payload.surface)) {
+          // Guarded on the ordering token so a stale answer cannot narrate a
+          // row the user has moved past.
+          if (action.meta.requestId === state.lastResumeRequestId) {
+            state.unresumableResume = {
+              key: action.meta.arg.key,
+              title: action.meta.arg.title,
+              surface: action.payload.surface ?? '',
+              reason: action.payload.ok ? 'surface' : 'failed',
+            }
+          }
+          return
+        }
         if (action.payload.ok) {
           // The row just became an open tab, so it leaves the Older-sessions
           // pane — that pane is the complement of the tab list, and leaving the
@@ -5276,6 +5825,21 @@ const chatSlice = createSlice({
           state.slotState = 'idle'
           state.pendingTurnSlot = null
           setPagingCursor(state, action.payload.hasMore, action.payload.nextBefore)
+        }
+      })
+      .addCase(resumeFromHistory.rejected, (state, action) => {
+        // The likeliest failure of all: `api.resumeChatSlot` throws on any
+        // non-2xx, so a 404/409/5xx or a dropped connection lands HERE, not on
+        // the `ok: false` branch above. Every caller's handling of it was a
+        // silent swallow -- ChatPage's `catch {}`, the palette providers'
+        // `void dispatch`, the notification panel's console log -- so the click
+        // looked exactly as dead as the bug this field exists to fix.
+        if (action.meta.requestId !== state.lastResumeRequestId) return
+        state.unresumableResume = {
+          key: action.meta.arg.key,
+          title: action.meta.arg.title,
+          surface: '',
+          reason: 'failed',
         }
       })
       .addCase(deleteHistorySession.fulfilled, (state, action) => {
@@ -5319,8 +5883,8 @@ const chatSlice = createSlice({
 })
 
 export const {
-  setActiveSlot, clearSlotState, setPendingInput, setAgentSwitchNotice, setQuestionCard, retireStatelessQuestion, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
-  removeThinking, confirmOptimisticSend, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, startLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
+  setActiveSlot, clearSlotState, setPendingInput, setAgentSwitchNotice, clearUnresumableResume, setQuestionCard, retireStatelessQuestion, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
+  removeThinking, confirmOptimisticSend, resolveOptimisticSteer, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, startLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
   sseContextUsage, setVoicePlaying, setVoiceAudio,
   toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, requestSlotReveal, clearSlotReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, sseSubagentSpawn, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued,
   sseSubagentBatchUpdate, sseSubagentBatchChunks, selectSubagent, clearTerminalSubagents,

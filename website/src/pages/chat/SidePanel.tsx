@@ -225,6 +225,9 @@ interface SidePanelProps {
   onReconcileIssue?: (url: string) => void
   onAddSourceToChat?: (text: string) => void
   onSubmitComments?: (message: string) => void
+  /** Gateway connection flag — forwarded to document tab bodies to gate
+   *  their submit-comments-to-chat affordances while offline. */
+  connected?: boolean
   /** Pinned messages for this session, plus the two actions the Pins tab needs.
    *  Prop-drilled rather than re-queried here because the JUMP is ChatPage's:
    *  landing on a pin that is not in the loaded window has to page older
@@ -369,7 +372,7 @@ export default function SidePanel({
   tabsCtl, slot, onFileOpen, onArtifactOpen, onAddToContext,
   projectDir, navLinks, navResolving, sources, selectedSourceUrl, onSelectSource, onReconcileSource,
   issues, selectedIssueUrl, onSelectIssue, onReconcileIssue,
-  onAddSourceToChat, onSubmitComments, onFileSave, onClose, panelHidden,
+  onAddSourceToChat, onSubmitComments, connected = true, onFileSave, onClose, panelHidden,
   pins, pinsLoading, onJumpToPin, onUnpin,
   slotTitle, chatMode,
   expanded, fillWidth, canDockBottom = true,
@@ -560,7 +563,12 @@ export default function SidePanel({
           (-mb-px on the GROUPS, not the chips — the tablist scrolls and would
           clip an overflowing chip) so the active chip's opaque background
           covers the line across its own span, keeping the mouth open. */}
-      <div className="side-panel-strip flex items-end gap-1.5 shrink-0 px-2 pt-2 pb-0 min-h-10 rounded-tl-xl bg-bg-elevated border-b border-border">
+      {/* focus-caption-reserve (right dock only): in focus mode this strip is
+          the surface at the window's top-trailing corner, where Windows and
+          frameless Linux paint their caption controls — the panel chrome below
+          would sit under them, covered and unclickable. Bottom-docked the strip
+          is nowhere near that corner, so it takes no reserve. */}
+      <div className={`side-panel-strip flex items-end gap-1.5 shrink-0 px-2 pt-2 pb-0 min-h-10 rounded-tl-xl bg-bg-elevated border-b border-border${isBottom ? '' : ' focus-caption-reserve'}`}>
         {/* Pinned views (Changes / Files / Artifacts): always present, fixed at
             the front, non-closable, not draggable, compact. The group's 8px gap
             matches the active chip's corner-piece width, so a piece lands in the
@@ -807,6 +815,7 @@ export default function SidePanel({
                 onAddToContext={onAddToContext}
                 projectDir={projectDir}
                 onSubmitComments={onSubmitComments}
+                connected={connected}
                 onTerminalSendToChat={onAddSourceToChat}
                 diffLineNumbers={diffLineNumbers}
                 setDiffLineNumbers={setDiffLineNumbers}
@@ -884,7 +893,7 @@ function McpAppTabBody({ tab, slot }: { tab: PanelTab; slot: string }) {
  * Rail visibility is a single app-wide preference; the rail only renders at
  * all when the chat has a project dir whose tree the backend serves.
  */
-function FileTabBody({ tab, active, projectDir, scrollMemoryKey, onContentChange, onDiskContent, onDiffModeChange, onFileSave, onFileOpen, onAddToContext, onClose, onSubmitComments, onRevealConsumed }: {
+function FileTabBody({ tab, active, projectDir, scrollMemoryKey, onContentChange, onDiskContent, onDiffModeChange, onFileSave, onFileOpen, onAddToContext, onClose, onSubmitComments, connected = true, onRevealConsumed }: {
   tab: PanelTab
   /** Is this the visible tab? Background file tabs stay mounted, so the panel
    *  needs this to keep its Cmd+F handler off a document the user cannot see. */
@@ -903,6 +912,7 @@ function FileTabBody({ tab, active, projectDir, scrollMemoryKey, onContentChange
   onAddToContext?: (absPath: string, kind: 'file' | 'dir') => void
   onClose: () => void
   onSubmitComments?: (m: string) => void
+  connected?: boolean
   onRevealConsumed: () => void
 }) {
   const [railOpen, setRailOpen] = usePersistedBool('mc-files-rail-open', false)
@@ -928,6 +938,7 @@ function FileTabBody({ tab, active, projectDir, scrollMemoryKey, onContentChange
       onClose={onClose}
       liveWatch
       onSubmitComments={onSubmitComments}
+      connected={connected}
       revealLine={tab.revealLine}
       onRevealConsumed={onRevealConsumed}
       railOpen={railUsable && railOpen}
@@ -955,7 +966,7 @@ function FileTabBody({ tab, active, projectDir, scrollMemoryKey, onContentChange
   )
 }
 
-function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDiskContent, onDiffModeChange, onRevealConsumed, onPathChange, onFileSave, onFileOpen, onAddToContext, onSubmitComments, onTerminalSendToChat, diffLineNumbers, setDiffLineNumbers, diffSideBySide, setDiffSideBySide }: {
+function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDiskContent, onDiffModeChange, onRevealConsumed, onPathChange, onFileSave, onFileOpen, onAddToContext, onSubmitComments, connected = true, onTerminalSendToChat, diffLineNumbers, setDiffLineNumbers, diffSideBySide, setDiffSideBySide }: {
   tab: PanelTab; active: boolean; slot: string
   /** The chat's project directory — the file-browser rail's tree root. */
   projectDir?: string
@@ -975,6 +986,7 @@ function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDi
   /** Right-click "Add to context" on a file-browser rail row. */
   onAddToContext?: (absPath: string, kind: 'file' | 'dir') => void
   onSubmitComments?: (m: string) => void
+  connected?: boolean
   onTerminalSendToChat?: (text: string) => void
   diffLineNumbers: boolean; setDiffLineNumbers: (fn: (v: boolean) => boolean) => void
   diffSideBySide: boolean; setDiffSideBySide: (fn: (v: boolean) => boolean) => void
@@ -1002,6 +1014,7 @@ function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDi
         onAddToContext={onAddToContext}
         onClose={onClose}
         onSubmitComments={onSubmitComments}
+        connected={connected}
         onRevealConsumed={onRevealConsumed}
       />
     )
@@ -1029,6 +1042,7 @@ function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDi
         scrollMemoryKey={scrollMemoryKey}
         onClose={onClose}
         onSubmitComments={onSubmitComments}
+        connected={connected}
       />
     )
   }

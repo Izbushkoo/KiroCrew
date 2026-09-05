@@ -17,6 +17,8 @@ Agent isolation:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 from contextlib import contextmanager
@@ -25,26 +27,8 @@ from typing import Iterator, Optional
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew.atomic_write import atomic_write, fsync_dir
 from kiro_crew.platform_compat import file_lock, restrict_to_owner
-
-
-def _fsync_dir(path: Path) -> None:
-    """Fsync a directory so a rename/create is durable across power loss.
-
-    No-op where directory fds cannot be opened for fsync (e.g. Windows),
-    where the atomic rename + file fsync already provide the guarantee.
-    """
-    try:
-        dir_fd = os.open(str(path), os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(dir_fd)
-    except OSError:
-        pass
-    finally:
-        os.close(dir_fd)
 
 
 class SecretValue:
@@ -266,6 +250,18 @@ class SecretVault:
         """Return all stored secret names."""
         return list(self._load_entries().keys())
 
+    def derive_subkey(self, purpose: str) -> bytes:
+        """Derive a purpose-scoped 32-byte key from the vault key (HMAC-SHA256).
+
+        Lets other agent-fenced mechanisms (e.g. the cron grant-pin HMAC) key
+        themselves without a second key file and its own birth/corruption
+        handling — the vault key's exclusive-create birth, fsync durability,
+        and owner-only ACL are inherited. Distinct purposes yield independent
+        keys, and the vault key itself is never handed out.
+        """
+
+        return hmac.new(self._get_or_create_key(), purpose.encode(), hashlib.sha256).digest()
+
     # ── Key management ──
 
     def _get_or_create_key(self) -> bytes:
@@ -322,7 +318,11 @@ class SecretVault:
                 pass
             raise
         os.close(fd)
-        _fsync_dir(self._config_dir)
+        # best_effort: the key file is created, written and fsynced by this point, and
+        # the failure cleanup above has already been left behind. Raising here would
+        # report a key that IS on disk as never created, and the caller's recovery for
+        # that is to mint a second one over it.
+        fsync_dir(self._config_dir, best_effort=True)
         return key
 
     # ── Crypto helpers ──
@@ -367,6 +367,16 @@ class SecretVault:
 
         raw = self._store_path.read_text(encoding="utf-8")
         envelope = json.loads(raw)
+
+        # A corrupt / hand-edited store can carry a non-object top-level value
+        # (a list, a string, null, a number). Guard before ``.get`` so it fails
+        # closed with a descriptive ValueError rather than a raw AttributeError,
+        # matching the ``entries`` guard below. No store content is echoed.
+        if not isinstance(envelope, dict):
+            raise ValueError(
+                f"Vault store corrupt: top-level value must be an object, "
+                f"got {type(envelope).__name__}."
+            )
 
         if envelope.get("backend") != self._BACKEND:
             raise ValueError(
@@ -453,4 +463,10 @@ class SecretVault:
                 fsync=True,
                 restrict_to_owner=True,
             )
-            _fsync_dir(self._config_dir)
+            # best_effort, and it is this call site's own decision, not a weakening of
+            # the helper: atomic_write has already COMMITTED the entry. A raise here
+            # would abort set_if_absent before it returns its fingerprint, so a
+            # migration would omit an entry that is on disk from its rollback set and
+            # let it shadow the plaintext it was migrating away from. The directory
+            # entry is the least of what is at stake once the value is stored.
+            fsync_dir(self._config_dir, best_effort=True)

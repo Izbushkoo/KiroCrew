@@ -183,10 +183,17 @@ not write it off as flakiness.
 - User is waiting and total time < 30 min → `wait` + poll, no loop.
 - "Babysit / monitor / keep checking" in THIS conversation, in a phase where
   you ACT most cycles (fixing findings, pushing revisions) → `monitor_start`.
-- **Pure-watch phase of a PR babysit** — waiting on CI or reviewers, nothing
-  to do until a signal → arm the **`pr_watch` script cron** (below). Zero
-  tokens per quiet cycle; it wakes THIS session with one agent turn only when
-  something unexpected happens.
+- **Pure-watch phase of a PR babysit** — waiting on CI or reviewers, nothing to
+  do until a signal → still `monitor_start`, and name the pull request in the
+  instruction **by full URL** — `https://github.com/<owner>/<repo>/pull/<N>`.
+  That form is the only one that selects a subject: a bare `PR #123`, or the
+  `owner/name#123` shorthand, deliberately refuses inference, so the loop stays
+  on the plain timer and every interval spends a turn. The user will usually say
+  "babysit PR #123"; you write the URL. A loop naming one public GitHub pull
+  request that way is gated by default:
+  quiet cycles cost no agent turn, and it wakes only on a real change. The
+  `pr_watch` script cron (below) is now only for what that cannot reach --
+  an enterprise host, or detection with no owning loop.
 - Reacting to review feedback or CI on a PR → `monitor_start` or in-turn
   `wait`+poll for the active-fix phase. **Never an agent (LLM) cron, never
   HEARTBEAT.md** (see below). The `pr_watch` script cron is fine: it is the
@@ -198,12 +205,26 @@ not write it off as flakiness.
   `script` cron at roughly a 5-minute interval.
 - External system will call back → `register_hook`.
 
-### Watch mode — zero-token PR polling with `pr_watch.py`
+### Watch mode — a manual cron for what the default gate cannot reach
 
-A babysit spends most of its life waiting: CI runs for ten minutes, reviewers
-take longer, and every `monitor_start` cycle that discovers "nothing changed"
-still pays a full agent turn on the session's whole context. Watch mode moves
-the *detection* to a script cron and keeps the *judgment* in this session:
+**Read this first: you probably do not need this section.** A `monitor_start`
+loop whose instruction names ONE public GitHub pull request is already gated --
+it observes that pull request each interval with one bounded `gh` call and
+re-injects your message only when it actually changed, so a cycle where nothing
+changed costs no agent turn. That is the default, on every arming surface, with
+no steps to take. Use it, and skip to the end of this section.
+
+Watch mode is the manual version, and only three situations still need it:
+
+- the pull request is on an **enterprise host** -- the gate pins public GitHub,
+  because choosing a host from data is not something a watch message may do;
+- there is **no owning loop** to gate: you want detection without a babysit
+  session, e.g. a fire-and-forget notification;
+- you need the cron's own knobs -- `known_reds` to suppress failures inherited
+  from the base branch, `note` to carry text into the wake, `wake_on_green`.
+
+If none of those apply, arming this cron gives you a second watcher on the same
+pull request, and the two will wake you separately for the same event.
 
 ```
 script cron (zero tokens, every ~5 min)
@@ -214,12 +235,11 @@ script cron (zero tokens, every ~5 min)
         · a comment or review someone else posted)
 ```
 
-**Why the interval can be small.** A `monitor_start` cycle costs a full agent
-turn on the session's whole context, which is what forces its interval up: at
-30 seconds it would burn the window on nothing. A tick of this cron costs one
-bounded `gh` call and no tokens at all, so the interval is limited by API
-politeness rather than by spend -- 60s is reasonable, and 300s is a default
-rather than a floor.
+**Why the interval can be small.** A tick of this cron costs one bounded `gh`
+call and no tokens at all, so the interval is limited by API politeness rather
+than by spend -- 60s is reasonable, and 300s is a default rather than a floor.
+An UNGATED `monitor_start` cycle, by contrast, costs a full agent turn on the
+session's whole context, which is what forces its interval up.
 
 Arm it **from the session that owns the babysit** — the cron captures that
 session as its wake target; armed anywhere else, the wake lands in the wrong
@@ -610,9 +630,13 @@ Two limits worth knowing before you trust it on an arbitrary PR:
 
 User: "babysit PR #247 until it's review-ready"
 
+Note what the message does with that: the user said `PR #247`, and the armed
+instruction names the pull request by FULL URL. That is what makes the loop
+observation-gated -- copy the user's bare number into the message and it is not.
+
 ```
 monitor_start(
-  message="Check PR #247. FIRST read
+  message="Check https://github.com/owner/repo/pull/247. FIRST read
            gh pr view 247 --json mergeable,mergeStateStatus,reviewDecision —
            rules 6 and 7 of the babysit skill govern what each value means.
            Then run

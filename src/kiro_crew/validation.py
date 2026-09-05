@@ -31,13 +31,29 @@ from typing import Any
 # no native library is loaded on any platform. Aliased so the schema block below
 # reads as "the computer-use vocabulary" rather than bare names.
 from kiro_crew.computer_use import types as _cu_types
-from kiro_crew.constants import AWS_PROFILE_NAME_RE, WINDOWS_DEVICE_STEMS
+from kiro_crew.constants import (
+    AWS_PROFILE_NAME_RE,
+    CHANNEL_OWNER_DM_NAMESPACES,
+    MAX_BANNER_CHARS,
+    SLACK_NAMESPACE,
+    WINDOWS_DEVICE_STEMS,
+)
 
 # Reasoning-effort vocabulary: ``effort.py`` is the single source of truth for
 # the valid levels; EFFORT_VALUES additionally admits ``""`` ("unset — defer to
 # the role pin / provider default"). Import-safe: ``effort`` pulls in only
 # ``model_registry`` (stdlib-only), so no cycle back into validation.
 from kiro_crew.effort import EFFORT_VALUES
+from kiro_crew.monitoring.models import (
+    MAX_MONITOR_AGENT_TURNS,
+    MAX_MONITOR_CADENCE_SECS,
+    MAX_MONITOR_PROVIDER_ERRORS,
+    MAX_MONITOR_RUNTIME_SECS,
+    MAX_MONITOR_STOP_REASON_CHARS,
+    MAX_MONITOR_TOKENS,
+    MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
+    MIN_MONITOR_CADENCE_SECS,
+)
 from kiro_crew.project_scope import SCOPE_FRAGMENT_RE
 
 # ── Constants ──
@@ -1131,6 +1147,32 @@ AUTONUDGE_STOP_SCHEMA = ToolSchema(
     ],
 )
 
+MONITOR_WATCH_SCHEMA = ToolSchema(
+    tool_name="monitor_watch",
+    fields=[
+        FieldSpec("kind", str, required=True, allowed=frozenset({"github_pull_request"})),
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+        FieldSpec("objective", str, required=True, allowed=frozenset({"review_ready"})),
+        FieldSpec(
+            "interval_secs",
+            int,
+            min_val=MIN_MONITOR_CADENCE_SECS,
+            max_val=MAX_MONITOR_CADENCE_SECS,
+        ),
+        FieldSpec("max_runtime_secs", int, min_val=1, max_val=MAX_MONITOR_RUNTIME_SECS),
+        FieldSpec("max_agent_turns", int, min_val=1, max_val=MAX_MONITOR_AGENT_TURNS),
+        FieldSpec("max_tokens", int, min_val=1, max_val=MAX_MONITOR_TOKENS),
+        FieldSpec("max_provider_errors", int, min_val=1, max_val=MAX_MONITOR_PROVIDER_ERRORS),
+        FieldSpec("wake_instructions", str, max_len=MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS),
+    ],
+)
+
+MONITOR_INSPECT_SCHEMA = ToolSchema(tool_name="monitor_inspect")
+MONITOR_STOP_SCHEMA = ToolSchema(
+    tool_name="monitor_stop",
+    fields=[FieldSpec("reason", str, max_len=MAX_MONITOR_STOP_REASON_CHARS)],
+)
+
 # monitor_start creates an AutoNudge loop bound to the calling session (the
 # agent-facing "babysit this PR" primitive). message caps match the REST
 # endpoint's 8000-char limit; interval bounds mirror autonudge's
@@ -1144,6 +1186,15 @@ MONITOR_START_SCHEMA = ToolSchema(
         FieldSpec("interval_secs", int, min_val=15, max_val=86400),
         FieldSpec("max_cycles", int, min_val=0, max_val=1000),
         FieldSpec("max_runtime_secs", int, min_val=0, max_val=604800),
+        # Opt-OUT of observation gating. Absent means gated, matching the tool's
+        # default, so a caller written before this field existed keeps the
+        # default behaviour rather than silently escaping it.
+        FieldSpec("gate", bool),
+        # The short row shown in the transcript instead of the full message. An
+        # ENTRY bound only: the authorised add path re-checks the cap AFTER
+        # redaction, which is the one that governs what gets stored, because
+        # redaction can grow the string.
+        FieldSpec("banner", str, max_len=MAX_BANNER_CHARS),
     ],
 )
 
@@ -1158,6 +1209,15 @@ MONITOR_UPDATE_SCHEMA = ToolSchema(
         FieldSpec("interval_secs", int, min_val=15, max_val=86400),
         FieldSpec("max_cycles", int, min_val=0, max_val=1000),
         FieldSpec("max_runtime_secs", int, min_val=0, max_val=604800),
+        FieldSpec("target", str, max_len=MAX_SHORT_STRING),
+        FieldSpec("objective", str, allowed=frozenset({"review_ready"})),
+        FieldSpec("max_agent_turns", int, min_val=1, max_val=MAX_MONITOR_AGENT_TURNS),
+        FieldSpec("max_tokens", int, min_val=1, max_val=MAX_MONITOR_TOKENS),
+        FieldSpec("max_provider_errors", int, min_val=1, max_val=MAX_MONITOR_PROVIDER_ERRORS),
+        FieldSpec("wake_instructions", str, max_len=MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS),
+        # Same bound as the arm side, for the reason the comment above gives: a
+        # loop must not be updatable into a state monitor_start would refuse.
+        FieldSpec("banner", str, max_len=MAX_BANNER_CHARS),
     ],
 )
 
@@ -2035,6 +2095,11 @@ _ISSUE_RADAR_CREW_EVENT_KINDS = frozenset(
         "handback",
         "skip",
         "yield",
+        # The one crew-level kind: the crew looked at the queue and took nothing.
+        # It is the only kind valid with NO ``number``, and it is invalid WITH one
+        # — a relation between two fields, so it is enforced on the write route
+        # and in the store rather than here.
+        "sweep",
     }
 )
 #: Mirrors ``crew_store.SKIP_SCOPES`` — the classification a crew attaches to a
@@ -2107,7 +2172,16 @@ ISSUE_RADAR_CREW_RECORD_SCHEMA = ToolSchema(
         # Bounds the number that becomes the work item's FILENAME
         # (``crews/<crew_id>/<n>.json``) — same ENAMETOOLONG rationale as the
         # investigation record, hence the same constant.
-        FieldSpec("number", int, required=True, min_val=1, max_val=_ISSUE_RADAR_MAX_ITEM_NUMBER),
+        #
+        # NOT required. A crew that swept its queue and took nothing has no issue
+        # to name, and requiring one here left it recording the cycle against an
+        # issue it never acted on. The coupling that replaces the requirement —
+        # a missing number is valid ONLY with the crew-level ``sweep`` kind, and
+        # ``sweep`` is valid ONLY without one — is enforced on the write route and
+        # in the store, because it is a relation between two fields and this
+        # schema validates them one at a time. Keeping the bound here still
+        # matters: when a number IS sent it is the filename.
+        FieldSpec("number", int, min_val=1, max_val=_ISSUE_RADAR_MAX_ITEM_NUMBER),
         FieldSpec("phase", str, max_len=32, allowed=_ISSUE_RADAR_CREW_PHASES),
         # Bounded but deliberately NOT ``allowed=``, unlike ``phase`` beside it.
         # An out-of-vocabulary phase has to be refused — it would corrupt the
@@ -2425,6 +2499,21 @@ FILE_WRITE_SCHEMA = ToolSchema(
 # is what actually authorizes it.
 _TARGET_ID_RE = re.compile(r"^[\x21-\x7e]{1,512}$")
 
+# Every legal ``send_message`` ``session`` value: the delivery MODES plus every
+# channel a proactive send may name. Built from the shared
+# ``CHANNEL_SEND_NAMESPACES`` so this, the tool's advertised enum and the gateway's
+# accepted ``channel_type`` set are three views of ONE roster rather than three
+# lists that drift -- which is the #6514 defect, where this pattern and the tool's
+# enum both still read "discord" alone months after eight more transports were
+# registered and made serviceable by the gateway's channel-neutral owner-DM leg.
+#
+# ``origin`` is added because it is a delivery MODE rather than a transport, and
+# ``slack`` because it routes through its own client instead of the channel ladder;
+# both are outside the send roster for those reasons, not by omission.
+_SEND_MESSAGE_SESSION_RE = re.compile(
+    "^(origin|" + "|".join((SLACK_NAMESPACE, *CHANNEL_OWNER_DM_NAMESPACES)) + ")$"
+)
+
 
 # Fields that select or shape a SLACK delivery. Combined with the
 # ``channel_type``/``target_id`` pair — which addresses a non-Slack destination
@@ -2500,13 +2589,23 @@ SEND_MESSAGE_SCHEMA = ToolSchema(
         # Must accept every value ``mcp_tools.messaging._SESSION_TARGETS``
         # advertises: this pattern runs BEFORE the handler, so a value missing
         # here is rejected as malformed even though the tool's own enum offers
-        # it. Spelled out rather than imported because ``mcp_tools`` imports this
-        # module; ``test_mcp_messaging_discord`` pins the two together.
+        # it. That is what happened to the eight non-Discord channels in #6514.
+        #
+        # DERIVED from the same roster the tool's enum and the gateway's accepted
+        # ``channel_type`` set are built from, so the three cannot disagree.
+        # Importing it costs no cycle: the roster is homed in ``kiro_crew.constants``,
+        # which imports only ``os`` and ``re``. It is deliberately NOT read from
+        # ``messaging.link`` (which re-exports it): importing a name from there
+        # executes ``messaging/__init__.py``, pulling in ``driver`` -> ``acp`` ->
+        # ``hooks``, and ``hooks`` -> ``webhooks`` -> ``validation`` is already an
+        # edge, so reading it from this module that way closes a startup cycle.
+        # ``unified`` is excluded because it is a session-key bucket, not a
+        # transport; ``origin`` is added because it is a delivery MODE.
         FieldSpec(
             "session",
             str,
             max_len=MAX_SHORT_STRING,
-            pattern=re.compile(r"^(origin|slack|discord)$"),
+            pattern=_SEND_MESSAGE_SESSION_RE,
         ),
         FieldSpec("caller_session", str, max_len=MAX_SHORT_STRING, pattern=CRON_SESSION_RE),
     ],
@@ -2653,6 +2752,13 @@ SESSION_CREATE_SCHEMA = ToolSchema(
     fields=[
         FieldSpec("title", str, required=False, default="", max_len=200),
         FieldSpec("agent", str, required=False, default="", max_len=MAX_SHORT_STRING),
+        # A sidebar-folder reference — a folder id OR a ``/``-separated human
+        # path, the same shape ``chat_folder_move_session.folder`` takes — so
+        # filing is atomic with creation instead of a create-then-move pair a
+        # folder delete can land between (#6118). Bounded like every other
+        # folder reference; the two readings share no charset, so only the
+        # length is checked here.
+        FieldSpec("folder", str, required=False, default="", max_len=_ARTIFACT_FOLDER_REF_MAX),
     ],
 )
 
@@ -2710,6 +2816,9 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "register_hook": REGISTER_HOOK_SCHEMA,
     "file_send": FILE_SEND_SCHEMA,
     "autonudge_stop": AUTONUDGE_STOP_SCHEMA,
+    "monitor_watch": MONITOR_WATCH_SCHEMA,
+    "monitor_inspect": MONITOR_INSPECT_SCHEMA,
+    "monitor_stop": MONITOR_STOP_SCHEMA,
     "monitor_start": MONITOR_START_SCHEMA,
     "monitor_update": MONITOR_UPDATE_SCHEMA,
     "ask_question": ASK_QUESTION_SCHEMA,
@@ -2807,6 +2916,17 @@ MCP_CRON_SCHEMAS: dict[str, ToolSchema] = {
         tool_name="cron_trigger",
         fields=[
             FieldSpec("job_id", str, required=True, max_len=16, pattern=_JOB_ID_RE),
+        ],
+    ),
+    # Agent-initiated vault-secret REQUEST for a script cron. Records a
+    # pending grant only; the operator approves in the dashboard. The mapping's
+    # keys/values are re-validated at the persistence layer
+    # (cron_script.validate_secret_env_grant) — this schema bounds shape/size.
+    "cron_secret_request": ToolSchema(
+        tool_name="cron_secret_request",
+        fields=[
+            FieldSpec("job_id", str, required=True, max_len=16, pattern=_JOB_ID_RE),
+            FieldSpec("secrets", dict, required=True),
         ],
     ),
 }

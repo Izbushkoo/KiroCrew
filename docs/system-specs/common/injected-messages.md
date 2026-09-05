@@ -45,6 +45,28 @@ was reachable. `dashboard/handlers/messaging.py` wraps the text:
 **How to treat it:** do the work it implies. If a cron reports a build failure,
 fix the build. There is nobody to ask.
 
+## Structured monitor wake
+
+The probe controller injects an action turn only for a newly actionable
+fingerprint. The controller constructs one envelope, and dashboard, Slack, and
+Discord pass those exact bytes through:
+
+```
+[Monitor wake]
+Monitor <id>: GitHub pull request <target>; objective: review_ready.
+Fingerprint: <fingerprint>. Classification: <reason code>.
+Head: <revision>. Changed: <allowlisted canonical facts>.
+Next action: <bounded instructions>.
+```
+
+`MONITOR_WAKE_PREFIX = '[Monitor wake]'` is defined in `dashboard/state.py`.
+The complete envelope is redacted before its 4,096-character cap and contains
+only canonical provider facts, never raw responses, logs, comments, diffs,
+stdout, or stderr. Dashboard stores it as role `nudge` with compact monitor
+identity metadata; messaging surfaces receive the same content. It is
+automation, not user speech. A raw provider completion event is the only signal
+that the resulting agent action finished.
+
 ## Sub-agent completion
 
 A background sub-agent finished. `slack/gateway.py` builds the envelope on the
@@ -287,9 +309,35 @@ next turn into the same slot:
 - `{{STOP_FILE}}` in the configured message is substituted with the resolved stop
   sentinel path before the tag is prepended.
 - The slot entry uses role `nudge` with a structured `nudge` meta block (`cycle`,
-  `loop_id`), so the dashboard shows a compact cycle chip. The tag stays in
-  `content` because that is what the model reads, and the body is deliberately not
-  duplicated into meta: a multi-KB payload is stored and broadcast once.
+  `loop_id`), so the dashboard shows a compact cycle chip. The body is deliberately
+  not duplicated into meta: a multi-KB payload is stored and broadcast once.
+- **The visible row and the model's prompt are separate strings, and only an opt-in
+  `banner` makes them differ.** With no banner the two carry the same body, so an
+  existing loop's transcript is unchanged and `content` is what the model reads. With
+  a banner set, `content` carries that short stand-in instead of the message body and
+  is no longer what the model reads — the prompt still carries the full message. The
+  prompt is never shortened: re-delivering the whole instruction every cycle is the
+  guarantee the nudge exists to provide.
+- **`banner` is optional on every arming surface** and defaults to absent.
+  `POST /api/autonudge` and `PATCH /api/autonudge/{loop_id}` accept it; accepting it
+  on `PATCH` is what lets a running loop be quieted without resetting its budgets. The
+  MCP tools `monitor_start` and `monitor_update` carry it in their input schemas, and
+  `monitor_update` treats an explicit empty string as "clear", so a banner set once can
+  be removed without tearing the loop down. It is capped at `MAX_BANNER_CHARS` (500),
+  two orders of magnitude under the 8000-char `message` limit, because the two fields
+  have different jobs: `message` is an instruction re-delivered to the model every
+  cycle, a banner is one display line.
+- **A non-blank banner on a channel-bound loop is refused with 400.** A `slack:` /
+  `discord:` / `webex:` loop delivers the nudge as the turn's own input and has no
+  separate display surface to shorten, so storing one would be dead config the runtime
+  could never honour. A blank banner is still accepted there, since that is the default
+  every channel-bound caller already passes. A persisted banner is additionally repaired
+  at load: a non-string value is blanked, and a persisted string banner is
+  credential-scrubbed and re-capped (redaction runs before the cap slice, so a
+  secret straddling the cap is masked whole). A caller-supplied banner is also
+  credential-scrubbed at the write path with the same `redact_exfiltration_urls` /
+  `redact_credentials` passes the `message` field gets, since a banner is persisted and
+  served by `GET /api/autonudge`.
 - A nudge arriving while the slot is already running is DROPPED, not queued.
   Queueing would stack identical multi-KB payloads and blow the context window; the
   next idle tick schedules again.
@@ -298,6 +346,15 @@ next turn into the same slot:
 - Loops persist to `autonudge.json` under the data home and are re-armed on gateway
   restart. A slot that is unreachable (no history, deleted, or closed) has its loop
   removed.
+- Structured monitor action accounting is a separate internal completion
+  callback, not a new injected-message envelope. Until the probe dispatcher is
+  attached, structured records remain fail-closed. The dormant adapters do not
+  change the legacy `[auto-nudge cycle N]` body, delivered-cycle count, `fired`
+  event, or rearm timing. When attached, dashboard and Discord report only a raw
+  provider completion; Slack likewise requires the raw provider completion and
+  shares its one consumed usage result with telemetry. A dispatched monitor wake
+  that reaches stream exhaustion remains in flight only until its durable,
+  bounded completion-evidence deadline; no synthetic completion is injected.
 
 **How to treat it:** it is a self-prompt. Continue the work; the operator asked for
 the loop, but is not waiting on this specific message.

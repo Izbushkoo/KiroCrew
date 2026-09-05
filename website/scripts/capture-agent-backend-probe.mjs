@@ -42,16 +42,15 @@ const row = (id, policy_id, over = {}) => ({
 })
 
 /**
- * Scene 1 — what THIS host actually returns today: kiro and kas resolved, claude
- * not selectable on a public build (its registry row is absent) and, separately,
- * only half-installed. `selectable: false` is what the panel reports, because the
- * build gate outranks the machine gate.
+ * Scene 1 — what THIS host actually returns today. Claude Code IS selectable on a
+ * public build (`acp/client.py` owns its whole spawn path and the adapter is a public
+ * npm package), so the only thing standing between this operator and a Claude session
+ * is the adapter itself, and the panel names it plus the command that installs it.
  */
 const SCENE_LOCAL = {
-  schemaEnum: ['', 'kas'],
+  schemaEnum: ['', 'kas', 'claude'],
   backends: [
     row('claude', 'claude', {
-      selectable: false,
       installed: 'missing',
       missing_components: ['claude-agent-acp'],
       install_command: CLAUDE_INSTALL,
@@ -62,14 +61,16 @@ const SCENE_LOCAL = {
 }
 
 /**
- * Scene 2 — the missing-component line. Same host state, but on a build whose
- * edition registered the claude provider, so the machine gate is now the one that
- * decides and the panel names the component plus its install command.
+ * Scene 2 — a managed deployment whose policy denies the harness. The row is GONE,
+ * not greyed: a dimmed chip invites the reader to go find out how to enable it, and
+ * there is nothing they can do from this machine. The footer sentence is what
+ * explains the absence.
  */
-const SCENE_MISSING = {
-  schemaEnum: ['', 'kas', 'claude'],
+const SCENE_DENIED = {
+  schemaEnum: ['', 'kas'],
   backends: [
     row('claude', 'claude', {
+      selectable: false,
       installed: 'missing',
       missing_components: ['claude-agent-acp'],
       install_command: CLAUDE_INSTALL,
@@ -103,6 +104,44 @@ const SCENE_RESTART = {
   schemaEnum: ['', 'kas', 'claude'],
   backends: [
     row('claude', 'claude', { restart_required: true }),
+    row('kas', 'kas'),
+    row('', 'kiro'),
+  ],
+}
+
+/**
+ * Scene 5 — Codex installed, and the one thing that verdict does not answer. The
+ * adapter ships its own Codex binary, so `installed` really is the whole install
+ * fact; a session can still die on its first turn for want of a credential. The
+ * caveat names both branches of the remedy and says outright that neither is
+ * checked here, because the panel does not read those files — a `missing` verdict
+ * would disable the switch for an operator who is authenticated by a path the
+ * check cannot see.
+ */
+const SCENE_CODEX = {
+  schemaEnum: ['', 'kas', 'claude', 'codex'],
+  backends: [
+    row('claude', 'claude'),
+    row('codex', 'codex'),
+    row('kas', 'kas'),
+    row('', 'kiro'),
+  ],
+}
+
+/**
+ * Scene 6 — the two lines together on one row: the install line (what to run) above
+ * the standing caveat (what running it still will not do). Only the first is a
+ * measurement, and only the first disables the chip.
+ */
+const SCENE_CODEX_MISSING = {
+  schemaEnum: ['', 'kas', 'claude', 'codex'],
+  backends: [
+    row('claude', 'claude'),
+    row('codex', 'codex', {
+      installed: 'missing',
+      missing_components: ['codex-acp'],
+      install_command: 'npm i -g @agentclientprotocol/codex-acp',
+    }),
     row('kas', 'kas'),
     row('', 'kiro'),
   ],
@@ -165,11 +204,14 @@ const reloadScene = async (next) => {
 }
 
 await page.goto(`${base}/developer?tab=agent-backend`, { waitUntil: 'domcontentloaded' })
+await page.getByText(CLAUDE_INSTALL, { exact: false }).waitFor({ timeout: 20000 })
 await shoot('agent-backend-local.png')
 
-await reloadScene(SCENE_MISSING)
-await page.getByText(CLAUDE_INSTALL, { exact: false }).waitFor({ timeout: 20000 })
-await shoot('agent-backend-missing.png')
+await reloadScene(SCENE_DENIED)
+await page
+  .getByRole('button', { name: 'Claude Code' })
+  .waitFor({ state: 'detached', timeout: 20000 })
+await shoot('agent-backend-denied.png')
 
 await reloadScene(SCENE_UNKNOWN)
 await shoot('agent-backend-unknown.png')
@@ -178,6 +220,14 @@ await reloadScene(SCENE_RESTART)
 await page.getByText('must restart', { exact: false }).waitFor({ timeout: 20000 })
 await shoot('agent-backend-restart.png')
 
+await reloadScene(SCENE_CODEX)
+await page.getByText('Codex signs in on its own', { exact: false }).waitFor({ timeout: 20000 })
+await shoot('agent-backend-codex-signin.png')
+
+await reloadScene(SCENE_CODEX_MISSING)
+await page.getByText('codex-acp', { exact: false }).waitFor({ timeout: 20000 })
+await shoot('agent-backend-codex-missing.png')
+
 await browser.close()
 srv.close()
 
@@ -185,4 +235,4 @@ if (errors.length) {
   console.error('console/page errors:\n' + errors.join('\n'))
   process.exit(1)
 }
-console.log(`wrote 4 frames to ${OUT}`)
+console.log(`wrote 6 frames to ${OUT}`)

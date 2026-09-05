@@ -6,12 +6,15 @@ import { SplitGlyph } from './SplitGlyph'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { useModelsDegraded } from '../providers/modelListHealth'
 import ChatMessageList from '../app-sdk/ChatMessageList'
+import { useChatScrollFollow } from '../app-sdk/useChatScrollFollow'
+import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { createTranscriptRenderers } from '../pages/chat/transcriptRenderers'
 import ChatInput from './ChatInput'
 import ChatDropOverlay, { useChatFileDrop } from './ChatDropOverlay'
 import PendingQuestionCard from './PendingQuestionCard'
 import QueueStack, { SubagentDeliveryProgress, splitPaneMessages } from './QueueStack'
 import SubagentProgressBar from '../pages/chat/SubagentProgressBar'
+import ChatFooter from '../pages/chat/ChatFooter'
 import AgentDropdownList, { DefaultAgentRow, ManageAgentsFooter } from './AgentDropdownList'
 import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
 import ModelDropdownList from './ModelDropdownList'
@@ -22,14 +25,15 @@ import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
 import { useAvailableModels } from '../hooks/useAvailableModels'
 import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutation'
+import { useQueuedMessageActions, queuedSendStash } from '../hooks/useQueuedMessageActions'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useAppSelector, useAppDispatch, store } from '../store'
-import { PANE_HYDRATE_LIMIT, retireStatelessQuestion, captureStatelessCard, capturePendingAskId, confirmOptimisticSend, selectSlotMessages, selectSlotStreamState, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, cancelQueuedMessage, editQueuedMessage, setAgentSwitchNotice, pendingQuestionFor } from '../store/chatSlice'
+import { PANE_HYDRATE_LIMIT, retireStatelessQuestion, captureStatelessCard, capturePendingAskId, confirmOptimisticSend, selectSlotMessages, selectSlotStreamState, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, setAgentSwitchNotice, pendingQuestionFor } from '../store/chatSlice'
 import { deriveFollowUpOptions } from '../app-sdk/protocol'
 import { CONTENT_WIDTH, loadChatConfig, type ChatConfig } from '../pages/chat/ChatSettings'
 import { tryQuickSend } from '../lib/quickSend'
-import { confirmedDelivered, readSendReceipt } from '../utils/sendDelivery'
 import { mergeRecoveredDraft } from '../utils/chatDrafts'
+import { sendTurn } from '../chat-core/transport/sendTurn'
 import { triggerRefresh, updateSlot } from '../store/dashboardSlice'
 import { performSlotSwitch } from '../lib/slotSwitch'
 import { performAgentSlotSwitch } from '../lib/agentSwitch'
@@ -41,11 +45,6 @@ import { displayModel } from '../lib/model'
 
 
 import { i18nT } from '../i18n/t'
-/** Stop waiting on a pane send's response. Mirrors the same bound in
- *  `ChatPage.send`, and carries its meaning too: reaching it means the request
- *  was received and only the reply is late, so the turn's output arrives over
- *  the socket rather than through this promise. It is NOT a failure signal. */
-const SEND_ABORT_MS = 10_000
 
 /**
  * ChatPane — one live chat session in the native session grid.
@@ -107,9 +106,10 @@ export default function ChatPane({
   const [uploadError, setUploadError] = useState('')
   const [agentBtnRect, setAgentBtnRect] = useState<DOMRect | null>(null)
   const [modelBtnRect, setModelBtnRect] = useState<DOMRect | null>(null)
-  const endRef = useRef<HTMLDivElement>(null)
-  const lastHashRef = useRef('')
-  const isAtBottomRef = useRef(true)
+  // Shared stick-to-bottom follow (same FollowController core as the main
+  // chat's virtualizer): RO-driven re-pin on any content growth or collapse,
+  // released only by a genuine user scroll up, re-armed at the bottom.
+  const follow = useChatScrollFollow({ resetKey: slotKey })
 
   const allMessages = useAppSelector((s) => selectSlotMessages(s, slotKey))
   const activeSlot = useAppSelector((s) => s.chat.activeSlot)
@@ -153,6 +153,13 @@ export default function ChatPane({
     () => splitPaneMessages(allMessages),
     [allMessages],
   )
+  // EVERY queued row, cards and hidden system deliveries alike. A reorder
+  // submits the full sequence — see useQueuedMessageActions — so the
+  // non-interactive rows `splitPaneMessages` strips out are still needed here.
+  const allQueuedMessages = useMemo(
+    () => allMessages.filter(m => m.role === 'queued'),
+    [allMessages],
+  )
 
   // Follow-up [OPTIONS:] pills for this pane's composer — the same
   // derive-and-pass wiring ChatPage uses, adapted to the pane's own signals.
@@ -185,6 +192,15 @@ export default function ChatPane({
   // click handler see the in-flight state, not the render it closed over.
   const planActionMutation = usePlanActionMutation(slotKey, followUpSourceKey)
   const planActionMutationRef = useRef(planActionMutation); planActionMutationRef.current = planActionMutation
+  // One spelling for every plan-chip gesture (single-click, double-click,
+  // Send-now). `sourceKeyAtClick` is the row the gesture started on.
+  const dispatchPlanFollowUp = (action: string, sourceKeyAtClick?: string | null): boolean => {
+    if (!(followUpIsPlan && isPlanAction(action))) return false
+    if (!paneSlot) return true
+    if (paneSlot.mode !== 'orchestrator') return false
+    planActionMutationRef.current.mutate({ slot: slotKey, action, clickedSourceKey: sourceKeyAtClick })
+    return true
+  }
   const followUpOptionsKey = followUpOptions.join('\x00')
   useEffect(() => { setFollowUpPicked(new Set()) }, [followUpOptionsKey, slotKey])
   // Quick Send parity with ChatPage: same query key, so the cache is shared
@@ -228,11 +244,18 @@ export default function ChatPane({
   const availableModels = useAvailableModels()
   const modelDD = useFilteredDropdown(availableModels)
   // See ChatPage: display what will actually run, not a pin the account lost
-  // access to. The degraded flag gates it — a cached list served while
-  // /api/models fails is stale and cannot disprove entitlement — and is
-  // subscribed to, since it can flip while the served list stays identical.
+  // access to. The slot's own `model_withheld` verdict answers that when the
+  // backend has one; the degraded flag gates only the list-membership fallback —
+  // a cached list served while /api/models fails is stale and cannot disprove
+  // entitlement — and is subscribed to, since it can flip while the served list
+  // stays identical.
   const _modelsDegraded = useModelsDegraded(provider.id)
-  const shownModel = displayModel(paneSlot?.model || '', availableModels, _modelsDegraded)
+  const shownModel = displayModel(
+    paneSlot?.model || '',
+    availableModels,
+    _modelsDegraded,
+    paneSlot?.model_withheld,
+  )
 
   // One-time hydrate of this slot's message history via React Query + the api
   // client (caching + cross-pane dedup; staleTime Infinity keeps it one-shot —
@@ -258,35 +281,10 @@ export default function ChatPane({
     if (slotDetail?.messages) dispatch(hydrateSlotMessages({ slot: slotKey, messages: slotDetail.messages, hasMore: slotDetail.has_more, bounded: hydrateLimit !== undefined, total: slotDetail.total, running: slotDetail.running }))
   }, [slotDetail, slotKey, dispatch, hydrateLimit])
 
-  // Track whether this pane is scrolled to the bottom. The endRef sentinel sits
-  // at the bottom of the scroll container (the overflow-y-auto div); when it's
-  // intersecting, the user is pinned to the bottom. Mirrors ChatPage's
-  // isAtBottom guard so auto-scroll never yanks a user who scrolled up to read
-  // earlier messages in a streaming pane.
-  useEffect(() => {
-    const el = endRef.current
-    if (!el || !el.parentElement) return
-    const observer = new IntersectionObserver(
-      ([entry]) => { isAtBottomRef.current = entry.isIntersecting },
-      { root: el.parentElement, threshold: 0.1 },
-    )
-    observer.observe(el)
-    return () => observer.disconnect()
-  }, [])
-
-  const msgHash =
-    messages.length + ':' + (messages[messages.length - 1]?.content?.length || 0) + ':' + queuedMessages.length
-  useEffect(() => {
-    if (msgHash !== lastHashRef.current) {
-      lastHashRef.current = msgHash
-      // Only auto-scroll when the user is already at the bottom — don't drag
-      // someone reading history back down on every message hash change.
-      if (!isAtBottomRef.current) return
-      // Smooth only when idle; during streaming use 'instant' so we don't queue
-      // dozens of concurrent smooth-scroll animations per second (jank).
-      endRef.current?.scrollIntoView({ behavior: running ? 'instant' : 'smooth' })
-    }
-  }, [msgHash, running])
+  // Scroll follow (auto-pin, release, jump pill) is owned by useChatScrollFollow
+  // above — the ResizeObserver on the content wrapper replaces the old
+  // message-hash effect, so growth on EARLIER rows (a tool result updating, a
+  // thinking block expanding) and turn-collapse shrink re-pin too.
 
 
   const switchAgent = useCallback(async (name: string) => {
@@ -505,110 +503,72 @@ export default function ChatPane({
       // can re-click any time.
       if (!optionText) restoreIntoComposer(text, files)
     }
-    // Same 10s abort `ChatPage.send` uses. Without it a HUNG (not refused) POST
-    // settles neither way until the browser's own network timeout, so the
-    // message sits on screen looking sent for minutes with the composer already
-    // cleared — the exact window this change exists to close, and the one place
-    // the removed 30s notice used to speak sooner.
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), SEND_ABORT_MS)
-    api.sendChat(llm, slotKey, undefined, controller.signal, meta)
-      .then(async (r) => {
-        clearTimeout(timeout)
-        const { body, outcome } = await readSendReceipt(r)
-        // The server accepted neither `ok` nor `queued` (or refused with a status
-        // and no readable body), so nothing was sent. Reported before the card
-        // logic below, which only runs on acceptance.
-        if (outcome === 'refused') {
-          reportFailedSend(typeof body.error === 'string' ? body.error : undefined)
-          return
-        }
-        // NO READABLE RECEIPT on a 2xx: the request was accepted and only its
-        // ANSWER is mangled, so this send is in exactly the state an abort leaves
-        // one — it may well have started a turn, whose output arrives over the
-        // socket. The catch below already refuses to report an abort as a failure
-        // because handing the payload back invites a retry that duplicates a
-        // delivered turn, side effects included; the same is true here, so an
-        // unknown takes no action either way rather than claiming a refusal it
-        // cannot prove.
-        if (outcome === 'unknown') return
-        // A `queued` acceptance with no wire text is not an acceptance at all.
-        // `chat_handlers` queues `if message:` but returns `{ok, queued}`
-        // unconditionally, so an attachment-only send that raced the slot into
-        // the busy state was neither queued nor broadcast — nothing carries the
-        // attachment, and the composer has already cleared. Reported so the file
-        // comes back rather than vanishing. (The same request answers 400 when
-        // the slot is idle, which the branch above already handles.)
-        if (body.queued && !llm.trim()) { reportFailedSend(); return }
-        // The response is the delivery receipt for this pane's optimistic bubble
-        // (#4131) — see the same dispatch in ChatPage.send for why no `chat_message`
-        // echo is coming. Parsed unconditionally now: the previous early return on
-        // "no card and no ask" skipped the body entirely, which would have skipped
-        // this confirmation too. `confirmedDelivered` accepts only an IMMEDIATE
-        // dispatch: a queued acceptance is not a receipt for this bubble.
-        if (confirmedDelivered(body)) dispatch(confirmOptimisticSend({ slot: slotKey, sendId, mid: typeof body.mid === 'string' ? body.mid : undefined }))
-        if (!cardAtSend && !askAtSend) return
-        // `ok` only: a QUEUED acceptance is still cancellable — the queued
-        // path retires at its queue_pop instead (removeQueuedMessage).
-        if (body.ok && !body.queued && cardAtSend) dispatch(retireStatelessQuestion({ slot: slotKey, expected: cardAtSend }))
-        void resolveAskAfterSend(body, askAtSend, dispatch)
-      })
-      .catch((e: unknown) => {
-        clearTimeout(timeout)
-        // An abort means the request WAS received and only the RESPONSE is late,
-        // which is what `ChatPage` records at its own timeout ("message was
-        // received, WS will deliver response") — the turn is running and its
-        // output arrives over the socket. Reporting that as a failure would hand
-        // the payload back and invite a retry that duplicates a turn already in
-        // flight, side effects included. Only a rejection that is NOT an abort
-        // means the send never left.
-        if (e instanceof DOMException && e.name === 'AbortError') return
-        reportFailedSend()
-      })
+    // Receipt semantics live in the chat-core transport (sendTurn owns the
+    // abort deadline and the shared readSendReceipt classification). This
+    // pane only decides how to REACT
+    // per status: failures report on the pane that owns the message and hand
+    // the payload back. `unknown` proves a 2xx was received, while
+    // `response-late` proves no refusal either; restoring either one here could
+    // invite a retry that duplicates a turn already in flight, side effects
+    // included, so the optimistic composer row stays pending.
+    void sendTurn({ message: llm, slot: slotKey, meta }).then((receipt) => {
+      if (receipt.status === 'refused' || receipt.status === 'transport-error') {
+        reportFailedSend(receipt.reason)
+        return
+      }
+      if (receipt.status === 'unknown' || receipt.status === 'response-late') return
+      // The receipt names the queue entry this send became: bind the
+      // pre-send composer state to it so cancelling that card restores the
+      // TYPED text and re-stages the files (issue #560). This matters MORE
+      // here than on ChatPage: the pane sends attachments via `meta.files`,
+      // so the queued row's content carries no markers and the parser
+      // fallback has nothing to recover the files from. `!optionText`
+      // mirrors the composer-consumption gate above -- an option send never
+      // consumed the draft, so there is no pre-send state to bind. An empty
+      // wire text can never reach here (sendTurn classifies it `refused`),
+      // and the guard requires the receipt's `queue_id`.
+      if (receipt.status === 'queued' && typeof receipt.body.queue_id === 'string' && receipt.body.queue_id && !optionText) {
+        queuedSendStash.set(receipt.body.queue_id, { raw: text, files, sent: llm })
+      }
+      // The response is the delivery receipt for this pane's optimistic bubble
+      // because no `chat_message` echo is coming for a dashboard send. Only
+      // an IMMEDIATE dispatch counts: a queued acceptance is not a receipt for
+      // this bubble.
+      if (receipt.status === 'dispatched') {
+        dispatch(confirmOptimisticSend({
+          slot: slotKey,
+          sendId,
+          mid: typeof receipt.body.mid === 'string' ? receipt.body.mid : undefined,
+        }))
+      }
+      if (!cardAtSend && !askAtSend) return
+      // Immediate dispatch only: a QUEUED acceptance is still cancellable —
+      // the queued path retires at its queue_pop instead (removeQueuedMessage).
+      if (receipt.status === 'dispatched' && cardAtSend) dispatch(retireStatelessQuestion({ slot: slotKey, expected: cardAtSend }))
+      void resolveAskAfterSend(receipt.body, askAtSend, dispatch)
+    })
   }, [input, pendingFiles, busy, slotKey, dispatch, restoreIntoComposer, reportSendFailure])
 
   const onStop = useCallback(() => { dispatch(requestStop({ slotId: slotKey, force: false })) }, [dispatch, slotKey])
-  const onCancelQueued = useCallback((queueId: string) => {
-    dispatch(cancelQueuedMessage({ slot: slotKey, queue_id: queueId }))
-    api.cancelQueuedMessage(slotKey, queueId).catch(() => undefined)
-  }, [dispatch, slotKey])
-  const onInterruptQueued = useCallback((queueId: string) => { api.interruptSlot(slotKey, queueId).catch(() => undefined) }, [slotKey])
-  const onEditQueued = useCallback((queueId: string, content: string) => {
-    const trimmed = content.trim()
-    if (!trimmed) return
-    // Optimistically update the card; WS event reconciles other clients.
-    // Mirrors ChatPage.handleEditQueued — split view (⌘D) must offer the same
-    // inline edit the single-chat QueueStack does.
-    dispatch(editQueuedMessage({ slot: slotKey, queue_id: queueId, content: trimmed }))
-    api.editQueuedMessage(slotKey, queueId, trimmed).catch(() => undefined)
-  }, [dispatch, slotKey])
-  const onReorderQueued = useCallback((queueId: string, direction: 'next' | 'later') => {
-    // Build the order from ALL queued messages in the slot, not just the
-    // interactive ones QueueStack renders: hidden system deliveries and
-    // recovery continuations are queued too, and submitting only the visible
-    // ids would let the backend append the omitted ones at the tail, silently
-    // demoting automation. The swap happens between adjacent VISIBLE cards but
-    // is expressed inside the complete id sequence.
-    const fullIds = allMessages
-      .filter(m => m.role === 'queued')
-      .map(m => m.meta?.queueId as string)
-      .filter(Boolean)
-    const visibleIds = queuedMessages.map(m => m.meta?.queueId as string).filter(Boolean)
-    const vFrom = visibleIds.indexOf(queueId)
-    const vTo = direction === 'next' ? vFrom - 1 : vFrom + 1
-    if (vFrom < 0 || vTo < 0 || vTo >= visibleIds.length) return
-    const a = fullIds.indexOf(visibleIds[vFrom])
-    const b = fullIds.indexOf(visibleIds[vTo])
-    if (a < 0 || b < 0) return
-    const next = [...fullIds]
-    ;[next[a], next[b]] = [next[b], next[a]]
-    // No optimistic dispatch: the server commits and broadcasts queue_reorder
-    // to every client including this one, and that WS event is the
-    // authoritative store update. A local dispatch with rollback-on-failure
-    // could restore a stale order when the server committed but the HTTP
-    // response was lost, leaving this client in conflict with execution order.
-    api.reorderQueuedMessages(slotKey, next).catch(() => undefined)
-  }, [slotKey, allMessages, queuedMessages])
+  // The same queue-card recipe the single-chat surface runs (#5891), owned once
+  // so the two cannot drift again the way #2240 found them drifted.
+  //
+  // Restore is this pane's own composer helper, which MERGES rather than
+  // assigns: a pane's composer is local state with no per-slot draft store, so
+  // clobbering it would destroy whatever the user had started typing. Before
+  // this, cancelling here restored nothing at all and the text was simply gone.
+  const {
+    onCancel: onCancelQueued,
+    onInterrupt: onInterruptQueued,
+    onEdit: onEditQueued,
+    onReorder: onReorderQueued,
+    pendingIds: queuePendingIds,
+  } = useQueuedMessageActions({
+    slot: slotKey,
+    allQueued: allQueuedMessages,
+    visibleQueued: queuedMessages,
+    restoreDraft: restoreIntoComposer,
+  })
   // Split-view panes draw the SAME transcript rows as the single-chat surface,
   // through the SDK's row registry: the live ToolCallLine (purpose / input /
   // output / live status), the workflow and sub-agent launch cards, thinking
@@ -703,6 +663,13 @@ export default function ChatPane({
 
         <ChatDropOverlay active={dragOver} />
 
+        {/* Zero-height anchor so the top fade overlays the scroller's first
+            24px, dissolving content under the header edge (shared chrome —
+            see ChatScrollChrome's layout contract). */}
+        <div className="relative z-[1]">
+          <EdgeFade side="top" />
+        </div>
+
         {/* stable theming hook 'chat-container' — see website/docs/theming-contract.md */}
         {/* overflow-x-hidden: `overflow-y-auto` alone leaves overflow-x at
             `visible`, which CSS then forces to compute to `auto` — so any single
@@ -710,7 +677,8 @@ export default function ChatPane({
             gives the WHOLE message list a draggable horizontal scrollbar that
             sits right above the composer. The conversation should never pan
             sideways; wide children scroll within themselves. */}
-        <div className="chat-container flex-1 overflow-y-auto overflow-x-hidden py-3 min-h-0">
+        <div ref={follow.scrollerRef} onScroll={follow.onScroll} className="chat-container flex-1 overflow-y-auto overflow-x-hidden py-3 min-h-0">
+          <div ref={follow.contentRef}>
           {messages.length === 0 && !running && (
             <div className="text-center text-muted text-[13px] py-8">{i18nT('components.chatPane.session_ready_type_a_message_to_start')}</div>
           )}
@@ -725,14 +693,38 @@ export default function ChatPane({
             </button>
           )}
           <ChatMessageList messages={messages} running={running} renderers={renderers} hideCardOwnedOAuth={connectionsUiOn} />
-          <div ref={endRef} />
+          {/* The same working indicator the full chat page shows (the ghost-pose
+              carousel, theme-swappable via themeBranding): a running turn in a
+              pane — a member DM, a split pane — was otherwise invisible between
+              tool steps. Inside the scroll container, after the last message,
+              so it reads as "the reply is coming" exactly where the reply will
+              land. Stop/regenerate chrome stays page-level: the pane derives
+              the footer's inputs from its own per-slot stream state. */}
+          <ChatFooter
+            running={running || !!paneSlot?.running}
+            stopping={streamState === 'stopping' || !!paneSlot?.stopping}
+            state={streamState}
+            lastRole={messages[messages.length - 1]?.role ?? ''}
+            streamTick={
+              messages[messages.length - 1]?.role === 'streaming'
+                ? (messages[messages.length - 1]?.content.length ?? 0)
+                : 0
+            }
+          />
+          </div>
         </div>
+        {/* Bottom fade overlays the scroller's last 24px above the status bars
+            and composer (in-flow height cancelled by its own negative margin). */}
+        <EdgeFade side="bottom" />
+
+        <div className="relative">
+        <JumpToBottomButton visible={!follow.isAtBottom && messages.length > 0} onClick={follow.scrollToBottom} />
 
         <SubagentProgressBar slot={slotKey} />
 
         <SubagentDeliveryProgress count={systemDeliveryCount} />
         {queuedMessages.length > 0 && (
-          <QueueStack messages={queuedMessages} onCancel={onCancelQueued} onInterrupt={onInterruptQueued} onEdit={onEditQueued} onReorder={onReorderQueued} />
+          <QueueStack messages={queuedMessages} onCancel={onCancelQueued} onInterrupt={onInterruptQueued} onEdit={onEditQueued} onReorder={onReorderQueued} pendingIds={queuePendingIds} />
         )}
 
         {/* The pending ask_question card renders per pane: in split mode the
@@ -741,33 +733,26 @@ export default function ChatPane({
             full window. */}
         <PendingQuestionCard
           slotKey={slotKey}
-          /* doSend() reads the composer state, so the fallback sends directly,
-             and `sendChat` returns the raw Response — a refusal RESOLVES here
-             rather than rejecting, so the receipt has to be read. The card is
-             already cleared by the time this runs, which makes this the one send
-             in the pane whose payload nothing else carries: a failure it did not
-             report would destroy the user's answer outright AND leave the agent
-             waiting with nothing on screen saying so. Every refusal therefore
-             gets an error row and the answer back, through the same recovery
-             `doSend` uses. */
+          /* doSend() reads the composer state, so the fallback sends directly
+             through the chat-core transport. The card is already cleared by
+             the time this runs, so a swallowed failure would destroy the
+             user's answer outright; on refusal, transport failure, or
+             the abort deadline it goes back into the composer through the
+             same recovery `doSend` uses. `response-late` restores HERE unlike
+             the composer send: a deadline can fire before the POST ever
+             reached the gateway, and with the card gone a silently lost
+             answer has no other trace — the worst case is a duplicate answer,
+             which the user can see and delete. `unknown` stays silent — a 2xx
+             proves the request was accepted, so the answer may well have
+             landed, and handing it back would invite a second answer to a
+             question already gone. */
           onFallbackSend={(text) => {
             const fail = (reason?: string) => { reportSendFailure(reason); restoreIntoComposer(text) }
-            api
-              .sendChat(text, slotKey)
-              .then(async (res) => {
-                if (!res) { fail(); return }
-                // The RECEIPT, not the status alone: a 200 answering `{ok:false}`
-                // is a refusal too, and a status-only check let it pass as a
-                // success. An unreadable 2xx stays silent, as it always has here
-                // and as the composer's own send now does — the request was
-                // accepted, so the answer may well have landed, and handing it
-                // back would invite a second answer to a question already gone.
-                const { body, outcome } = await readSendReceipt(res)
-                if (outcome === 'refused') fail(typeof body.error === 'string' ? body.error : undefined)
-              })
-              // No body to quote on a transport reject, so the shared
-              // connectivity copy stands rather than a raw fetch message.
-              .catch(() => fail())
+            void sendTurn({ message: text, slot: slotKey }).then((receipt) => {
+              if (receipt.status === 'refused' || receipt.status === 'transport-error' || receipt.status === 'response-late') {
+                fail(receipt.reason)
+              }
+            })
           }}
         />
 
@@ -808,27 +793,9 @@ export default function ChatPane({
             // chat. A plan-SHAPED message carrying non-protocol labels keeps
             // the composer path — dispatching those would 400 server-side
             // while also skipping the append, leaving a dead chip.
-            if (followUpIsPlan && isPlanAction(o)) {
-              // Slot record not yet delivered (the first WS slots snapshot
-              // can land after this pane hydrates its transcript from the
-              // detail fetch, e.g. on a reload with a restored grid): the
-              // mode is UNKNOWN, so neither dispatching nor appending is
-              // safe — appending would type an approval label into the
-              // composer, the reported bug. No-op until the record resolves.
-              if (!paneSlot) return
-              if (paneSlot.mode === 'orchestrator') {
-                // No isPending pre-check here: single-flight lives in the
-                // hook's per-slot latch, which drops a duplicate Go/Go All
-                // but must let Cancel through — a render-scoped isPending
-                // check would swallow the stop control while a Go settles.
-                // `sourceKeyAtClick` is the row the user actually clicked on
-                // (the chip debounces 220ms and the row can be replaced by a
-                // byte-identical footer inside that window without remounting
-                // the chip); the hook refuses it if it no longer matches.
-                planActionMutationRef.current.mutate({ slot: slotKey, action: o, clickedSourceKey: sourceKeyAtClick })
-                return
-              }
-            }
+            // Slot record not yet delivered: dispatchPlanFollowUp no-ops
+            // rather than appending an approval label (the reported bug).
+            if (dispatchPlanFollowUp(o, sourceKeyAtClick)) return
             // One-click Quick Send takes the same gate as ChatPage: enabled +
             // no shift + not busy + not already in multi-select.
             if (tryQuickSend(o, dashCfg?.quick_send, e.shiftKey, busy, followUpPickedRef.current.size, (t: string) => doSend(t))) return
@@ -863,7 +830,13 @@ export default function ChatPane({
               setFollowUpPicked(next)
             }
           }}
-          onFollowUpSend={(text?: string) => doSend(text)}
+          onFollowUpSend={(text?: string, sourceKeyAtClick?: string | null) => {
+            // Double-click and Send-now share dispatchPlanFollowUp with
+            // single-click (#6240). `sourceKeyAtClick` is the first-click
+            // row — a straddled double-click on a replaced footer is refused.
+            if (text && dispatchPlanFollowUp(text, sourceKeyAtClick)) return
+            doSend(text)
+          }}
           project={paneSlot?.project ?? ''}
           onUploadFiles={uploadFiles}
           pendingFiles={pendingFiles}
@@ -873,6 +846,7 @@ export default function ChatPane({
           onDragOver={dropTargetProps.onDragOver}
           onDragLeave={dropTargetProps.onDragLeave}
         />
+        </div>
 
         {/* Agent picker portal — anchored to the input-bar agent button. */}
         {agentDD.open && agentBtnRect && createPortal(

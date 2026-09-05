@@ -769,6 +769,53 @@ function dragOwnedBelow(chain: HTMLElement[], root: HTMLElement, side: Side): bo
   return false
 }
 
+/**
+ * Whether an active TEXT SELECTION owns the touch starting at `target`.
+ *
+ * A long-press selects a word and puts two drag handles on it, and extending
+ * the selection is a HORIZONTAL drag over ordinary chat text — dead center in
+ * this gesture's arming surface. Nothing else here can see it: the handles are
+ * browser chrome, not elements in the chain, so `dragOwnedBelow` finds no claim
+ * and `findHorizontalScroller` no scroller, and the handle drag passed every
+ * guard and locked as an open-drawer gesture — the drawer slid in mid-selection.
+ * The selection itself is the signal: a non-collapsed range means the user is
+ * working WITH the text under the finger, and a horizontal drag during one is
+ * the handle, not the drawer — the hamburger is still there for the exception.
+ *
+ * A focused EDITABLE under the finger is the same situation one step earlier:
+ * the caret's own handle drags before any range exists, so a touch that begins
+ * inside the element being typed in yields too. Focus is required — merely
+ * containing an input must not turn a whole form into a gesture sink, and an
+ * idle input the user is not in carries no handle to defer to.
+ *
+ * Reads the COMPOSED chain, like the two guards above, and for the same reason
+ * (see `touchedChain`): outside a shadow root both `e.target` AND
+ * `document.activeElement` are retargeted to the host, so a walk up
+ * `parentElement` from the retargeted target never meets an editable inside
+ * one. The chain crosses the boundary, and the focus side descends through
+ * `shadowRoot.activeElement` to the element that really holds the caret.
+ *
+ * Fails toward the gesture, like every guard here: no document (SSR, a bare
+ * test environment) means no selection to defer to.
+ */
+function selectionOwnsTouch(chain: HTMLElement[]): boolean {
+  if (typeof document === 'undefined') return false
+  const sel = typeof document.getSelection === 'function' ? document.getSelection() : null
+  if (sel && !sel.isCollapsed) return true
+  // The deepest focused element: `document.activeElement` stops at a shadow
+  // HOST, and each root names its own inner focus.
+  let active: Element | null = document.activeElement
+  while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement
+  if (!active) return false
+  for (const node of chain) {
+    const editable = node instanceof HTMLInputElement
+      || node instanceof HTMLTextAreaElement
+      || node.isContentEditable
+    if (editable && (node === active || node.contains(active))) return true
+  }
+  return false
+}
+
 interface DrawerSwipeOptions {
   /** Bind the gesture at all. Mobile-only — a pointer device has the toggle. */
   enabled: boolean
@@ -807,12 +854,25 @@ interface DrawerSwipeOptions {
   /** Released. `open` is the state the panel settled into, reported only once
    *  the settle animation has finished so an unmount cannot cut it short. */
   onSettle: (open: boolean) => void
+  /**
+   * Released, reported at the moment the release DECISION is made rather than
+   * when the panel finishes arriving.
+   *
+   * `onSettle` deliberately waits for the animation so a consumer cannot unmount
+   * the panel mid-slide, but that makes it the wrong signal for anything gating
+   * on intent. Two sibling instances sharing one element exclude each other
+   * (one panel's closing direction is the other's opening direction), and a gate
+   * keyed on arrival stays shut for the whole ~200-300ms slide — so a swipe that
+   * dismissed one panel could not be followed straight away by a swipe revealing
+   * the other. This fires ~300ms earlier and carries the same boolean.
+   */
+  onCommit?: (open: boolean) => void
 }
 
 /** @returns whether a drag currently owns the panel (suppress transitions). */
 export function useDrawerSwipe(
   ref: React.RefObject<HTMLElement | null>,
-  { enabled, side = 'left', travel, open, x, onGestureOpen, onSettle }: DrawerSwipeOptions,
+  { enabled, side = 'left', travel, open, x, onGestureOpen, onSettle, onCommit }: DrawerSwipeOptions,
 ): boolean {
   const [dragging, setDragging] = useState(false)
 
@@ -847,6 +907,8 @@ export function useDrawerSwipe(
   onGestureOpenRef.current = onGestureOpen
   const onSettleRef = useRef(onSettle)
   onSettleRef.current = onSettle
+  const onCommitRef = useRef(onCommit)
+  onCommitRef.current = onCommit
   const travelRef = useRef(travel)
   travelRef.current = travel
 
@@ -1125,6 +1187,12 @@ export function useDrawerSwipe(
       // opens it, and the hamburger is always there. Decided at touchstart
       // because it no longer depends on the direction.
       if (findHorizontalScroller(chain)) return
+      // An active text selection — or the focused editable being typed in —
+      // owns the drag: extending a selection rightward IS a horizontal drag
+      // over plain chat text, and its handles are browser chrome that neither
+      // chain reader above can see. Decided here like `findHorizontalScroller`,
+      // because it does not depend on the direction.
+      if (selectionOwnsTouch(chain)) return
       travelPx.current = span()
       startX.current = touch.clientX
       startY.current = touch.clientY
@@ -1156,6 +1224,12 @@ export function useDrawerSwipe(
         // toward it. This is also what lets a left and a right instance share
         // one element — each rejects the other's opening direction.
         if (openRef.current ? dx * openDir > 0 : dx * openDir < 0) { reset(); return }
+        // A long-press SELECTS mid-touch: the finger goes down, the selection
+        // appears under it, and the SAME touch drags the handle on without
+        // lifting — so the touchstart check saw nothing. Re-checked only while
+        // pending: an already-locked drag owns the panel, and a selection
+        // appearing under it must not yank the panel away mid-slide.
+        if (selectionOwnsTouch(touchedChain(e, el))) { reset(); return }
         phase.current = 'locked'
         // The finger owns the page from here: no vertical scroll under the
         // drawer, and no click on release.
@@ -1223,6 +1297,10 @@ export function useDrawerSwipe(
       // restarting from rest: it decelerates from the finger's own speed, and a
       // harder flick arrives sooner. A hold-and-release already zeroed `v`
       // above, which is exactly the case with no momentum to carry.
+      // Announce the decision before the slide, so a consumer gating on intent
+      // (a sibling instance's mutual exclusion) opens up now rather than in
+      // ~300ms. `onSettle` still reports arrival, which is what may unmount.
+      onCommitRef.current?.(target)
       settle(target ? 0 : closedOffset(), target, v)
     }
 

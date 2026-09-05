@@ -36,7 +36,7 @@ The dashboard provides a `/artifacts` library page for browse/search and a
 
 | Field | Type | Notes |
 |---|---|---|
-| `slug` | string | URL-safe handle, derived from `name` if not given |
+| `slug` | string | URL-safe handle. Derived from `name` when not given, resolving a collision by suffixing (`-2`, `-3`, …); an explicitly-passed slug is refused — never renamed — when it is already taken or malformed |
 | `name` | string | Human-readable display name |
 | `kind` | enum | `widget`, `html`, `markdown`, `svg`, `json`, `text`, `webapp`, `image` — inferred on save when the caller omits it (see [Kind inference](#kind-inference)) |
 | `source` | enum | `chat` (default), `cron`, `subagent`, `manual`, `import` |
@@ -124,7 +124,7 @@ middleware live in one place.
 ```
 kirocrew artifact list [--tag T] [--kind K] [--q SUBSTR]
 kirocrew artifact show <slug> [--version N] [--meta]
-kirocrew artifact save --name N [--kind K] [--content C | --content-file F] [--tags A,B] [--description D]
+kirocrew artifact save --name N [--slug S] [--kind K] [--content C | --content-file F] [--tags A,B] [--description D]
 kirocrew artifact update <slug> [--content C | --content-file F] [--name N] [--description D] [--tags A,B]
 kirocrew artifact versions <slug>
 kirocrew artifact delete <slug>
@@ -483,7 +483,7 @@ every write-side unit test still green — so test the round-trip
 - **Restricted sessions** — POST/PATCH/DELETE are denied when the dashboard
   classifies the session as restricted (`_is_restricted_session`).
 - **SEL audit** — every mutation emits a `log_tool_invocation` event from the
-  HTTP layer (`api/dashboard/handlers/artifacts.py`). Reads are not audited.
+  HTTP layer (`dashboard/handlers/artifacts.py`). Reads are not audited.
   `_audit` redacts caller-supplied text before it reaches the SEL writer (which
   signs bytes as-written and does NOT redact): the `error` string and every
   string leaf of `extra` metadata pass through `redact_via_context`, so an

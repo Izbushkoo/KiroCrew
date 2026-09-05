@@ -596,6 +596,26 @@ activity panel (all three with gestures), and the notification sheet (no gesture
 portaled). Only the chat page declares a claim, because it is the only one that binds
 its own gesture inside the shell.
 
+**Two sibling instances exclude each other on INTENT, not on arrival.** The chat page
+binds `useDrawerSwipe` twice on one element — sessions drawer on the left, side panel on
+the right. While both are closed, DIRECTION separates them: each rejects the drag that
+would open the other. Once one is open it cannot, because that panel's closing drag is
+the other's opening drag, so each instance is `enabled` only while its sibling is not
+open.
+
+Spell that gate as `phase !== 'open'`, never `phase === 'closed'`, and give the consumer
+the release decision through `onCommit` rather than `onSettle`. `onSettle` deliberately
+waits for the settle animation so a consumer cannot unmount a panel mid-slide, which
+makes it the wrong signal for a gate: keyed on arrival, the exclusion stayed shut for the
+whole ~300ms slide, so a swipe that dismissed one panel could not be followed straight
+away by a swipe revealing the other — the user had to wait out an animation they had
+already finished driving. The hazard lasts exactly as long as the sibling is OPEN.
+
+A committed close therefore parks the phase at `'closing'`, not `'closed'`: the panel is
+still on screen and its mount predicate keys on `!== 'closed'`, so writing `'closed'`
+here would cut the slide short. That also matches what a tap-driven close already did,
+which is why the chrome derived from the phase does not change timing.
+
 ### A panel that gains a gesture must be bound LIVE to its offset
 
 A panel moved only by a tap may serialize its offset at render time —
@@ -773,9 +793,14 @@ Inline within a `Card`, built from the shared primitives:
   reliably hand a finger drag to that shape — Settings → Voice → Language showed
   7 of its ~41 codes with the rest unreachable. A themed list nobody can scroll
   is worse than an OS-drawn list that works. Because the choice lives inside
-  `SimpleSelect`, no call site makes it: keep reaching for the components above
-  and the touch case is already handled. `NativeSelect` is the single file
-  exempted from the `no-restricted-syntax` rule; do not add a second.
+  `SimpleSelect`, no call site makes it — and `SettingsSelect` inherits it by
+  wrapping `SimpleSelect`. It goes no further: `SearchableSelect`,
+  `DropdownMenu` and `AgentSelector` keep the themed popup on a coarse pointer,
+  since a native `<select>` cannot host a filter box, per-option sublabels or a
+  command menu. Reaching for one of those does not mean the touch case has been
+  handled for you; whether that scroller is a real defect on a phone is
+  unresolved in #5551. `NativeSelect` is the single file exempted from the
+  `no-restricted-syntax` rule; do not add a second.
 - `Toggle` for a boolean switch. It carries `role="switch"`, `aria-checked` and
   `aria-disabled` itself, so do not re-add them.
 

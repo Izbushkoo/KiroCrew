@@ -336,7 +336,7 @@ async def test_the_windows_branch_validates_the_OPENED_descriptor_path(
     monkeypatch.setattr(app_routes, "apps_dir", lambda: root)
     monkeypatch.setattr(app_routes, "supports_pinned_walk", lambda: False)
     monkeypatch.setattr(
-        app_routes, "_fd_real_path", lambda fd: str(tmp_path / "elsewhere" / "app.js")
+        app_routes, "fd_real_path", lambda fd: str(tmp_path / "elsewhere" / "app.js")
     )
     status, body = await _get(f"/apps/{APP}/ui/app.js")
     assert status == 404
@@ -355,7 +355,7 @@ async def test_the_windows_branch_fails_closed_when_the_fd_path_is_unreadable(
     (ui / "app.js").write_bytes(b"const x = 1\n")
     monkeypatch.setattr(app_routes, "apps_dir", lambda: root)
     monkeypatch.setattr(app_routes, "supports_pinned_walk", lambda: False)
-    monkeypatch.setattr(app_routes, "_fd_real_path", lambda fd: None)
+    monkeypatch.setattr(app_routes, "fd_real_path", lambda fd: None)
     status, _body = await _get(f"/apps/{APP}/ui/app.js")
     assert status == 404
 
@@ -549,6 +549,32 @@ async def test_a_multi_chunk_file_streams_complete_and_bounded(
         assert resp.status == 200
         assert resp.headers["Content-Length"] == str(len(payload))
         assert await resp.read() == payload
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_stream_releases_its_permit(ui_root: Path) -> None:
+    """The head-of-line fix: the write loop is bounded by wall clock, so a
+    client that stops reading cannot hold a `_UI_STREAM_SEMAPHORE` permit (and
+    its descriptor) forever. This route bypasses token auth, so 8 such clients
+    would otherwise wedge every app UI on the host. A zero deadline expires at
+    the first await, which is the same path a stalled reader takes."""
+    payload = b"x" * 4096
+    (ui_root / "stalled.js").write_bytes(payload)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(app_routes, "_UI_STREAM_TIMEOUT", 0)
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(f"/apps/{APP}/ui/stalled.js")
+            # Headers are sent before the loop, so the abort shows up as a body
+            # that cannot satisfy the announced Content-Length.
+            with pytest.raises(Exception):
+                await resp.read()
+    # The permit is back: nothing is left holding the route, and an ordinary
+    # request served afterwards is the proof that matters.
+    assert not app_routes._UI_STREAM_SEMAPHORE.locked()
+    async with TestClient(TestServer(_make_app())) as client:
+        ok = await client.get(f"/apps/{APP}/ui/stalled.js")
+        assert ok.status == 200
+        assert await ok.read() == payload
 
 
 @pytest.mark.asyncio

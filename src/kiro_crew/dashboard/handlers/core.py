@@ -28,7 +28,6 @@ from kiro_crew.computer_use.types import MAX_TREE_NODES_LIMIT as _CU_MAX_TREE_NO
 from kiro_crew.computer_use.types import MIN_SCREENSHOT_MAX_PX as _CU_MIN_SCREENSHOT_MAX_PX
 from kiro_crew.config.loader import (
     _VALID_STT_PROVIDERS,
-    AUTO_INGEST_CHUNK_BUDGET_MAX,
     AUTOCOMPACT_PCT_MAX,
     AUTOCOMPACT_PCT_MIN,
     COMPLETION_KEEP_CHARS_MIN,
@@ -37,7 +36,6 @@ from kiro_crew.config.loader import (
     EXTRACTION_POOL_SIZE_MAX,
     EXTRACTION_POOL_SIZE_MIN,
     FOLDER_INGEST_CHUNK_BUDGET_MAX,
-    KNOWLEDGE_MAX_SOURCES_MAX,
     MAX_SUBAGENTS_FIXED_FLOOR,
     MCP_PROBE_TIMEOUT_MAX,
     MCP_PROBE_TIMEOUT_MIN,
@@ -68,6 +66,8 @@ from kiro_crew.effort import EFFORT_LEVELS
 from kiro_crew.executors import discovery_executor
 from kiro_crew.metrics import provider as _metrics_provider
 from kiro_crew.security_posture import build_posture_snapshot_async, posture_counts_async
+from kiro_crew.session_workspace import is_valid_id
+from kiro_crew.stt import decoder as stt_decoder
 from kiro_crew.stt import models as stt_models
 from kiro_crew.stt.limits import (
     MAX_IDLE_EVICT_SECS,
@@ -81,6 +81,7 @@ from kiro_crew.transcribe import (
     _whisper_language,
     availability_detail,
     ensure_ffmpeg_in_path,
+    ffmpeg_source,
     is_available,
 )
 
@@ -177,7 +178,7 @@ _DASHBOARD_HTML_NOT_FOUND = (
     " the package before starting the gateway.</p>"
     "<p><strong>Try restarting Kiro Crew.</strong> The exact restart step"
     " depends on your environment: if you installed it as a service use"
-    " <code>kirocrew service restart</code> (systemd / launchd); otherwise"
+    " <code>kirocrew restart</code> (systemd / launchd); otherwise"
     " stop the running <code>kirocrew gateway</code> process and start it"
     " again.</p>"
 )
@@ -280,10 +281,15 @@ async def logo(request: web.Request) -> web.StreamResponse:
 async def api_branding(request: web.Request) -> web.Response:
     """GET /api/dashboard/branding — bot name and avatar config."""
     cfg = KiroCrewConfig.load()
+    # `direct_local` is the canonical client-side origin signal: true only for a
+    # direct-local (loopback, no proxy) caller. The dashboard reads it to gate
+    # OS-desktop file actions (open/reveal); any future consumer of origin
+    # posture should reuse this flag rather than invent a second home.
     return web.json_response(
         {
             "bot_name": cfg.dashboard.bot_name or "Kiro Crew",
             "avatar": "/logo.png",
+            "direct_local": is_direct_local_request(request),
         }
     )
 
@@ -313,6 +319,28 @@ def _liveness_payload(request: web.Request) -> dict[str, object]:
 async def api_health(request: web.Request) -> web.Response:
     """GET /api/health — liveness, with identity for direct-local callers."""
     return web.json_response(_liveness_payload(request))
+
+
+async def api_version(request: web.Request) -> web.Response:
+    """GET /api/version — this gateway's exact version, for an authenticated peer.
+
+    Exists because remote execution is fenced by version EQUALITY: a local
+    session may only dispatch its turns to a connected crew running the identical
+    gateway build, since the two ends exchange a wire vocabulary that is not
+    versioned independently. ``/api/health`` cannot answer that question — it
+    reveals ``version`` only to a direct-local caller with a served ``Host``, on
+    purpose, to keep an exact-version fingerprint off the public probe boundary.
+
+    So this route is NOT public. It is deliberately absent from
+    ``token_auth._BYPASS_EXACT`` and from ``origin.PROBE_PATHS``, which means it
+    requires the dashboard credential and a served ``Host`` like any other API
+    route. A peer reads it over its tunnel with the port-scoped cookie the
+    instance manager already mints, exactly as the session-search and
+    session-import carriers do — so nothing is exposed to an anonymous caller
+    that was not exposed before, and the fingerprint decision at
+    :func:`_liveness_payload` stands unchanged.
+    """
+    return web.json_response({"version": kiro_crew.__version__})
 
 
 async def api_live(request: web.Request) -> web.Response:
@@ -567,6 +595,9 @@ _CODE_STT_UNAVAILABLE = "stt_unavailable"
 _CODE_STT_MISSING_AUDIO = "stt_missing_audio_field"
 _CODE_STT_AUDIO_TOO_LARGE = "stt_audio_too_large"
 _CODE_STT_FAILED = "stt_transcription_failed"
+#: A decoder fetch asked of a desktop release. Its own payload is the only decoder
+#: it will run, so the remedy is reinstalling the app, not a download.
+_CODE_STT_DECODER_BUNDLED = "stt_decoder_bundled"
 
 #: Background model-download and prewarm tasks, held ONLY so the loop keeps a
 #: strong reference: a task nobody references can be collected mid-await. Both
@@ -818,7 +849,7 @@ async def api_stt_status(request: web.Request) -> web.Response:
 
     # availability_detail imports the recogniser (or the AWS client), and each
     # is_present stats a model file: none of it belongs on the loop.
-    def _probe() -> tuple[stt.Availability, list[dict[str, object]], bool]:
+    def _probe() -> tuple[stt.Availability, list[dict[str, object]], bool, str | None]:
         # kiro_crew.stt.engine is imported HERE rather than at module scope: it
         # pulls numpy, and this module is imported on the gateway boot path, where
         # a gateway with speech-to-text switched off would otherwise pay for an
@@ -829,9 +860,17 @@ async def api_stt_status(request: web.Request) -> web.Response:
             {"name": m.name, "size_bytes": m.size_bytes, "present": stt_models.is_present(m)}
             for m in stt_models.CATALOG
         ]
-        return availability_detail(cfg.stt), catalog, stt_engine.shared_engine().loaded
+        ensure_ffmpeg_in_path()
+        # Resolved on the same thread as the rest: it lists a store directory and,
+        # when a candidate is there, hashes up to 80 MB to authenticate it.
+        return (
+            availability_detail(cfg.stt),
+            catalog,
+            stt_engine.shared_engine().loaded,
+            ffmpeg_source(),
+        )
 
-    detail, catalog, engine_loaded = await asyncio.to_thread(_probe)
+    detail, catalog, engine_loaded, decoder_source = await asyncio.to_thread(_probe)
     present = {str(row["name"]): bool(row["present"]) for row in catalog}
     return web.json_response(
         {
@@ -851,6 +890,21 @@ async def api_stt_status(request: web.Request) -> web.Response:
             # between a 30 ms transcription and one that pays a load first.
             "engine_loaded": engine_loaded,
             "download": dict(stt_models.store().status),
+            # The decoder every compressed input goes through, and what can be
+            # done about it. `source` names WHICH of the three the transcode path
+            # would run, because each one is repaired differently; `auto_fetch`
+            # says whether this host can be fixed in place at all, so the panel
+            # offers a button instead of a shell command; `os`/`arch` are the
+            # GATEWAY's, not the browser's, and are what a hand-off to an agent
+            # session needs in order to name the right remedy.
+            "ffmpeg": {
+                "present": decoder_source is not None,
+                "source": decoder_source,
+                "auto_fetch": _ffmpeg_auto_fetch(),
+                "os": platform.system(),
+                "arch": platform.machine(),
+                "download": dict(stt_decoder.store().status),
+            },
         }
     )
 
@@ -889,6 +943,63 @@ async def api_stt_prepare(request: web.Request) -> web.Response:
     return web.json_response(
         {"model": model.name, "download": dict(stt_models.store().status)}, status=202
     )
+
+
+#: Values of the status endpoint's ``ffmpeg.auto_fetch``. ``bundled`` is not
+#: "available on a desktop app": a release carries its own authenticated decoder
+#: and repairs itself by being reinstalled, so downloading one there would install
+#: a second decoder the bundled resolver refuses to look at by design.
+AUTO_FETCH_AVAILABLE = "available"
+AUTO_FETCH_UNSUPPORTED = "unsupported"
+AUTO_FETCH_BUNDLED = "bundled"
+
+
+def _ffmpeg_auto_fetch() -> str:
+    """Whether this host's decoder can be fetched, and if not, why not."""
+    if platform_compat.is_bundled_interpreter():
+        return AUTO_FETCH_BUNDLED
+    if stt_decoder.artifact_for() is None:
+        return AUTO_FETCH_UNSUPPORTED
+    return AUTO_FETCH_AVAILABLE
+
+
+async def api_stt_ffmpeg_download(request: web.Request) -> web.Response:
+    """POST /api/stt/ffmpeg/download — start, or join, the decoder fetch.
+
+    Answers 202 with the current transfer state and lets the caller poll
+    ``GET /api/stt/status``, for the same reason ``POST /api/stt/prepare`` does: a
+    ~30 MB wheel is not something to hold a request open behind. Concurrent
+    callers share one transfer through the store's own lock.
+
+    Refused on a bundled interpreter rather than quietly answering 202: a desktop
+    release already carries an authenticated decoder, its resolver deliberately
+    never looks anywhere else, and so a fetch there would spend the operator's
+    bandwidth on a file nothing can use.
+    """
+    denied = _deny_app_token(request, "stt.ffmpeg_download")
+    if denied is not None:
+        return denied
+    auto_fetch = _ffmpeg_auto_fetch()
+    if auto_fetch != AUTO_FETCH_AVAILABLE:
+        return web.json_response(
+            {
+                "error": "no decoder can be fetched for this install",
+                "code": (
+                    stt_decoder.CODE_UNSUPPORTED
+                    if auto_fetch == AUTO_FETCH_UNSUPPORTED
+                    else _CODE_STT_DECODER_BUNDLED
+                ),
+                "auto_fetch": auto_fetch,
+            },
+            status=409,
+        )
+    store = stt_decoder.store()
+    if store.status.get("stage") != stt_decoder.STAGE_DOWNLOADING:
+        # Skipped while a transfer is already running purely so a polling panel
+        # cannot accumulate tasks; the store's lock, not this check, is what makes
+        # concurrent callers safe.
+        _spawn_stt_background(store.ensure())
+    return web.json_response({"download": dict(store.status)}, status=202)
 
 
 async def api_stt_prewarm(request: web.Request) -> web.Response:
@@ -943,7 +1054,19 @@ def _transcribe_extra_importable() -> bool:
 
 
 def _ffmpeg_install_commands() -> list[str]:
-    """System-decoder fallback for source installs without the ``voice`` extra."""
+    """System-decoder commands a source install can actually run, else ``[]``.
+
+    An empty list means "there is nothing a terminal can usefully be told here",
+    and the Settings page then offers the decoder fetch or a hand-off to an agent
+    session instead. It is not the same as "nothing is wrong": ``ffmpeg.present``
+    on ``GET /api/stt/status`` is what says whether a decoder exists.
+
+    There is deliberately no fallback command. A distribution with no FFmpeg
+    package (Amazon Linux, RHEL without EPEL) and no build script in reach used to
+    be handed ``echo 'Build ffmpeg from source: …'``, which a user pasted into a
+    terminal and got a URL echoed back at them -- a command whose only effect is to
+    print a sentence is a dead end wearing the costume of an instruction.
+    """
     ensure_ffmpeg_in_path()
     if _find_ffmpeg():
         return []
@@ -954,8 +1077,9 @@ def _ffmpeg_install_commands() -> list[str]:
         return ["winget install --id Gyan.FFmpeg"]
     if shutil.which("apt-get"):
         return ["sudo apt-get install -y ffmpeg"]
-    # Amazon Linux: no ffmpeg in the distro repos — build minimal ffmpeg from
-    # source (the official recommendation).
+    # Amazon Linux: no ffmpeg in the distro repos. A source build is the only
+    # honest answer, and only when the script is actually present -- naming a path
+    # that does not exist is worse than saying nothing.
     proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
     script = os.path.join(proj, "scripts", "build-ffmpeg.sh") if proj else ""
     if script and os.path.isfile(script):
@@ -964,7 +1088,7 @@ def _ffmpeg_install_commands() -> list[str]:
             " || sudo yum install -y gcc make nasm diffutils",
             f"bash {shlex.quote(script)}",
         ]
-    return ["echo 'Build ffmpeg from source: https://ffmpeg.org/releases/'"]
+    return []
 
 
 def _stt_prereq_commands(provider: str = "local") -> list[str]:
@@ -982,20 +1106,29 @@ def _stt_prereq_commands(provider: str = "local") -> list[str]:
     An empty list means "nothing to do", which is the steady state.
     """
     cmds: list[str] = []
+    # Which extra to name depends on the provider, because the two halves are
+    # separately installable and an extra resolves ATOMICALLY: advising the full
+    # `voice` set to a cloud-only user drags in the local recogniser, which has
+    # no wheel on some platforms and fails the whole install.
+    extra = ""
     if provider == PROVIDER_LOCAL:
         # Only the missing-extra case is actionable by pip. A platform with no
         # prebuilt wheel needs a C++ toolchain instead, and the availability
         # `detail` on GET /api/stt/status is what says so.
         needs_extra = stt.availability().code == stt.CODE_EXTRA_MISSING
+        extra = "voice"
     elif provider == "transcribe":
         needs_extra = not _transcribe_extra_importable()
+        extra = "voice-aws"
     else:
         needs_extra = False
     # Suppressed where no pip channel into this interpreter exists — frozen build,
     # code-signed app bundle, pip-less or PEP 668 python. The Settings page shows
     # an unsupported notice there instead of a command that cannot succeed.
     if needs_extra and _pip_install_channel_available():
-        cmds.append(pip_extra_install_command("voice"))
+        command = pip_extra_install_command(extra)
+        if command:
+            cmds.append(command)
     if not platform_compat.is_bundled_interpreter():
         cmds.extend(_ffmpeg_install_commands())
     return cmds
@@ -1746,16 +1879,10 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # require approval regardless — enforced in the generation path).
     "skills.auto_create_from_sessions": {"type": "bool"},
     "skills.approval_required": {"type": "bool"},
-    # Knowledge Library auto-ingest. Chunk budget max mirrors the point past which
+    # Knowledge Library ingestion. Chunk budget max mirrors the point past which
     # a single sweep stops being a trickle; dedup cadence max is ~a day of sweeps.
     "knowledge.auto_add_documents": {"type": "bool"},
-    "knowledge.auto_register_project_docs": {"type": "bool"},
     "knowledge.auto_ingest_artifacts": {"type": "bool"},
-    "knowledge.auto_ingest_chunk_budget": {
-        "type": "int",
-        "min": 0,
-        "max": AUTO_INGEST_CHUNK_BUDGET_MAX,
-    },
     "knowledge.folder_ingest_chunk_budget": {
         "type": "int",
         "min": 0,
@@ -1763,7 +1890,6 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     },
     "knowledge.dedup_every_n_sweeps": {"type": "int", "min": 0, "max": DEDUP_EVERY_N_SWEEPS_MAX},
     "knowledge.sweep_chunk_budget": {"type": "int", "min": 0, "max": SWEEP_CHUNK_BUDGET_MAX},
-    "knowledge.max_sources": {"type": "int", "min": 0, "max": KNOWLEDGE_MAX_SOURCES_MAX},
     "knowledge.embed_rate_limit": {"type": "int", "min": 0, "max": EMBED_RATE_LIMIT_MAX},
     "knowledge.extraction_model": {"type": "str"},
     "knowledge.extraction_pool_size": {
@@ -2305,9 +2431,49 @@ async def api_token_local(request: web.Request) -> web.Response:
 # ── Session workspace (Orchestrated Chat) ────────────────────────────
 
 
+def _invalid_session_path_id(session_id: str, agent_id: str | None = None) -> web.Response | None:
+    """400 for a path id ``session_workspace`` would refuse, else ``None``.
+
+    Both ids reach a filesystem path (``sessions/{session_id}/agent-{agent_id}.md``)
+    and are validated there by ``_validate_id``, which RAISES. The raise is the
+    correct containment behaviour -- it is what stops ``..`` from escaping the
+    session root -- but an un-caught one leaves the route answering 500 to what
+    is really a malformed request, so it is translated here instead.
+
+    The predicate is imported rather than restated: this must refuse exactly the
+    set the path join refuses, no wider (a narrower guard would break the ``:``
+    in a real key like ``dashboard:slot-3``) and no narrower (a wider one puts
+    the 500 back). Shape follows ``cron.py``'s ``_invalid_path_id_response`` --
+    400 with an ``invalid_<name>`` ``code`` -- which is the contract #6301 names
+    and which AGENTS.md's code-field rule requires.
+
+    ``agent_id`` is checked second because that is the order the sinks validate
+    in, so the reported code names the half the caller must actually fix.
+
+    ``is_valid_id`` is imported at module scope per AUTOSDE ``top-level-imports``
+    -- there is no cycle, ``session_workspace`` pulling only stdlib and
+    ``config.paths``. The three ``list_results`` / ``read_result`` /
+    ``result_path`` imports below stay function-local: they are pre-existing, and
+    hoisting them would bind the names here at import time, which is exactly what
+    the existing tests' ``monkeypatch`` of ``kiro_crew.session_workspace.<fn>``
+    relies on NOT happening. That is a separate change with its own test fallout.
+    """
+    if not is_valid_id(session_id):
+        return web.json_response(
+            {"error": "invalid session id", "code": "invalid_session_id"}, status=400
+        )
+    if agent_id is not None and not is_valid_id(agent_id):
+        return web.json_response(
+            {"error": "invalid agent id", "code": "invalid_agent_id"}, status=400
+        )
+    return None
+
+
 async def api_session_agents_list(request: web.Request) -> web.Response:
     """GET /api/sessions/{id}/agents — list sub-agent results for a session."""
     session_id = request.match_info["id"]
+    if (_e := _invalid_session_path_id(session_id)) is not None:
+        return _e
     from kiro_crew.session_workspace import list_results  # noqa: F811
 
     results = list_results(session_id)
@@ -2325,6 +2491,8 @@ async def api_session_agent_result(request: web.Request) -> web.Response:
     """GET /api/sessions/{id}/agents/{agent_id} — read sub-agent result."""
     session_id = request.match_info["id"]
     agent_id = request.match_info["agent_id"]
+    if (_e := _invalid_session_path_id(session_id, agent_id)) is not None:
+        return _e
     from kiro_crew.session_workspace import read_result  # noqa: F811
 
     content = read_result(session_id, agent_id)
@@ -2348,6 +2516,11 @@ async def api_session_agent_stream(request: web.Request) -> web.StreamResponse:
     """GET /api/sessions/{id}/agents/{agent_id}/stream — SSE stream of result file."""
     session_id = request.match_info["id"]
     agent_id = request.match_info["agent_id"]
+    # Before the ok-record below as well as before prepare(): a refused request
+    # is not a stream that happened to be empty, so it must not be audited as
+    # one, and once the response is prepared the status is already on the wire.
+    if (_e := _invalid_session_path_id(session_id, agent_id)) is not None:
+        return _e
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="session.agent.stream",

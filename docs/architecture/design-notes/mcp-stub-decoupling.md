@@ -65,12 +65,14 @@ Two paths emit stubs, and both are now unconditional for stdio servers:
 
 - **Agent-declared servers** in `~/.kiro/agents/*.json`, wrapped in that agent's
   overlay.
-- **Global `settings/mcp.json` servers**, relocated into each agent's overlay so
-  the stub carries the right agent identity, and dropped from the settings
-  overlay in the same pass. That relocation is what keeps a server from being
-  wrapped twice under two identities; it previously applied only to poolable
-  servers, leaving everything else to merge raw with no stub and therefore no
-  callback address.
+- **Global `settings/mcp.json` servers**, injected into each agent's overlay so
+  the stub carries the right agent identity. The injected stub takes precedence
+  over the raw same-named global entry at ACP `session/new`
+  (`session_servers.py`), which is what keeps a server from being wrapped twice
+  under two identities; no settings overlay is written and the real settings
+  file is never modified (#8111). The injection previously applied only to
+  poolable servers, leaving everything else to merge raw with no stub and
+  therefore no callback address.
 
 ## The acquisition path
 
@@ -145,7 +147,8 @@ unrelated session.
 - `UNPOOLABLE_SERVERS` — Kiro Crew's own MCP servers, which bind to
   `KIROCREW_SESSION_KEY` and are passed through unwrapped. They are already
   per-session by construction; giving them stubs is a separate change.
-- HTTP/SSE MCP entries. They need no stub and stay raw in the settings overlay.
+- HTTP/SSE MCP entries. They need no stub and merge raw from the real settings
+  file.
 - Per-server MCP Apps control. Orthogonal to stub emission.
 
 ## Superseded: the stub is opt-in per server, not unconditional
@@ -162,9 +165,19 @@ a choice.
 
 What replaced it:
 
-- **`mcp_gateway.stub_servers`** — the per-server opt-in, empty by default.
-  Routing is what interposes a stub, so it is the single per-server decision and the
-  only thing that can grant MCP Apps for that server.
+- **`mcp_gateway.stub_servers`** — the stub ROSTER, empty by default. Routing is
+  what interposes a stub, so this is the per-server decision and the only thing
+  that can grant MCP Apps for that server. It is a layer an edition can own: a
+  distribution that wants its known servers stubbed out of the box ships them
+  here, and keeps adding to it, because a toggle no longer rewrites it.
+- **`mcp_gateway.stub_overrides`** — the operator's deviations from that roster,
+  as a sparse `name -> bool` map. This is what MCP Management writes: a name the
+  operator never touched keeps following the roster, so growing the roster reaches
+  them and their own opt-outs survive it. An override that agrees with the roster
+  is pruned rather than stored — identical in effect, and storing it would pin
+  that server against the next roster change. A flat resulting list could not do
+  both: unstubbing one name out of a shipped roster means writing back the
+  survivors, and that list then answers the question forever.
 - **`mcp_gateway.enabled`** — unchanged meaning (share backends), now global over the
   stub set. There is no per-server sharing switch.
 - **`mcp_gateway.poolable_servers`** — deprecated alias, read only when

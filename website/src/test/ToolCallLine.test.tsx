@@ -321,7 +321,7 @@ describe('ToolCallLine inline expansion', () => {
 
 describe('ToolCallLine file-open icon', () => {
   beforeEach(() => {
-    globalThis.fetch = vi.fn(() => Promise.resolve({ ok: true, status: 200 })) as any
+    globalThis.fetch = vi.fn(() => Promise.resolve({ ok: true, status: 200 })) as unknown as typeof fetch
   })
 
   function fileMsg(overrides: Partial<ChatMessage> = {}): ChatMessage {
@@ -334,7 +334,7 @@ describe('ToolCallLine file-open icon', () => {
         messages: [fileMsg()],
         toolLog: [{ type: 'tool', text: 'Read /etc/hosts', purpose: 'Read a file', tool_call_id: 'tc_file', input, output: 'ok', ts: 1 }],
         slotRunning: false,
-      } as any,
+      } as unknown as ChatState,
     })
   }
 
@@ -386,7 +386,7 @@ describe('ToolCallLine file-open icon', () => {
   })
 
   it('does not render the icon when the file does not exist (HEAD 404)', async () => {
-    globalThis.fetch = vi.fn(() => Promise.resolve({ ok: false, status: 404 })) as any
+    globalThis.fetch = vi.fn(() => Promise.resolve({ ok: false, status: 404 })) as unknown as typeof fetch
     const store = fileStore('{"path":"/etc/hosts"}')
     renderWithProviders(<ToolCallLine message={fileMsg()} running={false} onFileOpen={vi.fn()} />, { store })
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
@@ -445,7 +445,13 @@ describe('ToolCallLine entrance reveal', () => {
  *  therefore ease their own HEIGHT — the pin then spreads over those frames and
  *  reads as a slide. */
 describe('ToolCallLine row slide', () => {
-  it('keeps the shell status line mounted while it collapses, then drops it', async () => {
+  it('freezes the shell status line on completion instead of collapsing it', async () => {
+    // The collapse this test USED to pin (ease to zero, then unmount) fired
+    // once per tool boundary, and above a bottom-pinned reader every one of
+    // those eases moved the viewport down and back up -- the tool-rhythm
+    // 'bounces in place' report. The row now freezes into the elapsed total
+    // and is reclaimed with the turn's collapse: within-turn height at this
+    // row is monotonic.
     const msg = toolMsg({ meta: { tool_call_id: 'tc_slide_exit' } })
     const store = createTestStore({
       chat: {
@@ -458,15 +464,13 @@ describe('ToolCallLine row slide', () => {
     renderWithProviders(<ToolCallLine message={msg} running />, { store })
     expect(screen.getByText(/Running ·/)).toBeTruthy()
 
-    // The tool result lands — the status line no longer applies.
+    // The tool result lands — the live 'Running' wording retires…
     act(() => {
       store.dispatch(sseToolResult({ slot: 'S', output: 'hello', tool_call_id: 'tc_slide_exit' }))
     })
-    // Still in the DOM on the commit that hid it: it is easing its height to
-    // zero, not vanishing in one frame (which is what jumped the rows above).
-    expect(screen.getByText(/Running ·/)).toBeTruthy()
-    // …and gone once the collapse finishes.
     await waitFor(() => expect(screen.queryByText(/Running ·/)).toBeNull())
+    // …but the row itself STAYS, frozen at the elapsed total.
+    expect(screen.getByTestId('shell-activity')).toBeTruthy()
   })
 
   it('grows a first-appearance row from zero height and releases it afterwards', async () => {

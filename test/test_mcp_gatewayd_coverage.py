@@ -677,6 +677,11 @@ _AUDIT_CASES = [
     ("_audit_pool_fallback", ("caller", "demo-mcp", "pool full"), "mcp-gateway.fallback"),
     ("_audit_pool_rejected", ("caller", "demo-mcp", "unknown target"), "mcp-gateway.ensure_backend"),
     ("_audit_prewarm_spawn", ("demo-mcp",), "mcp-gateway.prewarm-spawn"),
+    (
+        "_audit_reserved_stub_prefix_denied",
+        ("__app_call__deadbeef",),
+        "mcp-gateway.reserved-stub-prefix-denied",
+    ),
 ]
 
 
@@ -1006,12 +1011,15 @@ class TestEnvTargetResolver:
         monkeypatch.setenv("PYTHONPATH", "/host/site-packages")
         monkeypatch.setenv("PYTHONHOME", "/host/python")
         monkeypatch.setenv("PYTHONPYCACHEPREFIX", "/host/cache/pycache")
+        monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
 
         resolved = gw.env_target_resolver(key)
         assert resolved is not None
         _command, _args, env, _work_dir = resolved
 
-        for leaked_key in ("PYTHONPATH", "PYTHONHOME", "PYTHONPYCACHEPREFIX"):
+        for leaked_key in (
+            "PYTHONPATH", "PYTHONHOME", "PYTHONPYCACHEPREFIX", "PYTHONDONTWRITEBYTECODE",
+        ):
             assert leaked_key not in env
 
 
